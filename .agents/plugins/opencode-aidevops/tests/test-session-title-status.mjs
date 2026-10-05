@@ -91,7 +91,7 @@ test("terminal title sequences reject empty and control-only titles", () => {
   assert.equal(terminalTitleSequence("Task\u0007 title"), "\u001B]0;Task  title\u0007");
 });
 
-test("session status handler follows only the active interactive root session", async () => {
+test("session status handler follows the active interactive root session family", async () => {
   const statuses = [];
   let resets = 0;
   const handler = createSessionTitleStatusHandler({
@@ -105,6 +105,7 @@ test("session status handler follows only the active interactive root session", 
 
   await handler(event("session.created", { info: { id: "root-1", title: "Root" } }));
   await handler(event("session.created", { info: { id: "child-1", parentID: "root-1", title: "Child" } }));
+  // Child busy must paint the tab even while the root itself is idle.
   await handler(event("session.status", { sessionID: "child-1", status: { type: "busy" } }));
   await handler(event("permission.replied", { requestID: "unknown", sessionID: "root-1", reply: "once" }));
   await handler(event("session.status", { sessionID: "root-1", status: { type: "busy" } }));
@@ -112,14 +113,67 @@ test("session status handler follows only the active interactive root session", 
   await handler(event("permission.asked", { id: "permission-root", sessionID: "root-1" }));
   await handler(event("session.status", { sessionID: "root-1", status: { type: "idle" } }));
   await handler(event("permission.replied", { requestID: "permission-root", sessionID: "root-1", reply: "once" }));
+  // One permission remains (child); stay yellow until it clears.
+  await handler(event("permission.replied", {
+    requestID: "permission-child",
+    sessionID: "child-1",
+    reply: "once",
+  }));
   await handler(event("session.status", { sessionID: "root-1", status: { type: "retry" } }));
+  // Root idle while child still busy keeps the tab white.
   await handler(event("session.status", { sessionID: "root-1", status: { type: "idle" } }));
+  await handler(event("session.status", { sessionID: "child-1", status: { type: "idle" } }));
   await handler(event("session.created", { info: { id: "root-2", title: "New root" } }));
   await handler(event("session.status", { sessionID: "root-1", status: { type: "busy" } }));
   await handler(event("session.status", { sessionID: "root-2", status: { type: "idle" } }));
 
   assert.equal(resets, 2);
-  assert.deepEqual(statuses, ["idle", "busy", "permission", "busy", "retry", "idle", "idle", "idle"]);
+  assert.deepEqual(statuses, [
+    "idle",
+    "busy",
+    "busy",
+    "permission",
+    "permission",
+    "busy",
+    "retry",
+    "busy",
+    "idle",
+    "idle",
+    "idle",
+  ]);
+});
+
+test("child running/busy keeps the tab busy after root assistant completion", async () => {
+  const statuses = [];
+  const handler = createSessionTitleStatusHandler({
+    isHeadless: () => false,
+    isEnabled: () => true,
+    setTerminalTitleStatus: (status) => statuses.push(status),
+  });
+
+  await handler(event("session.created", { info: { id: "root-family", title: "Family" } }));
+  await handler(event("session.created", {
+    info: { id: "child-family", parentID: "root-family", title: "Child" },
+  }));
+  await handler(event("message.updated", {
+    info: { id: "user-family", sessionID: "root-family", role: "user", time: { created: 10 } },
+  }));
+  await handler(event("session.status", { sessionID: "child-family", status: { type: "running" } }));
+  await handler(event("message.updated", {
+    info: {
+      id: "assistant-family",
+      sessionID: "root-family",
+      parentID: "user-family",
+      role: "assistant",
+      finish: "stop",
+      time: { created: 10, completed: 20 },
+    },
+  }));
+  await handler(event("session.status", { sessionID: "root-family", status: { type: "idle" } }));
+  await handler(event("session.status", { sessionID: "child-family", status: { type: "idle" } }));
+  await handler(event("session.deleted", { sessionID: "child-family" }));
+
+  assert.deepEqual(statuses, ["idle", "busy", "busy", "busy", "busy", "idle", "idle"]);
 });
 
 test("first root user message marks the session busy before native status", async () => {

@@ -24,7 +24,7 @@ tools:
 - **Script**: `~/.aidevops/agents/scripts/terminal-title-helper.sh`
 - **Auto-sync**: Runs via `pre-edit-check.sh` on task refs in linked worktrees
 - **Session sync**: For issue/PR work, OpenCode session titles should begin with `Issue #123:` or `PR #456:` plus a succinct description; branch auto-sync is only the fallback when no issue/PR context exists. Force branch sync via `session-rename_sync_branch`.
-- **Session status**: Interactive OpenCode root sessions prefix the terminal-only title with ⚪ from the first submitted user message and retain it across descriptive title updates, 🔴 for `retry`, 🟡 while awaiting permission, and 🟢 for `idle`. Stored OpenCode session titles remain unchanged.
+- **Session status**: Interactive OpenCode root sessions prefix the terminal-only title with ⚪ from the first submitted user message and retain it across descriptive title updates, 🔴 for `retry`, 🟡 while awaiting permission, and 🟢 for `idle`. Child/subagent sessions in the active root family also drive ⚪/🟡/🔴 so multi-session turns stay non-green while work continues. Stored OpenCode session titles remain unchanged.
 
 **Commands**:
 
@@ -60,7 +60,7 @@ terminal-title-helper.sh detect            # Check terminal compatibility
 
 Uses OSC escape sequences (`printf '\033]0;%s\007' "title"`). **Full support**: Tabby, iTerm2, Windows Terminal, Kitty, Alacritty, WezTerm, Hyper, GNOME Terminal, Konsole, VS Code Terminal, xterm. **Partial**: Apple Terminal (basic), tmux/screen (requires config).
 
-The OpenCode plugin consumes the first root-user `message.updated` event plus `session.status`, `permission.asked`, and `permission.replied` events only for the active interactive root session. Subagent and headless-worker events are ignored. Managed launchers disable OpenCode's competing native terminal-title writer, shell helpers yield while OpenCode is active, and native session-rename tools share the plugin controller so status remains applied across title changes.
+The OpenCode plugin consumes the first root-user `message.updated` event plus `session.status`, `permission.asked`, and `permission.replied` events for the active interactive root session and its child/subagent family. Headless-worker sessions are ignored. Child `session.status` / permission events keep the tab ⚪ or 🟡 while the root is idle between turns. Managed launchers disable OpenCode's competing native terminal-title writer, shell helpers yield while OpenCode is active, and native session-rename tools share the plugin controller so status remains applied across title changes.
 
 OpenCode V2 (`opencode2`) runs server plugins in a tty-less background service, so the status title comes from the TUI entrypoint `plugins/opencode-aidevops/v2-plugin/tui.mjs` instead. It reads the TUI session store (running → ⚪, pending permission → 🟡, otherwise 🟢), writes through the TUI renderer, writes immediately on status or title changes, and re-applies an unchanged title every 2s so V2's own `OC | <title>` writer cannot persist. `OPENCODE_DISABLE_TERMINAL_TITLE` has no effect on V2; the ownership variables above still apply.
 
