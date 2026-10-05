@@ -91,7 +91,7 @@ test("terminal title sequences reject empty and control-only titles", () => {
   assert.equal(terminalTitleSequence("Task\u0007 title"), "\u001B]0;Task  title\u0007");
 });
 
-test("session status handler follows the active interactive root session family", async () => {
+test("session status handler follows each root family and switches focus across roots", async () => {
   const statuses = [];
   let resets = 0;
   const handler = createSessionTitleStatusHandler({
@@ -123,22 +123,26 @@ test("session status handler follows the active interactive root session family"
   // Root idle while child still busy keeps the tab white.
   await handler(event("session.status", { sessionID: "root-1", status: { type: "idle" } }));
   await handler(event("session.status", { sessionID: "child-1", status: { type: "idle" } }));
+  // Second root must get its own idle/busy lifecycle (Triage multi-session).
   await handler(event("session.created", { info: { id: "root-2", title: "New root" } }));
+  await handler(event("session.status", { sessionID: "root-2", status: { type: "busy" } }));
+  await handler(event("session.updated", { info: { id: "root-1", title: "Root again" } }));
   await handler(event("session.status", { sessionID: "root-1", status: { type: "busy" } }));
+  await handler(event("session.updated", { info: { id: "root-2", title: "Back to two" } }));
   await handler(event("session.status", { sessionID: "root-2", status: { type: "idle" } }));
 
-  assert.equal(resets, 2);
+  assert.equal(resets, 0);
   assert.deepEqual(statuses, [
     "idle",
     "busy",
-    "busy",
-    "permission",
     "permission",
     "busy",
     "retry",
     "busy",
     "idle",
+    "busy",
     "idle",
+    "busy",
     "idle",
   ]);
 });
@@ -173,7 +177,7 @@ test("child running/busy keeps the tab busy after root assistant completion", as
   await handler(event("session.status", { sessionID: "child-family", status: { type: "idle" } }));
   await handler(event("session.deleted", { sessionID: "child-family" }));
 
-  assert.deepEqual(statuses, ["idle", "busy", "busy", "busy", "busy", "idle", "idle"]);
+  assert.deepEqual(statuses, ["idle", "busy", "idle"]);
 });
 
 test("first root user message marks the session busy before native status", async () => {
@@ -305,7 +309,7 @@ test("legacy idle and permission events retain lifecycle status compatibility", 
   }));
   await handler(event("session.idle", { sessionID: "root-legacy" }));
 
-  assert.deepEqual(statuses, ["idle", "idle", "permission", "busy", "idle"]);
+  assert.deepEqual(statuses, ["idle", "permission", "busy", "idle"]);
 });
 
 test("permission status persists until current and legacy requests both reply", async () => {
@@ -332,7 +336,7 @@ test("permission status persists until current and legacy requests both reply", 
   }));
   await handler(event("session.idle", { sessionID: "root-pending" }));
 
-  assert.deepEqual(statuses, ["idle", "permission", "permission", "busy", "idle"]);
+  assert.deepEqual(statuses, ["idle", "permission", "busy", "idle"]);
 });
 
 test("event lifecycle renders idle, busy, permission, and waiting titles end to end", async () => {
@@ -409,6 +413,42 @@ test("session status handler supports hot-loaded root sessions and ignores headl
   }));
   await headlessHandler(event("session.status", { sessionID: "headless-root", status: { type: "idle" } }));
 
-  assert.equal(resets, 1);
+  assert.equal(resets, 0);
   assert.deepEqual(statuses, ["idle", "busy"]);
+});
+
+test("sibling root sessions each get busy and idle status when focused", async () => {
+  const statuses = [];
+  const handler = createSessionTitleStatusHandler({
+    isHeadless: () => false,
+    isEnabled: () => true,
+    setTerminalTitleStatus: (status) => statuses.push(status),
+  });
+
+  await handler(event("session.created", { info: { id: "triage-a", title: "Guardz" } }));
+  await handler(event("message.updated", {
+    sessionID: "triage-a",
+    info: { id: "user-a", sessionID: "triage-a", role: "user", time: { created: 1 } },
+  }));
+  await handler(event("session.created", { info: { id: "triage-b", title: "Ransomware" } }));
+  await handler(event("message.updated", {
+    sessionID: "triage-b",
+    info: { id: "user-b", sessionID: "triage-b", role: "user", time: { created: 2 } },
+  }));
+  await handler(event("message.updated", {
+    sessionID: "triage-b",
+    info: {
+      id: "assistant-b",
+      sessionID: "triage-b",
+      parentID: "user-b",
+      role: "assistant",
+      finish: "stop",
+      time: { created: 2, completed: 3 },
+    },
+  }));
+  await handler(event("session.updated", { info: { id: "triage-a", title: "Guardz" } }));
+  await handler(event("session.status", { sessionID: "triage-a", status: { type: "busy" } }));
+  await handler(event("session.updated", { info: { id: "triage-b", title: "Ransomware" } }));
+
+  assert.deepEqual(statuses, ["idle", "busy", "idle", "busy", "idle", "busy", "idle"]);
 });

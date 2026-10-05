@@ -58,24 +58,55 @@ function rootOf(sessionID, state) {
   return id || sessionID;
 }
 
-function isInActiveFamily(sessionID, state) {
-  if (!state.activeRootSessionID || !sessionID) return false;
-  if (sessionID === state.activeRootSessionID) return true;
-  return rootOf(sessionID, state) === state.activeRootSessionID;
+function isInFamily(sessionID, rootID, state) {
+  if (!rootID || !sessionID) return false;
+  if (sessionID === rootID) return true;
+  return rootOf(sessionID, state) === rootID;
 }
 
-function familyHasActiveWork(state) {
-  for (const status of state.familyStatus.values()) {
+function isInActiveFamily(sessionID, state) {
+  return isInFamily(sessionID, state.activeRootSessionID, state);
+}
+
+function turnFor(rootID, state) {
+  let turn = state.turns.get(rootID);
+  if (!turn) {
+    turn = {
+      activeUserMessageID: "",
+      activeUserCreatedAt: null,
+      completedUserMessageID: "",
+      completedAssistantMessageIDs: new Set(),
+      seenUserMessageIDs: new Set(),
+    };
+    state.turns.set(rootID, turn);
+  }
+  return turn;
+}
+
+function familyHasActiveWork(rootID, state) {
+  for (const [sessionID, status] of state.familyStatus.entries()) {
+    if (!isInFamily(sessionID, rootID, state)) continue;
     if (status === "busy" || status === "retry") return true;
   }
   return false;
 }
 
+function activePendingPermissionCount(state) {
+  let count = 0;
+  for (const sessionID of state.pendingPermissionSessions.values()) {
+    if (isInActiveFamily(sessionID, state)) count += 1;
+  }
+  return count;
+}
+
 function resolveTitleStatus(state) {
-  if (state.pendingPermissionIDs.size > 0) return "permission";
+  if (activePendingPermissionCount(state) > 0) return "permission";
+  const rootID = state.activeRootSessionID;
+  if (!rootID) return "idle";
   let hasRetry = false;
   let hasBusy = false;
-  for (const status of state.familyStatus.values()) {
+  for (const [sessionID, status] of state.familyStatus.entries()) {
+    if (!isInFamily(sessionID, rootID, state)) continue;
     if (status === "retry") hasRetry = true;
     if (status === "busy") hasBusy = true;
   }
@@ -85,50 +116,53 @@ function resolveTitleStatus(state) {
 }
 
 function emitResolvedStatus(state, setTerminalTitleStatus) {
-  setTerminalTitleStatus(resolveTitleStatus(state));
+  const next = resolveTitleStatus(state);
+  // Idempotent: session.idle/status while already 🟡/🟢 must not thrash Tabby.
+  if (next === state.lastEmittedStatus) return;
+  state.lastEmittedStatus = next;
+  setTerminalTitleStatus(next);
 }
 
-function activateRootSession({ sessionID, state, resetState, setTerminalTitleStatus }) {
-  state.activeRootSessionID = sessionID;
-  resetState();
-  state.familyStatus.set(sessionID, "idle");
-  setTerminalTitleStatus("idle");
+/** Soft-focus a root without wiping sibling root status (multi-session tabs). */
+function focusRoot(sessionID, state, setTerminalTitleStatus, { emit = true } = {}) {
+  if (!sessionID) return;
+  const rootID = rootOf(sessionID, state);
+  state.activeRootSessionID = rootID;
+  if (!state.familyStatus.has(rootID)) state.familyStatus.set(rootID, "idle");
+  turnFor(rootID, state);
+  if (emit) emitResolvedStatus(state, setTerminalTitleStatus);
 }
 
 function handleSessionCreated(context) {
-  const { info, state } = context;
+  const { info, state, setTerminalTitleStatus } = context;
   if (!info?.id) return;
   registerSessionInfo(info, state);
   if (isRootSessionInfo(info)) {
-    activateRootSession(context);
+    // Do not reset sibling roots — Triage keeps many parallel root sessions.
+    focusRoot(info.id, state, setTerminalTitleStatus);
     return;
   }
-  if (isInActiveFamily(info.id, state) && !state.familyStatus.has(info.id)) {
+  if (!state.familyStatus.has(info.id)) {
     state.familyStatus.set(info.id, "idle");
   }
+  // Child of some root: if it belongs to the focused root, refresh title.
+  if (isInActiveFamily(info.id, state)) emitResolvedStatus(state, setTerminalTitleStatus);
 }
 
 function handleSessionUpdated(context) {
-  const { info, state } = context;
+  const { info, state, setTerminalTitleStatus } = context;
   if (!info?.id) return;
   registerSessionInfo(info, state);
-  if (state.activeRootSessionID || !isRootSessionInfo(info)) {
-    if (isInActiveFamily(info.id, state) && !state.familyStatus.has(info.id)) {
-      state.familyStatus.set(info.id, "idle");
-    }
+  if (isRootSessionInfo(info)) {
+    // Session switch / title update on a root → follow focus so 🟢/⚪ works
+    // for every root session in the tab, not only the first one created.
+    focusRoot(info.id, state, setTerminalTitleStatus);
     return;
   }
-  activateRootSession(context);
+  if (!state.familyStatus.has(info.id)) state.familyStatus.set(info.id, "idle");
 }
 
-function handleSessionDeleted({ sessionID, state, resetState, setTerminalTitleStatus }) {
-  if (sessionID === state.activeRootSessionID) {
-    state.activeRootSessionID = "";
-    resetState();
-    return;
-  }
-  if (!state.activeRootSessionID) return;
-
+function handleSessionDeleted({ sessionID, state, setTerminalTitleStatus, resetTerminalTitleState }) {
   const toDelete = new Set([sessionID]);
   let grew = true;
   while (grew) {
@@ -140,97 +174,166 @@ function handleSessionDeleted({ sessionID, state, resetState, setTerminalTitleSt
     }
   }
 
-  let removed = false;
   for (const id of toDelete) {
-    if (state.familyStatus.delete(id)) removed = true;
-    if (state.sessionParent.delete(id)) removed = true;
+    state.familyStatus.delete(id);
+    state.sessionParent.delete(id);
+    state.turns.delete(id);
+    for (const [requestID, owner] of [...state.pendingPermissionSessions.entries()]) {
+      if (owner === id) state.pendingPermissionSessions.delete(requestID);
+    }
   }
-  if (removed) emitResolvedStatus(state, setTerminalTitleStatus);
-}
 
-function handleUserMessageUpdated({ info, state, setTerminalTitleStatus }) {
-  const messageID = info.id || "";
-  if (!rememberMessageID(state.seenUserMessageIDs, messageID)) return;
-  const createdAt = Number.isFinite(info.time?.created) ? info.time.created : null;
-  if (
-    state.activeUserMessageID &&
-    state.activeUserCreatedAt !== null &&
-    (createdAt === null || createdAt < state.activeUserCreatedAt)
-  ) {
-    return;
+  if (toDelete.has(state.activeRootSessionID)) {
+    // Prefer another known root; else clear.
+    let next = "";
+    for (const id of state.familyStatus.keys()) {
+      if (!state.sessionParent.has(id)) {
+        next = id;
+        break;
+      }
+    }
+    state.activeRootSessionID = next;
+    if (!next) {
+      state.lastEmittedStatus = "";
+      resetTerminalTitleState();
+      return;
+    }
   }
-  state.activeUserMessageID = messageID;
-  state.activeUserCreatedAt = createdAt;
-  state.completedUserMessageID = "";
-  if (state.activeRootSessionID) state.familyStatus.set(state.activeRootSessionID, "busy");
-  // Keep 🟡 while permissions are outstanding; family busy is retained for the
-  // reply path without re-emitting permission on every user-message update.
-  if (state.pendingPermissionIDs.size > 0) return;
   emitResolvedStatus(state, setTerminalTitleStatus);
 }
 
-function handleAssistantMessageUpdated({ info, state, setTerminalTitleStatus }) {
+function handleUserMessageUpdated({ info, sessionID, state, setTerminalTitleStatus }) {
+  const rootID = rootOf(sessionID, state);
+  focusRoot(rootID, state, setTerminalTitleStatus, { emit: false });
+  const turn = turnFor(rootID, state);
+  const messageID = info.id || "";
+  if (!rememberMessageID(turn.seenUserMessageIDs, messageID)) return;
+  const createdAt = Number.isFinite(info.time?.created) ? info.time.created : null;
+  if (
+    turn.activeUserMessageID &&
+    turn.activeUserCreatedAt !== null &&
+    (createdAt === null || createdAt < turn.activeUserCreatedAt)
+  ) {
+    return;
+  }
+  turn.activeUserMessageID = messageID;
+  turn.activeUserCreatedAt = createdAt;
+  turn.completedUserMessageID = "";
+  state.familyStatus.set(rootID, "busy");
+  if (activePendingPermissionCount(state) > 0) return;
+  emitResolvedStatus(state, setTerminalTitleStatus);
+}
+
+function handleAssistantMessageUpdated({ info, sessionID, state, setTerminalTitleStatus }) {
+  const rootID = rootOf(sessionID, state);
+  const turn = turnFor(rootID, state);
   if (
     !isTerminalAssistantCompletion(info) ||
-    state.pendingPermissionIDs.size > 0 ||
-    !state.activeUserMessageID ||
-    info.parentID !== state.activeUserMessageID
+    activePendingPermissionCount(state) > 0 ||
+    !turn.activeUserMessageID ||
+    info.parentID !== turn.activeUserMessageID
   ) return;
-  if (!rememberMessageID(state.completedAssistantMessageIDs, info.id)) return;
-  state.completedUserMessageID = state.activeUserMessageID;
-  if (state.activeRootSessionID) state.familyStatus.set(state.activeRootSessionID, "idle");
+  if (!rememberMessageID(turn.completedAssistantMessageIDs, info.id)) return;
+  turn.completedUserMessageID = turn.activeUserMessageID;
+  state.familyStatus.set(rootID, "idle");
+  focusRoot(rootID, state, setTerminalTitleStatus, { emit: false });
   emitResolvedStatus(state, setTerminalTitleStatus);
 }
 
 function handleMessageUpdated(context) {
   const { info, sessionID, state } = context;
-  // Root-turn message heuristics stay root-only; child activity is driven by
-  // session.status so multi-session work still paints ⚪ while children run.
-  if (sessionID !== state.activeRootSessionID) return;
+  if (!sessionID) return;
+  // Child sessions: status events drive the tab; ignore child message heuristics.
+  if (state.sessionParent.has(sessionID)) return;
+  // Only known roots (or the focused root) drive message heuristics. Ignore
+  // unregistered ids so stray child events without session.created cannot
+  // steal focus from the real root.
+  const isKnownRoot = state.familyStatus.has(sessionID) && !state.sessionParent.has(sessionID);
+  const isFocusedRoot = sessionID === state.activeRootSessionID;
+  if (!isKnownRoot && !isFocusedRoot) return;
   if (info?.role === "user") handleUserMessageUpdated(context);
   else handleAssistantMessageUpdated(context);
 }
 
 function handleSessionStatus({ event, sessionID, state, setTerminalTitleStatus }) {
-  if (!isInActiveFamily(sessionID, state) || state.pendingPermissionIDs.size > 0) return;
+  if (!sessionID) return;
   const status = normalizeSessionStatus(event.properties?.status?.type);
   if (!ROOT_SESSION_STATUSES.has(status)) return;
+
+  // Adopt unknown sessions as their own root so multi-session tabs work even
+  // when session.created was missed (long-lived OpenCode restore).
+  if (!state.familyStatus.has(sessionID) && !state.sessionParent.has(sessionID)) {
+    state.familyStatus.set(sessionID, "idle");
+  }
+
+  const rootID = rootOf(sessionID, state);
+  focusRoot(rootID, state, setTerminalTitleStatus, { emit: false });
+  if (activePendingPermissionCount(state) > 0) {
+    state.familyStatus.set(sessionID, status);
+    emitResolvedStatus(state, setTerminalTitleStatus);
+    return;
+  }
+
+  const turn = turnFor(rootID, state);
   if (
-    sessionID === state.activeRootSessionID &&
+    sessionID === rootID &&
     status === "busy" &&
-    state.completedUserMessageID &&
-    state.completedUserMessageID === state.activeUserMessageID
+    turn.completedUserMessageID &&
+    turn.completedUserMessageID === turn.activeUserMessageID
   ) return;
-  if (sessionID === state.activeRootSessionID && status !== "idle") state.completedUserMessageID = "";
+  if (sessionID === rootID && status !== "idle") turn.completedUserMessageID = "";
   state.familyStatus.set(sessionID, status);
   emitResolvedStatus(state, setTerminalTitleStatus);
 }
 
 function handleSessionIdle({ sessionID, state, setTerminalTitleStatus }) {
-  if (!isInActiveFamily(sessionID, state) || state.pendingPermissionIDs.size > 0) return;
+  if (!sessionID) return;
+  if (!state.familyStatus.has(sessionID) && !state.sessionParent.has(sessionID)) {
+    state.familyStatus.set(sessionID, "idle");
+  }
+  const rootID = rootOf(sessionID, state);
+  focusRoot(rootID, state, setTerminalTitleStatus, { emit: false });
   state.familyStatus.set(sessionID, "idle");
+  if (activePendingPermissionCount(state) > 0) {
+    emitResolvedStatus(state, setTerminalTitleStatus);
+    return;
+  }
   emitResolvedStatus(state, setTerminalTitleStatus);
 }
 
 function handlePermissionAsked({ event, sessionID, state, setTerminalTitleStatus }) {
-  if (!isInActiveFamily(sessionID, state)) return;
+  if (!sessionID) return;
   const requestID = event.properties?.id;
   if (!requestID) return;
-  state.completedUserMessageID = "";
-  state.pendingPermissionIDs.add(requestID);
-  setTerminalTitleStatus("permission");
+  const rootID = rootOf(sessionID, state);
+  focusRoot(rootID, state, setTerminalTitleStatus, { emit: false });
+  const turn = turnFor(rootID, state);
+  turn.completedUserMessageID = "";
+  state.pendingPermissionSessions.set(requestID, sessionID);
+  emitResolvedStatus(state, setTerminalTitleStatus);
 }
 
 function handlePermissionReplied({ event, sessionID, state, setTerminalTitleStatus }) {
-  if (!isInActiveFamily(sessionID, state)) return;
   const requestID = event.properties?.requestID || event.properties?.permissionID;
-  const wasPending = state.pendingPermissionIDs.delete(requestID);
-  if (!wasPending || state.pendingPermissionIDs.size > 0) return;
-  state.completedUserMessageID = "";
-  // Permission replies historically resume work as busy even before the next
-  // native status event; keep that when the family is otherwise idle.
-  if (!familyHasActiveWork(state) && state.activeRootSessionID) {
-    state.familyStatus.set(state.activeRootSessionID, "busy");
+  if (!requestID) return;
+  const owner = state.pendingPermissionSessions.get(requestID);
+  const wasPending = state.pendingPermissionSessions.delete(requestID);
+  if (!wasPending) return;
+
+  const focusID = sessionID || owner || state.activeRootSessionID;
+  if (focusID) focusRoot(focusID, state, setTerminalTitleStatus, { emit: false });
+  if (activePendingPermissionCount(state) > 0) {
+    emitResolvedStatus(state, setTerminalTitleStatus);
+    return;
+  }
+
+  const rootID = state.activeRootSessionID;
+  if (rootID) {
+    const turn = turnFor(rootID, state);
+    turn.completedUserMessageID = "";
+    // Permission replies historically resume work as busy even before the next
+    // native status event; keep that when the focused family is otherwise idle.
+    if (!familyHasActiveWork(rootID, state)) state.familyStatus.set(rootID, "busy");
   }
   emitResolvedStatus(state, setTerminalTitleStatus);
 }
@@ -255,26 +358,11 @@ export function createSessionTitleStatusHandler({
 } = {}) {
   const state = {
     activeRootSessionID: "",
-    activeUserMessageID: "",
-    activeUserCreatedAt: null,
-    completedUserMessageID: "",
-    completedAssistantMessageIDs: new Set(),
-    pendingPermissionIDs: new Set(),
-    seenUserMessageIDs: new Set(),
+    lastEmittedStatus: "",
     familyStatus: new Map(),
     sessionParent: new Map(),
-  };
-
-  const resetState = () => {
-    state.activeUserMessageID = "";
-    state.activeUserCreatedAt = null;
-    state.completedUserMessageID = "";
-    state.completedAssistantMessageIDs.clear();
-    state.pendingPermissionIDs.clear();
-    state.seenUserMessageIDs.clear();
-    state.familyStatus.clear();
-    state.sessionParent.clear();
-    resetTerminalTitleState();
+    turns: new Map(),
+    pendingPermissionSessions: new Map(),
   };
 
   return async function sessionTitleStatusHandler(input) {
@@ -285,6 +373,13 @@ export function createSessionTitleStatusHandler({
     const sessionID = sessionIDFrom(event);
     if (!sessionID) return;
 
-    EVENT_HANDLERS.get(event.type)?.({ event, info, sessionID, state, resetState, setTerminalTitleStatus });
+    EVENT_HANDLERS.get(event.type)?.({
+      event,
+      info,
+      sessionID,
+      state,
+      resetTerminalTitleState,
+      setTerminalTitleStatus,
+    });
   };
 }
