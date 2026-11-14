@@ -615,6 +615,28 @@ _build_run_cmd() {
 	return 0
 }
 
+# _claude_agent_id: map an OpenCode agent name to a Claude Code agent ID.
+# "Build+" -> "build-plus"; other names are lowercased with spaces as hyphens.
+# Prints nothing when no matching ~/.claude/agents/<id>.md exists, so the
+# caller falls back to its default instead of passing an unknown --agent.
+_claude_agent_id() {
+	local agent_name="$1"
+	[[ -n "$agent_name" ]] || return 0
+	local claude_agent_dir="${AIDEVOPS_CLAUDE_AGENT_DIR:-$HOME/.claude/agents}"
+	if [[ -f "$claude_agent_dir/${agent_name}.md" ]]; then
+		printf '%s' "$agent_name"
+		return 0
+	fi
+	local agent_id
+	agent_id=$(printf '%s' "$agent_name" | tr '[:upper:]' '[:lower:]')
+	agent_id="${agent_id//+/-plus}"
+	agent_id="${agent_id// /-}"
+	if [[ -f "$claude_agent_dir/${agent_id}.md" ]]; then
+		printf '%s' "$agent_id"
+	fi
+	return 0
+}
+
 # _build_claude_cmd: build the claude CLI headless command as null-delimited tokens.
 # Used when --runtime claude is explicitly specified. OpenCode remains the default.
 # Args: selected_model work_dir prompt title agent_name [extra_args...]
@@ -647,6 +669,11 @@ _build_claude_cmd() {
 		printf '%s\0' "$prompt"
 	fi
 	printf '%s\0' "--output-format" "stream-json" "--verbose"
+	# OpenCode agent display names ("Build+") are not Claude Code agent IDs.
+	# Claude Code resolves --agent against ~/.claude/agents/<id>.md and exits 1
+	# with "--agent 'Build+' not found" otherwise, which surfaced as
+	# local_error on every Claude-runtime dispatch.
+	agent_name=$(_claude_agent_id "$agent_name")
 	if [[ -n "$agent_name" ]]; then
 		printf '%s\0' "--agent" "$agent_name"
 	elif type -P claude >/dev/null 2>&1; then

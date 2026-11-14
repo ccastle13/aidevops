@@ -815,7 +815,7 @@ _execute_run_attempt() {
 		"model=${selected_model} runtime=${runtime} fix_the_fixer=${_T3077_FIX_THE_FIXER:-0}"
 	print_info "[lifecycle] worker_start session=$session_key model=$selected_model runtime=$runtime pid=$$"
 	case "$runtime" in
-	claude) _invoke_claude "$output_file" "$exit_code_file" "$work_dir" "${cmd[@]}" ;;
+	claude) _invoke_claude "$output_file" "$exit_code_file" "$work_dir" "${cmd[@]}" && _capture_claude_stream_evidence "$output_file" ;;
 	*) _invoke_opencode "$output_file" "$exit_code_file" "${cmd[@]}" ;;
 	esac
 	_complete_run_attempt_invocation

@@ -16,7 +16,7 @@
  * Extracted from claude-proxy.mjs as part of t2070 to drop file complexity.
  */
 
-import { mkdirSync, readFileSync, writeFileSync } from "fs";
+import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { compactExactInstructionDocument } from "./context-catalogue.mjs";
@@ -274,6 +274,41 @@ export function parseChatMessages(messages) {
     systemPrompt: sanitizeClaudeCliSystemPrompt(systemParts.join("\n\n").trim()),
     prompt: renderConversationPrompt(conversation),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Per-request working directory
+// ---------------------------------------------------------------------------
+
+const WORKING_DIRECTORY_LINE = /^[ \t]*Working directory:[ \t]*(\/[^\r\n]*?)[ \t]*$/m;
+
+/**
+ * Resolve the directory the `claude` child should run in for this request.
+ *
+ * The proxy listens on one fixed port and later OpenCode processes adopt the
+ * first live listener (proxy-lifecycle.mjs), so the `directory` captured at
+ * launch belongs to whichever session started it. Every other session —
+ * including headless workers in pre-created worktrees — then ran Claude's
+ * tools in the wrong checkout and reported the worktree as unreachable.
+ * OpenCode's own system prompt carries the requesting session's
+ * `Working directory:`; use it when it names an existing absolute directory,
+ * otherwise keep the launch directory.
+ *
+ * @param {string} systemPrompt  System text from the incoming request
+ * @param {string} fallback      Directory captured when the proxy launched
+ * @returns {string}
+ */
+export function resolveRequestDirectory(systemPrompt, fallback) {
+  const match = typeof systemPrompt === "string" ? WORKING_DIRECTORY_LINE.exec(systemPrompt) : null;
+  if (!match) return fallback;
+  const candidate = match[1];
+  if (candidate.includes("\0") || candidate.split("/").includes("..")) return fallback;
+  try {
+    const resolved = realpathSync(candidate);
+    return statSync(resolved).isDirectory() ? resolved : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -338,6 +338,84 @@ _invoke_claude() {
 	return 0
 }
 
+#######################################
+# Record the answering model and token usage of a Claude CLI run.
+# Claude `stream-json` ends with a `result` event carrying aggregate `usage`,
+# `total_cost_usd` and `modelUsage` keyed by the model that actually answered.
+# OpenCode runs get this from the runtime DB; Claude runs previously logged
+# nothing, so per-model token comparisons were impossible. Reuses the observed_*
+# metric fields written by _record_invocation_metric. Never fails the run.
+# Args: output_file
+#######################################
+_capture_claude_stream_evidence() {
+	local output_file="$1"
+	local evidence=""
+	local observed_model="" request_count="" tokens_total="" cost_usd=""
+	[[ -f "$output_file" ]] || return 0
+	evidence=$(
+		python3 - "$output_file" <<'PY' 2>/dev/null
+import json
+import sys
+
+result = None
+request_ids = set()
+for line in open(sys.argv[1], errors="ignore"):
+    line = line.strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        continue
+    kind = obj.get("type")
+    if kind == "assistant":
+        message = obj.get("message") or {}
+        if (isinstance(message, dict) and message.get("id")
+                and message.get("model") != "<synthetic>" and not obj.get("error")):
+            # One API response streams as several events sharing message.id.
+            request_ids.add(message["id"])
+    elif kind == "result":
+        result = obj
+if not isinstance(result, dict):
+    sys.exit(0)
+
+
+def as_int(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+models = sorted(
+    "anthropic/" + name
+    for name in (result.get("modelUsage") or {})
+    if isinstance(name, str) and name
+)
+usage = result.get("usage") or {}
+tokens = sum(
+    as_int(usage.get(key))
+    for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+)
+cost = result.get("total_cost_usd")
+cost = "" if not isinstance(cost, (int, float)) or isinstance(cost, bool) else repr(float(cost))
+print("\t".join([",".join(models), str(len(request_ids)), str(tokens), cost]))
+PY
+	) || evidence=""
+	[[ -n "$evidence" ]] || return 0
+	IFS=$'\t' read -r observed_model request_count tokens_total cost_usd <<<"$evidence"
+	# A run whose only turns were synthetic CLI errors had no answering model.
+	[[ "$request_count" =~ ^[1-9][0-9]*$ ]] || return 0
+	[[ "$observed_model" =~ ^[a-z0-9._/,-]+$ ]] && _MODEL_REPLAY_OBSERVED_MODEL="$observed_model"
+	if [[ "$request_count" =~ ^[0-9]+$ ]]; then
+		_MODEL_REPLAY_REQUEST_COUNT="$request_count"
+		_MODEL_REPLAY_USAGE_COUNT="1"
+	fi
+	[[ "$tokens_total" =~ ^[1-9][0-9]*$ ]] && _MODEL_REPLAY_TOKENS_TOTAL="$tokens_total"
+	if [[ "$cost_usd" =~ ^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]]; then
+		_MODEL_REPLAY_COST_COUNT="1"
+		_MODEL_REPLAY_COST_USD="$cost_usd"
+	fi
+	return 0
+}
+
 # =============================================================================
 # Output preservation and classification
 # =============================================================================

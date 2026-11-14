@@ -31,6 +31,7 @@ import {
   parseChatMessages,
   resolveAgentAndModel,
   resolveEffortLevel,
+  resolveRequestDirectory,
 } from "./claude-proxy-context.mjs";
 import {
   buildOpenAIResponse,
@@ -210,12 +211,15 @@ function normaliseRequestBody(req, incoming) {
   };
 }
 
-async function handleChatCompletions(req, directory) {
+async function handleChatCompletions(req, launchDirectory) {
   const incoming = await req.json();
   const body = normaliseRequestBody(req, incoming);
+  // The listener is shared across OpenCode processes; run the child in the
+  // requesting session's directory, not the one that launched the proxy.
+  const directory = resolveRequestDirectory(body.systemPrompt, launchDirectory);
 
   console.error(
-    `[aidevops] Claude proxy: request model=${body.model} agent=${body.agentName} stream=${body.stream} systemChars=${body.systemPrompt.length} promptChars=${body.prompt.length}`,
+    `[aidevops] Claude proxy: request model=${body.model} agent=${body.agentName} stream=${body.stream} systemChars=${body.systemPrompt.length} promptChars=${body.prompt.length} cwdSource=${directory === launchDirectory ? "launch" : "request"}`,
   );
   maybeDumpDebugRequest(body);
 

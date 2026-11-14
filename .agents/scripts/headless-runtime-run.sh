@@ -504,6 +504,51 @@ _handle_cmd_run_watchdog_attempt() {
 	return 0
 }
 
+# Print 1 when this worker dispatch is a cross-dispatch tier handoff: the
+# issue's earlier runs (metrics, last 30 days) used a lower tier than the one
+# now dispatched, as after escalate_issue_tier's simple -> standard -> thinking
+# cascade. In-run escalation already sets routing_escalated; without this, the
+# re-dispatched higher-tier worker logged routing_escalated=false.
+# Args: role tier
+_headless_dispatch_tier_handoff() {
+	local role="$1"
+	local tier="$2"
+	local issue_number="${WORKER_ISSUE_NUMBER:-}"
+	local repo_slug="${DISPATCH_REPO_SLUG:-${WORKER_REPO_SLUG:-}}"
+	local metrics_file="${METRICS_FILE:-}"
+	[[ "$role" == "$_CMD_RUN_ROLE_WORKER" && "$issue_number" =~ ^[0-9]+$ && -n "$repo_slug" ]] || return 0
+	[[ "$tier" == "standard" || "$tier" == "thinking" ]] || return 0
+	[[ -f "$metrics_file" ]] || return 0
+	ROLE="$role" ISSUE_NUMBER="$issue_number" REPO_SLUG="$repo_slug" TIER="$tier" python3 - "$metrics_file" <<'PY' 2>/dev/null || true
+import json
+import os
+import sys
+import time
+from collections import deque
+
+rank = {"simple": 0, "standard": 1, "thinking": 2}
+issue = int(os.environ["ISSUE_NUMBER"])
+repo = os.environ["REPO_SLUG"]
+current = rank[os.environ["TIER"]]
+cutoff = time.time() - 30 * 86400
+lowest = None
+with open(sys.argv[1], errors="ignore") as handle:
+    for line in deque(handle, maxlen=50000):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if (record.get("issue_number") != issue or record.get("repo_slug") != repo
+                or record.get("role") != os.environ["ROLE"] or record.get("ts", 0) < cutoff):
+            continue
+        prior = rank.get(record.get("routing_tier"))
+        if prior is not None and (lowest is None or prior < lowest):
+            lowest = prior
+print("1" if lowest is not None and current > lowest else "0")
+PY
+	return 0
+}
+
 # Execute bounded attempts and route each result through focused policies.
 _cmd_run_attempt_loop() {
 	local max_continuation_retries="${HEADLESS_CONTINUATION_MAX_RETRIES:-10}" continuation_count=0
@@ -533,6 +578,10 @@ _cmd_run_attempt_loop() {
 	local _run_metric_output_file="" _run_metric_session_id="" completion_state="complete"
 	local _cmd_run_disposition="" _cmd_run_return_status=1
 	local routing_attempt=0 routing_reason="headless_dispatch" routing_escalated=0 routing_candidate_index=-1
+	if [[ "$(_headless_dispatch_tier_handoff "$role" "$tier_override")" == "1" ]]; then
+		routing_escalated=1
+		routing_reason="tier_escalation_handoff"
+	fi
 	_HRW_PRIOR_ATTEMPT_ACTIVITY=0
 	while [[ "$attempt" -le "$max_attempts" ]]; do
 		routing_attempt=$((routing_attempt + 1))

@@ -337,6 +337,18 @@ for line in Path(sys.argv[1]).read_text(errors="ignore").splitlines():
     if event_type in {"text", "tool", "tool-invocation", "tool-result", "step_start", "step_finish", "reasoning"}:
         activity = True
         break
+    # Claude CLI `--output-format stream-json` emits assistant/user message
+    # envelopes instead of OpenCode part events. A model turn with content
+    # (text, thinking, tool_use) or a returned tool_result is real activity;
+    # without this, Claude runs that opened PRs were classified no_activity.
+    # Synthetic turns (model "<synthetic>", top-level "error") are CLI-generated
+    # failure notices such as authentication_failed, not model activity.
+    if event_type in {"assistant", "user"} and not obj.get("error"):
+        message = obj.get("message") or {}
+        if (isinstance(message, dict) and message.get("content")
+                and message.get("model") != "<synthetic>"):
+            activity = True
+            break
 
 print("1" if activity else "0")
 PY

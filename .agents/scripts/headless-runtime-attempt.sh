@@ -174,6 +174,41 @@ _prepare_headless_worker_signing() {
 	return 1
 }
 
+# Print the directory OpenCode recorded for a session, or nothing.
+# Args: session_id
+_headless_session_recorded_directory() {
+	local session_id="$1"
+	local shared_db="${HOME}/.local/share/opencode/opencode.db"
+	[[ -n "$session_id" && -f "$shared_db" ]] || return 0
+	sqlite3_with_timeout "$shared_db" \
+		"SELECT directory FROM session WHERE id = '$(sql_escape "$session_id")';" 2>/dev/null || true
+	return 0
+}
+
+# A continued worker session keeps its conversation, including every absolute
+# path it used. When a redispatch resumes that session in a replacement
+# worktree (the earlier one was cleaned up), the model kept running tools in
+# the deleted path and blocked with "Bash workdir does not exist"
+# (observed on a private repo, 2026-11-13). The isolated DB is already rebound to the new directory
+# (_seed_worker_db_session_context); this tells the model too. Prints a
+# relocation notice when the recorded directory is gone, otherwise nothing.
+# Args: session_id work_dir
+_HEADLESS_RELOCATED_MARKER="[aidevops:worktree-relocated]"
+_headless_relocated_session_notice() {
+	local session_id="$1"
+	local work_dir="$2"
+	local recorded="" current=""
+	[[ -n "$session_id" && -n "$work_dir" ]] || return 0
+	recorded=$(_headless_session_recorded_directory "$session_id")
+	current=$(cd "$work_dir" 2>/dev/null && pwd -P) || current="$work_dir"
+	if [[ -z "$recorded" || "$recorded" == "$current" || "$recorded" == "$work_dir" || -d "$recorded" ]]; then
+		return 0
+	fi
+	printf '%s Your earlier worktree %s no longer exists. This run uses %s: use it for every workdir and file path, and do not reuse paths from earlier turns. Commits made only in the old worktree may survive on its branch; check with git branch --list and git log --all before redoing work.' \
+		"$_HEADLESS_RELOCATED_MARKER" "$recorded" "$current"
+	return 0
+}
+
 # Resolve prompt transport, provider/session state, and the runtime command.
 _prepare_run_attempt_command() {
 	local prepare_status=0
@@ -185,7 +220,9 @@ _prepare_run_attempt_command() {
 		return "$prepare_status"
 	fi
 	runtime="${headless_runtime:-opencode}"
-	if [[ "$role" == "$HEADLESS_ROLE_MODEL_REPLAY" ]]; then
+	# Claude runs also report observed model/tokens (_capture_claude_stream_evidence);
+	# reset so a retry never inherits the previous attempt's usage.
+	if [[ "$role" == "$HEADLESS_ROLE_MODEL_REPLAY" || "$runtime" == "claude" ]]; then
 		_MODEL_REPLAY_OBSERVED_MODEL=""
 		_MODEL_REPLAY_OBSERVED_VARIANT=""
 		_MODEL_REPLAY_REQUEST_COUNT=""
@@ -204,6 +241,16 @@ _prepare_run_attempt_command() {
 	if [[ "$role" == "$HEADLESS_ROLE_TRIAGE" || "$role" == "$HEADLESS_ROLE_MODEL_REPLAY" ]] &&
 		! _headless_private_workload_enabled; then
 		force_file_transport=1
+	fi
+	if [[ "$runtime" == "opencode" && "$role" != "pulse" && "$prompt" != *"$_HEADLESS_RELOCATED_MARKER"* ]] &&
+		! _headless_run_is_ephemeral "$role"; then
+		local relocation_notice=""
+		relocation_notice=$(_headless_relocated_session_notice \
+			"$(get_session_id "$(extract_provider "$selected_model")" "$session_key")" "$work_dir")
+		if [[ -n "$relocation_notice" ]]; then
+			prompt="${relocation_notice}"$'\n\n'"${prompt}"
+			print_info "[lifecycle] session_worktree_relocated session_key=$session_key"
+		fi
 	fi
 	if ! _prepare_runtime_prompt_transport "$runtime" "$prompt" "$force_file_transport"; then
 		_report_run_attempt_prelaunch_failure \
