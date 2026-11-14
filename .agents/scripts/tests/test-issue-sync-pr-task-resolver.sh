@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESOLVER="${SCRIPT_DIR}/../issue-sync-pr-task-resolver.sh"
 WORKFLOW="${SCRIPT_DIR}/../../../.github/workflows/issue-sync-reusable.yml"
-PROTECTED_PUBLISH_CALL='issue-sync-git-push-helper\.sh" publish-todo main 3'
+PROTECTED_PUBLISH_CALL="issue-sync-git-push-helper\.sh\" publish-todo \"\\\$ISSUE_SYNC_TARGET_BRANCH\" 3"
 MULTI_TASK_PUBLICATION="chore: mark \\\$UPDATED_TASK_IDS complete (\\\$PROOF) \[skip ci\]"
 PAIR_MATCH="if [[ \"\${ISSUE_TASK_PAIR%%:*}\" == \"\$ISSUE_NUM\" ]]"
 MAPPED_TASK_REF="TASK_REF=\" Task \$MAPPED_TASK_ID\""
@@ -54,6 +54,9 @@ cat >"${TMP_DIR}/TODO.md" <<'EOF'
 - [ ] t102 renamed task text ref:GH#702
 - [ ] t103 first close ref:GH#703
 - [ ] t104 second close ref:GH#704
+- [ ] t106 real task without issue mapping
+- [x] t107 completed task without issue mapping
+- [ ] t108.1 subtask without issue mapping
 EOF
 
 check_success "canonical tNNN title agrees" "t100" "700" "t100|700|true|700:t100"
@@ -62,6 +65,15 @@ check_success "recovery or renamed title uses ref" "" "702" "t102|702|true|702:t
 check_success "multiple closing issues preserve associations" "t103" "703 704" "t103 t104|703 704|true|703:t103 704:t104"
 check_success "ordinary non-task closing issue is preserved" "" "999" "|999|false|"
 check_success "For/Ref overlap is vetoed before resolution" "" "700 999" "|999|false|" "700"
+check_success "issue-derived title without TODO task is issue-only" "t999" "999" "|999|false|"
+check_success "unknown title with no closing issues is issue-only" "t999" "" "||false|"
+check_success "task ID prefix does not count as an exact task" "t10" "999" "|999|false|"
+check_success "parent ID does not match a subtask" "t108" "999" "|999|false|"
+check_success "vetoed mapping does not make unknown title task-backed" "t999" "700 999" "|999|false|" "700"
+check_failure "real task still requires a closing-issue mapping" "t106" "999"
+check_failure "completed task still requires a closing-issue mapping" "t107" "999"
+check_failure "subtask still requires a closing-issue mapping" "t108.1" "999"
+check_failure "real task without closing issues still fails" "t106" ""
 
 printf '%s\n' '- [ ] t105 duplicate ref ref:GH#700' >>"${TMP_DIR}/TODO.md"
 check_failure "duplicate ref is ambiguous" "t100" "700"

@@ -123,8 +123,36 @@ def outputs_fresh(json_path: Path, badge_dir: Path, legacy_badge_dir: Path | Non
         required.extend([legacy_badge_dir / "loc-total.svg", legacy_badge_dir / "loc-languages.svg"])
     if any(not item.exists() for item in required):
         return False
-    age_seconds = _dt.datetime.now().timestamp() - json_path.stat().st_mtime
-    return age_seconds < max_age_hours * 3600
+    generated_at = recorded_generated_at(json_path)
+    if generated_at is None:
+        return False
+    age_seconds = _dt.datetime.now(tz=_dt.timezone.utc).timestamp() - generated_at.timestamp()
+    return 0 <= age_seconds < max_age_hours * 3600
+
+
+def recorded_generated_at(json_path: Path) -> _dt.datetime | None:
+    """Return the outputs' own generated_at; None (stale) when missing or unparsable.
+
+    File mtime is not usable: a fresh CI checkout stamps every file with the
+    checkout time, which made outputs look fresh forever (GH#34263).
+    """
+    try:
+        value = json.loads(json_path.read_text(encoding="utf-8")).get("generated_at")
+        parsed = _dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (OSError, ValueError, AttributeError):
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def dependency_badge_value(deps: dict[str, Any]) -> str:
+    """Badge text; splits runtime from dev-only so dev tooling is not read as runtime risk."""
+    direct = int(deps["direct"])
+    dev = int(deps.get("dev", 0))
+    if dev > 0:
+        return f"{int(deps.get('runtime', direct - dev))} runtime, {dev} dev"
+    if int(deps["total"]) == direct:
+        return f"{direct} direct"
+    return f"{direct}/{int(deps['total'])}"
 
 
 def write_outputs(metrics: dict[str, Any], output_dir: Path, badge_dir: Path, legacy_badge_dir: Path | None, top_n: int) -> None:
@@ -138,8 +166,7 @@ def write_outputs(metrics: dict[str, Any], output_dir: Path, badge_dir: Path, le
     deps = metrics["dependencies"]
     write_text(badge_dir / "loc.svg", render_flat_badge("lines of code", human_count(total_code), "#007ec6"))
     write_text(badge_dir / "languages.svg", render_languages_svg(metrics["languages"], top_n))
-    dep_value = f"{int(deps['direct'])} direct" if int(deps["total"]) == int(deps["direct"]) else f"{int(deps['direct'])}/{int(deps['total'])}"
-    write_text(badge_dir / "dependencies.svg", render_flat_badge("dependencies", dep_value, "#4c1"))
+    write_text(badge_dir / "dependencies.svg", render_flat_badge("dependencies", dependency_badge_value(deps), "#4c1"))
 
     write_text(badge_dir / "loc-total.svg", render_flat_badge("lines of code", human_count(total_code), "#007ec6"))
     write_text(badge_dir / "loc-languages.svg", render_languages_svg(metrics["languages"], top_n))

@@ -57,6 +57,8 @@ assert_eq() {
 extract_functions() {
 	# Use awk to extract the three functions by name.
 	awk '
+		/^_setup_opencode_profile_id\(\)/, /^}$/ { print; next }
+		/^_setup_opencode_profile_value\(\)/, /^}$/ { print; next }
 		/^_setup_opencode_timeout_cmd\(\)/, /^}$/ { print; next }
 		/^_setup_opencode_version_output\(\)/, /^}$/ { print; next }
 		/^_setup_opencode_help_output\(\)/, /^}$/ { print; next }
@@ -64,18 +66,34 @@ extract_functions() {
 		/^_setup_opencode_first_line\(\)/, /^}$/ { print; next }
 		/^_setup_opencode_homebrew_owner_action\(\)/, /^}$/ { print; next }
 		/^_setup_opencode_print_manual_install_hint\(\)/, /^}$/ { print; next }
+		/^_setup_opencode_v2_install_root\(\)/, /^}$/ { print; next }
+		/^_setup_opencode_v2_install_binary\(\)/, /^}$/ { print; next }
+		/^_setup_install_opencode_package\(\)/, /^}$/ { print; next }
+		/^_setup_opencode_installer\(\)/, /^}$/ { print; next }
+		/^_setup_opencode_print_missing_installer\(\)/, /^}$/ { print; next }
 		/^_setup_opencode_node_path_for_binary\(\)/, /^}$/ { print; next }
+		/^_setup_opencode_fallback_path_for_binary\(\)/, /^}$/ { print; next }
 		/^_setup_opencode_binary_is_ephemeral\(\)/, /^}$/ { print; next }
 		/^_setup_clear_canary_negative_cache\(\)/, /^}$/ { print; next }
 		/^_setup_opencode_managed_shim_target\(\)/, /^}$/ { print; next }
+		/^_setup_opencode_target_is_safe\(\)/, /^}$/ { print; next }
+		/^_setup_opencode_quote_value\(\)/, /^}$/ { print; next }
+		/^_setup_opencode_v2_shim_version_marker\(\)/, /^}$/ { print; next }
+		/^_setup_append_opencode_v2_session_guard\(\)/, /^}$/ { print; next }
+		/^_setup_write_opencode_v2_shim\(\)/, /^}$/ { print; next }
+		/^_setup_write_opencode_v1_shim\(\)/, /^}$/ { print; next }
 		/^_setup_ensure_opencode_stable_shim\(\)/, /^}$/ { print; next }
+		/^_setup_record_opencode_binary_path\(\)/, /^}$/ { print; next }
+		/^_setup_opencode_v2_preview_enabled\(\)/, /^}$/ { print; next }
 		/^_setup_find_valid_opencode_binary\(\)/, /^}$/ { print; next }
+		/^_setup_find_post_install_opencode_binary\(\)/, /^}$/ { print; next }
 		/^_setup_record_valid_opencode_binary\(\)/, /^}$/ { print; next }
 		/^_setup_record_current_opencode_binary\(\)/, /^}$/ { print; next }
 		/^_setup_find_valid_opencode_alternative\(\)/, /^}$/ { print; next }
 		/^_setup_validate_opencode_binary\(\)/, /^}$/ { print; next }
 		/^_setup_opencode_force_heal\(\)/, /^}$/ { print; next }
 		/^setup_opencode_cli\(\)/, /^}$/ { print; next }
+		/^setup_opencode_runtimes\(\)/, /^}$/ { print; next }
 	' "$TOOL_INSTALL" >"$SANDBOX/extract.sh"
 	# Verify extraction worked
 	if ! grep -q "^_setup_validate_opencode_binary()" "$SANDBOX/extract.sh"; then
@@ -137,6 +155,120 @@ INNER_EOF
 	source "$SANDBOX/extract.sh"
 	return 0
 }
+
+echo "Nix regression: logical profiles, aliases, quoting, and safe replacement"
+(
+	source_extracted
+	# Discovery probes /opt/homebrew/bin before PATH; treat host binaries
+	# outside the sandbox (logical or physical path) as ephemeral so a
+	# Homebrew OpenCode cannot win.
+	sandbox_physical=$(cd "$SANDBOX" && pwd -P)
+	_setup_opencode_binary_is_ephemeral() {
+		local bin="$1"
+		[[ "$bin" == "$SANDBOX/"* || "$bin" == "$sandbox_physical/"* ]] && return 1
+		return 0
+	}
+	export HOME="$SANDBOX/nix home"
+	store="$HOME/store generation \$literal \"quoted\""
+	profile="$HOME/.nix-profile/bin/opencode"
+	shim="$HOME/.local/bin/opencode"
+	mkdir -p "$store/bin" "$HOME/.local/bin"
+	cat >"$store/bin/opencode" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+--version) printf '1.14.25\n' ;;
+--help) printf 'opencode run [message..]\n' ;;
+args) shift; printf '<%s>\n' "$@"; exit 23 ;;
+path) printf '%s\n' "$PATH" ;;
+esac
+exit 0
+EOF
+	chmod +x "$store/bin/opencode"
+	ln -s "$store" "$HOME/.nix-profile"
+	_setup_write_opencode_v1_shim "$shim" "/missing/opencode" ""
+	chmod +x "$shim"
+	# Profile dirs are found only because they are on PATH: no built-in roots.
+	export PATH="$HOME/.local/bin:/usr/bin:/bin"
+	printf 'no-path-profile=%s\n' "$(_setup_find_valid_opencode_binary 2>/dev/null || true)"
+	export PATH="$HOME/.local/bin:$HOME/.nix-profile/bin:/usr/bin:/bin"
+	printf 'discovered=%s\n' "$(_setup_find_valid_opencode_binary)"
+	rm "$HOME/.nix-profile"
+	mkdir -p "$HOME/.local/state/nix"
+	ln -s "$store" "$HOME/.local/state/nix/profile"
+	export PATH="$HOME/.local/bin:$HOME/.local/state/nix/profile/bin:/usr/bin:/bin"
+	printf 'modern=%s\n' "$(_setup_find_valid_opencode_binary)"
+	rm "$HOME/.local/state/nix/profile"
+	export PATH="$HOME/.local/bin:$store/bin:/usr/bin:/bin"
+	printf 'store-path=%s\n' "$(_setup_find_valid_opencode_binary)"
+	export PATH="$HOME/.local/bin:$HOME/.nix-profile/bin:/usr/bin:/bin"
+	ln -s "$store" "$HOME/.nix-profile"
+	_setup_ensure_opencode_stable_shim "$profile" >/dev/null
+	printf 'target=%s\n' "$(_setup_opencode_managed_shim_target "$shim")"
+	printf 'daemon=%s\n' "$(env -i HOME="$HOME" PATH=/usr/bin:/bin "$shim" --version)"
+	checksum=$(cksum "$shim")
+	_setup_ensure_opencode_stable_shim "$profile" >/dev/null
+	[[ "$checksum" == "$(cksum "$shim")" ]] && printf 'idempotent=yes\n'
+	ln -s "$shim" "$HOME/alias"
+	printf 'alias-discovery=%s\n' "$(_setup_find_valid_opencode_binary "$HOME/alias")"
+	_setup_ensure_opencode_stable_shim "$HOME/alias" >/dev/null
+	printf 'alias-target=%s\n' "$(_setup_opencode_managed_shim_target "$shim")"
+	# The launcher follows an upgraded profile rather than pinning its store.
+	mkdir -p "$HOME/next/bin"
+	cp "$store/bin/opencode" "$HOME/next/bin/opencode"
+	rm "$HOME/.nix-profile"
+	ln -s "$HOME/next" "$HOME/.nix-profile"
+	rm -rf "$store"
+	printf 'upgraded=%s\n' "$("$shim" --version)"
+	# Exercise shell-special target paths too, not only spaces in HOME.
+	special="$HOME/next/bin/opencode \$literal \"quoted\" \`tick\` \\slash"
+	cp "$HOME/next/bin/opencode" "$special"
+	_setup_ensure_opencode_stable_shim "$special" >/dev/null
+	[[ "$(_setup_opencode_managed_shim_target "$shim")" == "$special" ]] && printf 'quoted-target=yes\n'
+	rc=0
+	# shellcheck disable=SC2016 # Deliberately forward literal shell syntax.
+	"$shim" args 'a b' '\$not-expanded' '"quoted"' >"$SANDBOX/nix-args" || rc=$?
+	printf 'exit=%s\n' "$rc"
+	checksum=$(cksum "$shim")
+	_setup_ensure_opencode_stable_shim "$HOME/missing" >/dev/null 2>&1 && exit 1
+	[[ "$checksum" == "$(cksum "$shim")" ]] && printf 'missing-preserved=yes\n'
+	# Reject a managed chain that reaches its own symlink alias before probing.
+	_setup_write_opencode_v1_shim "$HOME/cycle" "$HOME/cycle-alias" ""
+	chmod +x "$HOME/cycle"
+	ln -s "$HOME/cycle" "$HOME/cycle-alias"
+	SECONDS=0
+	rc=0
+	_setup_validate_opencode_binary "$HOME/cycle" || rc=$?
+	printf 'cycle=%s\n' "$rc"
+	[[ "$SECONDS" -lt 3 ]] && printf 'cycle-bounded=yes\n'
+	# A generated-launcher failure must not replace a functioning launcher.
+	_setup_validate_opencode_binary() {
+		local bin="$1"
+		[[ "$bin" == *.tmp.* ]] && return 1
+		return 0
+	}
+	_setup_ensure_opencode_stable_shim "$profile" >/dev/null 2>&1 && exit 1
+	[[ "$checksum" == "$(cksum "$shim")" ]] && printf 'failed-generation-preserved=yes\n'
+) >"$SANDBOX/nix-results"
+case "$(grep '^no-path-profile=' "$SANDBOX/nix-results")" in
+*"/.nix-profile/"* | *"/nix/profile/"*) assert_eq "profile not on PATH is ignored" "ignored" "discovered" ;;
+*) assert_eq "profile not on PATH is ignored" "ignored" "ignored" ;;
+esac
+assert_eq "Nix profile discovered behind local shim" "discovered=$SANDBOX/nix home/.nix-profile/bin/opencode" "$(grep '^discovered=' "$SANDBOX/nix-results")"
+assert_eq "modern Nix profile discovered" "modern=$SANDBOX/nix home/.local/state/nix/profile/bin/opencode" "$(grep '^modern=' "$SANDBOX/nix-results")"
+assert_eq "later store PATH candidate discovered" "store-path=$SANDBOX/nix home/store generation \$literal \"quoted\"/bin/opencode" "$(grep '^store-path=' "$SANDBOX/nix-results")"
+assert_eq "profile path remains logical" "target=$SANDBOX/nix home/.nix-profile/bin/opencode" "$(grep '^target=' "$SANDBOX/nix-results")"
+assert_eq "clean daemon executes generated shim" "daemon=1.14.25" "$(grep '^daemon=' "$SANDBOX/nix-results")"
+assert_eq "repeated setup is idempotent" "idempotent=yes" "$(grep '^idempotent=' "$SANDBOX/nix-results")"
+assert_eq "discovery rejects shim symlink alias" "alias-discovery=$SANDBOX/nix home/.nix-profile/bin/opencode" "$(grep '^alias-discovery=' "$SANDBOX/nix-results")"
+assert_eq "alias input unwraps to real target" "alias-target=$SANDBOX/nix home/.nix-profile/bin/opencode" "$(grep '^alias-target=' "$SANDBOX/nix-results")"
+assert_eq "profile upgrade survives old store removal" "upgraded=1.14.25" "$(grep '^upgraded=' "$SANDBOX/nix-results")"
+assert_eq "shell-special target round trips" "quoted-target=yes" "$(grep '^quoted-target=' "$SANDBOX/nix-results")"
+assert_eq "argument boundaries and literal text preserved" $'<a b>\n<\\$not-expanded>\n<"quoted">' "$(<"$SANDBOX/nix-args")"
+assert_eq "underlying exit status preserved" "exit=23" "$(grep '^exit=' "$SANDBOX/nix-results")"
+assert_eq "missing target preserves launcher" "missing-preserved=yes" "$(grep '^missing-preserved=' "$SANDBOX/nix-results")"
+assert_eq "recursive alias rejected" "cycle=2" "$(grep '^cycle=' "$SANDBOX/nix-results")"
+assert_eq "recursive alias rejected without execution" "cycle-bounded=yes" "$(grep '^cycle-bounded=' "$SANDBOX/nix-results")"
+assert_eq "failed generated launcher preserves original" "failed-generation-preserved=yes" "$(grep '^failed-generation-preserved=' "$SANDBOX/nix-results")"
 
 # --- Test 1: validator on real opencode ------------------------------------
 echo "Test 1: _setup_validate_opencode_binary on real opencode shim"
@@ -201,6 +333,22 @@ chmod +x "$SANDBOX/bin/opencode-path-check"
 ) >"$SANDBOX/out1d" 2>&1 || rc1d=$?
 assert_eq "empty PATH expansion has no trailing colon" "0" "${rc1d:-0}"
 
+echo "Test 1e: validator accepts OpenCode help emitted on stderr"
+cat >"$SANDBOX/bin/opencode-stderr-help" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == "--version" ]] && echo "1.18.31"
+[[ "${1:-}" == "--help" ]] && echo "opencode run [message..]     run opencode with a message" >&2
+exit 0
+EOF
+chmod +x "$SANDBOX/bin/opencode-stderr-help"
+(
+	source_extracted
+	rc=0
+	_setup_validate_opencode_binary "$SANDBOX/bin/opencode-stderr-help" || rc=$?
+	echo "$rc"
+) >"$SANDBOX/out1e" 2>&1
+assert_eq "stderr help opencode -> rc=0" "0" "$(tail -1 "$SANDBOX/out1e")"
+
 # --- Test 2: validator on claude CLI shim ----------------------------------
 echo "Test 2: _setup_validate_opencode_binary on claude CLI shim"
 cat >"$SANDBOX/bin/opencode-claude" <<'EOF'
@@ -216,6 +364,45 @@ chmod +x "$SANDBOX/bin/opencode-claude"
 	echo "$rc"
 ) >"$SANDBOX/out2" 2>&1
 assert_eq "claude shim -> rc=1" "1" "$(tail -1 "$SANDBOX/out2")"
+
+echo "Test 2d: V2 profile accepts only a V2 OpenCode binary"
+cat >"$SANDBOX/bin/opencode-v2" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == "--version" ]] && echo "opencode v2.0.3"
+[[ "${1:-}" == "--help" ]] && printf 'OpenCode command line interface\nrun  Run OpenCode with a message\n'
+[[ "$*" == *auth-env* ]] && printf '%s|%s\n' "${XDG_CONFIG_HOME:-}" "${GH_CONFIG_DIR:-}"
+exit 0
+EOF
+chmod +x "$SANDBOX/bin/opencode-v2"
+(
+	source_extracted
+	AIDEVOPS_OPENCODE_PROFILE=v2 _setup_validate_opencode_binary "$SANDBOX/bin/opencode-v2"
+) >"$SANDBOX/out2d" 2>&1
+assert_eq "V2 profile accepts V2 binary" "0" "$?"
+(
+	source_extracted
+	rc=0
+	AIDEVOPS_OPENCODE_PROFILE=v2 _setup_validate_opencode_binary "$SANDBOX/bin/opencode-real" || rc=$?
+	echo "$rc"
+) >"$SANDBOX/out2e" 2>&1
+assert_eq "V2 profile rejects V1 binary" "1" "$(tail -1 "$SANDBOX/out2e")"
+
+# Exercise the generated shim even on hosts whose unrelated V1 install tests
+# encounter a pre-existing system OpenCode binary.
+(
+	source_extracted
+	_setup_write_opencode_v2_shim "$SANDBOX/v2-auth-shim" "$SANDBOX/bin/opencode-v2" ""
+)
+chmod +x "$SANDBOX/v2-auth-shim"
+assert_eq "V2 shim forwards the default gh config to tool shells" \
+	"$HOME/.aidevops/runtimes/opencode-v2/config|$HOME/.config/gh" \
+	"$(env -u GH_CONFIG_DIR -u XDG_CONFIG_HOME AIDEVOPS_TABBY_V2_RECOVERY=0 "$SANDBOX/v2-auth-shim" auth-env)"
+assert_eq "V2 service forwards the caller's XDG gh config" \
+	"$HOME/.aidevops/runtimes/opencode-v2/config|$HOME/caller-config/gh" \
+	"$(env -u GH_CONFIG_DIR XDG_CONFIG_HOME="$HOME/caller-config" AIDEVOPS_TABBY_V2_RECOVERY=0 "$SANDBOX/v2-auth-shim" serve auth-env)"
+assert_eq "V2 service retains an explicit gh config override" \
+	"$HOME/.aidevops/runtimes/opencode-v2/config|$HOME/custom-gh" \
+	"$(GH_CONFIG_DIR="$HOME/custom-gh" AIDEVOPS_TABBY_V2_RECOVERY=0 "$SANDBOX/v2-auth-shim" service auth-env)"
 
 # --- Test 2b: validator rejects multi-digit non-opencode majors ------------
 echo "Test 2b: _setup_validate_opencode_binary rejects major >=10"
@@ -352,6 +539,8 @@ cp "$SANDBOX/bin/opencode-claude" "$SANDBOX/bin/opencode"
 		[[ "$bin" == "$SANDBOX/bin/"* ]] && return 1
 		return 0
 	}
+	# Keep this force-heal case isolated from any valid host-level OpenCode.
+	_setup_find_valid_opencode_alternative() { return 1; }
 	export PATH="$SANDBOX/bin:$PATH"
 	rc=0
 	setup_opencode_cli || rc=$?
@@ -389,7 +578,7 @@ rc6b=$(grep '^rc=' "$SANDBOX/out6b" | tail -1)
 resolved6b=$(tail -1 "$SANDBOX/out6b")
 assert_eq "qwen stable shim heal rc" "rc=0" "$rc6b"
 assert_eq "qwen stable shim rewritten" "$HOME/.local/bin/opencode" "$resolved6b"
-if "$HOME/.local/bin/opencode" --help 2>/dev/null | grep -q 'opencode run \[message\.\.\]'; then
+if "$HOME/.local/bin/opencode" --help 2>&1 | grep -q 'opencode run \[message\.\.\]'; then
 	assert_eq "qwen shim now points to valid opencode" "rewritten" "rewritten"
 else
 	assert_eq "qwen shim now points to valid opencode" "rewritten" "not-rewritten"
@@ -444,6 +633,7 @@ EOF
 chmod +x "$SANDBOX/bin/npm" "$SANDBOX/bin/bun"
 (
 	source_extracted
+	_setup_find_valid_opencode_alternative() { return 1; }
 	setup_prompt() {
 		local _var="$1"
 		local _prompt="$2"
@@ -475,6 +665,7 @@ EOF
 chmod +x "$SANDBOX/bin/npm"
 (
 	source_extracted
+	_setup_find_valid_opencode_alternative() { return 1; }
 	npm_global_install() {
 		printf '%s\n' "installer failed: permission denied" >&2
 		return 1
@@ -492,8 +683,67 @@ assert_eq "install failure rc" "rc=0" "$rc8"
 assert_eq "install failure has no sudo npm hint" "0" "$sudo_hint8"
 assert_eq "install failure uses npm hint" "1" "$npm_hint8"
 
-# --- Test 9: Homebrew-owned invalid binary gets brew remediation ------------
-echo "Test 9: setup_opencode_cli failure hint respects Homebrew ownership"
+# --- Test 9: first identity probes can time out after installation -----------
+echo "Test 9: setup retries transient post-install OpenCode validation"
+rm -f "$HOME/.aidevops/.opencode-bin-resolved" "$HOME/.local/bin/opencode" "$SANDBOX/bin/opencode" "$SANDBOX/transient-probes"
+(
+	source_extracted
+	_setup_opencode_binary_is_ephemeral() {
+		local bin="$1"
+		[[ "$bin" == "$SANDBOX/bin/"* ]] && return 1
+		return 0
+	}
+	_setup_find_valid_opencode_binary() {
+		local preferred_bin="${1:-}"
+		[[ -n "$preferred_bin" ]] || return 1
+		_setup_validate_opencode_binary "$preferred_bin" || return 1
+		printf '%s\n' "$preferred_bin"
+	}
+	npm_global_install() {
+		cat >"$SANDBOX/bin/opencode" <<'INNER_EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then
+	probe_file="$(dirname "$0")/../transient-probes"
+	probe_count=0
+	[[ -f "$probe_file" ]] && probe_count=$(cat "$probe_file")
+	probe_count=$((probe_count + 1))
+	printf '%s\n' "$probe_count" >"$probe_file"
+	if [[ "$probe_count" -le 2 ]]; then
+		sleep 5
+	fi
+	echo "1.14.25"
+fi
+[[ "${1:-}" == "--help" ]] && echo "opencode run [message..]     run opencode with a message"
+exit 0
+INNER_EOF
+		chmod +x "$SANDBOX/bin/opencode"
+		return 0
+	}
+	export -f npm_global_install 2>/dev/null || true
+	export PATH="$SANDBOX/bin:/usr/bin:/bin"
+	export AIDEVOPS_OPENCODE_VERSION_TIMEOUT=1
+	export AIDEVOPS_OPENCODE_POST_INSTALL_ATTEMPTS=3
+	export AIDEVOPS_OPENCODE_POST_INSTALL_RETRY_DELAY=0
+	rc=0
+	setup_opencode_cli || rc=$?
+	echo "rc=$rc"
+	cat "$HOME/.aidevops/.opencode-bin-resolved" 2>/dev/null || echo "MISSING"
+) >"$SANDBOX/out9" 2>&1
+rc9=$(grep '^rc=' "$SANDBOX/out9" | tail -1)
+resolved9=$(tail -1 "$SANDBOX/out9")
+install_count9=$(grep -c "OpenCode installed" "$SANDBOX/out9" || true)
+probe_count9=$(cat "$SANDBOX/transient-probes" 2>/dev/null || printf '0')
+assert_eq "transient post-install validation rc" "rc=0" "$rc9"
+assert_eq "transient post-install validation records stable shim" "$HOME/.local/bin/opencode" "$resolved9"
+assert_eq "transient post-install validation installs once" "1" "$install_count9"
+if [[ "$probe_count9" -ge 3 ]]; then
+	assert_eq "transient post-install validation retries" "retried" "retried"
+else
+	assert_eq "transient post-install validation retries" "retried" "probes=$probe_count9"
+fi
+
+# --- Test 10: Homebrew-owned invalid binary gets brew remediation -----------
+echo "Test 10: setup_opencode_cli failure hint respects Homebrew ownership"
 rm -f "$HOME/.aidevops/.opencode-bin-resolved" "$SANDBOX/bin/opencode"
 mkdir -p "$SANDBOX/homebrew/bin" "$SANDBOX/homebrew/Cellar/opencode/1.0.0/bin"
 cat >"$SANDBOX/homebrew/bin/opencode" <<'EOF'
@@ -518,6 +768,7 @@ EOF
 chmod +x "$SANDBOX/bin/brew"
 (
 	source_extracted
+	_setup_find_valid_opencode_alternative() { return 1; }
 	_setup_opencode_binary_is_ephemeral() {
 		local bin="$1"
 		case "$bin" in
@@ -539,7 +790,7 @@ assert_eq "homebrew remediation rc" "rc=0" "$rc9"
 assert_eq "homebrew remediation uses brew" "1" "$brew_hint9"
 assert_eq "homebrew remediation has no sudo npm hint" "0" "$sudo_hint9"
 
-# --- Test 10: shared installer policy uses npm first for OpenCode -----------
+# --- Test 11: shared installer policy uses npm first for OpenCode -----------
 echo "Test 10: npm_global_install prefers npm for opencode-ai when bun also exists"
 mkdir -p "$SANDBOX/install-policy/bin" "$SANDBOX/install-policy/prefix/lib"
 cat >"$SANDBOX/install-policy/bin/npm" <<EOF
@@ -643,7 +894,7 @@ chmod +x "$shim_path"
 	export HOME="$shim_home"
 	export PATH="$real_dir:$PATH"
 	_setup_opencode_binary_is_ephemeral() { return 1; }
-	_setup_ensure_opencode_stable_shim "$shim_path"
+	_setup_ensure_opencode_stable_shim "$real_dir/opencode"
 ) >"$SANDBOX/out12" 2>&1
 assert_eq "old managed shim is repaired" "$shim_path" "$(tail -1 "$SANDBOX/out12")"
 if grep -Fq '# aidevops:terminal-title-owner' "$shim_path"; then
@@ -660,7 +911,7 @@ shim_checksum=$(cksum "$shim_path")
 	export HOME="$shim_home"
 	export PATH="$real_dir:$PATH"
 	_setup_opencode_binary_is_ephemeral() { return 1; }
-	_setup_ensure_opencode_stable_shim "$shim_path"
+	_setup_ensure_opencode_stable_shim "$real_dir/opencode"
 ) >/dev/null 2>&1
 assert_eq "title-owning shim regeneration is idempotent" "$shim_checksum" "$(cksum "$shim_path")"
 
@@ -681,6 +932,7 @@ chmod +x "$repair_shim"
 	source_extracted
 	export HOME="$repair_home"
 	export PATH="$repair_home/.local/bin:$repair_bin:$PATH"
+	_setup_find_valid_opencode_alternative() { printf '%s\n' "$repair_bin/opencode"; }
 	rc=0
 	setup_opencode_cli || rc=$?
 	printf 'rc=%s\n' "$rc"
@@ -699,6 +951,181 @@ repair_checksum=$(cksum "$repair_shim")
 	setup_opencode_cli
 ) >/dev/null 2>&1
 assert_eq "broken marked shim repair is idempotent" "$repair_checksum" "$(cksum "$repair_shim")"
+
+echo "Test 14: V2 stable shim isolates runtime state and defaults the server port"
+v2_home="$SANDBOX/v2-home"
+v2_real_dir="$v2_home/.bun/bin"
+v2_shim="$v2_home/.local/bin/opencode2"
+mkdir -p "$v2_real_dir"
+cat >"$v2_real_dir/opencode2" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+--version) printf 'opencode v2.0.3\n' ;;
+--help) printf 'OpenCode command line interface\nrun  Run OpenCode with a message\n' ;;
+env-check)
+	printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
+		"${AIDEVOPS_OPENCODE_PROFILE:-}" "${XDG_CONFIG_HOME:-}" \
+		"${XDG_DATA_HOME:-}" "${XDG_CACHE_HOME:-}" "${XDG_STATE_HOME:-}" \
+		"${TMPDIR:-}" "${OPENCODE_CONFIG:-}" "${AIDEVOPS_OAUTH_POOL_FILE:-}"
+	;;
+auth-env) printf '%s|%s\n' "${XDG_CONFIG_HOME:-}" "${GH_CONFIG_DIR:-}" ;;
+"") printf 'pwd=%s\n' "$PWD" ;;
+--session) printf 'session=%s pwd=%s\n' "${2:-}" "$PWD" ;;
+*)
+	if [[ "$*" == *auth-env* ]]; then
+		printf '%s|%s\n' "${XDG_CONFIG_HOME:-}" "${GH_CONFIG_DIR:-}"
+	elif [[ "$*" == *session-env* ]]; then
+		printf '%s|%s|%s|%s|%s|%s\n' "${AIDEVOPS_HEADLESS:-}" "${OPENCODE_PID:-}" \
+			"${AIDEVOPS_SESSION_ORIGIN:-}" "${AIDEVOPS_AGENTS_DIR:-}" "${GITHUB_ACTIONS:-}" "${OPENAI_API_KEY:-}"
+	else
+		printf '%s\n' "$*"
+	fi
+	;;
+esac
+EOF
+chmod +x "$v2_real_dir/opencode2"
+(
+	source_extracted
+	export HOME="$v2_home"
+	_setup_opencode_binary_is_ephemeral() { return 1; }
+	AIDEVOPS_OPENCODE_PROFILE=v2 _setup_ensure_opencode_stable_shim "$v2_real_dir/opencode2"
+) >"$SANDBOX/out14" 2>&1
+assert_eq "V2 isolation shim path" "$v2_shim" "$(tail -1 "$SANDBOX/out14")"
+v2_root="$v2_home/.aidevops/runtimes/opencode-v2"
+assert_eq "V2 shim exports isolated roots" \
+	"v2|$v2_root/config|$v2_root/data|$v2_root/cache|$v2_root/state|$v2_root/tmp|$v2_root/config/opencode/opencode.json|$v2_root/auth/oauth-pool.json" \
+	"$(HOME="$v2_home" "$v2_shim" env-check)"
+custom_v2_root="$v2_home/custom-v2-root"
+assert_eq "V2 shim honors a custom isolation root" \
+	"v2|$custom_v2_root/config|$custom_v2_root/data|$custom_v2_root/cache|$custom_v2_root/state|$custom_v2_root/tmp|$custom_v2_root/config/opencode/opencode.json|$custom_v2_root/auth/oauth-pool.json" \
+	"$(HOME="$v2_home" AIDEVOPS_OPENCODE_V2_ROOT="$custom_v2_root" "$v2_shim" env-check)"
+assert_eq "V2 tool shells use caller's default gh config, not isolated OpenCode config" \
+	"$v2_root/config|$v2_home/.config/gh" \
+	"$(env -u GH_CONFIG_DIR -u XDG_CONFIG_HOME HOME="$v2_home" "$v2_shim" auth-env)"
+assert_eq "V2 shared service preserves caller's XDG gh config" \
+	"$v2_root/config|$v2_home/caller-config/gh" \
+	"$(env -u GH_CONFIG_DIR HOME="$v2_home" XDG_CONFIG_HOME="$v2_home/caller-config" "$v2_shim" serve auth-env)"
+assert_eq "V2 shared service honors explicit GH_CONFIG_DIR" \
+	"$v2_root/config|$v2_home/custom-gh" \
+	"$(HOME="$v2_home" XDG_CONFIG_HOME="$v2_home/caller-config" GH_CONFIG_DIR="$v2_home/custom-gh" "$v2_shim" service auth-env)"
+assert_eq "V2 serve gets isolated default port" "serve --port 4097 --hostname 127.0.0.1" \
+	"$(HOME="$v2_home" "$v2_shim" serve --hostname 127.0.0.1)"
+assert_eq "V2 serve preserves explicit port" "serve --port 4999" "$(HOME="$v2_home" "$v2_shim" serve --port 4999)"
+assert_eq "V2 serve supports configured default port" "serve --port 4555" \
+	"$(HOME="$v2_home" AIDEVOPS_OPENCODE_V2_PORT=4555 "$v2_shim" serve)"
+assert_eq "V2 serve after a boolean global option gets the isolated port" \
+	"--print-logs serve --port 4097" "$(HOME="$v2_home" "$v2_shim" --print-logs serve)"
+assert_eq "V2 serve after a valued global option gets the isolated port" \
+	"--log-level DEBUG serve --port 4097" "$(HOME="$v2_home" "$v2_shim" --log-level DEBUG serve)"
+assert_eq "V2 leading global option preserves an explicit port" \
+	"--print-logs serve --port 4999" "$(HOME="$v2_home" "$v2_shim" --print-logs serve --port 4999)"
+assert_eq "V2 does not treat a run message as the serve subcommand" \
+	"run serve" "$(HOME="$v2_home" "$v2_shim" run serve)"
+v2_caller_env=(AIDEVOPS_HEADLESS=1 OPENCODE_PID=4242 AIDEVOPS_SESSION_ORIGIN=worker
+	AIDEVOPS_AGENTS_DIR=/stale/bundle GITHUB_ACTIONS=true OPENAI_API_KEY=placeholder-key)
+assert_eq "V2 shared-service commands drop caller session and headless env" "||||true|placeholder-key" \
+	"$(env "${v2_caller_env[@]}" HOME="$v2_home" "$v2_shim" service session-env)"
+assert_eq "V2 standalone commands keep the caller env" \
+	"1|4242|worker|/stale/bundle|true|placeholder-key" \
+	"$(env "${v2_caller_env[@]}" HOME="$v2_home" "$v2_shim" run --standalone session-env)"
+v2_marker_root="$v2_home/.aidevops/.agent-workspace/work/opencode-tabby-recovery"
+v2_marker_dir="$v2_marker_root/ses_abcdef123456"
+v2_project_dir="$v2_home/project"
+v2_resolver_dir="$v2_home/.aidevops/agents/plugins/opencode-aidevops"
+mkdir -p "$v2_marker_dir" "$v2_project_dir" "$v2_resolver_dir"
+v2_project_dir=$(cd "$v2_project_dir" && pwd -P)
+printf 'process.stdout.write(%s + "\\t/data\\tses_abcdef123456\\n");\n' "\"$v2_project_dir\"" \
+	>"$v2_resolver_dir/session-recovery-marker.mjs"
+assert_eq "V2 TUI resumes the marked session from its project directory" \
+	"session=ses_abcdef123456 pwd=$v2_project_dir" \
+	"$(cd "$v2_marker_dir" && HOME="$v2_home" "$v2_shim" 2>/dev/null)"
+printf 'process.exitCode = 1;\n' >"$v2_resolver_dir/session-recovery-marker.mjs"
+assert_eq "V2 TUI falls back to HOME for an unresolvable recovery marker" "pwd=$v2_home" \
+	"$(cd "$v2_marker_dir" && HOME="$v2_home" "$v2_shim" 2>/dev/null)"
+assert_eq "V2 TUI outside a recovery marker keeps its directory" "pwd=$v2_project_dir" \
+	"$(cd "$v2_project_dir" && HOME="$v2_home" "$v2_shim" 2>/dev/null)"
+for isolated_dir in config data cache state tmp auth; do
+	if [[ -d "$v2_root/$isolated_dir" ]]; then
+		assert_eq "V2 shim creates isolated $isolated_dir directory" "present" "present"
+	else
+		assert_eq "V2 shim creates isolated $isolated_dir directory" "present" "absent"
+	fi
+done
+
+echo "Test 15: dual-runtime setup preserves V1 and fail-opens the V2 preview"
+(
+	source_extracted
+	setup_opencode_cli() {
+		printf '%s:%s\n' "${AIDEVOPS_OPENCODE_PROFILE:-v1}" "${AIDEVOPS_OPENCODE_PRESERVE_PRIMARY_RECEIPT:-0}"
+		[[ "${AIDEVOPS_OPENCODE_PROFILE:-v1}" != "v2" ]]
+	}
+	AIDEVOPS_OPENCODE_PROFILE=v1 setup_opencode_runtimes
+) >"$SANDBOX/out15" 2>&1
+assert_eq "default setup installs V1 then isolated V2" $'v1:0\nv2:1' "$(grep -E '^v[12]:' "$SANDBOX/out15")"
+if grep -Fq 'V1 remains available' "$SANDBOX/out15"; then
+	assert_eq "V2 setup failure is explicitly non-disruptive" "warned" "warned"
+else
+	assert_eq "V2 setup failure is explicitly non-disruptive" "warned" "missing"
+fi
+(
+	source_extracted
+	setup_opencode_cli() { printf '%s\n' "${AIDEVOPS_OPENCODE_PROFILE:-v1}"; }
+	AIDEVOPS_OPENCODE_PROFILE=v1 AIDEVOPS_INSTALL_OPENCODE2_PREVIEW=0 setup_opencode_runtimes
+) >"$SANDBOX/out15b" 2>&1
+assert_eq "preview opt-out leaves V1 setup enabled" "v1" "$(grep -E '^v[12]$' "$SANDBOX/out15b")"
+(
+	source_extracted
+	setup_opencode_cli() {
+		printf '%s:%s\n' "${AIDEVOPS_OPENCODE_PROFILE:-v1}" "${AIDEVOPS_OPENCODE_PRESERVE_PRIMARY_RECEIPT:-0}"
+	}
+	AIDEVOPS_OPENCODE_PROFILE=v2 setup_opencode_runtimes
+) >"$SANDBOX/out15c" 2>&1
+assert_eq "V2-primary setup keeps V1 as rollback" $'v1:1\nv2:0' "$(grep -E '^v[12]:' "$SANDBOX/out15c")"
+
+echo "Test 16: V2 setup installs under its isolated runtime root"
+v2_install_home="$SANDBOX/v2-install-home"
+v2_install_bin="$SANDBOX/v2-install-bin"
+v2_install_root="$v2_install_home/.aidevops/runtimes/opencode-v2/runtime"
+mkdir -p "$v2_install_home" "$v2_install_bin"
+cat >"$v2_install_bin/npm" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >"$HOME/npm-install-args"
+prefix=""
+while [[ $# -gt 0 ]]; do
+	if [[ "$1" == "--prefix" ]]; then
+		prefix="$2"
+		shift 2
+		continue
+	fi
+	shift
+done
+mkdir -p "$prefix/node_modules/.bin"
+cat >"$prefix/node_modules/.bin/opencode2" <<'SHIM'
+#!/usr/bin/env bash
+[[ "${1:-}" == "--version" ]] && printf 'opencode v2.0.3\n'
+[[ "${1:-}" == "--help" ]] && printf 'OpenCode command line interface\nrun  Run OpenCode with a message\n'
+exit 0
+SHIM
+chmod +x "$prefix/node_modules/.bin/opencode2"
+EOF
+chmod +x "$v2_install_bin/npm"
+(
+	source_extracted
+	export HOME="$v2_install_home"
+	export PATH="$v2_install_bin:/usr/bin:/bin"
+	AIDEVOPS_OPENCODE_PROFILE=v2 setup_opencode_cli
+	printf 'resolved=%s\n' "$(<"$HOME/.aidevops/.opencode-v2-bin-resolved")"
+) >"$SANDBOX/out16" 2>&1
+assert_eq "V2 isolated install records the stable shim" \
+	"resolved=$v2_install_home/.local/bin/opencode2" "$(tail -1 "$SANDBOX/out16")"
+assert_eq "V2 install uses npm with a private prefix" \
+	"install --no-audit --no-fund --prefix $v2_install_root @opencode/cli@latest" \
+	"$(<"$v2_install_home/npm-install-args")"
+v2_install_exec=$(grep '^exec "' "$v2_install_home/.local/bin/opencode2")
+# The shim keeps the logical path by design (see _setup_ensure_opencode_stable_shim);
+# on macOS mktemp returns /var/..., whose physical form is /private/var/...
+assert_eq "V2 stable shim targets the private package binary" \
+	"exec \"$v2_install_root/node_modules/.bin/opencode2\" \"\$@\"" "$v2_install_exec"
 
 echo ""
 echo "===== Results: $PASS passed, $FAIL failed ====="

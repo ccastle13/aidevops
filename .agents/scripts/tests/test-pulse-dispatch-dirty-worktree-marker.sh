@@ -6,6 +6,14 @@
 
 set -euo pipefail
 
+# Resolve native Git once from the system default PATH (portable to non-FHS
+# hosts such as NixOS); fixtures must bypass the aidevops git wrapper.
+TEST_NATIVE_GIT=$(command -p -v git) || {
+	printf '%s\n' 'Native Git is unavailable on the system PATH' >&2
+	exit 1
+}
+export TEST_NATIVE_GIT
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit
 LIB_SCRIPT="${SCRIPT_DIR}/../pulse-dispatch-lib.sh"
 WORKER_LAUNCH_SCRIPT="${SCRIPT_DIR}/../pulse-dispatch-worker-launch.sh"
@@ -17,6 +25,7 @@ readonly TEST_RESET='\033[0m'
 TESTS_RUN=0
 TESTS_FAILED=0
 TEST_GH_POST_COUNT=0
+TEST_STATS_COUNTERS=""
 
 print_result() {
 	local test_name="$1"
@@ -44,12 +53,13 @@ gh() {
 		TEST_GH_POST_COUNT=$((TEST_GH_POST_COUNT + 1))
 		return 0
 	fi
-	if [[ "$subcommand" != "api" || "$endpoint" != "repos/marcusquinn/aidevops/issues/26635/comments?per_page=100" ]]; then
+	if [[ "$subcommand" != "api" || "$endpoint" != "repos/marcusquinn/aidevops/issues/26635/comments?per_page=100&since="* || "$*" != *"--paginate --slurp"* ]]; then
 		printf 'unexpected gh call: %s\n' "$*" >&2
 		return 1
 	fi
-	printf '%s\n' "${TEST_GH_COMMENTS_JSON:-[]}"
-	return 0
+	[[ -z "${TEST_GH_COMMENTS_STDERR:-}" ]] || printf '%s\n' "$TEST_GH_COMMENTS_STDERR" >&2
+	printf '%s\n' "${TEST_GH_COMMENTS_JSON-[]}"
+	return "${TEST_GH_COMMENTS_RC:-0}"
 }
 
 load_lib() {
@@ -59,7 +69,10 @@ load_lib() {
 	source "$LIB_SCRIPT"
 	# shellcheck disable=SC1090 # test sources the worker launch helper by path.
 	source "$WORKER_LAUNCH_SCRIPT"
-	_dispatch_stats_increment() { return 0; }
+	_dispatch_stats_increment() {
+		TEST_STATS_COUNTERS="${TEST_STATS_COUNTERS}${1}"$'\n'
+		return 0
+	}
 	return 0
 }
 
@@ -70,7 +83,7 @@ test_recent_marker_blocks_dispatch() {
 		DISPATCH_DIRTY_WORKTREE_HOLD_SECONDS="21600" \
 		_dispatch_recent_dirty_worktree_marker_active "26635" "marcusquinn/aidevops"
 	local rc=$?
-	if [[ "$rc" -eq 0 ]]; then
+	if [[ "$rc" -eq 0 && "$_DISPATCH_DIRTY_MARKER_STATE" == block:* ]]; then
 		print_result "recent dirty marker blocks dispatch" 0
 		return 0
 	fi
@@ -133,7 +146,7 @@ test_marker_without_runner_key_stays_blocked() {
 }
 
 test_dirty_worktree_reuse_preserves_edits() {
-	git() { /usr/bin/git "$@"; }
+	git() { "$TEST_NATIVE_GIT" "$@"; }
 	local fixture_root=""
 	fixture_root=$(mktemp -d)
 	fixture_root=$(cd "$fixture_root" && pwd -P)
@@ -226,6 +239,87 @@ test_large_comment_payload_uses_stream_transport() {
 	return 0
 }
 
+test_paginated_and_unknown_marker_evidence() {
+	local recent='{"created_at":"2026-07-05T22:22:12Z","body":"WORKER_DIRTY_WORKTREE runner_key=runner-page-two"}'
+	local resolved='{"created_at":"2026-07-05T22:40:00Z","body":"WORKER_DIRTY_WORKTREE_RESOLVED"}'
+	local rc=0
+	TEST_GH_COMMENTS_JSON="[[],[${recent}]]" AIDEVOPS_DIRTY_WORKTREE_NOW_EPOCH=1783291032 \
+		DISPATCH_DIRTY_WORKTREE_HOLD_SECONDS=21600 \
+		_dispatch_recent_dirty_worktree_marker_active 26635 marcusquinn/aidevops || rc=$?
+	if [[ "$rc" -eq 0 && "$_DISPATCH_DIRTY_MARKER_STATE" == *runner_key=runner-page-two ]]; then
+		print_result "recent marker on a later page is not missed" 0
+	else
+		print_result "recent marker on a later page is not missed" 1
+	fi
+	local bad_data=""
+	for bad_data in '' '{}' '[{"body":"WORKER_DIRTY_WORKTREE"}]' \
+		'[{"created_at":"2026-07-05T22:22:12","body":"WORKER_DIRTY_WORKTREE"}]'; do
+		rc=0
+		TEST_GH_COMMENTS_JSON="$bad_data" _dispatch_recent_dirty_worktree_marker_active 26635 marcusquinn/aidevops || rc=$?
+		if [[ "$rc" -eq 0 && "$_DISPATCH_DIRTY_MARKER_STATE" == unknown ]]; then
+			print_result "incomplete marker evidence holds instead of clearing" 0
+		else
+			print_result "incomplete marker evidence holds instead of clearing" 1 "$bad_data"
+		fi
+	done
+	rc=0
+	TEST_GH_COMMENTS_JSON='[]' TEST_GH_COMMENTS_RC=1 \
+		_dispatch_recent_dirty_worktree_marker_active 26635 marcusquinn/aidevops || rc=$?
+	if [[ "$rc" -eq 0 && "$_DISPATCH_DIRTY_MARKER_STATE" == unknown ]]; then
+		print_result "API failure cannot become verified empty comments" 0
+	else
+		print_result "API failure cannot become verified empty comments" 1
+	fi
+	rc=0
+	TEST_GH_COMMENTS_JSON="[[${resolved}],[${recent}]]" AIDEVOPS_DIRTY_WORKTREE_NOW_EPOCH=1783291032 \
+		DISPATCH_DIRTY_WORKTREE_HOLD_SECONDS=21600 \
+		_dispatch_recent_dirty_worktree_marker_active 26635 marcusquinn/aidevops || rc=$?
+	if [[ "$rc" -eq 1 && "$_DISPATCH_DIRTY_MARKER_STATE" == clear ]]; then
+		print_result "marker resolution uses timestamps rather than response order" 0
+	else
+		print_result "marker resolution uses timestamps rather than response order" 1
+	fi
+	return 0
+}
+
+test_evidence_unavailable_hold_is_typed() {
+	local rc=0
+	TEST_STATS_COUNTERS=""
+	set +e
+	TEST_GH_COMMENTS_JSON='[]' TEST_GH_COMMENTS_RC=75 \
+		TEST_GH_COMMENTS_STDERR='[gh-transport] error_kind=github-api-read-deferred attempted=false deferred_by=local_admission retry_at=1893456000 reason="fixture"' \
+		_dispatch_skip_for_dirty_worktree_recovery 26635 marcusquinn/aidevops
+	rc=$?
+	set -e
+	local result=0
+	[[ "$rc" -eq 0 ]] || result=1
+	[[ "$_DISPATCH_DIRTY_MARKER_STATE" == unknown ]] || result=1
+	[[ "$_DISPATCH_DIRTY_MARKER_EVIDENCE_KIND" == transport_deferred ]] || result=1
+	[[ "$_DISPATCH_DIRTY_MARKER_REQUEST_ATTEMPTED" == false ]] || result=1
+	[[ "$_DISPATCH_DIRTY_MARKER_DEFERRED_BY" == local_admission ]] || result=1
+	[[ "$_DISPATCH_DIRTY_MARKER_RETRY_AT" == 1893456000 ]] || result=1
+	[[ "$_DISPATCH_DIRTY_MARKER_EXIT_CODE" == 75 ]] || result=1
+	grep -q 'DISPATCH_BLOCK_REASON reason=dirty_worktree_evidence_unavailable evidence_kind=transport_deferred attempted=false deferred_by=local_admission retry_at=1893456000 exit_code=75' "$LOGFILE" || result=1
+	[[ "$TEST_STATS_COUNTERS" == *"dispatch_candidate_blocked_dirty_worktree_evidence_unavailable"* ]] || result=1
+	print_result "unavailable marker evidence emits a typed conservative hold" "$result"
+	return 0
+}
+
+test_failed_and_unparsable_evidence_are_distinct() {
+	local rc=0 result=0
+	TEST_GH_COMMENTS_JSON='[]' TEST_GH_COMMENTS_RC=1 TEST_GH_COMMENTS_STDERR='provider read failed' \
+		_dispatch_recent_dirty_worktree_marker_active 26635 marcusquinn/aidevops || rc=$?
+	[[ "$rc" -eq 0 && "$_DISPATCH_DIRTY_MARKER_EVIDENCE_KIND" == transport_failed ]] || result=1
+	[[ "$_DISPATCH_DIRTY_MARKER_REQUEST_ATTEMPTED" == unknown && "$_DISPATCH_DIRTY_MARKER_EXIT_CODE" == 1 ]] || result=1
+	rc=0
+	TEST_GH_COMMENTS_JSON='{}' TEST_GH_COMMENTS_RC=0 TEST_GH_COMMENTS_STDERR='' \
+		_dispatch_recent_dirty_worktree_marker_active 26635 marcusquinn/aidevops || rc=$?
+	[[ "$rc" -eq 0 && "$_DISPATCH_DIRTY_MARKER_EVIDENCE_KIND" == unparsable ]] || result=1
+	[[ "$_DISPATCH_DIRTY_MARKER_REQUEST_ATTEMPTED" == true && "$_DISPATCH_DIRTY_MARKER_EXIT_CODE" == 0 ]] || result=1
+	print_result "failed and unparsable marker evidence retain distinct metadata" "$result"
+	return 0
+}
+
 test_prelaunch_lease_failure_logs_durable_reason() {
 	local fixture_dir=""
 	fixture_dir=$(mktemp -d)
@@ -301,6 +395,9 @@ main() {
 	test_later_resolution_clears_marker
 	test_expired_marker_does_not_block
 	test_large_comment_payload_uses_stream_transport
+	test_paginated_and_unknown_marker_evidence
+	test_evidence_unavailable_hold_is_typed
+	test_failed_and_unparsable_evidence_are_distinct
 	test_prelaunch_lease_failure_logs_durable_reason
 	test_expired_marker_clears_once_with_audit
 	test_marker_without_runner_key_stays_blocked

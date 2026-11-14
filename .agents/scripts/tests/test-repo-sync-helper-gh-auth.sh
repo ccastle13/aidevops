@@ -4,6 +4,14 @@
 
 set -euo pipefail
 
+# Resolve native Git once from the system default PATH (portable to non-FHS
+# hosts such as NixOS); fixtures must bypass the aidevops git wrapper.
+TEST_NATIVE_GIT=$(command -p -v git) || {
+	printf '%s\n' 'Native Git is unavailable on the system PATH' >&2
+	exit 1
+}
+export TEST_NATIVE_GIT
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPER="${SCRIPT_DIR}/../repo-sync-helper.sh"
 
@@ -49,14 +57,22 @@ run_case() {
 	printf '{"git_parent_dirs":["%s"]}\n' "${tmp_dir}/parent" >"${tmp_dir}/home/.config/aidevops/repos.json"
 
 	local rc=0
-	env \
-		HOME="${tmp_dir}/home" \
-		PATH="${tmp_dir}/bin:${PATH}" \
-		FAKE_GIT_LOG="${tmp_dir}/git.log" \
-		FAKE_GH_LOG="${tmp_dir}/gh.log" \
-		FAKE_TOKEN="SECRET_TOKEN_${case_name}" \
-		"$@" \
-		"$HELPER" check >"${tmp_dir}/stdout.log" 2>"${tmp_dir}/stderr.log" || rc=$?
+	local repeats=1 arg i
+	for arg in "$@"; do
+		if [[ "$arg" == FAKE_REPEAT=* ]]; then
+			repeats="${arg#FAKE_REPEAT=}"
+		fi
+	done
+	for ((i = 0; i < repeats; i++)); do
+		env -i \
+			HOME="${tmp_dir}/home" \
+			PATH="${tmp_dir}/bin:${PATH}" \
+			FAKE_GIT_LOG="${tmp_dir}/git.log" \
+			FAKE_GH_LOG="${tmp_dir}/gh.log" \
+			FAKE_TOKEN="SECRET_TOKEN_${case_name}" \
+			"$@" \
+			"$HELPER" check >"${tmp_dir}/stdout.log" 2>"${tmp_dir}/stderr.log" || rc=$?
+	done
 
 	LAST_CASE_DIR="$tmp_dir"
 	LAST_CASE_RC="$rc"
@@ -73,22 +89,30 @@ run_canonical_guard_case() {
 	ln -s "${SCRIPT_DIR}/../git" "${tmp_dir}/bin/git"
 	ln -s "${SCRIPT_DIR}/fixtures/repo-sync-fake-gh.sh" "${tmp_dir}/bin/gh"
 
-	/usr/bin/git init -q --bare "$remote"
-	/usr/bin/git init -q -b main "$repo" 2>/dev/null || {
-		/usr/bin/git init -q "$repo"
-		/usr/bin/git -C "$repo" checkout -q -b main
+	"$TEST_NATIVE_GIT" init -q --bare "$remote"
+	"$TEST_NATIVE_GIT" init -q -b main "$repo" 2>/dev/null || {
+		"$TEST_NATIVE_GIT" init -q "$repo"
+		"$TEST_NATIVE_GIT" -C "$repo" checkout -q -b main
 	}
-	/usr/bin/git -C "$repo" config user.name Test
-	/usr/bin/git -C "$repo" config user.email test@example.invalid
+	"$TEST_NATIVE_GIT" -C "$repo" config user.name Test
+	"$TEST_NATIVE_GIT" -C "$repo" config user.email test@example.invalid
 	printf 'seed\n' >"${repo}/README.md"
-	/usr/bin/git -C "$repo" add README.md
-	/usr/bin/git -C "$repo" commit -q -m seed
-	/usr/bin/git -C "$repo" remote add origin "$remote"
-	/usr/bin/git -C "$repo" push -q -u origin main
+	"$TEST_NATIVE_GIT" -C "$repo" add README.md
+	"$TEST_NATIVE_GIT" -C "$repo" commit -q -m seed
+	"$TEST_NATIVE_GIT" -C "$repo" remote add origin "$remote"
+	"$TEST_NATIVE_GIT" -C "$repo" push -q -u origin main
+	"$TEST_NATIVE_GIT" clone -q -b main "$remote" "${tmp_dir}/writer"
+	"$TEST_NATIVE_GIT" -C "${tmp_dir}/writer" config user.name Test
+	"$TEST_NATIVE_GIT" -C "${tmp_dir}/writer" config user.email test@example.invalid
+	printf 'second\n' >"${tmp_dir}/writer/second.txt"
+	"$TEST_NATIVE_GIT" -C "${tmp_dir}/writer" add second.txt
+	"$TEST_NATIVE_GIT" -C "${tmp_dir}/writer" commit -q -m second
+	"$TEST_NATIVE_GIT" -C "${tmp_dir}/writer" push -q origin main
+	"$TEST_NATIVE_GIT" -C "$repo" fetch -q origin main
 	printf '{"git_parent_dirs":["%s"]}\n' "${tmp_dir}/parent" >"${tmp_dir}/home/.config/aidevops/repos.json"
 
 	local before
-	before=$(/usr/bin/git -C "$repo" show-ref)
+	before=$("$TEST_NATIVE_GIT" -C "$repo" show-ref)
 	local rc=0
 	env \
 		HOME="${tmp_dir}/home" \
@@ -96,12 +120,41 @@ run_canonical_guard_case() {
 		FAKE_GH_LOG="${tmp_dir}/gh.log" \
 		"$HELPER" check >"${tmp_dir}/stdout.log" 2>"${tmp_dir}/stderr.log" || rc=$?
 	local after
-	after=$(/usr/bin/git -C "$repo" show-ref)
+	after=$("$TEST_NATIVE_GIT" -C "$repo" show-ref)
 
 	LAST_CASE_DIR="$tmp_dir"
 	LAST_CASE_RC="$rc"
 	LAST_CANONICAL_REFS_UNCHANGED=0
 	[[ "$before" == "$after" ]] && LAST_CANONICAL_REFS_UNCHANGED=1
+
+	# Exercise actual unpushed and dirty state, not just fake Git responses.
+	printf 'local-only\n' >"${repo}/local.txt"
+	"$TEST_NATIVE_GIT" -C "$repo" add local.txt
+	"$TEST_NATIVE_GIT" -C "$repo" commit -q -m local-only
+	printf 'staged\n' >>"${repo}/README.md"
+	"$TEST_NATIVE_GIT" -C "$repo" add README.md
+	printf 'unstaged\n' >>"${repo}/README.md"
+	printf 'untracked\n' >"${repo}/untracked.txt"
+	before=$(canonical_snapshot "$repo")
+	env HOME="${tmp_dir}/home" \
+		PATH="${tmp_dir}/bin:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+		FAKE_GH_LOG="${tmp_dir}/gh.log" \
+		"$HELPER" check >"${tmp_dir}/dirty-stdout.log" 2>"${tmp_dir}/dirty-stderr.log" || rc=$?
+	after=$(canonical_snapshot "$repo")
+	LAST_CASE_RC="$rc"
+	LAST_CANONICAL_DIRTY_UNCHANGED=0
+	[[ "$before" == "$after" ]] && LAST_CANONICAL_DIRTY_UNCHANGED=1
+	return 0
+}
+
+canonical_snapshot() {
+	local repo="$1"
+	"$TEST_NATIVE_GIT" -C "$repo" show-ref
+	"$TEST_NATIVE_GIT" -C "$repo" rev-parse HEAD
+	"$TEST_NATIVE_GIT" -C "$repo" write-tree
+	"$TEST_NATIVE_GIT" -C "$repo" diff --binary
+	"$TEST_NATIVE_GIT" -C "$repo" diff --cached --binary
+	cksum "${repo}/README.md" "${repo}/local.txt" "${repo}/untracked.txt"
 	return 0
 }
 
@@ -153,6 +206,20 @@ assert_file_contains "${LAST_CASE_DIR}/home/.aidevops/logs/repo-sync.log" "retry
 assert_file_not_contains "${LAST_CASE_DIR}/home/.aidevops/logs/repo-sync.log" "SECRET_TOKEN_github_fallback" "GitHub auth fallback log does not contain token"
 assert_file_not_contains "${LAST_CASE_DIR}/git.log" "SECRET_TOKEN_github_fallback" "GitHub auth fallback command line does not contain token"
 
+run_case github_ssh_fallback FAKE_FETCH_MODE=auth_then_success FAKE_REMOTE_URL=git@github.com:example/repo.git
+assert_rc 0 "$LAST_CASE_RC" "GitHub SSH auth failure retries over HTTPS"
+assert_file_contains "${LAST_CASE_DIR}/git.log" "ls-remote https://github.com/example/repo.git refs/heads/main" "SSH fallback passes HTTPS URL explicitly"
+assert_file_contains "${LAST_CASE_DIR}/git.log" "ssh_command=ssh -o BatchMode=yes" "SSH attempt disables interactive askpass"
+assert_file_contains "${LAST_CASE_DIR}/git.log" "credential.helper=!gh auth git-credential" "SSH fallback uses gh credential helper"
+assert_file_not_contains "${LAST_CASE_DIR}/git.log" "remote set-url" "SSH fallback does not alter configured remote"
+
+run_case github_ssh_scheme FAKE_FETCH_MODE=auth_then_success FAKE_REMOTE_URL=ssh://git@github.com/example/repo.git
+assert_rc 0 "$LAST_CASE_RC" "GitHub ssh:// URL retries over HTTPS"
+
+run_case untrusted_ssh_host FAKE_FETCH_MODE=auth_then_success FAKE_REMOTE_URL=git@notgithub.com:example/repo.git
+assert_rc 1 "$LAST_CASE_RC" "non-GitHub SSH remote does not get GitHub credentials"
+assert_file_not_contains "${LAST_CASE_DIR}/git.log" "credential.helper=!gh auth git-credential" "non-GitHub SSH remote has no gh retry"
+
 run_case non_github_no_fallback FAKE_FETCH_MODE=auth_then_success FAKE_REMOTE_URL=https://gitlab.com/example/repo.git
 assert_rc 1 "$LAST_CASE_RC" "non-GitHub auth failure still fails"
 assert_file_not_contains "${LAST_CASE_DIR}/git.log" "credential.helper=!gh auth git-credential" "non-GitHub remote does not use gh credential helper"
@@ -160,6 +227,14 @@ assert_file_not_contains "${LAST_CASE_DIR}/git.log" "credential.helper=!gh auth 
 run_case dirty_skip FAKE_DIRTY=1 FAKE_FETCH_MODE=auth_then_success
 assert_rc 0 "$LAST_CASE_RC" "dirty worktree remains skipped"
 assert_file_not_contains "${LAST_CASE_DIR}/git.log" "ls-remote origin" "dirty worktree skips remote diagnostic before auth fallback"
+
+run_case untracked_skip FAKE_UNTRACKED=1 FAKE_FETCH_MODE=auth_then_success
+assert_rc 0 "$LAST_CASE_RC" "untracked worktree remains skipped"
+assert_file_not_contains "${LAST_CASE_DIR}/git.log" "ls-remote origin" "untracked files block canonical eligibility"
+
+run_case branch_skip FAKE_CURRENT_BRANCH=feature FAKE_FETCH_MODE=success
+assert_rc 0 "$LAST_CASE_RC" "non-default branch remains skipped"
+assert_file_not_contains "${LAST_CASE_DIR}/git.log" "ls-remote origin" "non-default branch avoids remote diagnostic"
 
 run_case diverged_pull FAKE_FETCH_MODE=success FAKE_LOCAL_SHA=aaaa FAKE_UPSTREAM_SHA=bbbb
 assert_rc 0 "$LAST_CASE_RC" "diverged canonical is diagnostic-only"
@@ -171,11 +246,21 @@ assert_rc 1 "$LAST_CASE_RC" "failed GitHub fallback exits with failure"
 assert_file_not_contains "${LAST_CASE_DIR}/home/.aidevops/logs/repo-sync.log" "SECRET_TOKEN_github_fallback_failure_redacts" "failed GitHub fallback log redacts token"
 assert_file_contains "${LAST_CASE_DIR}/home/.aidevops/logs/repo-sync.log" "[redacted-credential]" "failed GitHub fallback log includes redacted credential marker"
 
+run_case repeated_failures FAKE_REPEAT=3 FAKE_FETCH_MODE=auth_always_fail FAKE_REMOTE_URL=https://github.com/example/repo.git
+assert_rc 1 "$LAST_CASE_RC" "three failing runs retain failure exit"
+if [[ "$(jq -r '.repo_observations | to_entries[0].value.fail_runs' "${LAST_CASE_DIR}/home/.aidevops/cache/repo-sync-state.json")" == 3 ]]; then
+	pass "persistent failure counter records three consecutive runs"
+else
+	fail "persistent failure counter records three consecutive runs"
+fi
+
 run_canonical_guard_case
 assert_rc 0 "$LAST_CASE_RC" "repo-sync completes through the deployed canonical Git shim"
-assert_file_contains "${LAST_CASE_DIR}/home/.aidevops/logs/repo-sync.log" "already up to date" "canonical repo-sync reads the remote branch tip"
+assert_file_contains "${LAST_CASE_DIR}/home/.aidevops/logs/repo-sync.log" "CONVERGENCE_ELIGIBLE (read-only default)" "clean strictly-behind canonical is reported eligible"
 assert_file_not_contains "${LAST_CASE_DIR}/stderr.log" "BLOCKED by canonical Git guard" "canonical repo-sync is not rejected as mutation"
 assert_rc 1 "$LAST_CANONICAL_REFS_UNCHANGED" "canonical repo-sync leaves local refs unchanged"
+assert_rc 1 "$LAST_CANONICAL_DIRTY_UNCHANGED" "real canonical unpushed commit, index, tracked and untracked bytes remain unchanged"
+assert_file_contains "${LAST_CASE_DIR}/home/.aidevops/logs/repo-sync.log" "working tree is dirty" "real dirty canonical is skipped"
 
 if [[ $failures -gt 0 ]]; then
 	printf '\n%d repo-sync gh-auth test(s) failed\n' "$failures" >&2

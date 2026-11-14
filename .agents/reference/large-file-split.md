@@ -25,7 +25,7 @@ but workers couldn't discover from the brief.
 |--------|-----------|-------------|
 | `function-complexity` | 100 lines | `(file, fname)` |
 | `nesting-depth` | 4 levels deep | `(file, 'NEST')` |
-| `file-size` | 1500 lines (shell) | `(file)` |
+| `file-size` | Non-README Markdown: 1000 lines at root / 500 elsewhere | `(file)` |
 
 **Decision rule for brief authors:**
 
@@ -54,6 +54,17 @@ extract plan without re-discovering it from scratch.
 to the PR with a `## Complexity Bump Justification` section. See section 4 of this doc.
 
 ## 1. When to Use This
+
+### Markdown size remediation
+
+The pre-push hook, local linter and CI ratchet gate non-README Markdown above 1,000 lines at repository root (no `/` in the repo-relative path), or 500 lines elsewhere. `README.md` anywhere is exempt. Existing violations remain debt, not a new regression; code file length is not gated by this metric.
+
+When a hook self-blocks or any process reports a Markdown size violation:
+
+1. Review the **whole document** for concision **without losing any detail**: repetition, wordiness, duplicated sections and tables instead of prose. Apply that pass wherever possible; preserve facts, constraints and discoverability.
+2. Only if that is insufficient, split/index while preserving all detail and navigation.
+   - **Verbatim historical records** whose prose must not change (step 1 does not apply): `historical-markdown-archive.py archive SOURCE NEW_DIR` writes LF-bounded parts (default 400 lines), a SHA-256 manifest and a noncanonical README, verifying the staged output against SOURCE before publishing; `verify NEW_DIR [--original SOURCE]` re-checks it. Run `--help` for limits; never use it for active guidance.
+3. Only then consider a justified `complexity-bump-ok` / `COMPLEXITY_GUARD_DISABLE=1` bypass under the existing authorization rules. Record why concision and splitting cannot solve it (for example an exact upstream copy); never silently bypass a gate.
 
 Use this playbook when:
 
@@ -208,7 +219,8 @@ human reviewer can distinguish a split artifact from new debt.
 ### 4.2 Pre-push complexity guard
 
 The client-side `complexity-regression-pre-push.sh` hook rejects on the same
-false positive. Targeted bypass:
+false positive. For Markdown, follow the conciseness-first sequence above before
+considering an authorized, justified targeted bypass:
 
 ```bash
 COMPLEXITY_GUARD_DISABLE=1 git push
@@ -296,6 +308,8 @@ cannot be statically followed without `-x`).
 
 ## Testing
 
+- `file-split-verify.py --base origin/main --head HEAD` (section 7.5):
+  `<paste the summary line, e.g. removed=N added=N removed-only=0 review=0 gated=0 warn=0 ...>`
 - `shellcheck <all-files>` -- clean at warning+error severity
 - Smoke test via the real caller path (`SCRIPT_DIR=... source <orchestrator>`):
   all expected functions resolve; behaviour is identical
@@ -378,6 +392,43 @@ COMPLEXITY_GUARD_DISABLE=1 git push --dry-run
 
 If the dry run passes with the complexity guard disabled, the only remaining
 gate is the CI `complexity-bump-ok` label (section 4.1).
+
+### 7.5 Pure-move verification
+
+Prove the split is a pure move instead of self-assessing "behaviour unchanged":
+
+```bash
+python3 ~/.aidevops/agents/scripts/file-split-verify.py --base origin/main --head HEAD
+# Merged squash PR: --base <merge-sha>^ --head <merge-sha>
+```
+
+It reads only local git (`git diff -U0 --no-renames BASE...HEAD`), so workers,
+reviewers and pulse can run it on any range without GitHub API cost. The first
+line is the summary to paste into the PR body's `## Testing` section:
+
+```text
+removed=N added=N removed-only=N review=N gated=N warn=N residue=N moved-functions=N result=PASS|FAIL
+```
+
+- **removed-only** -- a removed line with no identical added line: logic was
+  deleted or edited. FAIL.
+- **review** -- an added line that is not split scaffolding (blank, comments,
+  include guards, `source` lines with their directory resolution, `unset`,
+  `fi`, `return 0 2>/dev/null || exit 0`). FAIL. The script docstring holds the
+  exact allowlist; scaffolding lines are counted as `residue`.
+- **gated** -- a shell function moved from file A to file B while a trust gate
+  pins `caller_function == "<fn>"` together with A's file identity
+  (`framework_script("A")`, `caller_script == */.agents/scripts/A`).
+  `caller_script` is `BASH_SOURCE[1]` at the wrapper call, the file that
+  *defines* the calling function, so the move silently breaks the allowlist.
+  FAIL: keep the function in A, or update the gate and its tests in the same PR.
+- **warn** -- stale `A::<fn>` pointers (and related `EDIT:` lines) in tracked
+  text, listed as `file:line`. Fix them in the split PR; warnings do not change
+  the exit code.
+
+Exit 0 = pure move, 1 = FAIL, 2 = usage or git error. An intentional
+non-move edit fails by design: list each reported line in the PR body or move
+the edit to a separate PR.
 
 ---
 

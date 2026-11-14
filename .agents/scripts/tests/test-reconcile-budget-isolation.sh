@@ -61,6 +61,8 @@ trap 'rm -rf "$TEST_TMPDIR"' EXIT
 LOGFILE="${TEST_TMPDIR}/pulse.log"
 : >"$LOGFILE"
 export LOGFILE
+# GH#34299: keep the single-pass resume cursor out of the real state dir.
+export AIDEVOPS_RECONCILE_SP_CURSOR_FILE="${TEST_TMPDIR}/reconcile-single-pass.cursor"
 
 # Fake repos.json — one pulse-enabled repo
 REPOS_JSON="${TEST_TMPDIR}/repos.json"
@@ -276,6 +278,152 @@ test_budget_state_at_function_entry() {
 	return 0
 }
 
+# GH#33048: exercise the extracted helper chain with real cycle/row scopes.
+# No live mutations: action stubs record the consuming stage and issue number.
+# shellcheck disable=SC2154 # Stubs consume locals assigned by the sourced row helper.
+test_extracted_cycle_caps_and_order() {
+	local result="" expected=""
+	result=$(
+		set -u
+		_PIR_SCRIPT_DIR="${TEST_TMPDIR}/absent"
+		RECONCILE_TIME_BUDGET_SECS=0
+		_pir_initialize_backfill_gates() { return 0; }
+		_repair_pending_planning_publications() { return 0; }
+		_repair_recently_closed_parents_cycle() { _PIR_RECENT_PARENT_CYCLE_REOPENED=0; return 0; }
+		_build_oimp_lookup_for_slug() { printf '|53=999|'; return 0; }
+		_log_substage_timing() { return 0; }
+		_read_cache_issues_for_slug() {
+			jq -cn '[range(1;91) as $n | {number:$n, title:"task", body:"", labels:[],
+				authorAssociation:"MEMBER", author:{login:"member",type:"User",is_bot:false}}]'
+			return 0
+		}
+		_should_reconcile_persistent_issue() { [[ "$issue_num" -eq 1 ]] || return 1; return 0; }
+		_action_reconcile_persistent_issue_labels() { printf 'persistent:%s\n' "$issue_num"; return 0; }
+		_should_reconcile_external_issue_gate() {
+			[[ "$issue_author_association:$issue_author_login:$issue_author_type:$issue_author_is_bot" == MEMBER:member:User:false ]] || exit 1
+			[[ "$issue_num" -eq 2 ]] || return 1
+			return 0
+		}
+		_action_reconcile_external_issue_gate() { _PIR_EXTERNAL_GATE_MUTATED=1; printf 'external:%s\n' "$issue_num"; return 0; }
+		_should_ciw() { [[ "$issue_num" -ge 3 && "$issue_num" -le 27 ]] || return 1; return 0; }
+		_action_ciw_single() { printf 'ciw:%s\n' "$issue_num"; return 0; }
+		_should_rsd() { [[ "$issue_num" -ge 28 && "$issue_num" -le 52 ]] || return 1; return 0; }
+		_action_rsd_single() {
+			printf 'rsd:%s\n' "$issue_num"
+			[[ "$issue_num" -eq 28 ]] && return 2
+			[[ "$issue_num" -eq 29 ]] && return 1
+			return 0
+		}
+		_should_oimp() { [[ "$issue_num" -ge 53 && "$issue_num" -le 67 ]] || return 1; return 0; }
+		_action_oimp_single() { printf 'oimp:%s\n' "$issue_num"; return 0; }
+		_should_cpt() { [[ "$issue_num" -eq 68 ]] || return 1; return 0; }
+		_action_cpt_single() { _SP_CPT_CLOSED=1; _SP_CPT_NUDGED=1; _SP_CPT_ESCALATED=1; printf 'parent:%s\n' "$issue_num"; return 0; }
+		_should_lia() { return 0; }
+		_action_lia_single() { printf 'lia:%s\n' "$issue_num"; return 0; }
+		# Force dedup availability without creating a new executable fixture.
+		HOME="$TEST_TMPDIR"
+		mkdir -p "$HOME/.aidevops/agents/scripts"
+		ln -s "$(command -v bash)" "$HOME/.aidevops/agents/scripts/dispatch-dedup-helper.sh"
+		reconcile_issues_single_pass
+		reconcile_issues_single_pass
+	)
+	expected=$(printf 'persistent:1\nexternal:2\n'; local n=0
+		for n in {3..22}; do printf 'ciw:%s\n' "$n"; done
+		for n in {23..27}; do printf 'lia:%s\n' "$n"; done
+		for n in {28..47}; do printf 'rsd:%s\n' "$n"; done
+		for n in {48..52}; do printf 'lia:%s\n' "$n"; done
+		for n in {53..62}; do printf 'oimp:%s\n' "$n"; done
+		printf 'parent:68\n')
+	if [[ "$result" == "${expected}"$'\n'"${expected}" ]] &&
+		grep -q 'persistent_repaired=1 external_gated=1 ciw_closed=20 rsd_closed=18 rsd_reset=1 oimp_closed=10 cpt_closed=1 cpt_nudged=1 cpt_escalated=1 cpt_reopened=0 lia_fixed=10 pbf_run=0 cbb_run=0' "$LOGFILE"; then
+		_pass "extracted cycle: cached trust, consuming order, caps, dynamic counters and repeat-call reset"
+	else
+		_fail "extracted cycle: action trace or caller-owned counter summary differs: ${result}"
+		grep 'actions completed:\|persistent_repaired=' "$LOGFILE" || true
+	fi
+	return 0
+}
+
+# GH#38047: stale-cache REST fallback must carry trust through the real gate.
+test_stale_cache_trust_fallback() {
+	local result=""
+	result=$(
+		_PIR_SCRIPT_DIR="${TEST_TMPDIR}/absent"
+		RECONCILE_TIME_BUDGET_SECS=0
+		PULSE_QUEUED_SCAN_LIMIT=4
+		PULSE_EXTERNAL_TRUST_FALLBACK_MAX=0
+		_PIR_EXTERNAL_TRUST_FALLBACKS_USED=25
+		_PIR_MISSING_AUTHOR_METADATA_BLOCKED=99
+		# Use the real reader with an expired snapshot, not a stubbed miss.
+		PULSE_PREFETCH_CACHE_FILE="${TEST_TMPDIR}/stale-cache.json"
+		printf '%s\n' '{"test/repo":{"last_prefetch":"2020-01-01T00:00:00Z","issues":[]}}' >"$PULSE_PREFETCH_CACHE_FILE"
+		_pir_initialize_backfill_gates() { return 0; }
+		_pir_reconcile_cycle_repairs() { return 0; }
+		_pir_backfill_pr_origin() { return 0; }
+		_build_oimp_lookup_for_slug() { return 0; }
+		_log_substage_timing() { return 0; }
+		# Already-held external issue must never reach the status:done stage.
+		_pir_backfill_external_contributor_label() { return 0; }
+		gh() {
+			local request="$*"
+			printf 'list\n' >>"${TEST_TMPDIR}/rest-list.log"
+			if [[ "$request" == 'api repos/test/repo/issues?state=open&per_page=100&page=1' ]]; then
+				jq -cn '[
+				{"number":1,"title":"member","body":null,"labels":[{"name":"status:done"}],"author_association":"MEMBER","user":{"login":"member","type":"User"}},
+				{"number":2,"title":"external","body":"","labels":[{"name":"status:done"},{"name":"needs-maintainer-review"}],"author_association":"NONE","user":{"login":"external","type":"User"}}
+				] + [range(100;198) | {number:.,pull_request:{}}]'
+				return 0
+			fi
+			if [[ "$request" == 'api repos/test/repo/issues?state=open&per_page=100&page=2' ]]; then
+				[[ "${fail_second_page:-0}" -eq 0 ]] || return 1
+				printf '%s\n' '[
+				{"number":3,"title":"owner","body":"","labels":[{"name":"status:done"}],"author_association":"OWNER","user":{"login":"owner","type":"User"}},
+				{"number":4,"title":"PR","body":"","labels":[{"name":"status:done"}],"author_association":"MEMBER","user":{"login":"member","type":"User"},"pull_request":{}},
+				{"number":5,"title":"unknown","body":"","labels":[{"name":"status:done"}]}
+				]'
+				return 0
+			fi
+			return 1
+		}
+		_action_rsd_single() {
+			printf 'reset:%s:%s:%s\n' "$issue_num" "$issue_author_association" "$issue_author_login"
+			return 2
+		}
+		# Force dedup availability with the existing test fixture.
+		HOME="$TEST_TMPDIR"
+		reconcile_issues_single_pass
+		reconcile_issues_single_pass
+		local rows="" rc=0
+		PULSE_QUEUED_SCAN_LIMIT=1
+		rows=$(_pir_list_open_issues_with_trust test/repo) || exit 1
+		[[ "$(printf '%s' "$rows" | jq -r 'map(.number) | join(",")')" == 1 ]] && printf 'bounded\n'
+		PULSE_QUEUED_SCAN_LIMIT=4
+		local fail_second_page=1
+		rows=$(_pir_list_open_issues_with_trust test/repo) || rc=$?
+		[[ "$rc" -eq 1 && -z "$rows" ]] && printf 'fail-closed\n'
+	)
+	if [[ "$result" == $'reset:1:MEMBER:member\nreset:3:OWNER:owner\nreset:1:MEMBER:member\nreset:3:OWNER:owner\nbounded\nfail-closed' ]] &&
+		[[ "$(grep -c '^list$' "${TEST_TMPDIR}/rest-list.log")" -eq 7 ]] &&
+		[[ "$(grep -c 'missing_author_metadata_blocked=1$' "$LOGFILE")" -eq 2 ]]; then
+		_pass "stale cache: paginated trust reaches stage 2, external/unknown rows stay gated, counter resets"
+	else
+		_fail "stale cache trust fallback: unexpected trace or counter: $result"
+	fi
+	return 0
+}
+
+test_extracted_inner_budget_abort() {
+	local _t2984_start_ts=$((SECONDS - 2)) _t2984_budget=1 _t2984_aborted=0
+	local issues_tsv='1||||MEMBER||User|false'
+	_pir_reconcile_issue_rows
+	if [[ "$_t2984_aborted" -eq 1 ]]; then
+		_pass "extracted rows: inner budget abort reaches the cycle-owned flag"
+	else
+		_fail "extracted rows: inner budget abort was lost across helper scope"
+	fi
+	return 0
+}
+
 # ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
@@ -284,6 +432,9 @@ test_budget_fits_outer_timeout
 test_budget_state_at_function_entry
 test_first_call_fast
 test_second_call_fast
+test_extracted_cycle_caps_and_order
+test_extracted_inner_budget_abort
+test_stale_cache_trust_fallback
 
 echo ""
 echo "Results: ${pass} passed, ${fail} failed"

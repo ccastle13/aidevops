@@ -36,24 +36,36 @@ If no worker launches, log `NO_DISPATCHABLE_EVIDENCE` with counts/reasons, sleep
 
 ## Initial Dispatch (DO THIS FIRST)
 
-### 1. Normalise PATH and check capacity
-
-Use the standalone worker activity helper for capacity checks. It is safe in
-interactive command policies and does not require sourcing `pulse-wrapper.sh`.
+### 1. Check circuit breaker and capacity
 
 ```bash
-export PATH="/bin:/usr/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
 ~/.aidevops/agents/scripts/circuit-breaker-helper.sh check  # exit 1 = stop
 
-MAX_WORKERS=$(cat ~/.aidevops/logs/pulse-max-workers 2>/dev/null || echo 4)
-[[ "$MAX_WORKERS" =~ ^[0-9]+$ ]] || MAX_WORKERS=4
-WORKER_COUNT=$(~/.aidevops/agents/scripts/worker-activity-helper.sh live-workers)
-[[ "$WORKER_COUNT" =~ ^[0-9]+$ ]] || WORKER_COUNT=0
-AVAILABLE=$((MAX_WORKERS - WORKER_COUNT))
-RUNNER_USER=$(gh api user --jq '.login' 2>/dev/null || whoami)
+~/.aidevops/agents/scripts/pulse-wrapper.sh --command capacity
+gh api user --jq '.login'
 ```
 
+The capacity command prints `MAX_WORKERS|WORKER_COUNT|AVAILABLE`; the `gh api`
+call prints `RUNNER_USER`. Substitute those literal values into later commands.
+Every command in this file must pass the OpenCode shared command policy: run one
+plain helper call per Bash invocation, never `export`, `source`, shell variables,
+`$(...)`, `$((...))`, `[[ ... ]]`, `&&`/`||` chains or redirects. Compute values
+yourself from printed output. The launcher already provides `PATH`.
+
 ### 2. Read pre-fetched state (DO NOT re-fetch)
+
+**Stale-state override:** if the launch prompt says no current snapshot exists,
+do not read or rely on the old snapshot. This overrides all pre-fetched-state
+instructions below. Run `bash ~/.aidevops/agents/scripts/pulse-wrapper.sh --command list-scope`
+to obtain current schedule-filtered `slug|path` pairs from configuration (use the
+path for `repo-cap` and dispatch). Limit
+triage and `list-candidates SLUG 100` to those slugs; use the named helpers and
+targeted `gh` reads for current evidence. `list-candidates` returns issues, not
+PRs, so in stale mode only, discover live PRs with one bounded call per scoped
+slug (`gh pr list --repo SLUG --state open --limit 50 --json number,title,headRefName,statusCheckRollup,reviewDecision,mergeable`),
+overriding the "do NOT run `gh pr list`" rule below. Do not infer absent data from the old
+snapshot. If scope lookup fails or returns no slugs, log a diagnostic and exit
+cleanly rather than using persisted scope or broadening to all repositories.
 
 The wrapper already fetched all open PRs and issues. Data is in your prompt between `--- PRE-FETCHED STATE ---` markers or in the state file path provided. Use it directly — do NOT run `gh pr list` or `gh issue list` (root cause of the "only processes first repo" bug).
 
@@ -63,16 +75,17 @@ The wrapper already fetched all open PRs and issues. Data is in your prompt betw
 
 **Most merging is handled deterministically by `merge_ready_prs_all_repos()` in pulse-wrapper.sh** before the LLM session starts. Focus on edge cases: PRs needing CI fix workers, `CHANGES_REQUESTED`, external contributor PRs, complex merge conflicts.
 
-For remaining collaborator PRs where CI passes: `REVIEW_REQUIRED` is NOT a merge blocker. Approve then merge:
+For remaining collaborator PRs where CI passes, first apply every pre-merge check below. Never merge an `origin:interactive` PR that the deterministic pass skipped under the GH#23238 manual-merge preference. Do not add `allow-auto-merge` or change preferences to bypass that decision. Explicit trusted PR-body text withholding merge authority (for example "No merge is authorized" or "no automatic merge") is a hold even if the PR is ready and green; do not approve or merge it until the trusted owner lifts the hold.
+
+For otherwise eligible PRs, `REVIEW_REQUIRED` alone is not a merge blocker; use the guarded approval/merge path without bypassing required approvals:
 
 ```bash
-source ~/.aidevops/agents/scripts/pulse-wrapper.sh
-approve_collaborator_pr NUMBER SLUG AUTHOR
+~/.aidevops/agents/scripts/pulse-wrapper.sh --command approve-pr NUMBER SLUG AUTHOR
 full-loop-helper.sh merge NUMBER SLUG --squash
 ```
 
-**Merge criteria:** CI all PASS (or NONE/PENDING) + author is collaborator → approve and merge.
-`CHANGES_REQUESTED` → dispatch fix worker. `APPROVED` → merge directly.
+**Merge criteria:** CI all PASS (or NONE/PENDING) + collaborator author + all policy/authority gates clear → attempt the guarded merge path.
+`CHANGES_REQUESTED` → dispatch fix worker. `APPROVED` does not override a policy or authority hold.
 Check external contributor gate before ANY approve/merge (see Pre-merge checks below).
 
 ### 3.5. Triage reviews for needs-maintainer-review issues (DETERMINISTIC — handled by shell)
@@ -84,16 +97,16 @@ Skip when: all slots occupied, issue created <5 min ago, or maintainer already c
 ### 4. Dispatch workers for open issues
 
 ```bash
-source ~/.aidevops/agents/scripts/pulse-wrapper.sh
-list_dispatchable_issue_candidates SLUG 100
+~/.aidevops/agents/scripts/pulse-wrapper.sh --command list-candidates SLUG 100
 
 # Atomic dispatch — runs all 7 dedup layers, assigns, launches, records ledger.
-# DO NOT pass a 9th parameter (model override). dispatch_with_dedup handles model
-# selection via the runtime resolver. Passing your own model bypasses it and causes
-# provider imbalance.
-dispatch_with_dedup NUMBER SLUG "Issue #NUMBER: TITLE" "TASK_ID: TITLE" "$RUNNER_USER" PATH \
-  "/full-loop Implement issue #NUMBER (URL) -- DESCRIPTION" || continue
+# Model selection is automatic via the runtime resolver; there is no model argument.
+~/.aidevops/agents/scripts/pulse-wrapper.sh --command dispatch NUMBER SLUG \
+  "Issue #NUMBER: TITLE" "TASK_ID: TITLE" RUNNER_USER "PATH" \
+  "/full-loop Implement issue #NUMBER (URL) -- DESCRIPTION"
 ```
+
+A non-zero dispatch exit means that candidate was skipped; continue with the next.
 
 Repeat until `AVAILABLE` slots are filled or no dispatchable issues remain.
 
@@ -102,8 +115,7 @@ Repeat until `AVAILABLE` slots are filled or no dispatchable issues remain.
 Transition replied issues to `needs-maintainer-review` so they re-enter the triage pipeline. No worker dispatch, no slots consumed.
 
 ```bash
-source ~/.aidevops/agents/scripts/pulse-wrapper.sh
-relabel_needs_info_replies
+~/.aidevops/agents/scripts/pulse-wrapper.sh --command relabel-needs-info
 ```
 
 ### 4.6. Dispatch FOSS contribution workers when idle capacity exists (t1702)
@@ -111,9 +123,10 @@ relabel_needs_info_replies
 Lowest priority — only when all managed-repo work is dispatched and slots remain.
 
 ```bash
-source ~/.aidevops/agents/scripts/pulse-wrapper.sh
-AVAILABLE=$(dispatch_foss_workers "$AVAILABLE")
+~/.aidevops/agents/scripts/pulse-wrapper.sh --command dispatch-foss AVAILABLE
 ```
+
+It prints the remaining available slot count; use that as the new `AVAILABLE`.
 
 Skip when: managed-repo slots occupied, daily budget exhausted, or no eligible FOSS repos.
 
@@ -166,18 +179,16 @@ After initial dispatch, enter a monitoring loop. Each cycle:
 2. **Sleep 60 seconds** — write a heartbeat log line first:
 
    ```bash
-   echo "[pulse] Monitoring cycle $N: sleeping 60s (active $WORKER_COUNT/$MAX_WORKERS, elapsed ${ELAPSED}s)"
+   echo "[pulse] Monitoring cycle N: sleeping 60s (active WORKER_COUNT/MAX_WORKERS, elapsed ELAPSED_SECONDS)"
    sleep 60
    ```
+
+   Replace the uppercase placeholders with literal numbers before running.
 
 3. **Check capacity**:
 
    ```bash
-   MAX_WORKERS=$(cat ~/.aidevops/logs/pulse-max-workers 2>/dev/null || echo 4)
-   [[ "$MAX_WORKERS" =~ ^[0-9]+$ ]] || MAX_WORKERS=4
-   WORKER_COUNT=$(~/.aidevops/agents/scripts/worker-activity-helper.sh live-workers)
-   [[ "$WORKER_COUNT" =~ ^[0-9]+$ ]] || WORKER_COUNT=0
-   AVAILABLE=$((MAX_WORKERS - WORKER_COUNT))
+   ~/.aidevops/agents/scripts/pulse-wrapper.sh --command capacity
    ```
 
 4. **If slots are open**: check for mergeable PRs (free), dispatch workers for highest-priority open issues, dispatch triage reviews (step 3.5), scan needs-info replies (step 4.5), dispatch FOSS workers if idle (step 4.6). Use the same dedup guards and dispatch commands as initial dispatch. Re-fetch issue state with targeted `gh` calls only for repos where you need to dispatch.
@@ -193,8 +204,10 @@ On exit, run best-effort cleanup:
 
 ```bash
 ~/.aidevops/agents/scripts/circuit-breaker-helper.sh record-success
-~/.aidevops/agents/scripts/backfill-status-available.sh --apply 2>&1 || true
+~/.aidevops/agents/scripts/backfill-status-available.sh --apply
 ```
+
+A non-zero exit here is non-fatal; note it in the summary and finish.
 
 Output a brief summary of total actions taken across all cycles (past tense).
 
@@ -228,13 +241,14 @@ For repos where `repo_allows_pulse_write_actions SLUG` fails (role=`contributor`
 
 3. **Workflow file guard.** `check_workflow_merge_guard` from `pulse-wrapper.sh`.
 
-4. **Review add-on.** `review-bot-gate-helper.sh check NUMBER SLUG`. Merge on `PASS`, `PASS_ADVISORY`, or `PASS_RATE_LIMITED`. `WAITING` is reserved for explicit strict/wait policy or the external-contributor trust boundary.
+4. **Review add-on.** `review-bot-gate-helper.sh check NUMBER SLUG`. Merge on `PASS`, `PASS_ADVISORY`, or `PASS_RATE_LIMITED`. `WAITING` is reserved for explicit strict/wait policy (GH#36931).
 
 5. **Unresolved review suggestions.** Check with `gh api "repos/SLUG/pulls/NUMBER/comments"`. If actionable, dispatch a fix worker (label `needs-review-fixes`).
 
 ### PR triage
 
-- **Green CI + collaborator** → `approve_collaborator_pr` then `full-loop-helper.sh merge NUMBER SLUG --squash`
+- **GH#23238 manual-merge preference / explicit trusted PR-body merge hold** → skip, even with green CI or approval; never override the deterministic pass
+- **Green CI + collaborator + all pre-merge gates clear** → `approve_collaborator_pr` then `full-loop-helper.sh merge NUMBER SLUG --squash`
 - **Green CI + strict-policy `WAITING` on bots** → skip; run `request-retry` only when a true rate-limit notice makes a retry useful
 - **Failing CI** → check if systemic (same check fails on 3+ PRs → file workflow issue). If per-PR, dispatch fix worker.
 - **Open 6+ hours with no recent commits** → comment, consider closing and re-filing
@@ -274,20 +288,17 @@ failures, also summarise what previous workers attempted.
 
 ### Model tier selection
 
-`dispatch_with_dedup` handles model selection automatically via the routing table, optional local overrides (`custom/configs/model-routing-table.json`), provider allowlist (`AIDEVOPS_HEADLESS_PROVIDER_ALLOWLIST`), and auth/availability checks. The resolved model is recorded in the dispatch comment. **Do NOT pass a model override (9th parameter) for default dispatches** — this bypasses the runtime resolver and causes provider imbalance.
+`pulse-wrapper.sh --command dispatch` handles model selection automatically from the issue's workload-tier label via the routing table, optional local overrides (`custom/configs/model-routing-table.json`), provider allowlist (`AIDEVOPS_HEADLESS_PROVIDER_ALLOWLIST`), and auth/availability checks. The resolved model is recorded in the dispatch comment. There is no model-override argument; never bypass the runtime resolver.
 
-Only pass a model override for tier escalation:
+For failure escalation, replace the tier label in one call, then dispatch normally:
 
 ```bash
-# ONLY for tier-labeled issues or failure escalation — NOT for default dispatches
-RESOLVED_MODEL=$(~/.aidevops/agents/scripts/model-availability-helper.sh resolve <tier>)
-dispatch_with_dedup NUMBER SLUG ... "$RESOLVED_MODEL"
+gh issue edit NUMBER --repo SLUG --remove-label tier:standard --add-label tier:thinking
 ```
 
 Precedence: (1) failure escalation (cascade: `tier:simple` → `tier:standard` →
-`tier:thinking`) > (2) the issue's canonical workload-tier label > (3) **omit
-the 9th parameter** so the runtime resolver selects. See
-[Task Taxonomy](../reference/task-taxonomy.md) for tier purposes.
+`tier:thinking`) > (2) the issue's canonical workload-tier label > (3) runtime
+resolver default. See [Task Taxonomy](../reference/task-taxonomy.md) for tier purposes.
 
 ### Agent routing from labels
 
@@ -305,28 +316,33 @@ the 9th parameter** so the runtime resolver selects. See
 
 ### Per-repo worker cap
 
-Default `MAX_WORKERS_PER_REPO=5`. Use `check_repo_worker_cap PATH` from `pulse-wrapper.sh` before dispatching — returns 0 (at cap, skip) or 1 (below cap, safe to dispatch).
+Default `MAX_WORKERS_PER_REPO=5`. Run `~/.aidevops/agents/scripts/pulse-wrapper.sh --command repo-cap "PATH"` before dispatching — returns 0 (at cap, skip) or 1 (below cap, safe to dispatch). Deterministic pulse dispatch does not apply this per-repo cap; it is a supervisor check only.
+
+Read the stdout `PULSE_COMMAND_RESULT` line rather than shell status probes: OpenCode may hide nonzero exit statuses. `command=repo-cap rc=0 outcome=at-cap` means skip; `command=repo-cap rc=1 outcome=below-cap` means capacity is available. After dispatch, `command=dispatch rc=0 outcome=launched` confirms launch; `rc=1` or `rc=3` with `outcome=deferred` means no launch. Other statuses report `outcome=failed`; do not count them as launches or available capacity. Both commands preserve their exit statuses and print exactly one result line in addition to any delegate output. Usage errors return 2 on stderr with no result line.
 
 ### Quality-debt worktree dispatch
 
 Quality-debt workers MUST use pre-created worktrees:
 
 ```bash
-source ~/.aidevops/agents/scripts/pulse-wrapper.sh
-QD_WT_PATH=$(create_quality_debt_worktree PATH NUMBER TITLE) || continue
-dispatch_with_dedup NUMBER SLUG "Issue #NUMBER: TITLE" "GH#NUMBER: TITLE" "$RUNNER_USER" \
-  "$QD_WT_PATH" "/full-loop Implement issue #NUMBER (URL) -- TITLE" || continue
+~/.aidevops/agents/scripts/pulse-wrapper.sh --command create-debt-worktree "PATH" NUMBER TITLE
+
+~/.aidevops/agents/scripts/pulse-wrapper.sh --command dispatch NUMBER SLUG \
+  "Issue #NUMBER: TITLE" "GH#NUMBER: TITLE" RUNNER_USER "QD_WT_PATH" \
+  "/full-loop Implement issue #NUMBER (URL) -- TITLE"
 ```
+
+Use the worktree path printed by `create-debt-worktree` as `QD_WT_PATH`; skip the issue on failure.
 
 **PR title for debt issues:** `GH#<number>: <description>` — never `qd-`, bare numbers, or `t` prefix.
 
 ## Audit-Quality Comments (MANDATORY)
 
-Every comment must be sufficient for a human or future agent to audit without reading logs. Generate signature footer first:
+Every comment must be sufficient for a human or future agent to audit without reading logs. Generate the signature footer first, then paste its printed output where the templates below say `SIG_FOOTER`:
 
 ```bash
-SIG_FOOTER=$(~/.aidevops/agents/scripts/gh-signature-helper.sh footer \
-  --model "<full model ID>" --issue "<slug>#<number>")
+~/.aidevops/agents/scripts/gh-signature-helper.sh footer \
+  --model "FULL_MODEL_ID" --issue "SLUG#NUMBER"
 ```
 
 **Dispatch comment** — posted automatically by `dispatch_with_dedup()` (GH#15317). Do NOT post a "Dispatching worker" comment manually — the function handles it deterministically after confirming the worker PID is alive. Duplicate dispatch comments break the Layer 5 dedup check.
@@ -339,7 +355,7 @@ Worker killed after <duration> with <N> commits (struggle_ratio: <ratio>).
 - **Reason**: <why killed>
 - **Diagnosis**: <1-line hypothesis>
 - **Next action**: <re-dispatch / escalate / manual review>
-${SIG_FOOTER}
+SIG_FOOTER
 ```
 
 **Merge/completion comment**:
@@ -348,7 +364,7 @@ ${SIG_FOOTER}
 Completed via PR #<N>.
 - **Attempts**: <total>
 - **Duration**: <wall-clock from first dispatch to merge>
-${SIG_FOOTER}
+SIG_FOOTER
 ```
 
 ## Hard Rules

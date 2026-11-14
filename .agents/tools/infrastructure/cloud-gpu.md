@@ -29,7 +29,7 @@ Deploy GPU-intensive AI models (voice, vision, LLMs) when local hardware is insu
 
 | Provider | GPUs | Pricing | Best For |
 |----------|------|---------|----------|
-| [RunPod](https://www.runpod.io/) | B200, H200, H100, A100, L40S, RTX 4090 | Per-second, $0.40-8.64/hr | General purpose, serverless |
+| [Runpod](https://www.runpod.io/) | B200, H200, H100, A100, L40S, RTX 4090 (30+ SKUs, 31 regions) | Per-second, $0.40-8.64/hr; Public Endpoints per output | General purpose, serverless, hosted media models (`content/video-runpod.md`) |
 | [Vast.ai](https://vast.ai/) | Consumer+datacenter, 10k+ | Auction+fixed, 5-6x cheaper | Budget, experimentation |
 | [Lambda](https://lambdalabs.com/) | GB300, B200, H200, H100 | Per-hour, reserved discounts | Research, training, enterprise |
 | [NVIDIA Cloud](https://www.nvidia.com/en-us/gpu-cloud/) | A100, H100 (DGX) | Per-hour, enterprise | Official NVIDIA stack |
@@ -49,6 +49,18 @@ VRAM: RTX 4090=24GB, L4=24GB, L40S=48GB, A100=80GB, H100=80GB, H200=141GB, B200=
 | 400B+ quantized (Llama 3.1 405B 4-bit) | 140-180GB | H200 / B200 | 3.35-8.64 |
 
 ## Deployment
+
+### Billable deployment contract
+
+Before any billable create or update, record the user-approved model publisher,
+repository, revision and quantization; runtime and image; GPU pool and quoted
+hourly price; storage; and worker minimum, maximum and idle timeout. Treat this
+snapshot as fixed for the deployment, including during provisioning recovery.
+Compare each proposed mutation with the approved snapshot and show the exact
+delta and new price to the user **before** changing a billable resource. Obtain
+explicit approval for every changed property; a cache failure does not authorize
+switching model provenance, GPU pool or pricing. If approval is unavailable,
+stop the mutation and diagnose within the approved configuration instead.
 
 ### 1. Provision
 
@@ -110,6 +122,17 @@ Spot instances (50-80% savings, termination risk) | Off-peak (10-30%) | Smaller 
 
 ## Monitoring + Troubleshooting
 
+**RunPod Serverless rollout:** `workers.max` describes steady-state autoscaling,
+not an instantaneous limit on worker records or a billable-worker count. During
+updates, reconcile endpoint version with each worker version, stale flag and
+lifecycle state; inspect the queue and live account spend before making worker
+or cost claims. For example, two stale previous-version records and one current
+worker with `max=1` are **not** proof of three concurrently billed workers. If
+spend or worker state is unavailable, report the uncertainty rather than infer
+billing from record count. Poll only for state transitions with a fixed
+cold-start deadline: space out unchanged status/log queries and stop at the
+deadline for diagnosis or an explicit decision, never an unbounded retry loop.
+
 ```bash
 # Health check
 nvidia-smi --query-gpu=name,memory.total,memory.used,temperature.gpu,utilization.gpu --format=csv,noheader
@@ -134,6 +157,8 @@ Never expose model APIs without auth -- use SSH tunnels or VPN. Store keys: `aid
 
 ## See Also
 
+- `content/video-runpod.md` -- Runpod Public Endpoints, Hub and bring-your-own media models
+- `content/media-generation-providers.md` -- API vs rented-GPU media cost comparison (`media-gen-cost-helper.sh`)
 - `tools/infrastructure/fireworks.md` -- managed inference, fine-tuning, and model hosting (Fireworks AI)
 - `tools/infrastructure/nearai.md` -- TEE-backed private inference (NEAR AI Cloud)
 - `tools/voice/speech-to-speech.md` -- voice pipeline with cloud GPU

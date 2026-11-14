@@ -233,7 +233,8 @@ JSON
 			previous_arg="$arg"
 		done
 		case "$repo_slug" in
-			owner/repo-a) jq -n '[range(0; 12) | {number: .}]' ;;
+			owner/repo-a) jq -n '[range(0; 12) | {number: ., isDraft: false, labels: [{name: "origin:worker"}]}]' ;;
+			owner/repo-b) jq -n '[range(0; 12) | {number: ., isDraft: true, labels: [{name: "origin:worker"}]}]' ;;
 			*) printf '[]\n' ;;
 		esac
 		return 0
@@ -294,6 +295,60 @@ JSON
 		print_result "guardrail: repo backlog admits only trusted review-repair provenance" 0
 	else
 		print_result "guardrail: repo backlog admits only trusted review-repair provenance" 1 "repo_a=${repo_a_numbers} repo_b=${repo_b_numbers}"
+	fi
+	return 0
+}
+
+test_open_pr_backlog_counts_only_ready_worker_prs() {
+	reset_guardrail_env
+	local repos_file="${TEST_ROOT}/repos-pr-backlog-threshold.json"
+	cat >"$repos_file" <<'JSON'
+{"initialized_repos":[
+  {"slug":"owner/mixed","path":"/tmp/mixed","pulse":true},
+  {"slug":"owner/worker","path":"/tmp/worker","pulse":true},
+  {"slug":"owner/low-cap","path":"/tmp/low-cap","pulse":true,"dispatch_open_pr_threshold":2},
+  {"slug":"owner/disabled","path":"/tmp/disabled","pulse":true,"dispatch_open_pr_threshold":0}
+]}
+JSON
+	export REPOS_JSON="$repos_file"
+	pulse_pr_list_get() {
+		local repo_slug="" previous_arg="" arg=""
+		for arg in "$@"; do
+			if [[ "$previous_arg" == "--repo" ]]; then
+				repo_slug="$arg"
+				break
+			fi
+			previous_arg="$arg"
+		done
+		case "$repo_slug" in
+			# 13 PRs: interactive, worker drafts, held worker PRs, and only two
+			# ready worker PRs (the GH#33727 field observation).
+			owner/mixed | owner/low-cap) jq -n '
+				[range(0; 6) | {number: ., isDraft: false, labels: [{name: "origin:interactive"}]}]
+				+ [range(6; 9) | {number: ., isDraft: true, labels: [{name: "origin:worker"}]}]
+				+ [{number: 9, isDraft: false, labels: [{name: "origin:worker"}, {name: "hold-for-review"}]}]
+				+ [{number: 10, isDraft: false, labels: [{name: "origin:worker"}, {name: "needs-maintainer-review"}]}]
+				+ [{number: 11, isDraft: false, labels: [{name: "origin:worker"}]}]
+				+ [{number: 12, isDraft: false, labels: [{name: "origin:worker-takeover"}]}]' ;;
+			owner/worker | owner/disabled) jq -n '[range(0; 12) | {number: ., isDraft: false, labels: [{name: "origin:worker"}]}]' ;;
+			*) printf '[]\n' ;;
+		esac
+		return 0
+	}
+	local candidates='[{"number":1,"labels":[{"name":"bug"}]}]'
+	local mixed="" worker="" low_cap="" disabled=""
+	mixed=$(_dispatch_filter_repo_pr_backlog_candidates owner/mixed "$candidates" | jq 'length')
+	worker=$(_dispatch_filter_repo_pr_backlog_candidates owner/worker "$candidates" | jq 'length')
+	low_cap=$(_dispatch_filter_repo_pr_backlog_candidates owner/low-cap "$candidates" | jq 'length')
+	disabled=$(_dispatch_filter_repo_pr_backlog_candidates owner/disabled "$candidates" | jq 'length')
+	if [[ "$mixed" == "1" && "$worker" == "0" && "$low_cap" == "0" && "$disabled" == "1" ]] &&
+		grep -q 'not applied: repo=owner/mixed open_prs_total=13 open_prs_counted=2 threshold=12' "$LOGFILE" &&
+		grep -q 'repo=owner/worker open_prs_total=12 open_prs_counted=12 threshold=12 ordinary_candidates_suppressed=1' "$LOGFILE" &&
+		grep -q 'repo=owner/low-cap open_prs_total=13 open_prs_counted=2 threshold=2 ordinary_candidates_suppressed=1' "$LOGFILE"; then
+		print_result "guardrail: PR backlog counts only ready worker PRs and honours per-repo threshold" 0
+	else
+		print_result "guardrail: PR backlog counts only ready worker PRs and honours per-repo threshold" 1 \
+			"mixed=${mixed} worker=${worker} low_cap=${low_cap} disabled=${disabled}"
 	fi
 	return 0
 }
@@ -386,6 +441,67 @@ test_pr_target_reason_is_classified_as_benign_block() {
 		print_result "guardrail: PR target classifies as benign block" 0
 	else
 		print_result "guardrail: PR target classifies as benign block" 1 "reason=${reason}"
+	fi
+	return 0
+}
+
+test_candidate_reason_uses_current_attempt_only() {
+	reset_guardrail_env
+	printf '%s\n' '[dispatch_with_dedup] DISPATCH_BLOCK_REASON reason=policy_gate issue=#4772 repo=exampleorg/examplerepo' \
+		'[pulse-wrapper] DISPATCH_CANDIDATE_ATTEMPT #4772 (exampleorg/examplerepo)' \
+		'[pulse-wrapper] DISPATCH_CANDIDATE_ATTEMPT #47720 (exampleorg/examplerepo)' \
+		'[dispatch_with_dedup] DISPATCH_BLOCK_REASON reason=policy_gate issue=#47720 repo=exampleorg/examplerepo' \
+		'[pulse-wrapper] DISPATCH_CANDIDATE_ATTEMPT #4772 (exampleorg/examplerepo-extra)' \
+		'[dispatch_with_dedup] DISPATCH_BLOCK_REASON reason=policy_gate issue=#4772 repo=exampleorg/examplerepo-extra' >>"$LOGFILE"
+	_dispatch_record_nonzero_dispatch_result 4772 exampleorg/examplerepo 3
+	if grep -q 'pre-launch failure stage=dispatch_with_dedup rc=3 reason=no_recent_log_evidence' "$LOGFILE" &&
+		grep -q '^dispatch_candidate_failed_reason_no_recent_log_evidence$' "$STATS_COUNTER_FILE" &&
+		! grep -q '^dispatch_candidate_failed_reason_unclassified_signal$' "$STATS_COUNTER_FILE"; then
+		print_result "guardrail: stale blocker and accounting line cannot obscure absent current evidence" 0
+	else
+		print_result "guardrail: stale blocker and accounting line cannot obscure absent current evidence" 1
+	fi
+	return 0
+}
+
+test_candidate_reason_preserves_current_typed_blocker() {
+	reset_guardrail_env
+	printf '%s\n' '[pulse-wrapper] DISPATCH_CANDIDATE_ATTEMPT #4772 (exampleorg/examplerepo)' \
+		'[pulse-wrapper] has active dispatch comment for #4772 (exampleorg/examplerepo)' \
+		'[dispatch_with_dedup] DISPATCH_BLOCK_REASON reason=publication_pending issue=#4772 repo=exampleorg/examplerepo' >>"$LOGFILE"
+	_dispatch_record_nonzero_dispatch_result 4772 exampleorg/examplerepo 3
+	if grep -q 'blocked:publication_pending benign dispatch block' "$LOGFILE" &&
+		! grep -q '^dispatch_candidate_failed_reason_unclassified_signal$' "$STATS_COUNTER_FILE"; then
+		print_result "guardrail: current typed blocker remains candidate-scoped and benign" 0
+	else
+		print_result "guardrail: current typed blocker remains candidate-scoped and benign" 1
+	fi
+	return 0
+}
+
+test_typed_candidate_reasons_survive_accounting() {
+	reset_guardrail_env
+	local reason=""
+	for reason in dedup_active_claim_unverified publication_pending rest_core_circuit_breaker dirty_worktree_evidence_unavailable; do
+		local classified_reason=""
+		classified_reason=$(_dispatch_candidate_failure_reason 4772 exampleorg/examplerepo 3 \
+			"active claim evidence: DISPATCH_BLOCK_REASON reason=${reason} issue=#4772 repo=exampleorg/examplerepo")
+		if [[ "$classified_reason" != "$reason" ]]; then
+			print_result "guardrail: structured reason overrides generic claim text" 1 "expected=${reason} actual=${classified_reason}"
+			return 0
+		fi
+		_dispatch_stats_increment_candidate_failed "$reason"
+		if ! grep -q "^dispatch_candidate_failed_reason_${reason}$" "$STATS_COUNTER_FILE"; then
+			print_result "guardrail: typed candidate reasons survive accounting" 1 "reason=${reason}"
+			return 0
+		fi
+	done
+	if _dispatch_candidate_benign_block_reason dedup_active_claim_unverified ||
+		_dispatch_candidate_benign_block_reason dirty_worktree_evidence_unavailable ||
+		! _dispatch_candidate_benign_block_reason publication_pending; then
+		print_result "guardrail: typed candidate reasons survive accounting" 1 "incorrect admission class"
+	else
+		print_result "guardrail: typed candidate reasons survive accounting" 0
 	fi
 	return 0
 }
@@ -540,15 +656,21 @@ EOF_KILL_RUNNER
 
 test_wrapper_registers_benign_block_cleanup() {
 	local wrapper_file="${SCRIPT_DIR}/pulse-wrapper.sh"
-	local cleanup_stack_count=""
-	cleanup_stack_count=$(grep -c "push_cleanup '_dispatch_cleanup_benign_blocks_cycle'" "$wrapper_file" 2>/dev/null || true)
-	if grep -Fq "trap '_dispatch_cleanup_benign_blocks_cycle;" "$wrapper_file" &&
+	local lock_module="${SCRIPT_DIR}/pulse-instance-lock.sh"
+	# t18678: graceful cleanup belongs to the dedicated lifetime EXIT handler,
+	# not the shared RETURN-trap cleanup stack. Match the call inside its body.
+	if grep -Eq "^[[:space:]]*trap[[:space:]]+'_pulse_exit_cleanup'[[:space:]]+EXIT" "$wrapper_file" &&
 		grep -Fq $'\t_dispatch_cleanup_stale_benign_blocks || true' "$wrapper_file" &&
-		[[ "$cleanup_stack_count" == "2" ]]; then
+		awk '
+			/^_pulse_exit_cleanup\(\) \{/ { in_fn = 1; next }
+			in_fn && /^}/ { exit }
+			in_fn && /^[[:space:]]*_dispatch_cleanup_benign_blocks_cycle[[:space:]]*\|\|[[:space:]]*true[[:space:]]*$/ { cleanup = 1 }
+			END { exit cleanup ? 0 : 1 }
+		' "$lock_module"; then
 		print_result "guardrail: pulse wrapper registers graceful and startup benign-ledger cleanup" 0
 		return 0
 	fi
-	print_result "guardrail: pulse wrapper registers graceful and startup benign-ledger cleanup" 1 "cleanup_stack_count=${cleanup_stack_count}"
+	print_result "guardrail: pulse wrapper registers graceful and startup benign-ledger cleanup" 1 "missing EXIT handler, handler ledger cleanup, or startup cleanup"
 	return 0
 }
 
@@ -628,19 +750,31 @@ test_apply_dispatch_max_preserves_benign_ledger_across_refill() {
 }
 
 test_dispatch_max_exports_benign_ledger_for_direct_callers() {
-	local engine_file="${SCRIPT_DIR}/pulse-dispatch-engine.sh"
-	if awk '
-		/^dispatch_max\(\) \{/ { in_dispatch=1 }
-		in_dispatch && /_dispatch_begin_benign_blocks_cycle >\/dev\/null/ { saw_begin=1 }
-		in_dispatch && saw_begin && /export _DISPATCH_BENIGN_BLOCKS_FILE/ { found=1; exit 0 }
-		in_dispatch && /^}/ { exit 1 }
-		END { exit(found ? 0 : 1) }
-	' "$engine_file"; then
+	# GH#33051 extracted round setup; verify its runtime export rather than
+	# requiring the ledger implementation to remain inline in dispatch_max.
+	local dispatch_definition=""
+	dispatch_definition=$(declare -f dispatch_max)
+	if [[ "$dispatch_definition" == *"_dispatch_prepare_round \"\$active_workers\" \"\$candidates_json\" \"\$candidate_count\""* ]] && (
+		unset _DISPATCH_BENIGN_BLOCKS_FILE AIDEVOPS_PULSE_BENIGN_BLOCKS_FILE _DISPATCH_FORCE_FLOOR
+		local _dispatch_owns_benign_blocks_cycle=0 _effective_slots=1
+		local _dispatch_path="max" _dispatch_max_parallel=1
+		# Ledger inheritance is independent of live GitHub capacity probes.
+		_dispatch_rest_core_requires_serial() {
+			return 1
+		}
+		_dispatch_prepare_round 1 '[]' 0
+		local ledger_file="${_DISPATCH_BENIGN_BLOCKS_FILE:-}" child_rc=0
+		# A new shell must inherit the same usable ledger, not create its own.
+		bash -c '[[ -n "${_DISPATCH_BENIGN_BLOCKS_FILE:-}" && -f "$_DISPATCH_BENIGN_BLOCKS_FILE" ]] && printf "child-visible\n" >>"$_DISPATCH_BENIGN_BLOCKS_FILE"' || child_rc=$?
+		[[ "$_dispatch_owns_benign_blocks_cycle" == "1" && -f "$ledger_file" && "$(<"$ledger_file")" == "child-visible" ]] || child_rc=1
+		_dispatch_cleanup_benign_blocks_cycle
+		[[ "$child_rc" == "0" && ! -e "$ledger_file" && -z "${_DISPATCH_BENIGN_BLOCKS_FILE:-}" ]]
+	); then
 		print_result "guardrail: dispatch_max exports benign block ledger for direct callers" 0
 		return 0
 	fi
 
-	print_result "guardrail: dispatch_max exports benign block ledger for direct callers" 1 "missing export in dispatch_max"
+	print_result "guardrail: dispatch_max exports benign block ledger for direct callers" 1 "round setup wiring, child ledger inheritance, or cleanup failed"
 	return 0
 }
 
@@ -722,19 +856,74 @@ JSON
 		printf '%s %s\n' "$repo_slug" "$limit" >/dev/null
 		cat <<'JSON'
 [
-  {"number": 20, "title": "broad research priority", "updatedAt": "2026-05-01T00:00:00Z", "labels": [{"name": "priority:high"}, {"name": "research"}, {"name": "tier:thinking"}], "assignees": []},
-  {"number": 21, "title": "low complexity actionable fix", "updatedAt": "2026-05-02T00:00:00Z", "labels": [{"name": "enhancement"}, {"name": "low-complexity"}, {"name": "status:available"}], "assignees": []}
+  {"number": 20, "title": "broad research backlog", "updatedAt": "2026-05-01T00:00:00Z", "labels": [{"name": "research"}, {"name": "tier:thinking"}], "assignees": []},
+  {"number": 21, "title": "low complexity actionable fix", "updatedAt": "2026-05-02T00:00:00Z", "labels": [{"name": "enhancement"}, {"name": "low-complexity"}, {"name": "status:available"}], "assignees": []},
+  {"number": 22, "title": "urgent research priority", "updatedAt": "2026-05-03T00:00:00Z", "labels": [{"name": "priority:high"}, {"name": "research"}, {"name": "tier:thinking"}], "assignees": []}
 ]
 JSON
 		return 0
 	}
 
-	local first_number=""
-	first_number=$(build_ranked_dispatch_candidates_json 10 | jq -r '.[0].number' 2>/dev/null) || first_number=""
-	if [[ "$first_number" == "21" ]]; then
-		print_result "guardrail: ranked dispatch prefers low-complexity actionable work over research backlog" 0
+	# GH#32703 intentionally gives urgent labels strict precedence. Complexity
+	# still orders ordinary backlog; assert both contracts in the same snapshot.
+	local ordered_numbers=""
+	ordered_numbers=$(build_ranked_dispatch_candidates_json 10 | jq -r '[.[].number] | join(",")' 2>/dev/null) || ordered_numbers=""
+	if [[ "$ordered_numbers" == "22,21,20" ]]; then
+		print_result "guardrail: ranked dispatch prefers low-complexity actionable work over non-urgent research backlog" 0
 	else
-		print_result "guardrail: ranked dispatch prefers low-complexity actionable work over research backlog" 1 "first=${first_number}"
+		print_result "guardrail: ranked dispatch prefers low-complexity actionable work over non-urgent research backlog" 1 "order=${ordered_numbers}"
+	fi
+	return 0
+}
+
+test_open_pr_backlog_snapshot_expires_within_guardrail_max_age() {
+	reset_guardrail_env
+	local cache_dir="${TEST_ROOT}/pr-list-provider-cache"
+	mkdir -p "$cache_dir"
+	local saved_disable="${PULSE_PR_LIST_PROVIDER_CACHE_DISABLE:-}"
+	export PULSE_PR_LIST_PROVIDER_CACHE_DISABLE=0
+	export PULSE_PR_LIST_PROVIDER_CACHE_DIR="$cache_dir"
+	export PULSE_PR_LIST_PROVIDER_CACHE_TTL=3600
+	export AIDEVOPS_GH_PR_LIST_CACHE_DISABLE=1
+	local live_file="${TEST_ROOT}/live-pr-count"
+	printf '12\n' >"$live_file"
+	# Underlying provider: emits <live_count> ready worker PRs.
+	gh_pr_list() {
+		local count=""
+		count=$(<"$live_file")
+		jq -n --argjson n "$count" '[range(0; $n) | {number: ., isDraft: false, labels: [{name: "origin:worker"}]}]'
+		return 0
+	}
+	# Re-source the real provider (earlier tests replaced pulse_pr_list_get).
+	unset _PULSE_PR_LIST_CACHE_LOADED
+	# shellcheck source=/dev/null
+	source "${SCRIPT_DIR}/pulse-pr-list-cache.sh"
+	local candidates='[{"number":1,"labels":[{"name":"bug"}]}]'
+	local first="" second="" third=""
+	first=$(_dispatch_filter_repo_pr_backlog_candidates owner/stale "$candidates" | jq 'length')
+	# Other runners merge PRs: live count drops below threshold.
+	printf '3\n' >"$live_file"
+	# Within the max age the snapshot is still reused (REST cost bounded).
+	second=$(_dispatch_filter_repo_pr_backlog_candidates owner/stale "$candidates" | jq 'length')
+	# Age every cache entry past the guardrail bound but well inside the 3600s TTL.
+	local entry=""
+	for entry in "$cache_dir"/pr-list-*.out; do
+		[[ -f "$entry" ]] || continue
+		perl -e 'my $t = time - 600; utime $t, $t, $ARGV[0]' "$entry"
+	done
+	third=$(_dispatch_filter_repo_pr_backlog_candidates owner/stale "$candidates" | jq 'length')
+	unset AIDEVOPS_GH_PR_LIST_CACHE_DISABLE PULSE_PR_LIST_PROVIDER_CACHE_DIR PULSE_PR_LIST_PROVIDER_CACHE_TTL
+	unset -f gh_pr_list pulse_pr_list_get
+	if [[ -n "$saved_disable" ]]; then
+		export PULSE_PR_LIST_PROVIDER_CACHE_DISABLE="$saved_disable"
+	else
+		unset PULSE_PR_LIST_PROVIDER_CACHE_DISABLE
+	fi
+	if [[ "$first" == "0" && "$second" == "0" && "$third" == "1" ]]; then
+		print_result "guardrail: PR backlog snapshot expires within guardrail max age despite 3600s cycle TTL" 0
+	else
+		print_result "guardrail: PR backlog snapshot expires within guardrail max age despite 3600s cycle TTL" 1 \
+			"first=${first} second=${second} third=${third}"
 	fi
 	return 0
 }
@@ -745,6 +934,7 @@ test_repeated_failures_pause_without_success
 test_mixed_runtime_roles_do_not_reduce_worker_capacity
 test_reconciled_outcomes_shape_all_worker_pressure_consumers
 test_open_pr_backlog_is_repo_scoped_with_debt_exemption
+test_open_pr_backlog_counts_only_ready_worker_prs
 test_historical_pr_events_cannot_throttle
 test_no_dispatchable_evidence_keeps_probe_slot
 test_no_dispatchable_evidence_preserves_min_floor_slots
@@ -752,6 +942,9 @@ test_clean_state_preserves_available_slots
 test_disabled_guardrail_still_updates_available_slots_gauge
 test_interactive_hold_reason_is_classified
 test_pr_target_reason_is_classified_as_benign_block
+test_candidate_reason_uses_current_attempt_only
+test_candidate_reason_preserves_current_typed_blocker
+test_typed_candidate_reasons_survive_accounting
 test_deterministic_block_reasons_are_benign
 test_benign_block_ledger_is_cycle_local_and_cleaned
 test_stale_benign_block_ledgers_are_reaped_safely
@@ -762,6 +955,7 @@ test_dispatch_max_exports_benign_ledger_for_direct_callers
 test_apply_dispatch_max_preserves_benign_ledger_across_refill
 test_ranked_candidates_prioritise_solvable_work
 test_ranked_candidates_prioritise_low_complexity_over_research
+test_open_pr_backlog_snapshot_expires_within_guardrail_max_age
 
 printf '\n====================\n'
 printf 'Tests run: %s\n' "$TESTS_RUN"

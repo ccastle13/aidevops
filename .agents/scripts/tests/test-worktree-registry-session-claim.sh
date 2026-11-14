@@ -8,6 +8,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 1
 REGISTRY_LIB="${SCRIPT_DIR}/../shared-worktree-registry.sh"
+WORKTREE_HELPER="${SCRIPT_DIR}/../worktree-helper.sh"
+GIT_BIN="${AIDEVOPS_TEST_GIT_BIN:-$(command -v git)}"
 TEST_ROOT=$(mktemp -d)
 WORKTREE_REGISTRY_DIR="${TEST_ROOT}/registry"
 WORKTREE_REGISTRY_DB="${WORKTREE_REGISTRY_DIR}/worktree-registry.db"
@@ -17,10 +19,12 @@ TESTS_RUN=0
 TESTS_FAILED=0
 OWNER_PID=""
 CLAIM_PID=""
+LOCK_PID=""
 
 cleanup() {
 	[[ -n "$OWNER_PID" ]] && kill "$OWNER_PID" >/dev/null 2>&1 || true
 	[[ -n "$CLAIM_PID" ]] && kill "$CLAIM_PID" >/dev/null 2>&1 || true
+	[[ -n "$LOCK_PID" ]] && kill "$LOCK_PID" >/dev/null 2>&1 || true
 	wait "$OWNER_PID" "$CLAIM_PID" 2>/dev/null || true
 	rm -rf "$TEST_ROOT"
 	return 0
@@ -74,14 +78,123 @@ create_linked_worktree_fixture() {
 	local branch="$3"
 
 	mkdir -p "$canonical_path"
-	/usr/bin/git -C "$canonical_path" init -q -b main || return 1
-	/usr/bin/git -C "$canonical_path" config user.name Test || return 1
-	/usr/bin/git -C "$canonical_path" config user.email test@example.invalid || return 1
-	/usr/bin/git -C "$canonical_path" config commit.gpgsign false || return 1
+	"$GIT_BIN" -C "$canonical_path" init -q -b main || return 1
+	"$GIT_BIN" -C "$canonical_path" config user.name Test || return 1
+	"$GIT_BIN" -C "$canonical_path" config user.email test@example.invalid || return 1
+	"$GIT_BIN" -C "$canonical_path" config commit.gpgsign false || return 1
 	printf 'seed\n' >"${canonical_path}/README.md" || return 1
-	/usr/bin/git -C "$canonical_path" add README.md || return 1
-	/usr/bin/git -C "$canonical_path" commit -q -m seed || return 1
-	/usr/bin/git -C "$canonical_path" worktree add -q -b "$branch" "$linked_path" || return 1
+	"$GIT_BIN" -C "$canonical_path" add README.md || return 1
+	"$GIT_BIN" -C "$canonical_path" commit -q -m seed || return 1
+	"$GIT_BIN" -C "$canonical_path" worktree add -q -b "$branch" "$linked_path" || return 1
+	return 0
+}
+
+test_registry_owner_verification_command() {
+	reset_registry
+	local canonical_path="${TEST_ROOT}/verify-canonical"
+	local linked_path="${TEST_ROOT}/verify-linked"
+	local session_id="ses_image_worktree"
+	create_linked_worktree_fixture "$canonical_path" "$linked_path" "feature/verify-linked" || {
+		print_result "registry command verifies exact live session owner" 1
+		return 0
+	}
+	register_worktree "$linked_path" "feature/verify-linked" --owner-pid "$OWNER_PID" --session "$session_id"
+
+	local rc=0 output=""
+	output=$("$WORKTREE_HELPER" registry verify-owner "$linked_path" "$session_id") || rc=1
+	[[ "$output" == "VERIFIED" ]] || rc=1
+	if "$WORKTREE_HELPER" registry verify-owner "$linked_path" "ses_other" >/dev/null 2>&1; then
+		rc=1
+	fi
+	if "$WORKTREE_HELPER" registry verify-owner "$canonical_path" "$session_id" >/dev/null 2>&1; then
+		rc=1
+	fi
+	print_result "registry command verifies exact live session owner" "$rc"
+	return 0
+}
+
+test_source_preflight_reclaims_only_dead_same_session_owner() {
+	reset_registry
+	local canonical_path="${TEST_ROOT}/source-canonical"
+	local linked_path="${TEST_ROOT}/source-linked"
+	local branch="feature/source-linked"
+	local session_id="ses_source_restart"
+	local rc=0 old_pid="" output=""
+	create_linked_worktree_fixture "$canonical_path" "$linked_path" "$branch" || {
+		print_result "source preflight repairs only a dead same-session owner" 1
+		return 0
+	}
+	mkdir -p "${TEST_ROOT}/bin"
+	printf '#!/usr/bin/env bash\nprintf "WORKTREE_PATH=%%s\\n" "%s"\n' "$linked_path" >"${TEST_ROOT}/bin/pre-edit-check.sh"
+	chmod +x "${TEST_ROOT}/bin/pre-edit-check.sh"
+	export OPENCODE_SESSION_ID="$session_id" OPENCODE_PID="$CLAIM_PID"
+	export AIDEVOPS_OPENCODE_SESSION_ID="$session_id"
+	export AIDEVOPS_SOURCE_CONTEXT_SOCKET="${TEST_ROOT}/no-socket"
+	sleep 300 &
+	old_pid=$!
+	register_worktree "$linked_path" "$branch" --owner-pid "$old_pid" --session "$session_id" --task 32884 || rc=1
+	kill "$old_pid" || rc=1
+	wait "$old_pid" 2>/dev/null || true
+	# The broker cannot connect to the intentionally absent socket; ownership must
+	# nevertheless be repaired before the proposal is attempted.
+	output=$(PATH="${TEST_ROOT}/bin:$PATH" "${SCRIPT_DIR}/../interactive-start-helper.sh" \
+		--issue 32884 --repo example/test --task restart --source-path README.md 2>&1) || true
+	[[ "$output" != *"source worktree owner changed"* ]] || rc=1
+	[[ "$(owner_info "$linked_path")" == "${CLAIM_PID}|${session_id}|"* ]] || rc=1
+	[[ "$("$WORKTREE_HELPER" registry verify-owner "$linked_path" "$session_id")" == "VERIFIED" ]] || rc=1
+
+	reset_registry
+	register_worktree "$linked_path" "$branch" --owner-pid "$OWNER_PID" --session "$session_id" --task 32884 || rc=1
+	PATH="${TEST_ROOT}/bin:$PATH" "${SCRIPT_DIR}/../interactive-start-helper.sh" \
+		--issue 32884 --repo example/test --task restart --source-path README.md >/dev/null 2>&1 && rc=1
+	[[ "$(owner_info "$linked_path")" == "${OWNER_PID}|${session_id}|"* ]] || rc=1
+
+	reset_registry
+	register_worktree "$linked_path" "$branch" --owner-pid "$OWNER_PID" --session ses_other --task 32884 || rc=1
+	PATH="${TEST_ROOT}/bin:$PATH" "${SCRIPT_DIR}/../interactive-start-helper.sh" \
+		--issue 32884 --repo example/test --task restart --source-path README.md >/dev/null 2>&1 && rc=1
+	[[ "$(owner_info "$linked_path")" == "${OWNER_PID}|ses_other|"* ]] || rc=1
+	if [[ "$rc" -ne 0 ]]; then
+		printf 'source preflight diagnostic: %s; owner=%s\n' "$output" "$(owner_info "$linked_path")" >&2
+	fi
+	print_result "source preflight repairs only a dead same-session owner" "$rc"
+	return 0
+}
+
+test_registry_sqlite_contention_is_bounded() {
+	reset_registry
+	_init_registry_db || {
+		print_result "registry SQLite contention waits boundedly" 1
+		return 0
+	}
+	local lock_sql="${TEST_ROOT}/hold-registry-lock.sql"
+	printf '%s\n' \
+		'BEGIN EXCLUSIVE;' \
+		"INSERT OR REPLACE INTO worktree_owners (worktree_path, branch, owner_pid) VALUES ('/tmp/lock-holder', 'lock-holder', 1);" \
+		'.shell sleep 2' \
+		'COMMIT;' >"$lock_sql"
+	command sqlite3 "$WORKTREE_REGISTRY_DB" <"$lock_sql" &
+	LOCK_PID=$!
+	sleep 1
+
+	local rc=0 started_at=$SECONDS elapsed=0
+	if AIDEVOPS_WORKTREE_REGISTRY_BUSY_TIMEOUT_MS=100 \
+		_wt_sqlite3 "$WORKTREE_REGISTRY_DB" \
+		"INSERT OR REPLACE INTO worktree_owners (worktree_path, branch, owner_pid) VALUES ('/tmp/bounded-writer', 'bounded-writer', 2);" \
+		>/dev/null 2>&1; then
+		rc=1
+	fi
+	elapsed=$((SECONDS - started_at))
+	[[ "$elapsed" -lt 2 ]] || rc=1
+	wait "$LOCK_PID" || rc=1
+	LOCK_PID=""
+
+	AIDEVOPS_WORKTREE_REGISTRY_BUSY_TIMEOUT_MS=1000 \
+		_wt_sqlite3 "$WORKTREE_REGISTRY_DB" \
+		"INSERT OR REPLACE INTO worktree_owners (worktree_path, branch, owner_pid) VALUES ('/tmp/bounded-writer', 'bounded-writer', 2);" \
+		>/dev/null 2>&1 || rc=1
+	[[ "$(_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "SELECT COUNT(*) FROM worktree_owners WHERE worktree_path = '/tmp/bounded-writer';")" == "1" ]] || rc=1
+	print_result "registry SQLite contention waits boundedly" "$rc"
 	return 0
 }
 
@@ -204,15 +317,15 @@ test_canonical_paths_are_purged_without_signalling_live_owner() {
 	local canonical_path="${TEST_ROOT}/canonical"
 	local linked_path="${TEST_ROOT}/linked"
 	mkdir -p "$canonical_path"
-	/usr/bin/git -C "$canonical_path" init -q -b develop
-	/usr/bin/git -C "$canonical_path" config user.name Test
-	/usr/bin/git -C "$canonical_path" config user.email test@example.invalid
-	/usr/bin/git -C "$canonical_path" config commit.gpgsign false
+	"$GIT_BIN" -C "$canonical_path" init -q -b develop
+	"$GIT_BIN" -C "$canonical_path" config user.name Test
+	"$GIT_BIN" -C "$canonical_path" config user.email test@example.invalid
+	"$GIT_BIN" -C "$canonical_path" config commit.gpgsign false
 	printf 'seed\n' >"${canonical_path}/README.md"
-	/usr/bin/git -C "$canonical_path" add README.md
-	/usr/bin/git -C "$canonical_path" commit -q -m seed
-	/usr/bin/git -C "$canonical_path" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/develop
-	/usr/bin/git -C "$canonical_path" worktree add -q -b feature/linked "$linked_path"
+	"$GIT_BIN" -C "$canonical_path" add README.md
+	"$GIT_BIN" -C "$canonical_path" commit -q -m seed
+	"$GIT_BIN" -C "$canonical_path" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/develop
+	"$GIT_BIN" -C "$canonical_path" worktree add -q -b feature/linked "$linked_path"
 
 	_init_registry_db
 	sqlite3 "$WORKTREE_REGISTRY_DB" "
@@ -481,8 +594,96 @@ test_owner_writers_fail_when_process_generation_is_unavailable() {
 	return 0
 }
 
+test_snapshot_is_read_only() {
+	reset_registry
+	local wt_path="${TEST_ROOT}/snapshot-source"
+	local rc=0 expected="" before=""
+	mkdir -p "$wt_path"
+	register_worktree "$wt_path" feature/snapshot --owner-pid "$OWNER_PID" --session snapshot || rc=1
+	expected=$(check_worktree_owner_snapshot "$wt_path") || rc=1
+	before=$(cksum "$WORKTREE_REGISTRY_DB")
+	(
+		_init_registry_db() { return 1; }
+		_wt_sqlite3() { return 1; }
+		[[ "$(check_worktree_owner_snapshot "$wt_path")" == "$expected" ]] || exit 1
+		[[ "$(check_worktree_owner "$wt_path")" == "${expected%|*}" ]] || exit 1
+	) || rc=1
+	[[ "$(cksum "$WORKTREE_REGISTRY_DB")" == "$before" ]] || rc=1
+	print_result "snapshot reads without migrations or SQLite CLI and preserves database bytes" "$rc"
+	return 0
+}
+
+test_snapshot_distinguishes_absence_from_failure() {
+	reset_registry
+	local wt_path="${TEST_ROOT}/snapshot-absent"
+	local rc=0 status=0 output="" before=""
+	output=$(check_worktree_owner_snapshot "$wt_path") || status=$?
+	[[ "$status" -eq 1 && -z "$output" && ! -e "$WORKTREE_REGISTRY_DB" ]] || rc=1
+	_init_registry_db || rc=1
+	status=0
+	output=$(check_worktree_owner_snapshot "$wt_path") || status=$?
+	[[ "$status" -eq 1 && -z "$output" ]] || rc=1
+	# Missing required schema is unknown, never an invitation to migrate on read.
+	sqlite3 "$WORKTREE_REGISTRY_DB" 'DROP TABLE worktree_owners; CREATE TABLE worktree_owners (worktree_path TEXT PRIMARY KEY);' || rc=1
+	before=$(cksum "$WORKTREE_REGISTRY_DB")
+	status=0
+	output=$(check_worktree_owner_snapshot "$wt_path") || status=$?
+	[[ "$status" -eq 2 && -z "$output" && "$(cksum "$WORKTREE_REGISTRY_DB")" == "$before" ]] || rc=1
+	printf 'not a database\n' >"$WORKTREE_REGISTRY_DB"
+	status=0
+	output=$(check_worktree_owner "$wt_path") || status=$?
+	[[ "$status" -eq 2 && -z "$output" ]] || rc=1
+	print_result "snapshot distinguishes absent database and owner from incompatible or corrupt database" "$rc"
+	return 0
+}
+
+test_snapshot_reads_during_uncommitted_writer() {
+	reset_registry
+	local wt_path="${TEST_ROOT}/snapshot-concurrent"
+	local rc=0 expected="" attempt=0
+	local ready="${TEST_ROOT}/snapshot-writer-ready" release="${TEST_ROOT}/snapshot-writer-release"
+	mkdir -p "$wt_path"
+	register_worktree "$wt_path" feature/snapshot --owner-pid "$OWNER_PID" --session original || rc=1
+	expected=$(check_worktree_owner_snapshot "$wt_path") || rc=1
+	python3 - "$WORKTREE_REGISTRY_DB" "$ready" "$release" <<'PY' &
+from pathlib import Path
+import sqlite3
+import sys
+import time
+database, ready, release = sys.argv[1:]
+with sqlite3.connect(database) as connection:
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute("UPDATE worktree_owners SET owner_session = 'uncommitted'")
+    Path(ready).touch()
+    deadline = time.monotonic() + 10
+    while not Path(release).exists():
+        if time.monotonic() >= deadline:
+            raise SystemExit(1)
+        time.sleep(0.02)
+    connection.rollback()
+PY
+	LOCK_PID=$!
+	while [[ ! -f "$ready" && "$attempt" -lt 100 ]]; do
+		sleep 0.02
+		attempt=$((attempt + 1))
+	done
+	[[ -f "$ready" ]] || rc=1
+	[[ "$(check_worktree_owner_snapshot "$wt_path")" == "$expected" ]] || rc=1
+	touch "$release"
+	wait "$LOCK_PID" || rc=1
+	LOCK_PID=""
+	print_result "snapshot reads committed owner while another writer holds its transaction" "$rc"
+	return 0
+}
+
 main() {
 	start_live_pids
+	test_snapshot_is_read_only
+	test_snapshot_distinguishes_absence_from_failure
+	test_snapshot_reads_during_uncommitted_writer
+	test_registry_sqlite_contention_is_bounded
+	test_registry_owner_verification_command
+	test_source_preflight_reclaims_only_dead_same_session_owner
 	test_same_opencode_session_rolls_owner_pid
 	test_parameterized_claim_preserves_metacharacters
 	test_legacy_equivalent_registry_path_resolves

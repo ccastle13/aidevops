@@ -36,6 +36,7 @@ _PAD_TRIAGE_OUTCOME_POSTED="posted"
 _PAD_TRIAGE_OUTCOME_REVIEW_FAILED="review_failed"
 _PAD_TRIAGE_OUTCOME_INFRASTRUCTURE_FAILED="infrastructure_failed"
 _PAD_TRIAGE_LAST_OUTCOME=""
+_PAD_TRIAGE_LAST_BUILD_OUTCOME=""
 _PAD_REVIEW_HOLD_LABEL="hold-for-review"
 _PAD_GITHUB_COMMENTS_READ_MALFORMED_REASON="github-comments-read-malformed"
 _PAD_GITHUB_COMMENTS_SNAPSHOT_TOO_LARGE_REASON="github-comments-snapshot-too-large"
@@ -193,6 +194,7 @@ _triage_mark_infrastructure_retry() {
 	local issue_num="$1"
 	local repo_slug="$2"
 	local reason="$3"
+	_PAD_TRIAGE_LAST_BUILD_OUTCOME="$_PAD_TRIAGE_OUTCOME_INFRASTRUCTURE_FAILED"
 
 	gh issue edit "$issue_num" --repo "$repo_slug" \
 		--remove-label "triage-failed" >/dev/null 2>&1 || true
@@ -216,10 +218,11 @@ _triage_mark_security_hold() {
 	local reason="$3"
 
 	[[ -n "$issue_num" && -n "$repo_slug" ]] || return 0
-	gh label create "security-review" --repo "$repo_slug" --color "D73A4A" \
+	# Attention colour: see label-sync-helper.sh palette groups.
+	gh label create "security-review" --repo "$repo_slug" --color "E4007C" \
 		--description "Requires security review — suspicious AI request" --force \
 		>/dev/null 2>&1 || true
-	gh label create "$_PAD_REVIEW_HOLD_LABEL" --repo "$repo_slug" --color "D73A4A" \
+	gh label create "$_PAD_REVIEW_HOLD_LABEL" --repo "$repo_slug" --color "E4007C" \
 		--description "Opt-out: block issue auto-dispatch or PR auto-merge for maintainer review" --force \
 		>/dev/null 2>&1 || true
 	if ! gh issue edit "$issue_num" --repo "$repo_slug" \
@@ -500,6 +503,7 @@ _triage_prefetch_issue() {
 #   $10 - immutable PR base SHA (empty for issues)
 #   $11 - immutable PR head SHA (empty for issues)
 #   $12 - GitHub-verified public evidence revision
+#   $13 - optional caller variable receiving the prompt file path
 #
 # Prints the temp file path to stdout. Returns 0.
 #######################################
@@ -516,6 +520,7 @@ _triage_write_prompt_file() {
 	local pr_base_sha="${10:-}"
 	local pr_head_sha="${11:-}"
 	local public_revision="${12:-}"
+	local result_var="${13:-}"
 	[[ "$public_revision" =~ ^[0-9a-f]{40,64}$ ]] || return 1
 
 	# #aidevops:trust-boundary — never silently truncate a public conversation.
@@ -608,7 +613,22 @@ _triage_write_prompt_file() {
 		return 1
 	fi
 
-	printf '%s\n' "$prefetch_file"
+	if [[ -n "$result_var" ]]; then
+		printf -v "$result_var" '%s' "$prefetch_file"
+	else
+		printf '%s\n' "$prefetch_file"
+	fi
+	return 0
+}
+
+_triage_emit_build_result() {
+	local result_var="$1"
+	local result="$2"
+	if [[ -n "$result_var" ]]; then
+		printf -v "$result_var" '%s' "$result"
+	else
+		printf '%s\n' "$result"
+	fi
 	return 0
 }
 
@@ -625,6 +645,7 @@ _triage_write_prompt_file() {
 #   $1 - issue_num
 #   $2 - repo_slug
 #   $3 - repo_path
+#   $4 - optional caller variable receiving the result
 #
 # Prints "<prefetch_file>|<content_hash>|<item_kind>|<pr_revision_pair>|<text_snapshot_hash>|<public_revision>".
 # Returns 0 on success, 1 if triage should be skipped.
@@ -633,6 +654,7 @@ _build_triage_review_prompt() {
 	local issue_num="$1"
 	local repo_slug="$2"
 	local repo_path="$3"
+	local result_var="${4:-}"
 	_triage_local_context_is_usable "$issue_num" "$repo_slug" "$repo_path" || return 1
 
 	# Declare receiving variables; populated by _triage_prefetch_issue via printf -v.
@@ -717,17 +739,15 @@ _build_triage_review_prompt() {
 		return 1
 	fi
 
-	local prefetch_file=""
-	prefetch_file=$(_triage_write_prompt_file \
+	local __TRIAGE_PREFETCH_FILE=""
+	_triage_write_prompt_file \
 		"$issue_num" "$repo_slug" "$repo_path" \
 		"$__TRIAGE_ISSUE_JSON" "$__TRIAGE_ISSUE_BODY" "$__TRIAGE_ISSUE_COMMENTS" \
 		"$pr_diff" "$pr_files" "$is_pr" "$pr_base_sha" "$pr_head_sha" \
-		"$public_revision") || return 1
+		"$public_revision" "__TRIAGE_PREFETCH_FILE" || return 1
+	local prefetch_file="$__TRIAGE_PREFETCH_FILE"
 
-	local pr_revision_pair="${pr_base_sha:+${pr_base_sha}:${pr_head_sha}}"
-	printf '%s|%s|%s|%s|%s|%s\n' \
-		"$prefetch_file" "$__TRIAGE_CONTENT_HASH" "$item_kind" \
-		"$pr_revision_pair" "$__TRIAGE_TEXT_SNAPSHOT_HASH" "$public_revision"
+	_triage_emit_build_result "$result_var" "${prefetch_file}|${__TRIAGE_CONTENT_HASH}|${item_kind}|${pr_base_sha:+${pr_base_sha}:${pr_head_sha}}|${__TRIAGE_TEXT_SNAPSHOT_HASH}|${public_revision}"
 	return 0
 }
 
@@ -797,7 +817,13 @@ dispatch_triage_reviews() {
 		[[ "$triage_count" -lt "$triage_max" ]] || break
 
 		local prompt_result=""
-		prompt_result=$(_build_triage_review_prompt "$issue_num" "$repo_slug" "$repo_path") || continue
+		_PAD_TRIAGE_LAST_BUILD_OUTCOME=""
+		if ! _build_triage_review_prompt "$issue_num" "$repo_slug" "$repo_path" "prompt_result"; then
+			if [[ "$_PAD_TRIAGE_LAST_BUILD_OUTCOME" == "$_PAD_TRIAGE_OUTCOME_INFRASTRUCTURE_FAILED" ]]; then
+				infrastructure_failed=$((infrastructure_failed + 1))
+			fi
+			continue
+		fi
 		local prompt_file="${prompt_result%%|*}"
 		local prompt_metadata="${prompt_result#*|}"
 		local content_hash="${prompt_metadata%%|*}"
@@ -926,12 +952,13 @@ dispatch_routine_comment_responses() {
 	local repos_json="${REPOS_JSON:-${HOME}/.config/aidevops/repos.json}"
 	local max_dispatches="${ROUTINE_COMMENT_MAX_PER_CYCLE:-2}"
 	local dispatched=0
+	local attempted=0
 
 	# Iterate pulse-enabled repos
 	local slug repo_path
 	while IFS='|' read -r slug repo_path; do
 		[[ -n "$slug" && -n "$repo_path" ]] || continue
-		[[ "$dispatched" -lt "$max_dispatches" ]] || break
+		[[ "$attempted" -lt "$max_dispatches" ]] || break
 
 		# Scan for unanswered comments
 		local scan_output
@@ -940,11 +967,12 @@ dispatch_routine_comment_responses() {
 
 		while IFS='|' read -r issue_number comment_id author body_preview; do
 			[[ -n "$issue_number" && -n "$comment_id" ]] || continue
-			[[ "$dispatched" -lt "$max_dispatches" ]] || break
+			[[ "$attempted" -lt "$max_dispatches" ]] || break
 
-			echo "[pulse-wrapper] Routine comment response: dispatching for #${issue_number} comment ${comment_id} by @${author} in ${slug}" >>"$LOGFILE"
-			bash "$responder" dispatch "$slug" "$repo_path" "$issue_number" "$comment_id" 2>>"$LOGFILE" || true
-			dispatched=$((dispatched + 1))
+			attempted=$((attempted + 1))
+			if bash "$responder" dispatch "$slug" "$repo_path" "$issue_number" "$comment_id" 2>>"$LOGFILE"; then
+				dispatched=$((dispatched + 1))
+			fi
 		done <<<"$scan_output"
 	done < <(jq -r '.initialized_repos[] | select(.maintenance != false) | select(.pulse == true) | select(.local_only != true) | "\(.slug)|\(.path)"' "$repos_json" 2>/dev/null)
 

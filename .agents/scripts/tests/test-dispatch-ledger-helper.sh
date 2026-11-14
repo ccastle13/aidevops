@@ -256,7 +256,7 @@ test_tier_telemetry_correlates_terminal_outcomes() {
 	success_count=$(jq -s '[.[] | select(.outcome == "success")] | length' "$telemetry_file")
 	terminal_count=$(jq -s '[.[] | select(.outcome != "pending")] | length' "$telemetry_file")
 	terminal_tier=$(jq -rs 'first(.[] | select(.attempt_id == "attempt-42" and .outcome == "success") | .tier)' "$telemetry_file")
-	report=$("$LEDGER_HELPER" tier-report)
+	report=$("$LEDGER_HELPER" tier-report --days 0)
 	[[ "$pending_count" == "3" && "$success_count" == "3" && "$terminal_count" == "3" ]] || result=1
 	[[ "$terminal_tier" == "simple" ]] || result=1
 	[[ "$report" == *"Total dispatches: 3"* && "$report" == *"Pending/unknown: 2"* ]] || result=1
@@ -284,12 +284,47 @@ test_tier_telemetry_handles_retries_and_legacy_pending() {
 	failed_tier=$(jq -r 'select(.outcome == "failed") | .tier' "$telemetry_file")
 	legacy_pending=$(jq -s '[.[] | select(.outcome == "pending" and .model == "legacy-model")] | length' "$telemetry_file")
 	terminal_count=$(jq -s '[.[] | select(.outcome != "pending")] | length' "$telemetry_file")
-	report=$("$LEDGER_HELPER" tier-report)
+	report=$("$LEDGER_HELPER" tier-report --days 0)
 	[[ "$success_tier" == "thinking" && "$failed_tier" == "simple" && "$legacy_pending" == "1" && "$terminal_count" == "2" ]] || result=1
 	[[ "$report" == *"Success: 1"* && "$report" == *"Failed: 1"* && "$report" == *"Pending/unknown: 0"* ]] || result=1
 	[[ "$report" == *"Legacy/unmatched terminal events: 0"* ]] || result=1
 	print_result "tier telemetry pairs retries newest-first and supports legacy pending rows" "$result" \
 		"success_tier=${success_tier}, failed_tier=${failed_tier}, legacy=${legacy_pending}"
+	teardown_test_env
+	return 0
+}
+
+test_tier_telemetry_attempt_match_fills_route_and_windows_report() {
+	setup_test_env
+	local telemetry_file="${AIDEVOPS_DISPATCH_LEDGER_DIR}/tier-telemetry.jsonl"
+	# Registered without an issue (manual launch) and without a route.
+	run_helper "$LEDGER_HELPER" register --session-key "manual-cli-51-1" \
+		--repo "owner/repo" --pid $$ --tier standard --model model-a --attempt-id attempt-51
+	run_helper "$LEDGER_HELPER" register --session-key "ci-repair-52" \
+		--repo "owner/repo" --pid $$ --attempt-id attempt-52
+	run_helper "$LEDGER_HELPER" record-outcome --attempt-id attempt-51 --issue 51 \
+		--repo "owner/repo" --session-key "manual-cli-51-1" --outcome success \
+		--model model-b --variant high --routing-attempts 2
+	run_helper "$LEDGER_HELPER" record-outcome --attempt-id attempt-52 --issue 52 \
+		--repo "owner/repo" --outcome failed --tier thinking --model model-c --variant low
+	# An old attempt outside the default 30-day window.
+	printf '%s\n' '{"schema":2,"attempt_id":"attempt-old","issue":"9","repo":"owner/repo","tier":"simple","model":"model-z","dispatched_at":"2020-01-01T00:00:00Z","outcome":"pending"}' >>"$telemetry_file"
+	printf '%s\n' '{"schema":2,"attempt_id":"attempt-old","issue":"9","repo":"owner/repo","tier":"simple","model":"model-z","outcome":"success","completed_at":"2020-01-01T01:00:00Z"}' >>"$telemetry_file"
+
+	local result=0 first="" second="" report="" all_report=""
+	first=$(jq -c 'select(.attempt_id == "attempt-51" and .outcome == "success") | [.tier, .model, .final_model, .variant, .routing_attempts]' "$telemetry_file")
+	second=$(jq -c 'select(.attempt_id == "attempt-52" and .outcome == "failed") | [.tier, .model, .variant]' "$telemetry_file")
+	report=$("$LEDGER_HELPER" tier-report)
+	all_report=$("$LEDGER_HELPER" tier-report --days 0)
+	[[ "$first" == '["standard","model-a","model-b","high",2]' ]] || result=1
+	[[ "$second" == '["thinking","model-c","low"]' ]] || result=1
+	[[ "$report" == *"Total dispatches: 2"* && "$report" != *"tier:simple"* ]] || result=1
+	[[ "$report" == *"tier:standard model-b@high — 1/1 (100.0%) deferred:0"* ]] || result=1
+	[[ "$report" == *"tier:thinking model-c@low — 0/1 (0.0%) deferred:0"* ]] || result=1
+	[[ "$all_report" == *"Total dispatches: 3"* && "$all_report" == *"tier:simple — 1/1 (100.0%)"* ]] || result=1
+	if "$LEDGER_HELPER" tier-report --days nope >/dev/null 2>&1; then result=1; fi
+	print_result "tier telemetry keeps route on attempt-matched outcomes and windows the report" "$result" \
+		"first=${first}, second=${second}"
 	teardown_test_env
 	return 0
 }
@@ -1132,6 +1167,46 @@ test_release_clears_lockdir_with_pid_file() {
 }
 
 #######################################
+# Test (GH#33916): a lease-less manual worker registers first through the
+# production headless-runtime-lib producer; the dispatcher's later register
+# for the same session is an idempotent no-op. The worker's entry must
+# therefore carry the issue and a `.git`-free repo so check-issue finds it,
+# and an unbound timestamp key must never be read as an issue number.
+#######################################
+test_manual_worker_registration_is_issue_visible() {
+	setup_test_env
+	local scripts_dir="${SCRIPT_DIR}/.."
+	local worktree="${TEST_ROOT}/worktree"
+	git init -q "$worktree"
+	git -C "$worktree" remote add origin "https://github.com/owner/repo.git"
+
+	local result=0 entry="" unbound_issue=""
+	(
+		SCRIPT_DIR="$scripts_dir"
+		# shellcheck source=../headless-runtime-lib.sh
+		source "${scripts_dir}/headless-runtime-lib.sh"
+		DISPATCH_LEDGER_HELPER="$LEDGER_HELPER"
+		unset AIDEVOPS_DISPATCH_LEASE_TOKEN
+		WORKER_ISSUE_NUMBER=51 _register_dispatch_ledger "manual-cli-51-1700000000" "$worktree"
+		WORKER_ISSUE_NUMBER=99 _register_dispatch_ledger "manual-cli-52-1700000000" "$worktree"
+	) || result=1
+	# Dispatcher-style registration after readiness (must not be needed).
+	run_helper "$LEDGER_HELPER" register --session-key "manual-cli-51-1700000000" \
+		--issue 51 --repo "owner/repo" --pid $$ --worktree "$worktree"
+
+	entry=$("$LEDGER_HELPER" check-issue --issue 51 --repo "owner/repo" 2>/dev/null) || result=1
+	[[ "$(printf '%s' "$entry" | jq -r '.session_key // ""')" == "manual-cli-51-1700000000" ]] || result=1
+	[[ "$(printf '%s' "$entry" | jq -r '.worktree_path // ""')" == "$worktree" ]] || result=1
+	unbound_issue=$(jq -rs 'map(select(.session_key == "manual-cli-52-1700000000")) | last | .issue_number' \
+		"${AIDEVOPS_DISPATCH_LEDGER_DIR}/dispatch-ledger.jsonl")
+	[[ "$unbound_issue" == "" ]] || result=1
+	print_result "manual worker self-registration is visible to check-issue (GH#33916)" "$result" \
+		"entry=${entry}, unbound_issue=${unbound_issue}"
+	teardown_test_env
+	return 0
+}
+
+#######################################
 # Run all tests
 #######################################
 main() {
@@ -1158,6 +1233,7 @@ main() {
 	test_record_recovery_rejects_missing_option_values
 	test_tier_telemetry_correlates_terminal_outcomes
 	test_tier_telemetry_handles_retries_and_legacy_pending
+	test_tier_telemetry_attempt_match_fills_route_and_windows_report
 	test_check_detects_inflight
 	test_check_returns_1_for_unknown
 	test_check_issue_detects_inflight
@@ -1189,6 +1265,7 @@ main() {
 	test_stale_lock_blocks_on_live_owner_within_max_age
 	test_stale_lock_recovered_legacy_no_pid_lockdir
 	test_release_clears_lockdir_with_pid_file
+	test_manual_worker_registration_is_issue_visible
 
 	echo ""
 	echo "=== Results: ${TESTS_RUN} tests, ${TESTS_FAILED} failed ==="

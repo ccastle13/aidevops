@@ -309,11 +309,12 @@ gh() {
 source '${WRAPPERS_FILE}'
 _ensure_origin_labels_for_args() { return 0; }
 _gh_validate_edit_args() { return 0; }
+_gh_guard_public_write_args() { return 0; }
 _rest_should_fallback() { return 1; }
 session_origin_label() { printf 'origin:worker'; return 0; }
 detect_session_origin() { printf 'worker'; return 0; }
 _gh_wrapper_auto_sig() { _GH_WRAPPER_SIG_MODIFIED_ARGS=(\"\$@\"); return 0; }
-gh_create_pr --repo owner/repo --title 'zsh smoke' --body 'body'
+gh_create_pr --repo owner/repo --title 'zsh smoke' --body 'For #42'
 " 2>&1) || true
 	if [[ "$zsh_pr_out" == *"https://github.com/owner/repo/pull/1"* && \
 	      "$zsh_pr_out" != *"_save_cleanup_scope"* && \
@@ -324,6 +325,96 @@ gh_create_pr --repo owner/repo --title 'zsh smoke' --body 'body'
 		fail "9: gh_create_pr sourced under zsh has quiet cleanup setup" \
 			"output: $(printf '%q' "$zsh_pr_out")"
 	fi
+fi
+
+# =============================================================================
+# Test 10: _gh_wrapper_normalize_stdin_body_file preserves argument order and
+# replaces only stdin body files under both bash and zsh.
+# =============================================================================
+test_stdin_body_normalization() {
+	local shell_path="$1"
+	local shell_name="$2"
+	local ordinary_body_file="${TMP}/ordinary-body.md"
+	local normalization_out
+
+	printf 'ordinary body\n' >"$ordinary_body_file"
+	normalization_out=$(printf 'stdin body\n' | AIDEVOPS_TEMP_DIR="$TMP" "$shell_path" -c "
+source '${WRAPPERS_FILE}'
+typeset -f _gh_primary_cooldown_preflight >/dev/null 2>&1 || exit 1
+push_cleanup() { return 0; }
+
+_gh_wrapper_normalize_stdin_body_file --repo owner/repo --body-file - --label managed
+stdin_args=\"\$(printf '%s|' \"\${_GH_WRAPPER_BODY_FILE_ARGS[@]}\")\"
+stdin_file=''
+expect_file=0
+for arg in \"\${_GH_WRAPPER_BODY_FILE_ARGS[@]}\"; do
+    if [[ \"\$expect_file\" -eq 1 ]]; then stdin_file=\"\$arg\"; break; fi
+    [[ \"\$arg\" == '--body-file' ]] && expect_file=1
+done
+[[ \"\$stdin_args\" == \"--repo|owner/repo|--body-file|\${stdin_file}|--label|managed|\" ]] || exit 1
+[[ \"\$(cat \"\$stdin_file\")\" == 'stdin body' ]] || exit 1
+
+_gh_wrapper_normalize_stdin_body_file --title 'stdin equals' --body-file=- --repo owner/repo
+equals_args=\"\$(printf '%s|' \"\${_GH_WRAPPER_BODY_FILE_ARGS[@]}\")\"
+equals_file=''
+for arg in \"\${_GH_WRAPPER_BODY_FILE_ARGS[@]}\"; do
+    case \"\$arg\" in --body-file=*) equals_file=\"\${arg#--body-file=}\" ;; esac
+done
+[[ \"\$equals_args\" == \"--title|stdin equals|--body-file=\${equals_file}|--repo|owner/repo|\" ]] || exit 1
+[[ \"\$(cat \"\$equals_file\")\" == '' ]] || exit 1
+
+_gh_wrapper_normalize_stdin_body_file --body-file '${ordinary_body_file}' --repo owner/repo --label managed
+ordinary_args=\"\$(printf '%s|' \"\${_GH_WRAPPER_BODY_FILE_ARGS[@]}\")\"
+[[ \"\$ordinary_args\" == \"--body-file|${ordinary_body_file}|--repo|owner/repo|--label|managed|\" ]] || exit 1
+printf 'OK\n'
+" 2>&1)
+	if [[ "$normalization_out" == "OK" ]]; then
+		pass "10: stdin body-file normalization preserves argv under ${shell_name}"
+	else
+		fail "10: stdin body-file normalization preserves argv under ${shell_name}" \
+			"output: $(printf '%q' "$normalization_out")"
+	fi
+	return 0
+}
+
+test_stdin_body_normalization /bin/bash "bash"
+if command -v zsh >/dev/null 2>&1; then
+	test_stdin_body_normalization "$(command -v zsh)" "zsh"
+else
+	skip "10: stdin body-file normalization preserves argv under zsh" "zsh not installed"
+fi
+
+# =============================================================================
+# Test 11 (GH#32723): gh_create_issue under /bin/bash (3.2 on macOS) with
+# nounset and no TODO-derived labels must not abort on empty array expansion.
+# On bash 4.4+ this is a plain smoke test; on 3.2 it reproduces the bug.
+# =============================================================================
+NOUNSET_CALLS="${TMP}/nounset_calls.log"
+: >"$NOUNSET_CALLS"
+nounset_out=$(/bin/bash -uc "
+gh() {
+    printf '%s\n' \"\$*\" >>'${NOUNSET_CALLS}'
+    if [[ \"\$1\" == 'issue' && \"\$2\" == 'create' ]]; then
+        printf 'https://github.com/owner/repo/issues/1\n'
+    fi
+    return 0
+}
+source '${WRAPPERS_FILE}'
+_ensure_origin_labels_for_args() { return 0; }
+_gh_validate_edit_args() { return 0; }
+_gh_guard_public_write_args() { return 0; }
+_rest_should_fallback() { return 1; }
+session_origin_label() { printf 'origin:worker'; return 0; }
+detect_session_origin() { printf 'worker'; return 0; }
+_gh_wrapper_auto_sig() { _GH_WRAPPER_SIG_MODIFIED_ARGS=(\"\$@\"); return 0; }
+_gh_ci_prepare_parent_contract_and_signature --repo owner/repo --title 'nounset smoke' --body 'body'
+gh_create_issue --repo owner/repo --title 'nounset smoke' --body 'body' --label bug
+" 2>&1) || true
+if [[ "$nounset_out" != *"unbound variable"* && "$nounset_out" == *"https://github.com/owner/repo/issues/1"* ]]; then
+	pass "11: gh_create_issue survives nounset with empty arrays under /bin/bash"
+else
+	fail "11: gh_create_issue survives nounset with empty arrays under /bin/bash" \
+		"output: $(printf '%q' "$nounset_out")"
 fi
 
 # =============================================================================

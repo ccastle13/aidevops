@@ -19,6 +19,36 @@
 
 set -euo pipefail
 
+# Resolve native Git once as an executable on the caller PATH (portable to
+# non-FHS hosts such as NixOS); fixtures must bypass the aidevops git wrapper.
+_resolve_native_git() {
+	local dir candidate target
+	local -a path_dirs=()
+	IFS=':' read -r -a path_dirs <<<"${PATH:-}"
+	for dir in "${path_dirs[@]}"; do
+		[[ "$dir" == /* ]] || continue
+		candidate="${dir}/git"
+		[[ -f "$candidate" && -x "$candidate" ]] || continue
+		# Skip the aidevops git wrapper.
+		if [[ "$candidate" == *aidevops* ]] || head -c 512 "$candidate" 2>/dev/null | grep -a 'aidevops' >/dev/null; then
+			continue
+		fi
+		while [[ -L "$candidate" ]]; do
+			target=$(readlink "$candidate") || break
+			[[ "$target" == /* ]] || target="$(dirname "$candidate")/${target}"
+			candidate="$target"
+		done
+		printf '%s\n' "$candidate"
+		return 0
+	done
+	return 1
+}
+TEST_NATIVE_GIT=$(_resolve_native_git) || {
+	printf '%s\n' 'Native Git (non-wrapper executable) not found on PATH' >&2
+	exit 1
+}
+export TEST_NATIVE_GIT
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPER="${SCRIPT_DIR}/../cleanup-worktrees-async-helper.sh"
 
@@ -78,22 +108,51 @@ run_helper_in_isolation() {
 
 	local stub_dir="${TEST_DIR}/scripts"
 	mkdir -p "$stub_dir"
+	cp "${SCRIPT_DIR}/../cleanup-worktrees-lock.sh" "${stub_dir}/cleanup-worktrees-lock.sh"
 
 	# Stub shared-constants.sh — defines nothing, just marks it was sourced
 	cat >"${stub_dir}/shared-constants.sh" <<'STUB'
 # stub shared-constants.sh
+timeout_sec() {
+	local seconds="$1"
+	shift
+	# Recovery 90s, verify-scratch sweep 60s, prune budget 540s + 60s backstop.
+	case "$seconds" in 60 | 90 | 600) ;; *) return 1 ;; esac
+	"$@" || return 1
+	return 0
+}
+config_get() {
+	local key="$1"
+	local fallback="$2"
+	[[ "$key" == "storage.worktree_archive_retention_mode" ]] || return 1
+	printf '%s\n' "${MOCK_RETENTION_CONFIG_MODE:-$fallback}"
+	return 0
+}
+# Non-zero means the cap is under pressure (GH#37330 budget selection).
+aidevops_worktree_capacity_check() {
+	[[ "${MOCK_PRESSURE:-0}" == 1 ]] && return 1
+	return 0
+}
+aidevops_worktree_cleanup_headroom_low() {
+	[[ "${MOCK_HEADROOM_LOW:-0}" == 1 ]] && return 0
+	return 1
+}
 STUB
 
 	# Stub pulse-cleanup.sh — defines mock cleanup_worktrees.
 	# Use literal return 0 / return 1 (not a variable) so the pre-commit
 	# return-statement ratchet doesn't flag the heredoc-embedded function.
 	local mock_ran_file="${TEST_DIR}/mock-ran"
+	local lifecycle_file="${TEST_DIR}/cleanup-lifecycle"
+	local registry_reconcile_file="${TEST_DIR}/registry-reconcile-ran"
 	local maintenance_ran_file="${TEST_DIR}/maintenance-ran"
+	local metadata_prune_ran_file="${TEST_DIR}/metadata-prune-ran"
 	local maintenance_result="${MOCK_MAINTENANCE_RESULT:-{\"schema\":\"test\",\"outcome\":\"no-candidates\"}}"
 	if [[ "${MOCK_CLEANUP_SKIPPED:-0}" -eq 1 ]]; then
 		cat >"${stub_dir}/pulse-cleanup.sh" <<STUB
 # stub pulse-cleanup.sh
 cleanup_worktrees() {
+	printf 'CLEANUP\n' >>"${lifecycle_file}"
 	printf 'MOCK_RAN\n' >>"${mock_ran_file}"
 	CLEANUP_WORKTREES_SKIPPED=1
 	return 0
@@ -103,6 +162,7 @@ STUB
 		cat >"${stub_dir}/pulse-cleanup.sh" <<STUB
 # stub pulse-cleanup.sh
 _mock_cleanup_worktrees() {
+	printf 'CLEANUP\n' >>"${lifecycle_file}"
 	printf 'MOCK_RAN\n' >>"${mock_ran_file}"
 	return 1
 }
@@ -113,7 +173,9 @@ STUB
 		cat >"${stub_dir}/pulse-cleanup.sh" <<STUB
 # stub pulse-cleanup.sh
 cleanup_worktrees() {
+	printf 'CLEANUP\n' >>"${lifecycle_file}"
 	printf 'MOCK_RAN\n' >>"${mock_ran_file}"
+	printf '%s\n' "\${1:-unset}" >>"${TEST_DIR}/cleanup-budget"
 	return 0
 }
 STUB
@@ -123,6 +185,23 @@ CLEANUP_WORKTREES_REMOVED_COUNT="${MOCK_REMOVED_COUNT:-0}"
 CLEANUP_WORKTREES_ARCHIVED_COUNT="${MOCK_ARCHIVED_COUNT:-0}"
 CLEANUP_WORKTREES_ARCHIVE_FAILED_COUNT="${MOCK_ARCHIVE_FAILED_COUNT:-0}"
 STUB
+	if [[ "${MOCK_REGISTRY_RECONCILE_EXIT:-0}" -ne 0 ]]; then
+		cat >>"${stub_dir}/pulse-cleanup.sh" <<STUB
+prune_worktree_registry() {
+	printf 'REGISTRY_RECONCILE_RAN\n' >>"${registry_reconcile_file}"
+	printf 'REGISTRY_RECONCILE\n' >>"${lifecycle_file}"
+	return 1
+}
+STUB
+	else
+		cat >>"${stub_dir}/pulse-cleanup.sh" <<STUB
+prune_worktree_registry() {
+	printf 'REGISTRY_RECONCILE_RAN\n' >>"${registry_reconcile_file}"
+	printf 'REGISTRY_RECONCILE\n' >>"${lifecycle_file}"
+	return 0
+}
+STUB
+	fi
 
 	# Copy the helper into stub_dir so that when it runs, BASH_SOURCE[0] points
 	# to stub_dir and dirname "${BASH_SOURCE[0]}" resolves to stub_dir. This
@@ -131,22 +210,71 @@ STUB
 	# so injecting SCRIPT_DIR via env does not work).
 	cp "$HELPER" "${stub_dir}/cleanup-worktrees-async-helper.sh"
 	chmod +x "${stub_dir}/cleanup-worktrees-async-helper.sh"
+	cat >"${stub_dir}/pulse-cleanup-progress.sh" <<STUB
+_pc_cleanup_resumable_unlocked() {
+	local budget="\$1" repo="\$2"
+	printf '%s %s\\n' "\$budget" "\$repo" >>"${TEST_DIR}/capacity-ran"
+	return 0
+}
+STUB
 	cat >"${stub_dir}/worktree-recovery-maintenance-helper.sh" <<STUB
 #!/usr/bin/env bash
 printf 'MAINTENANCE_RAN\\n' >>"${maintenance_ran_file}"
 printf '%s\\n' '${maintenance_result}'
 STUB
 	chmod +x "${stub_dir}/worktree-recovery-maintenance-helper.sh"
+	cat >"${stub_dir}/dirty-worktree-backup-helper.sh" <<STUB
+#!/usr/bin/env bash
+printf 'DIRTY_PRUNE_RAN\n' >>"${TEST_DIR}/dirty-prune-ran"
+STUB
+	chmod +x "${stub_dir}/dirty-worktree-backup-helper.sh"
+	cat >"${stub_dir}/worktree-archive-helper.sh" <<STUB
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >>"${TEST_DIR}/compact-retention-ran"
+exit "\${MOCK_ARCHIVE_RETENTION_EXIT:-0}"
+STUB
+	cat >"${stub_dir}/audit-worktree-removal-helper.sh" <<STUB
+prune_missing_worktree_metadata() {
+	local repo_arg="\$1"
+	local target_arg="\$2"
+	printf 'METADATA_PRUNE_RAN %s %s\\n' "\$repo_arg" "\$target_arg" >>"${metadata_prune_ran_file}"
+	return 0
+}
+STUB
+	if [[ -n "${MOCK_PRUNABLE_TARGET:-}" ]]; then
+		cat >"${stub_dir}/git" <<STUB
+#!/usr/bin/env bash
+if [[ "\$*" == *"rev-parse --show-toplevel"* ]]; then
+	printf '%s\\n' "${TEST_DIR}/repo"
+	exit 0
+fi
+if [[ "\$*" == *"worktree list --porcelain -z"* ]]; then
+	printf 'worktree %s\\0prunable gitdir file points to non-existent location\\0\\0' "${MOCK_PRUNABLE_TARGET}"
+	exit 0
+fi
+exec "$TEST_NATIVE_GIT" "\$@"
+STUB
+		chmod +x "${stub_dir}/git"
+		mkdir -p "${TEST_DIR}/repo"
+	fi
+	local helper_path_prefix="${PATH}"
+	if [[ -n "${MOCK_PRUNABLE_TARGET:-}" ]]; then
+		helper_path_prefix="${stub_dir}:${PATH}"
+	fi
 
+	# Run from TEST_DIR: the pressure probe counts the current repository's
+	# worktrees, and a host checkout over the cap must not bypass cadence here.
 	if [[ "${RUN_HELPER_UNSET_HOME:-0}" -eq 1 ]]; then
-		env -u HOME \
+		(cd "$TEST_DIR" && env -u HOME \
+			PATH="$helper_path_prefix" \
 			AIDEVOPS_LOG_DIR="${AIDEVOPS_LOG_DIR:-${TEST_DIR}/custom-logs}" \
 			CLEANUP_WORKTREES_ASYNC_CADENCE_MIN="${CLEANUP_WORKTREES_ASYNC_CADENCE_MIN:-10}" \
-			bash "${stub_dir}/cleanup-worktrees-async-helper.sh" 2>/dev/null || true
+			bash "${stub_dir}/cleanup-worktrees-async-helper.sh" "$@" 2>/dev/null) || true
 	else
-		env HOME="$TEST_DIR" \
+		(cd "$TEST_DIR" && env HOME="$TEST_DIR" \
+			PATH="$helper_path_prefix" \
 			CLEANUP_WORKTREES_ASYNC_CADENCE_MIN="${CLEANUP_WORKTREES_ASYNC_CADENCE_MIN:-10}" \
-			bash "${stub_dir}/cleanup-worktrees-async-helper.sh" 2>/dev/null || true
+			bash "${stub_dir}/cleanup-worktrees-async-helper.sh" "$@" 2>/dev/null) || true
 	fi
 	return 0
 }
@@ -156,7 +284,9 @@ STUB
 # ============================================================
 test_cold_start() {
 	local mock_ran="${TEST_DIR}/mock-ran"
-	rm -f "$mock_ran"
+	local registry_reconcile_ran="${TEST_DIR}/registry-reconcile-ran"
+	local lifecycle_file="${TEST_DIR}/cleanup-lifecycle"
+	rm -f "$mock_ran" "$registry_reconcile_ran" "$lifecycle_file"
 
 	MOCK_CLEANUP_EXIT=0 run_helper_in_isolation || true
 
@@ -165,6 +295,32 @@ test_cold_start() {
 	else
 		print_result "cold-start: cleanup_worktrees runs on first invocation" 1 \
 			"mock-ran marker not created; cleanup_worktrees was not called"
+	fi
+	local lifecycle=""
+	lifecycle=$(tr '\n' ' ' <"$lifecycle_file" 2>/dev/null || true)
+	if [[ -f "$registry_reconcile_ran" ]] && grep -q "REGISTRY_RECONCILE_RAN" "$registry_reconcile_ran" &&
+		[[ "$lifecycle" == "REGISTRY_RECONCILE CLEANUP " ]]; then
+		print_result "cold-start: registry ownership reconciles before cleanup" 0
+	else
+		print_result "cold-start: registry ownership reconciles before cleanup" 1 \
+			"registry reconciliation order was '${lifecycle}'"
+	fi
+	return 0
+}
+
+test_registry_reconciliation_failure_is_isolated() {
+	local mock_ran="${TEST_DIR}/mock-ran"
+	local last_run_file="${TEST_DIR}/.aidevops/logs/cleanup_worktrees.last-run"
+	local cleanup_log="${TEST_DIR}/.aidevops/logs/cleanup_worktrees.log"
+	rm -f "$mock_ran" "$last_run_file" "$cleanup_log"
+
+	MOCK_REGISTRY_RECONCILE_EXIT=1 MOCK_CLEANUP_EXIT=0 run_helper_in_isolation || true
+	if [[ -f "$mock_ran" && -f "$last_run_file" ]] &&
+		grep -q "registry reconciliation failed closed; continuing guarded cleanup" "$cleanup_log" 2>/dev/null; then
+		print_result "registry-reconcile: failure is logged and guarded cleanup continues" 0
+	else
+		print_result "registry-reconcile: failure is logged and guarded cleanup continues" 1 \
+			"cleanup marker, last-run, or failure diagnostic missing"
 	fi
 	return 0
 }
@@ -276,6 +432,47 @@ test_stale_pid_reclaim() {
 }
 
 # ============================================================
+# Ownerless locks: missing, empty and invalid owners respect the age grace.
+# ============================================================
+test_ownerless_lock() {
+	local owner="$1"
+	local freshness="$2"
+	local logs_dir="${TEST_DIR}/.aidevops/logs"
+	local lock_dir="${logs_dir}/cleanup_worktrees.lock"
+	local mock_ran="${TEST_DIR}/mock-ran"
+	local cleanup_log="${logs_dir}/cleanup_worktrees.log"
+	mkdir -p "$lock_dir"
+	case "$owner" in
+	empty) printf '' >"${lock_dir}/pid" ;;
+	invalid) printf 'not-a-pid\n' >"${lock_dir}/pid" ;;
+	missing) ;;
+	esac
+	if [[ "$freshness" == "old" ]]; then
+		# Portable touch format; no real-time waits or GNU-only date arithmetic.
+		touch -t 200001010000 "$lock_dir"
+	fi
+	AIDEVOPS_LOCK_OWNERLESS_GRACE_SECONDS=300 MOCK_CLEANUP_EXIT=0 run_helper_in_isolation
+	if [[ "$freshness" == "old" ]]; then
+		if [[ -f "$mock_ran" && ! -d "$lock_dir" ]] &&
+			grep -Eq 'Reclaiming ownerless lock \(age [0-9]+s\)' "$cleanup_log"; then
+			print_result "ownerless-${owner}: old lock reclaimed and cleanup runs" 0
+		else
+			print_result "ownerless-${owner}: old lock reclaimed and cleanup runs" 1 \
+				"cleanup, lock release, or age diagnostic missing"
+		fi
+	else
+		if [[ ! -f "$mock_ran" && -d "$lock_dir" ]] &&
+			grep -q 'Young ownerless lock' "$cleanup_log"; then
+			print_result "ownerless-${owner}: young lock protected" 0
+		else
+			print_result "ownerless-${owner}: young lock protected" 1 \
+				"young lock reclaimed or skip reason missing"
+		fi
+	fi
+	return 0
+}
+
+# ============================================================
 # TEST 6: failed cleanup — last-run NOT updated on non-zero exit
 # ============================================================
 test_failed_cleanup_no_last_run_update() {
@@ -347,6 +544,7 @@ test_term_exits_and_releases_lock() {
 	local helper_pid=""
 	local attempts=0
 	mkdir -p "$stub_dir"
+	cp "${SCRIPT_DIR}/../cleanup-worktrees-lock.sh" "${stub_dir}/cleanup-worktrees-lock.sh"
 	rm -rf "$lock_dir"
 	rm -f "$mock_ran"
 
@@ -416,6 +614,13 @@ test_async_lock_helpers_install_terminating_traps() {
 		cleanup-remote-branches-async-helper.sh \
 		opencode-db-archive-async-helper.sh; do
 		helper_path="${scripts_dir}/${helper_name}"
+		if [[ "$helper_name" == cleanup-worktrees-async-helper.sh ]]; then
+			# shellcheck disable=SC2016 # Verify the literal shared-library source contract.
+			if ! grep -Fq 'source "${SCRIPT_DIR}/cleanup-worktrees-lock.sh"' "$helper_path"; then
+				invalid_helpers="${invalid_helpers}${invalid_helpers:+, }${helper_name}"
+			fi
+			helper_path="${scripts_dir}/cleanup-worktrees-lock.sh"
+		fi
 		if ! grep -Fq "trap '_lock_signal_exit 130' INT" "$helper_path" ||
 			! grep -Fq "trap '_lock_signal_exit 143' TERM" "$helper_path"; then
 			invalid_helpers="${invalid_helpers}${invalid_helpers:+, }${helper_name}"
@@ -490,11 +695,107 @@ test_archive_outcome_summary_is_logged() {
 
 	MOCK_CLEANUP_EXIT=0 MOCK_REMOVED_COUNT=3 MOCK_ARCHIVED_COUNT=2 \
 		MOCK_ARCHIVE_FAILED_COUNT=1 run_helper_in_isolation || true
-	if grep -q 'outcome=success removed=3 archived=2 archive_failed=1' "$cleanup_log" 2>/dev/null; then
-		print_result "archive-summary: async cleanup reports archive/delete outcomes" 0
+	if grep -q 'outcome=success removed=3 archived=2 archive_failed=1 skip_reasons=none' "$cleanup_log" 2>/dev/null; then
+		print_result "archive-summary: async cleanup reports archive/delete outcomes and skip reasons" 0
 	else
-		print_result "archive-summary: async cleanup reports archive/delete outcomes" 1 \
+		print_result "archive-summary: async cleanup reports archive/delete outcomes and skip reasons" 1 \
 			"structured archive outcome summary missing"
+	fi
+	return 0
+}
+
+test_missing_metadata_prune_runs_after_success() {
+	local cleanup_log="${TEST_DIR}/.aidevops/logs/cleanup_worktrees.log"
+	local metadata_prune_ran="${TEST_DIR}/metadata-prune-ran"
+	local prunable_target="${TEST_DIR}/missing-worktree"
+	rm -f "$cleanup_log" "$metadata_prune_ran"
+
+	MOCK_CLEANUP_EXIT=0 MOCK_PRUNABLE_TARGET="$prunable_target" run_helper_in_isolation || true
+	if [[ -f "$metadata_prune_ran" ]] && grep -q "METADATA_PRUNE_RAN" "$metadata_prune_ran" 2>/dev/null &&
+		grep -q "pruned missing worktree metadata repo=${TEST_DIR}/repo" "$cleanup_log" 2>/dev/null; then
+		print_result "metadata-prune: async cleanup prunes stale gitdir entries after success" 0
+	else
+		print_result "metadata-prune: async cleanup prunes stale gitdir entries after success" 1 \
+			"metadata prune marker or log entry missing"
+	fi
+	return 0
+}
+
+# GH#32913: the API-free prune must not depend on the GitHub-bound cleanup.
+test_missing_metadata_prune_runs_when_cleanup_skipped() {
+	local metadata_prune_ran="${TEST_DIR}/metadata-prune-ran"
+	rm -f "$metadata_prune_ran"
+
+	MOCK_CLEANUP_SKIPPED=1 MOCK_PRUNABLE_TARGET="${TEST_DIR}/missing-worktree" run_helper_in_isolation || true
+	if grep -q "METADATA_PRUNE_RAN" "$metadata_prune_ran" 2>/dev/null; then
+		print_result "metadata-prune: runs even when GitHub-bound cleanup is skipped" 0
+	else
+		print_result "metadata-prune: runs even when GitHub-bound cleanup is skipped" 1 \
+			"metadata prune did not run on a safety-skipped cleanup cycle"
+	fi
+	return 0
+}
+
+test_compact_retention_policy() {
+	local policy=""
+	local marker=""
+	for policy in dry-run apply off invalid; do
+		teardown
+		setup
+		marker="${TEST_DIR}/compact-retention-ran"
+		AIDEVOPS_WORKTREE_ARCHIVE_RETENTION_MODE="$policy" run_helper_in_isolation
+		if [[ "$policy" == "dry-run" || "$policy" == "apply" ]]; then
+			if grep -q -- "prune --older-than 14d --max-total-size 20G --${policy} --budget-seconds 540" "$marker"; then
+				print_result "compact-retention: ${policy} forwards bounded policy" 0
+			else
+				print_result "compact-retention: ${policy} forwards bounded policy" 1
+			fi
+		elif ! grep -q '^prune' "$marker" 2>/dev/null; then
+			print_result "compact-retention: ${policy} never deletes" 0
+		else
+			print_result "compact-retention: ${policy} never deletes" 1
+		fi
+		# GH#36468: dead verification scratch is reclaimed in every mode.
+		if grep -qx 'sweep-scratch' "$marker" 2>/dev/null; then
+			print_result "compact-retention: ${policy} reclaims dead verify scratch" 0
+		else
+			print_result "compact-retention: ${policy} reclaims dead verify scratch" 1
+		fi
+	done
+	return 0
+}
+
+test_compact_retention_defaults_config_and_failure() {
+	AIDEVOPS_WORKTREE_ARCHIVE_RETENTION_MODE="" run_helper_in_isolation
+	if grep -q -- '--dry-run' "${TEST_DIR}/compact-retention-ran"; then
+		print_result "compact-retention: default is non-destructive preview" 0
+	else
+		print_result "compact-retention: default is non-destructive preview" 1
+	fi
+	teardown
+	setup
+	AIDEVOPS_WORKTREE_ARCHIVE_RETENTION_MODE="" MOCK_RETENTION_CONFIG_MODE=apply run_helper_in_isolation
+	if grep -q -- '--apply' "${TEST_DIR}/compact-retention-ran"; then
+		print_result "compact-retention: persisted operator opt-in is read" 0
+	else
+		print_result "compact-retention: persisted operator opt-in is read" 1
+	fi
+	teardown
+	setup
+	MOCK_ARCHIVE_RETENTION_EXIT=1 run_helper_in_isolation
+	if [[ -f "${TEST_DIR}/.aidevops/logs/cleanup_worktrees.last-run" ]] &&
+		grep -q 'compact-retention mode=dry-run rc=1' "${TEST_DIR}/.aidevops/logs/cleanup_worktrees.log"; then
+		print_result "compact-retention: failure is logged without blocking other cleanup" 0
+	else
+		print_result "compact-retention: failure is logged without blocking other cleanup" 1
+	fi
+	teardown
+	setup
+	MOCK_CLEANUP_SKIPPED=1 run_helper_in_isolation
+	if ! grep -q '^prune' "${TEST_DIR}/compact-retention-ran" 2>/dev/null; then
+		print_result "compact-retention: safety-skipped cleanup never applies retention" 0
+	else
+		print_result "compact-retention: safety-skipped cleanup never applies retention" 1
 	fi
 	return 0
 }
@@ -502,6 +803,144 @@ test_archive_outcome_summary_is_logged() {
 # ============================================================
 # MAIN
 # ============================================================
+
+test_lifecycle_only_never_expires_recovery() {
+	mkdir -p "${TEST_DIR}/scripts"
+	cat >"${TEST_DIR}/scripts/worktree_lifecycle_status.py" <<PY
+from pathlib import Path
+import sys
+assert sys.argv[1:] == ["reconcile", "--max-attempts", "5"]
+Path("${TEST_DIR}/receipt-reconcile-ran").touch()
+print('{"completed": 0}')
+PY
+	AIDEVOPS_WORKTREE_ARCHIVE_RETENTION_MODE=apply run_helper_in_isolation --lifecycle-only
+	if [[ -f "${TEST_DIR}/mock-ran" && -f "${TEST_DIR}/receipt-reconcile-ran" &&
+		! -e "${TEST_DIR}/maintenance-ran" && ! -e "${TEST_DIR}/compact-retention-ran" &&
+		! -e "${TEST_DIR}/dirty-prune-ran" ]]; then
+		print_result "lifecycle-only: reconcile and cleanup run without any recovery expiry" 0
+	else
+		print_result "lifecycle-only: reconcile and cleanup run without any recovery expiry" 1
+	fi
+	return 0
+}
+
+# GH#37330: capacity pressure scales the cleanup_worktrees budget outside
+# --lifecycle-only; routine runs keep 120 s and invalid overrides fall back.
+_budget_after_run() {
+	local budget_file="${TEST_DIR}/cleanup-budget"
+	rm -f "$budget_file" "${TEST_DIR}/.aidevops/logs/cleanup_worktrees.last-run"
+	run_helper_in_isolation "$@" >/dev/null
+	cat "$budget_file" 2>/dev/null || printf 'missing\n'
+	return 0
+}
+
+test_cleanup_budget_scales_under_pressure() {
+	local log="${TEST_DIR}/.aidevops/logs/cleanup_worktrees.log"
+	local routine="" pressured="" lifecycle="" invalid="" override=""
+	routine=$(MOCK_PRESSURE=0 _budget_after_run)
+	pressured=$(MOCK_PRESSURE=1 _budget_after_run)
+	lifecycle=$(MOCK_PRESSURE=1 _budget_after_run --lifecycle-only)
+	invalid=$(MOCK_PRESSURE=1 CLEANUP_WORKTREES_PRESSURE_BUDGET=abc _budget_after_run)
+	override=$(MOCK_PRESSURE=1 CLEANUP_WORKTREES_PRESSURE_BUDGET=300 _budget_after_run)
+	if [[ "$routine" == 120 && "$pressured" == 900 && "$lifecycle" == 120 &&
+		"$invalid" == 900 && "$override" == 300 ]] &&
+		grep -q 'cleanup budget=900 reason=capacity-pressure' "$log"; then
+		print_result "budget: pressure scales cleanup_worktrees outside lifecycle-only" 0
+	else
+		print_result "budget: pressure scales cleanup_worktrees outside lifecycle-only" 1 \
+			"routine=${routine} pressured=${pressured} lifecycle=${lifecycle} invalid=${invalid} override=${override}"
+	fi
+	return 0
+}
+
+test_headroom_bypasses_cadence() {
+	local logs="${TEST_DIR}/.aidevops/logs"
+	mkdir -p "$logs"
+	date +%s >"${logs}/cleanup_worktrees.last-run"
+	MOCK_HEADROOM_LOW=1 run_helper_in_isolation >/dev/null
+	if [[ "$(<"${TEST_DIR}/cleanup-budget")" == 900 ]] &&
+		grep -q 'cleanup budget=900 reason=disk-headroom' "${logs}/cleanup_worktrees.log"; then
+		print_result "headroom: pressure bypasses cadence with distinct reason" 0
+	else
+		print_result "headroom: pressure bypasses cadence with distinct reason" 1
+	fi
+	return 0
+}
+
+test_headroom_real_snapshot() {
+	# Exercise the real probe without running retirement on this host.
+	source "${SCRIPT_DIR}/../disk-capacity-lib.sh"
+	if aidevops_disk_capacity_snapshot "$TEST_DIR" &&
+		AIDEVOPS_WORKTREE_CLEANUP_FREE_KB=0 AIDEVOPS_WORKTREE_CLEANUP_FREE_PERCENT=100 aidevops_worktree_cleanup_headroom_low &&
+		! AIDEVOPS_WORKTREE_CLEANUP_FREE_KB=0 AIDEVOPS_WORKTREE_CLEANUP_FREE_PERCENT=0 aidevops_worktree_cleanup_headroom_low; then
+		print_result "headroom: real snapshot honors percentage overrides" 0
+	else
+		print_result "headroom: real snapshot honors percentage overrides" 1
+	fi
+	return 0
+}
+
+test_capacity_mode_is_scoped_and_locked() {
+	local logs="${TEST_DIR}/.aidevops/logs" rc=0
+	git init -q "${TEST_DIR}/repo"
+	mkdir -p "$logs"
+	date +%s >"${logs}/cleanup_worktrees.last-run"
+	AIDEVOPS_WORKTREE_ARCHIVE_RETENTION_MODE=apply run_helper_in_isolation --capacity "${TEST_DIR}/repo" 7
+	if [[ "$(<"${TEST_DIR}/capacity-ran")" == "7 ${TEST_DIR}/repo" &&
+		! -e "${TEST_DIR}/mock-ran" && ! -e "${TEST_DIR}/maintenance-ran" &&
+		! -e "${TEST_DIR}/compact-retention-ran" && ! -e "${TEST_DIR}/registry-reconcile-ran" &&
+		! -e "${TEST_DIR}/dirty-prune-ran" && ! -d "${logs}/cleanup_worktrees.lock" ]]; then
+		print_result "capacity: bypass cadence but not scope, maintenance or lock release" 0
+	else
+		print_result "capacity: bypass cadence but not scope, maintenance or lock release" 1
+	fi
+	mkdir "${logs}/cleanup_worktrees.lock"
+	printf '%s\n' "$$" >"${logs}/cleanup_worktrees.lock/pid"
+	rm -f "${TEST_DIR}/capacity-ran"
+	env HOME="$TEST_DIR" bash "${TEST_DIR}/scripts/cleanup-worktrees-async-helper.sh" --capacity "${TEST_DIR}/repo" 7 || rc=$?
+	if [[ "$rc" == 75 && ! -e "${TEST_DIR}/capacity-ran" ]]; then
+		print_result "capacity: async lock contention returns actionable status without cleanup" 0
+	else
+		print_result "capacity: async lock contention returns actionable status without cleanup" 1
+	fi
+	return 0
+}
+
+test_turbo_cache_prune() {
+	local repo="${TEST_DIR}/turbo-repo"
+	local helper="${SCRIPT_DIR}/../worktree-artefact-reclaim.sh"
+	mkdir -p "$repo/.turbo/cache"
+	"$TEST_NATIVE_GIT" -C "$repo" init -q
+	printf '.turbo/\n' >"$repo/.gitignore"
+	printf '{}\n' >"$repo/turbo.json"
+	printf 'old' >"$repo/.turbo/cache/old"
+	printf 'new' >"$repo/.turbo/cache/new"
+	touch -t 202001010000 "$repo/.turbo/cache/old"
+	ln -s "$repo/turbo.json" "$repo/.turbo/cache/link"
+	AIDEVOPS_TURBO_CACHE_MAX_SIZE=20G bash "$helper" --turbo-cache "$repo" >"$TEST_DIR/turbo-log"
+	if [[ ! -e "$repo/.turbo/cache/old" && -f "$repo/.turbo/cache/new" && -L "$repo/.turbo/cache/link" ]] &&
+		grep -q 'removed_files=1' "$TEST_DIR/turbo-log"; then
+		print_result 'turbo: age pruning preserves new files and symlinks' 0
+	else
+		print_result 'turbo: age pruning preserves new files and symlinks' 1
+	fi
+	printf 'another' >"$repo/.turbo/cache/another"
+	AIDEVOPS_TURBO_CACHE_MAX_SIZE=1 bash "$helper" --turbo-cache "$repo" >"$TEST_DIR/turbo-log"
+	if [[ ! -e "$repo/.turbo/cache/new" && ! -e "$repo/.turbo/cache/another" && -L "$repo/.turbo/cache/link" ]]; then
+		print_result 'turbo: size cap removes oldest regular entries' 0
+	else
+		print_result 'turbo: size cap removes oldest regular entries' 1
+	fi
+	printf 'preserve' >"$repo/.turbo/cache/keep"
+	printf '' >"$repo/.gitignore"
+	AIDEVOPS_TURBO_CACHE_MAX_SIZE=1 bash "$helper" --turbo-cache "$repo"
+	if [[ -f "$repo/.turbo/cache/keep" ]]; then
+		print_result 'turbo: nonignored cache is untouched' 0
+	else
+		print_result 'turbo: nonignored cache is untouched' 1
+	fi
+	return 0
+}
 
 main() {
 	echo "Running cleanup-worktrees-async-helper.sh tests"
@@ -514,7 +953,15 @@ main() {
 
 	setup
 
+	test_turbo_cache_prune
+	teardown
+	setup
 	test_cold_start
+	teardown
+	setup
+	test_registry_reconciliation_failure_is_isolated
+	teardown
+	setup
 	test_last_run_updated
 
 	# Must re-setup between tests that share state
@@ -529,6 +976,15 @@ main() {
 	teardown
 	setup
 	test_stale_pid_reclaim
+
+	local owner freshness
+	for owner in missing empty invalid; do
+		for freshness in old young; do
+			teardown
+			setup
+			test_ownerless_lock "$owner" "$freshness"
+		done
+	done
 
 	teardown
 	setup
@@ -565,6 +1021,17 @@ main() {
 	teardown
 	setup
 	test_archive_outcome_summary_is_logged
+
+	local test_case
+	for test_case in test_missing_metadata_prune_runs_after_success \
+		test_missing_metadata_prune_runs_when_cleanup_skipped \
+		test_compact_retention_policy test_compact_retention_defaults_config_and_failure \
+		test_lifecycle_only_never_expires_recovery test_capacity_mode_is_scoped_and_locked \
+		test_cleanup_budget_scales_under_pressure test_headroom_bypasses_cadence test_headroom_real_snapshot; do
+		teardown
+		setup
+		"$test_case"
+	done
 
 	echo ""
 	echo "Results: ${TESTS_PASSED}/${TESTS_RUN} passed, ${TESTS_FAILED} failed"

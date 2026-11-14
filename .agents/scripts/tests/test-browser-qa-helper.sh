@@ -7,6 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit
 HELPER="${SCRIPT_DIR}/../browser-qa-helper.sh"
 PLAYWRIGHT_RUNTIME="${SCRIPT_DIR}/../playwright-runtime.mjs"
+JOURNEY_RUNNER="${SCRIPT_DIR}/../browser-qa-journey.mjs"
 
 readonly TEST_RED='\033[0;31m'
 readonly TEST_GREEN='\033[0;32m'
@@ -70,8 +71,13 @@ test_resolve_clamps_to_anthropic_limit() {
 }
 
 test_guardrail_resizes_oversized_images() {
-	local tmp_dir
+	local tmp_dir original_path
 	tmp_dir=$(mktemp -d)
+	mkdir -p "${tmp_dir}/bin"
+	touch "${tmp_dir}/bin/magick"
+	chmod +x "${tmp_dir}/bin/magick"
+	original_path="$PATH"
+	PATH="${tmp_dir}/bin:${PATH}"
 	touch "${tmp_dir}/small.png"
 	touch "${tmp_dir}/large.png"
 
@@ -108,12 +114,18 @@ test_guardrail_resizes_oversized_images() {
 	fi
 
 	rm -rf "$tmp_dir"
+	PATH="$original_path"
 	return 0
 }
 
 test_guardrail_fails_hard_limit_violation() {
-	local tmp_dir
+	local tmp_dir original_path
 	tmp_dir=$(mktemp -d)
+	mkdir -p "${tmp_dir}/bin"
+	touch "${tmp_dir}/bin/magick"
+	chmod +x "${tmp_dir}/bin/magick"
+	original_path="$PATH"
+	PATH="${tmp_dir}/bin:${PATH}"
 	touch "${tmp_dir}/too-large.png"
 
 	get_image_dimensions() {
@@ -141,6 +153,7 @@ test_guardrail_fails_hard_limit_violation() {
 	fi
 
 	rm -rf "$tmp_dir"
+	PATH="$original_path"
 	return 0
 }
 
@@ -188,6 +201,27 @@ test_stability_unknown_option_rejected() {
 		print_result "stability: unknown option rejected" 0
 	else
 		print_result "stability: unknown option rejected" 1 "expected non-zero exit for unknown option"
+	fi
+	return 0
+}
+
+test_journey_requires_config_and_environment() {
+	local output exit_code
+	exit_code=0
+	output=$(cmd_journey --config /definitely/missing.json --environment test 2>&1) || exit_code=$?
+	if [[ "$exit_code" -ne 0 ]] && printf '%s' "$output" | grep -q "requires an existing"; then
+		print_result "journey: missing config is rejected before browser launch" 0
+	else
+		print_result "journey: missing config is rejected before browser launch" 1 "expected missing config error, got exit=${exit_code}"
+	fi
+	return 0
+}
+
+test_journey_runner_syntax() {
+	if node --check "$JOURNEY_RUNNER" >/dev/null 2>&1; then
+		print_result "journey: runner has valid Node syntax" 0
+	else
+		print_result "journey: runner has valid Node syntax" 1 "node --check failed"
 	fi
 	return 0
 }
@@ -243,8 +277,11 @@ test_runtime_resolves_npx_cached_package() {
 	local fake_modules="${tmp_dir}/cache/node_modules"
 	local isolated_dir="${tmp_dir}/isolated"
 	local browser_path="${tmp_dir}/chromium"
+	local brave_path="${fake_bin}/brave"
+	local brave_windows_path="${fake_bin}/brave.exe"
 	mkdir -p "$fake_bin" "${fake_modules}/.bin" "${fake_modules}/playwright" "$isolated_dir"
-	touch "$browser_path"
+	touch "$browser_path" "$brave_path" "$brave_windows_path"
+	chmod +x "$brave_path" "$brave_windows_path"
 
 	cat >"${fake_modules}/playwright/package.json" <<'JSON'
 {"name":"playwright","type":"module","exports":"./index.mjs"}
@@ -272,6 +309,8 @@ SH
 		PATH="${node_path%/*}:/usr/bin:/bin" node --input-type=module -e "import('playwright')"
 	) >/dev/null 2>&1 || direct_exit=$?
 
+	# Keep the framework-owned runtime prefix out of this npx-fallback case.
+	export AIDEVOPS_PLAYWRIGHT_RUNTIME_DIR="${tmp_dir}/no-owned-runtime"
 	local resolved=""
 	resolved=$(
 		AIDEVOPS_PLAYWRIGHT_MODULE="" \
@@ -280,11 +319,23 @@ SH
 			PATH="${fake_bin}:${node_path%/*}:/usr/bin:/bin" \
 			node "$PLAYWRIGHT_RUNTIME" check
 	) || true
+	local brave_status=""
+	brave_status=$(
+		AIDEVOPS_PLAYWRIGHT_MODULE="${fake_modules}/playwright/index.mjs" \
+			FAKE_PLAYWRIGHT_BROWSER="$browser_path" \
+			PATH="${fake_bin}:${node_path%/*}:/usr/bin:/bin" \
+			node "$PLAYWRIGHT_RUNTIME" status
+	) || true
+	local status_prefers_brave=0
+	if node -e 'const s=JSON.parse(process.argv[1]); process.exit(s.browserBinaryAvailable && s.browserExecutable !== process.argv[2] && /(?:Brave Browser|brave(?:-browser)?(?:\.exe)?)$/.test(s.browserExecutable) ? 0 : 1)' "$brave_status" "$browser_path"; then
+		status_prefers_brave=1
+	fi
 
 	rm -f "$browser_path"
 	local missing_browser_status=""
 	missing_browser_status=$(
 		AIDEVOPS_PLAYWRIGHT_MODULE="" \
+			AIDEVOPS_PLAYWRIGHT_BROWSER="chromium" \
 			FAKE_PLAYWRIGHT_BROWSER="$browser_path" \
 			FAKE_PLAYWRIGHT_MODULES="$fake_modules" \
 			PATH="${fake_bin}:${node_path%/*}:/usr/bin:/bin" \
@@ -295,13 +346,152 @@ SH
 		status_distinguishes_browser=1
 	fi
 
-	if [[ "$direct_exit" -ne 0 && "$resolved" == *"${fake_modules}/playwright/index.mjs" && "$status_distinguishes_browser" -eq 1 && ! -e "${isolated_dir}/package.json" && ! -d "${isolated_dir}/node_modules" ]]; then
-		print_result "runtime resolves npx cache when bare import fails" 0
+	if [[ "$direct_exit" -ne 0 && "$resolved" == *"${fake_modules}/playwright/index.mjs" && "$status_prefers_brave" -eq 1 && "$status_distinguishes_browser" -eq 1 && ! -e "${isolated_dir}/package.json" && ! -d "${isolated_dir}/node_modules" ]]; then
+		print_result "runtime resolves npx cache and prefers Brave" 0
 	else
-		print_result "runtime resolves npx cache when bare import fails" 1 "direct_exit=${direct_exit}, resolved=${resolved:-none}, browser_status=${missing_browser_status:-none}"
+		print_result "runtime resolves npx cache and prefers Brave" 1 "direct_exit=${direct_exit}, resolved=${resolved:-none}, brave_status=${brave_status:-none}, browser_status=${missing_browser_status:-none}"
+	fi
+
+	unset AIDEVOPS_PLAYWRIGHT_RUNTIME_DIR
+	rm -rf "$tmp_dir"
+	return 0
+}
+
+# GH#32589: real `npx --no-install` fails whenever the registry's latest
+# version is not cached, so the setup-owned prefix must resolve without npx.
+test_runtime_resolves_owned_prefix_without_npx() {
+	local tmp_dir
+	tmp_dir=$(mktemp -d)
+	local fake_bin="${tmp_dir}/bin"
+	local runtime_dir="${tmp_dir}/runtimes/playwright"
+	local owned_pkg="${runtime_dir}/node_modules/playwright"
+	local browser_path="${tmp_dir}/chromium"
+	mkdir -p "$fake_bin" "$owned_pkg" "${tmp_dir}/isolated"
+	touch "$browser_path"
+	chmod +x "$browser_path"
+
+	cat >"${owned_pkg}/package.json" <<'JSON'
+{"name":"playwright","version":"9.9.9","type":"module","exports":"./index.mjs"}
+JSON
+	cat >"${owned_pkg}/index.mjs" <<'JS'
+export const chromium = { executablePath: () => process.env.FAKE_PLAYWRIGHT_BROWSER };
+JS
+	printf '#!/usr/bin/env bash\nexit 1\n' >"${fake_bin}/npx"
+	chmod +x "${fake_bin}/npx"
+
+	local node_path
+	node_path=$(command -v node)
+	local runtime_env=(
+		AIDEVOPS_PLAYWRIGHT_MODULE=""
+		AIDEVOPS_PLAYWRIGHT_EXECUTABLE=""
+		AIDEVOPS_PLAYWRIGHT_BROWSER="chromium"
+		AIDEVOPS_PLAYWRIGHT_RUNTIME_DIR="$runtime_dir"
+		FAKE_PLAYWRIGHT_BROWSER="$browser_path"
+		PATH="${fake_bin}:${node_path%/*}:/usr/bin:/bin"
+	)
+	local resolved="" check_ok=0 stale_ok=0
+	resolved=$(cd "${tmp_dir}/isolated" && env "${runtime_env[@]}" node "$PLAYWRIGHT_RUNTIME" check) || true
+	if (cd "${tmp_dir}/isolated" && env "${runtime_env[@]}" AIDEVOPS_PLAYWRIGHT_VERSION="9.9.9" \
+		node "$PLAYWRIGHT_RUNTIME" runtime-check >/dev/null); then
+		check_ok=1
+	fi
+	if ! (cd "${tmp_dir}/isolated" && env "${runtime_env[@]}" AIDEVOPS_PLAYWRIGHT_VERSION="9.9.10" \
+		node "$PLAYWRIGHT_RUNTIME" runtime-check >/dev/null); then
+		stale_ok=1
+	fi
+
+	if [[ "$resolved" == *"${owned_pkg}/index.mjs" && "$check_ok" -eq 1 && "$stale_ok" -eq 1 ]]; then
+		print_result "runtime resolves setup-owned prefix without npx" 0
+	else
+		print_result "runtime resolves setup-owned prefix without npx" 1 "resolved=${resolved:-none}, runtime_check=${check_ok}, stale_detected=${stale_ok}"
+	fi
+
+	# GH#36181: with bundled Chromium removed, a valid configured executable
+	# satisfies readiness; unset, invalid or stale-pin cases do not.
+	local missing_env=("${runtime_env[@]}" FAKE_PLAYWRIGHT_BROWSER="${tmp_dir}/removed-chromium" AIDEVOPS_PLAYWRIGHT_VERSION="9.9.9")
+	local configured_ok=0 unset_ok=0 invalid_ok=0 configured_stale_ok=0 configured_status=""
+	if configured_status=$(cd "${tmp_dir}/isolated" && env "${missing_env[@]}" AIDEVOPS_PLAYWRIGHT_EXECUTABLE="$browser_path" \
+		node "$PLAYWRIGHT_RUNTIME" runtime-check) &&
+		[[ "$configured_status" == *"\"configuredExecutable\":\"${browser_path}\""* ]]; then
+		configured_ok=1
+	fi
+	if ! (cd "${tmp_dir}/isolated" && env "${missing_env[@]}" node "$PLAYWRIGHT_RUNTIME" runtime-check >/dev/null); then
+		unset_ok=1
+	fi
+	if ! (cd "${tmp_dir}/isolated" && env "${missing_env[@]}" AIDEVOPS_PLAYWRIGHT_EXECUTABLE="${tmp_dir}" \
+		node "$PLAYWRIGHT_RUNTIME" runtime-check >/dev/null); then
+		invalid_ok=1
+	fi
+	if ! (cd "${tmp_dir}/isolated" && env "${missing_env[@]}" AIDEVOPS_PLAYWRIGHT_EXECUTABLE="$browser_path" \
+		AIDEVOPS_PLAYWRIGHT_VERSION="9.9.10" node "$PLAYWRIGHT_RUNTIME" runtime-check >/dev/null); then
+		configured_stale_ok=1
+	fi
+	if [[ "$configured_ok" -eq 1 && "$unset_ok" -eq 1 && "$invalid_ok" -eq 1 && "$configured_stale_ok" -eq 1 ]]; then
+		print_result "runtime-check accepts a valid configured executable" 0
+	else
+		print_result "runtime-check accepts a valid configured executable" 1 "configured=${configured_ok}, unset=${unset_ok}, invalid=${invalid_ok}, stale=${configured_stale_ok}"
 	fi
 
 	rm -rf "$tmp_dir"
+	return 0
+}
+
+# GH#34425: execute URL resolution from every generated script, without a browser.
+test_generated_page_urls() {
+	local script_dir
+	script_dir=$(mktemp -d)
+	local base_url="https://example.com/dir/page?q=1/#section/"
+	local safe_url
+	safe_url=$(js_escape_string "$base_url")
+	local pages_default generator
+	local result=0
+	for pages_default in true false; do
+		for generator in screenshot screenshot-evidence smoke stability a11y; do
+			local script_file="${script_dir}/${generator}.mjs"
+			case "$generator" in
+			screenshot) _generate_screenshot_script "$script_file" "$safe_url" "{name:'desktop',width:1440,height:900}" "'/'" "$script_dir" 30000 false "$pages_default" ;;
+			screenshot-evidence)
+				_generate_screenshot_script "$script_file" "$safe_url" "{name:'desktop',width:1440,height:900}" "'/'" "$script_dir" 30000 false "$pages_default" \
+					"$(_build_schemes_js_array "light,dark")" "$(js_escape_string "[data-name='it\`s \$x']")" \
+					"$(js_escape_string "${script_dir}/measure.js")" "$(js_escape_string "after")"
+				;;
+			smoke) _generate_smoke_script "$script_file" "$safe_url" "'/'" 30000 "$pages_default" ;;
+			stability) _generate_stability_script "$script_file" "$safe_url" "'/'" 1 30000 500 10000 "$pages_default" ;;
+			a11y) _generate_a11y_script "$script_file" "$safe_url" "'/'" "$pages_default" ;;
+			esac
+			node --check "$script_file" || result=1
+			node - "$script_file" "$base_url" "$pages_default" <<'JS' || result=1
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const [file, base, useDefault] = process.argv.slice(2);
+const prefix = fs.readFileSync(file, 'utf8').split('async function run()')[0]
+  .replace(/^const playwrightImport = .*$/m, '')
+  .replace(/^const \{ chromium \} = .*$/m, '');
+const resolve = vm.runInNewContext(prefix + '\n(page) => resolvePageUrl(baseUrl, page, pagesDefault)', { URL });
+const defaultExpected = useDefault === 'true';
+for (const page of ['/', '/a', '/b', 'child', '?q=2', '#next', '/a?q=2#next']) {
+  assert.equal(resolve(page), defaultExpected ? base : new URL(page, base).href);
+}
+JS
+		done
+	done
+	rm -rf "$script_dir"
+	print_result "generated scripts preserve default URLs and resolve explicit paths" "$result"
+	return 0
+}
+
+test_frames_arguments() {
+	local result=0 output
+	output=$(cmd_frames --help) || result=1
+	[[ "$output" == *"Frames-specific Options"* ]] || result=1
+	if cmd_frames >/dev/null 2>&1; then result=1; fi
+	if cmd_frames --url >/dev/null 2>&1; then result=1; fi
+	if cmd_frames --url http://localhost --measure-file "$SCRIPT_DIR" >/dev/null 2>&1; then result=1; fi
+	if cmd_frames --url http://localhost --measure-file "$HELPER" --format invalid >/dev/null 2>&1; then result=1; fi
+	if cmd_frames --url http://localhost --measure-file "$HELPER" --no-after --after-selector body >/dev/null 2>&1; then result=1; fi
+	if cmd_frames --unknown value >/dev/null 2>&1; then result=1; fi
+	print_result "frames: help and argument validation" "$result"
 	return 0
 }
 
@@ -329,10 +519,15 @@ main() {
 	test_stability_rejects_invalid_reloads
 	test_stability_rejects_zero_reloads
 	test_stability_unknown_option_rejected
+	test_journey_requires_config_and_environment
+	test_journey_runner_syntax
+	test_frames_arguments
 	test_stability_script_generation
+	test_generated_page_urls
 	test_format_stability_markdown_stable
 	test_format_stability_markdown_unstable
 	test_runtime_resolves_npx_cached_package
+	test_runtime_resolves_owned_prefix_without_npx
 
 	echo "============================================="
 	echo "  Results: ${TESTS_PASSED}/${TESTS_RUN} passed, ${TESTS_FAILED} failed"

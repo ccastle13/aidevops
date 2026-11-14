@@ -5,58 +5,72 @@
 // ---------------------------------------------------------------------------
 
 import { existsSync } from "fs";
-import { execFileSync, execFile } from "child_process";
-import { join } from "path";
-import { recordToolCall } from "./observability.mjs";
-import { extractAndStoreIntent, consumeIntent } from "./intent-tracing.mjs";
+import { execFile } from "child_process";
+import { join, resolve } from "path";
+import { recordToolCall, toolCallSucceeded } from "./observability.mjs";
+import {
+  consumeIntentRecord,
+  peekIntentSource,
+  prepareIntent,
+} from "./intent-tracing.mjs";
 import { recordToolStart, consumeToolDuration } from "./timing-tracing.mjs";
+import {
+  compactSuccessfulBashOutput,
+  isVerboseBashOutput,
+  rememberBashOutputPolicy,
+} from "./output-compaction.mjs";
 import { qualityLog, runFileQualityGate } from "./quality-logging.mjs";
 import { enrichActiveSpan, detectTaskId, detectSessionOrigin } from "./otel-enrichment.mjs";
+import { assertLocalOnlyToolCall, activeLocalOnlyPolicy } from "./local-only-policy.mjs";
 import {
   checkSecretReadGate,
   isReadTool,
   secretReadBlockReason,
 } from "./quality-hooks-secret-read.mjs";
-import { checkSecretReadWithApproval } from "./source-access-approval.mjs";
+import {
+  SOURCE_ACCESS_REASON,
+  checkSecretReadWithApproval,
+  createSourceAccessMutationProvenance,
+} from "./source-access-approval.mjs";
+import {
+  beginObservedSourceMutation,
+  finishObservedSourceAccess,
+} from "./source-access-request.mjs";
 import { checkResearchStagingAccess } from "./research-staging-guard.mjs";
+import { checkRedirectLinkToolGate } from "./quality-hooks-redirect-link.mjs";
+import { checkGrepPathScope } from "./grep-path-guard.mjs";
+import { checkRedactedEdit } from "./redacted-edit-guard.mjs";
 import {
   bindActiveScriptsDir,
+  checkArgvSafetyGate,
   checkCanonicalGitSafetyGate,
   checkCanonicalWriteSafetyGate,
   isApplyPatchMutationTool,
   isDirectFileMutationTool,
 } from "./quality-hooks-git-safety.mjs";
+import { validateBashWorkingDirectory } from "./quality-hooks-workdir.mjs";
+import {
+  appendDisplayRedactionNote,
+  PEM_REDACTION_TOKEN,
+  REDACTION_TOKEN,
+  scrubCredentials,
+  scrubToolOutput,
+} from "./quality-hooks-output-scrub.mjs";
+import { defaultSecretValueRedactor } from "./registered-value-redaction.mjs";
+import { assertPrivateProcessingRead, loadPrivateProcessingPolicy } from "./private-processing-policy.mjs";
+import { assertBrowserTaskTransport } from "./browser-task-transport.mjs";
+import { adviseDockerCreation, appendDockerAdvisory } from "./docker-owner-advisory.mjs";
+import { admitToolOwner } from "./lifecycle-admission.mjs";
+
+export { needsDockerOwnerAdvisory } from "./docker-owner-advisory.mjs";
+
+export { scrubCredentials } from "./quality-hooks-output-scrub.mjs";
 
 // Re-export for consumers that import from this module
 export { scanForSecrets } from "./quality-logging.mjs";
 export { checkSecretReadGate, isReadTool } from "./quality-hooks-secret-read.mjs";
 
-// ---------------------------------------------------------------------------
-// Credential transcript scrub (GH#20207, Layer 4 of t2458)
-// Mirrors shared-constants.sh scrub_credentials regex.
-// Applied in handleToolAfter to redact tokens before they reach the model
-// or are persisted to the SQLite transcript store.
-// ---------------------------------------------------------------------------
-
-const CREDENTIAL_PATTERN =
-  /(^|[^A-Za-z0-9_-])(sk-|GOCSPX-|ghp_|gho_|ghs_|ghu_|github_pat_|glpat-|xoxb-|xoxp-)[A-Za-z0-9_-]{10,}/g;
-
-const REDACTION_TOKEN = "[redacted-credential]";
 const OPERATION_TITLE_MAX_LENGTH = 500;
-
-/**
- * Scrub known credential token prefixes from a string value.
- * @param {string} text
- * @returns {{ scrubbed: string, count: number }}
- */
-export function scrubCredentials(text) {
-  let count = 0;
-  const scrubbed = text.replace(CREDENTIAL_PATTERN, (_match, boundary) => {
-    count++;
-    return `${boundary}${REDACTION_TOKEN}`;
-  });
-  return { scrubbed, count };
-}
 
 /**
  * Prepare an untrusted tool title for bounded, single-line telemetry storage.
@@ -70,49 +84,6 @@ export function sanitizeOperationTitle(title) {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, OPERATION_TITLE_MAX_LENGTH);
-}
-
-/**
- * Recursively scrub credentials from any JSON-serialisable value.
- * @param {unknown} value
- * @returns {{ value: unknown, count: number }}
- */
-function scrubValue(value) {
-  if (typeof value === "string") {
-    const { scrubbed, count } = scrubCredentials(value);
-    return { value: scrubbed, count };
-  }
-  if (Array.isArray(value)) {
-    let total = 0;
-    const result = value.map((item) => {
-      const { value: v, count } = scrubValue(item);
-      total += count;
-      return v;
-    });
-    return { value: result, count: total };
-  }
-  if (value !== null && typeof value === "object") {
-    let total = 0;
-    const result = {};
-    for (const [k, v] of Object.entries(value)) {
-      const { value: scrubbed, count } = scrubValue(v);
-      result[k] = scrubbed;
-      total += count;
-    }
-    return { value: result, count: total };
-  }
-  return { value, count: 0 };
-}
-
-/**
- * Scrub credentials from tool output. Returns the sanitised output and a
- * boolean indicating whether any redaction occurred.
- * @param {unknown} output
- * @returns {{ output: unknown, redacted: boolean }}
- */
-function scrubToolOutput(output) {
-  const { value, count } = scrubValue(output);
-  return { output: value, redacted: count > 0 };
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +106,16 @@ function isWriteOrEditTool(tool) {
  */
 function isBashTool(tool) {
   return tool === "Bash" || tool === "bash";
+}
+
+/**
+ * Check if a tool name is the bounded-operation tool, including MCP-prefixed
+ * names such as `mcp__aidevops__aidevops_bounded_operation`.
+ * @param {string} tool
+ * @returns {boolean}
+ */
+function isBoundedOperationTool(tool) {
+  return typeof tool === "string" && /(?:^|[_.:/])aidevops_bounded_operation$/.test(tool);
 }
 
 // ---------------------------------------------------------------------------
@@ -167,41 +148,11 @@ export {
 };
 
 // ---------------------------------------------------------------------------
-// Pattern tracking
+// Operation logging
 // ---------------------------------------------------------------------------
 
 /**
- * Run a shell command and return stdout, or empty string on failure.
- * @param {string} cmd
- * @param {number} [timeout=5000]
- * @returns {string}
- */
-/**
- * Record a git operation pattern via pattern-tracker-helper.sh.
- * @param {string} scriptsDir
- * @param {string} title
- * @param {string} outputText
- */
-function recordGitPattern(scriptsDir, title, outputText) {
-  const patternTracker = join(scriptsDir, "pattern-tracker-helper.sh");
-  if (!existsSync(patternTracker)) return;
-
-  const success = !outputText.includes("error") && !outputText.includes("fatal");
-  const patternType = success ? "SUCCESS_PATTERN" : "FAILURE_PATTERN";
-
-  try {
-    execFileSync(
-      "bash",
-      [patternTracker, "record", patternType, `git operation: ${title.substring(0, 100)}`, "--tag", "quality-hook"],
-      { encoding: "utf-8", timeout: 5000, stdio: ["pipe", "pipe", "pipe"] },
-    );
-  } catch {
-    // best-effort
-  }
-}
-
-/**
- * Track Bash tool operations (git, lint) for pattern recording.
+ * Log Bash tool operations (git, lint) without subprocess recording.
  * @param {object} ctx - { scriptsDir, logsDir, qualityLogPath }
  * @param {string} title
  * @param {string} outputText
@@ -213,7 +164,6 @@ function trackBashOperation(ctx, title, outputText) {
     // informational telemetry in the quality log: writing it to stderr draws
     // over OpenCode's TUI and makes payload text part of console routing.
     qualityLog(ctx.logsDir, ctx.qualityLogPath, "INFO", `Git operation: ${boundedTitle}`);
-    recordGitPattern(ctx.scriptsDir, boundedTitle, outputText);
   }
 
   if (title.includes("shellcheck") || title.includes("linters-local")) {
@@ -264,18 +214,113 @@ function enforceDirectFileMutationSafety(ctx, input, output) {
   checkCanonicalWriteSafetyGate(filePath, ctx.scriptsDir, writeCwd, patchText);
 }
 
-function handleToolBefore(ctx, log, input, output) {
+function prepareToolIntent(log, input, output) {
+  const callID = input.callID || "";
+  if (!callID) return { callID, intent: "" };
+  const prepared = prepareIntent(callID, output.args, input.tool);
+  output.args = prepared.args;
+  const intent = prepared.intent || "";
+  if (intent) {
+    log("INFO", `Intent [${input.tool}] callID=${callID} source=${peekIntentSource(callID)}: ${intent}`);
+  }
+  return { callID, intent };
+}
+
+function enforceBashToolSafety(ctx, log, input, output, sessionId) {
+  if (!isBashTool(input.tool)) return;
+  const bashArgs = output.args ?? {};
+  const bashCwd = bashArgs.workdir ?? bashArgs.cwd ?? process.cwd();
+  validateBashWorkingDirectory(bashCwd);
+  bashArgs.command = checkCanonicalGitSafetyGate(
+    bashArgs.command || "",
+    ctx.scriptsDir,
+    bashCwd,
+    {
+      activeScriptsDir: ctx.activeScriptsDir,
+      activeScriptsDirBinding: ctx.activeScriptsDirBinding,
+      ownedListenerRoots: ctx.ownedListenerRoots(sessionId),
+    },
+  );
+  // Admit the policy-checked command before trusted signature repair adds
+  // multiline content (or writes its body file); neither changes Git targets.
+  admitToolOwner({
+    scriptsDir: ctx.scriptsDir, repositoryDir: ctx.repositoryDir, input, output,
+    bash: true, bounded: false, client: ctx.client,
+  });
+  const signatureModel = ctx.resolveSessionModel(sessionId);
+  checkSignatureFooterGate(bashArgs.command || "", log, ctx.scriptsDir, output, {
+    model: signatureModel,
+    useProcessModelFallback: false,
+  });
+  adviseDockerCreation(log, input, bashArgs.command || "", sessionId);
+}
+
+// GH#33969: bounded-operation starts get the same worker command policy as
+// Bash, including the owned-listener loopback allowance.
+function enforceBoundedOperationSafety(ctx, input, output, sessionId) {
+  if (!isBoundedOperationTool(input.tool)) return;
+  const args = output.args ?? {};
+  if (args.action !== "start") return;
+  checkArgvSafetyGate(args.command, ctx.scriptsDir, args.cwd || ctx.repositoryDir || process.cwd(), {
+    ownedListenerRoots: ctx.ownedListenerRoots(sessionId),
+  });
+}
+
+function enforceReadAndFileQuality(ctx, log, input, output, { sessionId, sourceContextForPath }) {
+  checkSecretReadWithApproval({
+    tool: input.tool,
+    args: output.args || {},
+    sessionId,
+    scriptsDir: ctx.scriptsDir,
+    repositoryDir: ctx.repositoryDir,
+    callId: input.callID || "",
+    provenance: ctx.sourceAccessProvenance,
+    isReadTool,
+    secretReadBlockReason,
+    checkSecretReadGate,
+    log,
+    verify: ctx.verifySourceAccessReceipt,
+    brokerMatches: ctx.sourceAccessBrokerMatches,
+    requestRun: ctx.sourceAccessRequestRun,
+    sourceContext: sourceContextForPath(output.args?.filePath || output.args?.file_path || ""),
+  });
+  checkGrepPathScope(input.tool, output.args || {}, ctx.repositoryDir);
+  checkResearchStagingAccess(input.tool, output.args || {});
+  checkRedactedEdit(input.tool, output.args || {}, ctx.repositoryDir);
+  if (!isWriteOrEditTool(input.tool)) return;
+  const filePath = output.args?.filePath || output.args?.file_path || "";
+  if (filePath) runFileQualityGate(ctx, filePath, output.args);
+}
+
+async function resolveToolSourceContexts(ctx, input, output, sessionId, after = false) {
+  if (!ctx.sourceAccessRuntime) return () => undefined;
+  const paths = ctx.sourceAccessProvenance.contextPaths(sessionId, input, output, after);
+  const path = output.args?.filePath || output.args?.file_path || "";
+  if (!after && isReadTool(input.tool) && path && secretReadBlockReason(path) === SOURCE_ACCESS_REASON) {
+    paths.push(path);
+  }
+  try {
+    const contexts = await ctx.sourceAccessRuntime.contexts(sessionId, paths);
+    return (filePath) => contexts.get(resolve(filePath));
+  } catch {
+    return () => undefined;
+  }
+}
+
+async function handleToolBefore(ctx, log, input, output) {
+  assertBrowserTaskTransport(input, output);
+  assertLocalOnlyToolCall(input.tool, output.args || {}, {
+    ...activeLocalOnlyPolicy(), directory: ctx.repositoryDir,
+  });
+  assertPrivateProcessingRead({ tool: input.tool, args: output.args || {},
+    repositoryDir: ctx.repositoryDir, sessionID: input.sessionID || input.sessionId || "",
+    classification: ctx.privateProcessingPolicy });
   ctx.continuationGuard?.beforeTool(input, output);
+  // GH#35655: never resolve/fetch/open redirect links via URL-bearing tools.
+  checkRedirectLinkToolGate(input.tool, output.args || {}, ctx.scriptsDir);
   enforceDirectFileMutationSafety(ctx, input, output);
 
-  const callID = input.callID || "";
-  let intent = "";
-  if (callID && output.args) {
-    intent = extractAndStoreIntent(callID, output.args) || "";
-    if (intent) {
-      log("INFO", `Intent [${input.tool}] callID=${callID}: ${intent}`);
-    }
-  }
+  const { callID, intent } = prepareToolIntent(log, input, output);
 
   // t2184: pair with tool.execute.after to compute duration_ms for the
   // tool_calls INSERT. recordToolStart no-ops on empty callID.
@@ -294,46 +339,59 @@ function handleToolBefore(ctx, log, input, output) {
   }).catch(() => {});
 
   const sessionId = input.sessionID || input.sessionId || input.session?.id || "";
-  if (isBashTool(input.tool)) {
-    const bashArgs = output.args ?? {};
-    const bashCwd = bashArgs.workdir || bashArgs.cwd || process.cwd();
-    bashArgs.command = checkCanonicalGitSafetyGate(
-      bashArgs.command || "",
-      ctx.scriptsDir,
-      bashCwd,
-      {
-        activeScriptsDir: ctx.activeScriptsDir,
-        activeScriptsDirBinding: ctx.activeScriptsDirBinding,
-      },
-    );
-    // t2685: pass scriptsDir + output so the hook can repair (mutate
-    // output.args.command) or block (throw) as appropriate.
-    const signatureModel = ctx.resolveSessionModel(sessionId);
-    checkSignatureFooterGate(bashArgs.command || "", log, ctx.scriptsDir, output, {
-      model: signatureModel,
-      useProcessModelFallback: false,
-    });
-  }
-
-  checkSecretReadWithApproval({
-    tool: input.tool,
-    args: output.args || {},
-    sessionId,
-    scriptsDir: ctx.scriptsDir,
+  const sourceContextForPath = await resolveToolSourceContexts(ctx, input, output, sessionId);
+  beginObservedSourceMutation({
     repositoryDir: ctx.repositoryDir,
-    isReadTool,
-    secretReadBlockReason,
-    checkSecretReadGate,
-    log,
+    sessionId,
+    sourceAccessProvenance: ctx.sourceAccessProvenance,
+    sourceAccessReason: ctx.sourceAccessReason,
+    sourceContextForPath,
+  }, input, output);
+  enforceBashToolSafety(ctx, log, input, output, sessionId);
+  enforceBoundedOperationSafety(ctx, input, output, sessionId);
+  if (isBashTool(input.tool)) rememberBashOutputPolicy(callID, output.args);
+  enforceReadAndFileQuality(ctx, log, input, output, { sessionId, sourceContextForPath });
+  admitToolOwner({
+    scriptsDir: ctx.scriptsDir, repositoryDir: ctx.repositoryDir, input, output,
+    bash: false, bounded: isBoundedOperationTool(input.tool), client: ctx.client,
   });
-  checkResearchStagingAccess(input.tool, output.args || {});
+}
 
-  if (!isWriteOrEditTool(input.tool)) return;
-
-  const filePath = output.args?.filePath || output.args?.file_path || "";
-  if (filePath) {
-    runFileQualityGate(ctx, filePath, output.args);
+function scrubObservedToolOutput(ctx, log, toolName, output) {
+  // GH#32362: exact registered secret values first (bare values in process
+  // command lines evade pattern scrubbing), then known credential patterns.
+  // Title and metadata are persisted with the tool part, so scrub them too.
+  const registered = ctx.secretRedactor.redactValue({
+    output: output.output,
+    title: output.title,
+    metadata: output.metadata,
+  });
+  if (registered.count > 0) {
+    for (const field of ["output", "title", "metadata"]) {
+      if (output[field] !== undefined) output[field] = registered.value[field];
+    }
+    log("WARN", `[credential-scrub] redacted registered secret value(s) from ${toolName} output`);
   }
+  const rawOutput = Object.fromEntries(
+    ["output", "title", "metadata"].filter((field) => output[field] !== undefined)
+      .map((field) => [field, output[field]]),
+  );
+  const { output: scrubbedOutput, redacted, count } = scrubToolOutput(rawOutput);
+  if (!redacted) return registered.count;
+  for (const field of Object.keys(rawOutput)) output[field] = scrubbedOutput[field];
+  log("WARN", `[credential-scrub] redacted credential token(s) from ${toolName} output`);
+  return registered.count + count;
+}
+
+function trackObservedToolEffects(ctx, log, toolName, input, output) {
+  const continuationResult = ctx.continuationGuard?.afterTool(input, output);
+  if (continuationResult?.replan) {
+    log("WARN", `[session-continuation] repeated ${continuationResult.loop.description} ${toolName} cycle requires replanning`);
+  }
+  if (isBashTool(toolName)) trackBashOperation(ctx, output.title || "", output.output || "");
+  if (!isWriteOrEditTool(toolName)) return;
+  const filePath = output.metadata?.filePath || "";
+  if (filePath) log("INFO", `File modified: ${filePath} via ${toolName}`);
 }
 
 /**
@@ -344,43 +402,47 @@ function handleToolBefore(ctx, log, input, output) {
  * @param {object} input - Tool input
  * @param {object} output - Tool output
  */
-function handleToolAfter(ctx, log, scriptsDir, input, output) {
+async function handleToolAfter(ctx, log, scriptsDir, input, output) {
   const toolName = input.tool || "";
+  const sessionId = input.sessionID || input.sessionId || input.session?.id || "";
+  const sourceContextForPath = await resolveToolSourceContexts(ctx, input, output, sessionId, true);
+
+  finishObservedSourceAccess({
+    sessionId,
+    sourceAccessProvenance: ctx.sourceAccessProvenance,
+    sourceAccessReason: ctx.sourceAccessReason,
+    sourceContextForPath,
+  }, input, output, toolCallSucceeded);
 
   // GH#20207 (t2458 Layer 4): scrub credentials from tool output before
   // persisting to the SQLite transcript store or sending to the model.
   // Applies to all tools — credentials can arrive via user scripts, third-party
   // CLIs, or runtime error backtraces, not just framework helpers.
   const rawOutput = output.output;
-  if (rawOutput !== undefined) {
-    const { output: scrubbedOutput, redacted } = scrubToolOutput(rawOutput);
-    if (redacted) {
-      output.output = scrubbedOutput;
-      log("WARN", `[credential-scrub] redacted credential token(s) from ${toolName} output`);
-    }
-  }
+  const bashOutputWasVerbose = isBashTool(toolName) && isVerboseBashOutput(rawOutput);
+  const redactionCount = scrubObservedToolOutput(ctx, log, toolName, output);
+  trackObservedToolEffects(ctx, log, toolName, input, output);
 
-  const continuationResult = ctx.continuationGuard?.afterTool(input, output);
-  if (continuationResult?.replan) {
-    log("WARN", `[session-continuation] repeated ${toolName} failure requires replanning`);
-  }
-
-  if (isBashTool(toolName)) {
-    trackBashOperation(ctx, output.title || "", output.output || "");
-  }
-
-  if (isWriteOrEditTool(toolName)) {
-    const filePath = output.metadata?.filePath || "";
-    if (filePath) {
-      log("INFO", `File modified: ${filePath} via ${toolName}`);
-    }
-  }
-
-  const intent = consumeIntent(input.callID || "");
-  // t2184: consumeToolDuration returns null when the callID wasn't paired
-  // (e.g., hook race on plugin reload) — recordToolCall emits SQL NULL.
+  // Consume timing before output compaction so the receipt can report runtime.
   const durationMs = consumeToolDuration(input.callID || "");
-  recordToolCall(input, output, intent, durationMs);
+  if (isBashTool(toolName)) {
+    compactSuccessfulBashOutput({
+      callID: input.callID || "",
+      output,
+      scriptsDir,
+      durationMs,
+      wasVerbose: bashOutputWasVerbose,
+      log,
+    });
+  }
+
+  const intentRecord = consumeIntentRecord(input.callID || "");
+  appendDockerAdvisory(input, output);
+  // GH#37382: tell the model that visible placeholders are display redactions.
+  appendDisplayRedactionNote(output, redactionCount, [REDACTION_TOKEN, PEM_REDACTION_TOKEN]);
+  // t2184: durationMs is null when the callID wasn't paired (for example,
+  // a hook race on plugin reload); recordToolCall emits SQL NULL.
+  recordToolCall(input, output, intentRecord?.intent, durationMs, intentRecord?.source);
 
   if (toolName === "mcp_task" || toolName === "task") {
     recordChildSubagent(output?.metadata?.task_id || "", scriptsDir, log);
@@ -392,6 +454,14 @@ export function createQualityHooks(deps) {
   const activeScriptsDir = deps.activeScriptsDir ?? scriptsDir;
   const activeScriptsDirBinding = bindActiveScriptsDir(activeScriptsDir, scriptsDir);
   const qualityLogPath = join(logsDir, "quality-hooks.log");
+  const sourceAccessProvenance = createSourceAccessMutationProvenance({
+    repositoryDir: deps.repositoryDir,
+    verify: deps.verifySourceAccessReceipt,
+    git: deps.git,
+    gitRun: deps.gitRun,
+    now: deps.now,
+  });
+  deps.sourceAccessRuntime?.attachSourceAccessProvenance?.(sourceAccessProvenance);
   // t2120: qualityDetailLog (in quality-logging.mjs) reads ctx.detailLogPath
   // and ctx.detailMaxBytes. Previously these were never populated here, so
   // every call to logQualityGateResult → qualityDetailLog threw
@@ -404,7 +474,9 @@ export function createQualityHooks(deps) {
   const detailLogPath = join(logsDir, "quality-hooks-detail.log");
   const detailMaxBytes = 5 * 1024 * 1024; // 5MB before rotation
   const ctx = {
+    privateProcessingPolicy: loadPrivateProcessingPolicy(),
     scriptsDir,
+    client: deps.client,
     activeScriptsDir,
     activeScriptsDirBinding,
     logsDir,
@@ -413,9 +485,19 @@ export function createQualityHooks(deps) {
     detailMaxBytes,
     repositoryDir: deps.repositoryDir,
     continuationGuard,
+    secretRedactor: deps.secretRedactor || defaultSecretValueRedactor(),
+    sourceAccessProvenance,
+    sourceAccessReason: SOURCE_ACCESS_REASON,
+    verifySourceAccessReceipt: deps.verifySourceAccessReceipt,
+    sourceAccessBrokerMatches: deps.sourceAccessBrokerMatches,
+    sourceAccessRequestRun: deps.sourceAccessRequestRun,
+    sourceAccessRuntime: deps.sourceAccessRuntime,
     resolveSessionModel: typeof deps.resolveSessionModel === "function"
       ? deps.resolveSessionModel
       : () => "",
+    ownedListenerRoots: typeof deps.ownedListenerRoots === "function"
+      ? deps.ownedListenerRoots
+      : () => [],
   };
 
   function boundQualityLog(level, message) {

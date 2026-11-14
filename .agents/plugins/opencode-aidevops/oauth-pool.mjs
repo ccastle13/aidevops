@@ -67,7 +67,8 @@ export {
 export {
   decodeCursorJWT, readCursorAuthJsonCredentials, readCursorStateDbCredentials,
   isCursorAgentAvailable, ensureValidToken, normalizeExpiredCooldowns,
-  authFailureBackoffMs, markAuthRefreshFailure,
+  authFailureBackoffMs, markAuthRefreshFailure, markRejectedTokenFailure,
+  forceRefreshOpenAIToken,
 } from "./oauth-pool-refresh.mjs";
 
 // Auth hooks & provider registration
@@ -101,14 +102,19 @@ function openCodeAuthPath() {
   return join(dataHome, "opencode", "auth.json");
 }
 
-export function readCurrentOpenAIAuth() {
+/** Read the OpenCode auth entry currently active for one provider. */
+export function readCurrentProviderAuth(provider) {
   const authPath = openCodeAuthPath();
   if (!existsSync(authPath)) return null;
   try {
-    return JSON.parse(readFileSync(authPath, "utf-8")).openai || null;
+    return JSON.parse(readFileSync(authPath, "utf-8"))[provider] || null;
   } catch {
     return null;
   }
+}
+
+export function readCurrentOpenAIAuth() {
+  return readCurrentProviderAuth("openai");
 }
 
 function matchesOpenAIAuth(account, auth) {
@@ -144,6 +150,13 @@ async function selectPoolAccount(provider, skipEmail) {
   return null;
 }
 
+// Runtime-neutral selection seam used by OpenCode V2's request hooks. V1 keeps
+// using the client.auth.set adapters below; exposing selection separately keeps
+// credential policy independent from either SDK's request shape.
+export async function selectRuntimePoolAccount(provider, skipEmail) {
+  return selectPoolAccount(provider, skipEmail);
+}
+
 export async function selectOpenAIStartupAccount(skipEmail) {
   const accounts = getAccounts("openai");
   if (accounts.length === 0) return null;
@@ -157,6 +170,20 @@ export async function selectOpenAIStartupAccount(skipEmail) {
   return selectPoolAccount("openai", skipEmail);
 }
 
+/**
+ * Select a valid OpenAI account for a discrete request. An explicit email is
+ * pinned: unavailable or invalid accounts fail instead of falling back.
+ */
+export async function selectOpenAIRequestAccount(email) {
+  const requestedEmail = String(email || "").trim();
+  if (!requestedEmail) return selectOpenAIStartupAccount();
+  const accounts = getAccounts("openai");
+  normalizeExpiredCooldowns("openai", accounts);
+  const account = accounts.find((candidate) => candidate.email === requestedEmail);
+  if (!account || !isAvailableAccount(account)) return null;
+  return await ensureValidToken("openai", account) ? account : null;
+}
+
 // ---------------------------------------------------------------------------
 // Token injection — inject selected account into provider auth
 // ---------------------------------------------------------------------------
@@ -164,6 +191,9 @@ export async function selectOpenAIStartupAccount(skipEmail) {
 export async function injectPoolToken(client, skipEmail) {
   const account = await selectPoolAccount("anthropic", skipEmail);
   if (!account) return false;
+  // GH#36707: mark the env token as pool-derived so headless selection and
+  // pulse capacity do not treat it as independent static-key capacity.
+  process.env.AIDEVOPS_ANTHROPIC_API_KEY_SOURCE = "oauth-pool";
   process.env.ANTHROPIC_API_KEY = account.access;
   try {
     await client.auth.set({
@@ -177,14 +207,17 @@ export async function injectPoolToken(client, skipEmail) {
 }
 
 export async function applyOpenAIPoolAccount(client, account) {
-  process.env.OPENAI_API_KEY = account.access;
-  process.env.AIDEVOPS_OPENAI_API_KEY_SOURCE = "oauth-pool";
   try {
-    await client.auth.set({
+    const result = await client.auth.set({
       path: { id: "openai" },
       body: { type: "oauth", refresh: account.refresh, access: account.access, expires: account.expires, accountId: account.accountId || "" },
     });
-  } catch { /* best-effort */ }
+    if (result?.error) return false;
+  } catch {
+    return false;
+  }
+  process.env.OPENAI_API_KEY = account.access;
+  process.env.AIDEVOPS_OPENAI_API_KEY_SOURCE = "oauth-pool";
   patchAccount("openai", account.email, { lastUsed: new Date().toISOString(), status: "active" });
   console.error(`[aidevops] OAuth pool: injected token for ${account.email} into built-in openai provider`);
   return account;
@@ -199,8 +232,7 @@ export async function rotateOpenAIPoolToken(client, skipEmail) {
 export async function injectOpenAIPoolToken(client, skipEmail) {
   const account = await selectOpenAIStartupAccount(skipEmail);
   if (!account) return false;
-  await applyOpenAIPoolAccount(client, account);
-  return true;
+  return Boolean(await applyOpenAIPoolAccount(client, account));
 }
 
 // ---------------------------------------------------------------------------

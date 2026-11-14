@@ -24,6 +24,8 @@ set -euo pipefail
 # Constants
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit
 source "${SCRIPT_DIR}/shared-constants.sh"
+source "${SCRIPT_DIR}/vault-data-policy-helper.sh"
+vault_runtime_policy_check "remote/eeat-scoring" || exit 64
 
 readonly SCRIPT_DIR
 readonly CONFIG_DIR="${HOME}/.config/aidevops"
@@ -453,7 +455,7 @@ _generate_python_analyzer_llm_backends() {
             "anthropic-version": "2023-06-01"
         }
         payload = {
-            "model": self.model if "claude" in self.model else "claude-sonnet-4-6",
+            "model": self.model if "claude" in self.model else "claude-sonnet-5-5",
             "max_tokens": 500,
             "messages": [{"role": "user", "content": f"{prompt}\n\nAnalyze this content:\n\n{content}"}]
         }

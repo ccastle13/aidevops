@@ -159,6 +159,40 @@ The scanner skips any file with that directive.
 - Parent issue #20581 (t2762) — systemic sweep and prevention
 - Canonical reference implementation: `.agents/scripts/progressive-load-check.sh:80-97` (pre-existing correct counter usage)
 
+## Early-Exit Pipe Readers (SIGPIPE)
+
+Under `set -o pipefail`, an early-exit reader (`grep -q`, `grep -m1`, `head`) closes the pipe after its first match. A writer still producing output receives SIGPIPE (exit 141), and `pipefail` reports 141 instead of the reader's 0. The result is a false "no match" that depends on input size and pipe buffer timing (a 256 KB body gave 100/100 false negatives on macOS in #33882).
+
+**Banned** (in scripts that enable `pipefail`, and in source-guarded libraries, which inherit the caller's `pipefail`):
+
+```bash
+printf '%s\n' "$body" | grep -qF "$marker"
+list_things | grep -m1 "$name"
+list_things | head -n 1
+```
+
+**Allowed:**
+
+```bash
+grep -qF -- "$marker" <<<"$body"            # here-string, no pipe
+out=$(list_things) || return 1              # capture first, then test
+[[ "$out" == *"$marker"* ]]
+{ writer || true; } | grep -q "$marker"     # only if the writer status is irrelevant
+```
+
+### Enforcement
+
+- CI gate: `.github/workflows/pipe-early-exit-check.yml` (diff-scoped — fails only on lines the PR adds; legacy matches are ignored). Judged files enable `pipefail` or carry the top-level source guard `[[ -n "${_X_LOADED:-}" ]] && return`; a sourced library runs under its caller's options (`pulse-wrapper.sh` sets `pipefail` for every `pulse-merge*.sh` module).
+- Required full scan: the Pulse-merge Regression Suites step in `code-quality.yml` judges every line of the suites and the `pulse-merge*.sh` libraries.
+- When rewriting a pipe, keep the input: `grep -q PATTERN` with neither a file nor `<<<` reads the caller's stdin.
+- Local check: `.agents/scripts/pipe-early-exit-check.sh --scan-files [--diff-base <ref>] <files>`.
+- Remediation snippets: `.agents/scripts/pipe-early-exit-check.sh --fix-hint`.
+- Fixtures that must contain the pattern add `# pipe-early-exit-check:disable` in the first 20 lines.
+
+### Originating incidents
+
+Issues GH#27981 (worktree branch lookup), GH#30824 (issue-sync first-match pipelines), GH#33882 (brief readiness on large briefs), GH#36235 (pulse-merge libraries: 200/200 false negatives on a 228 KB body put completed feedback routes on maintainer hold and misclassified CI infra failures).
+
 ## Stat portability (t3046)
 
 BSD/macOS and GNU `stat` use incompatible flags. `stat -f %m` is BSD/macOS-only; GNU `stat` uses `stat -c %Y`. Do not use `stat -f` in `.agents/scripts/**` unless it is inside a platform-guarded branch such as `case "$(uname)" in Darwin*|FreeBSD*)`.
@@ -463,6 +497,132 @@ mktemp /tmp/x-XXXXXX         # macOS: /tmp/x-mGVJcx (correct)
 ```
 
 GNU `mktemp` (Linux) accepts both forms, masking the bug in CI. The lint gate enforces the BSD-safe form everywhere so future macOS regressions are caught at PR time.
+
+## `set -e` vs. `RETURN` cleanup traps (#33301)
+
+A function that sets `trap '...cleanup...' RETURN` for its own disposable resources (temp dirs, Docker containers/volumes/networks) must never end with a bare failing test or command as its last statement when that function is invoked directly (not inside `if`/`&&`/`||`/a command substitution). Under `set -euo pipefail`, a failing bare command there triggers immediate script-wide `errexit` termination — which skips the function's own `RETURN` trap, since the process exits rather than returning.
+
+```bash
+# Banned: leaks cleanup on a nonzero result
+my_cmd_with_run_trap() {
+	trap 'rm -rf "$tmp"; docker rm -f "$container"' RETURN
+	...
+	[[ "$errors" -eq 0 ]]
+	return $?
+}
+
+# Correct: the trap always fires
+my_cmd_with_run_trap() {
+	trap 'rm -rf "$tmp"; docker rm -f "$container"' RETURN
+	...
+	[[ "$errors" -eq 0 ]] || return 1
+	return 0
+}
+```
+
+This bug shipped in `wp-plugin-release-helper.sh`'s `plugin-check` command and was only caught by actually running it against a failing fixture and checking `docker ps -a`/`network ls`/`volume ls` afterward — shellcheck and shfmt do not flag it.
+
+## Caller IFS in sourced libraries (GH#34558)
+
+Sourced libraries inherit the caller's `IFS`, including strict `IFS=$'\n\t'` settings that exclude spaces. Never rely on the default IFS for parsing: pin the delimiter on each `read` that splits fields, and use quoted arrays instead of unquoted expansions for word lists. Do not reset the caller's script-level IFS to make a library work.
+
+```bash
+# Banned: depends on the caller including space in IFS
+read -r uid mode <<<"$metadata"
+for tool in $tool_names; do
+    ...
+done
+
+# Allowed: the input contract is space-separated metadata
+IFS=' ' read -r uid mode <<<"$metadata"
+
+# Allowed: split a documented space-separated list once, then quote its array
+IFS=' ' read -r -a tools <<<"$tool_names"
+for tool in "${tools[@]}"; do
+    ...
+done
+```
+
+Choose the delimiter from the producer's contract (`IFS='.'` for version components, `IFS=':'` for PATH entries, or `IFS=$'\t'` for tab-separated fields). Use `IFS= read -r line` to preserve a whole line without splitting. The command-prefix form is local to that `read`, preserves the caller's IFS, and works in Bash 3.2. When values are already separate, build a quoted array directly rather than joining and splitting them again.
+
+### Why the failure is silent
+
+ShellCheck passes a bare multi-variable `read`; it cannot prove the caller's runtime IFS. A space-separated `"0 755"` under strict IFS becomes `uid="0 755"` and an empty `mode`, causing a resolver/parse miss rather than a syntax error. Verify sourced parsing under both default and strict caller IFS; lint alone is insufficient.
+
+### Originating incident
+
+GH#34558: `team-interface-buzz-worktree.sh` set strict IFS before sourcing `runtime-env.sh`, making trusted-tool resolution reject trusted executables. The merged fix pins `IFS=' ' read -r uid mode <<<"$metadata"` in `aidevops_resolve_trusted_tool`, `aidevops_dir_chain_is_trusted`, and `aidevops_physical_path`. Keep every two-variable metadata read pinned; the existing `tests/test-runtime-env.sh` and `tests/test-team-interface-buzz-worktree.mjs` cover the resolver and its strict-IFS caller.
+
+## Dynamic-scope shadowing in stubs and fixtures (GH#34846)
+
+Stub and fixture state that may share a name with locals in code under test must use a test-unique prefix (for example, `tb_fixture_comments`). Alternatively, pass the value through an exported environment variable with a unique prefix. Never use bare names such as `comments`, `issue_json`, `body`, or `labels` for fixture state when called helpers may declare locals of the same name.
+
+```bash
+# Banned: fetch resolves comments to the innermost local in its caller
+local comments='[]'
+fetch() { printf '%s\n' "$comments"; }
+
+# Allowed: fixture state cannot collide with common helper locals
+local tb_fixture_comments='[]'
+fetch() { printf '%s\n' "$tb_fixture_comments"; }
+```
+
+### Why the failure is silent
+
+Bash uses dynamic scoping: a variable read by a stub resolves to the innermost `local` of that name in the active call stack, not the scope where the stub was defined. ShellCheck cannot detect this. The stub can therefore return the callee's empty value, leaving an assertion to fail far from the cause. Diagnose with `set -x` and look for the stub printing an unexpected empty value immediately after a callee's `local <name>=` line.
+
+### Originating incident
+
+GH#34846 / PR #34849: `.agents/scripts/tests/test-terminal-blocker-circuit.sh` test `test_first_observation_scope_hold_releases_on_revision` used `comments` for fixture state. `_tbr_check_entry` in `.agents/scripts/terminal-blocker-recovery-helper.sh` declares `local comments=""` before calling the stub, so the stub printed an empty string. The fix renamed the fixture to `tb_fixture_comments`.
+
+## jq 1.7/1.8 portability (GH#35920)
+
+Hosts run different jq versions. Ubuntu runners and macOS `/usr/bin/jq` ship jq 1.7.1, and Homebrew installs jq 1.8.x. A Mac with Homebrew therefore has both, and `PATH` order decides which one runs. aidevops launchd jobs put `/opt/homebrew/bin` first, so a helper can pass CI on jq 1.7.1 and then run on jq 1.8.x in the pulse. Write jq that gives the same result on both versions. When jq output looks wrong, run the program under both binaries (`/usr/bin/jq` and `/opt/homebrew/bin/jq` on macOS) before debugging anything else.
+
+### Banned: a binding after an operator
+
+jq 1.8 changed binding precedence, a breaking change listed in the jq 1.8 NEWS (jqlang/jq #3053 and #3326). jq 1.7 reads `A and T as $x | B` as `A and (T as $x | B)`. jq 1.8 reads it as `(A and T) as $x | B`. The same split applies after `or`, comparisons, arithmetic (including unary `-`), `//`, every assignment operator (`=`, `|=`, `+=`, `//=` and the rest), `try` and `catch`. Start a binding at the beginning of a pipe, after `,`, `;`, `then`, `else` or `def f:`, or inside parentheses that state the grouping you mean.
+
+```bash
+# Banned: jq 1.7 prints true, jq 1.8 prints "boolean"
+jq -n 'true and "x" as $l | $l | type'
+
+# Allowed: the jq 1.7 reading, made explicit
+jq -n 'true and ("x" as $l | $l | type)'
+
+# Allowed: the jq 1.8 reading, made explicit
+jq -n '(true and "x") as $l | $l | type'
+```
+
+Both versions accept the banned form, so nothing fails loudly. The variable silently holds a different value, which can be a boolean where a string was expected, or a whole object where an assignment result was expected.
+
+### Other divergences
+
+Each row was checked under jq 1.7.1 and 1.8.2. The portable form gives the same result on both.
+
+| Construct | jq 1.7.1 | jq 1.8.2 | Portable form |
+|---|---|---|---|
+| Operator in an object value: `{y: .a // 3}` | syntax error | accepted | `{y: (.a // 3)}` |
+| String `index`, `rindex`, `indices` | byte offsets | code-point offsets | do not slice with them; use `split`, `sub` or `capture` |
+| `ltrimstr`, `rtrimstr` on a non-string | returns the input | error | `if type == "string" then ltrimstr("x") else . end` |
+| `tonumber` on `" 12"` or `"12\n"` | `12` | error | `gsub("^\\s+\|\\s+$"; "") \| tonumber`, or trim in shell first |
+| `last(f)` when `f` is empty | `null` | no output | `[f] \| last` |
+| `limit(n; f)` with negative `n` | all of `f` | error | clamp `n` to 0 or more |
+| A jq comment ending in `\` | ends at the newline | continues onto the next line | never end a jq comment with `\` |
+| `--indent 0` | compact | multi-line | `-c` |
+| `trim`, `ltrim`, `rtrim`, `trimstr`, `toboolean`, `skip`, `add/1`, `@urid` | not defined | defined | avoid them while any host runs jq 1.7 |
+
+### Enforcement
+
+- `.agents/scripts/jq-binding-precedence-check.py` rejects a binding after an operator in `.sh`, `.bash`, `.jq`, `.py`, `.yml` and `.yaml` files and in extensionless shell or Python scripts. It is a text scan, not a jq parser.
+- Local: the `jq-binding-precedence` gate in `.agents/scripts/linters-local.sh` runs in full and `--changed` modes with a zero baseline. Run it directly with `git ls-files | python3 .agents/scripts/jq-binding-precedence-check.py -`.
+- CI: the `jq 1.7/1.8 binding precedence (GH#35920)` step in the `Complexity Analysis` job of `.github/workflows/code-quality.yml`.
+- Override: only for text that is not a jq binding, such as prose or another language. Put `# jq-binding-precedence: ignore next -- <reason>` on the line before the reported line. The reason is required because a real jq binding is always fixable with parentheses.
+- The rows in "Other divergences" are guidance, not gates. They need data-flow knowledge that a text scan does not have.
+
+### Originating incident
+
+GH#35920: `_pcc_blocked_release_evidence` in `.agents/scripts/pr-checkpoint-continuation-helper.sh` bound `([body_lines | select(is_release)] | first // "") as $line` after `and`. Under jq 1.8.2, `$line` held the boolean conjunction, and the helper failed with `boolean (true) cannot be matched, as it is not a string`. CI used jq 1.7.1 and stayed green. The fix pipes the release line straight into the comparisons with no binding. Coverage: `tests/test-jq-binding-precedence-check.sh` for the checker, and `tests/test-pr-checkpoint-continuation-helper.sh` under both jq versions for the helper.
 
 ## Watchdog self-write anti-pattern (t3058 / t3071)
 

@@ -16,6 +16,7 @@
 //
 // Caching: raw update-check output is written to
 //   ~/.aidevops/cache/session-greeting-opencode.txt
+// (session-greeting-opencode-v2.txt under AIDEVOPS_OPENCODE_PROFILE=v2)
 // so non-Bash agents can read it without re-running the script (t2724 phase 2
 // template change points agents at this file).
 //
@@ -88,8 +89,55 @@ export {
 const execAsync = promisify(exec);
 
 const CACHE_DIR = join(homedir(), ".aidevops", "cache");
-const CACHE_BASENAME = "session-greeting-opencode.txt";
-const LOCK_BASENAME = "session-greeting-refresh.lock";
+
+// OpenCode V1 and V2 run side by side with different runtime versions. A
+// shared cache made V2 sessions greet with the V1 OpenCode version, so each
+// runtime profile owns its own cache and refresh lock.
+function isOpenCodeV2Profile(env = process.env) {
+  return env.AIDEVOPS_OPENCODE_PROFILE === "v2";
+}
+
+export function greetingCacheBasename(env = process.env) {
+  return isOpenCodeV2Profile(env) ? "session-greeting-opencode-v2.txt" : "session-greeting-opencode.txt";
+}
+
+export function greetingLockBasename(env = process.env) {
+  return isOpenCodeV2Profile(env) ? "session-greeting-refresh-v2.lock" : "session-greeting-refresh.lock";
+}
+
+/**
+ * Whether the plugin injects its resolved greeting block (GH#32444, GH#32592).
+ * `AIDEVOPS_PLUGIN_SESSION_GREETING=1|0` forces it on or off. Both runtimes
+ * default on: the root-session gate keeps the block on every request of an
+ * interactive root session, so the reusable prompt prefix stays stable, and
+ * the resolved versions spare the model the VERSION/cache reads the AGENTS.md
+ * fallback would otherwise require.
+ */
+export function isPluginGreetingEnabled(env = process.env, defaultEnabled = true) {
+  if (env.AIDEVOPS_PLUGIN_SESSION_GREETING === "1") return true;
+  if (env.AIDEVOPS_PLUGIN_SESSION_GREETING === "0") return false;
+  return defaultEnabled;
+}
+
+// Delimits the greeting fallback in the generated runtime-config AGENTS.md
+// (generate-runtime-config-agents.sh). Keep both sides in sync.
+export const GREETING_FALLBACK_START = "<!-- aidevops:greeting-fallback:start -->";
+export const GREETING_FALLBACK_END = "<!-- aidevops:greeting-fallback:end -->";
+const GREETING_FALLBACK_SECTION = new RegExp(
+  `${GREETING_FALLBACK_START}[\\s\\S]*?${GREETING_FALLBACK_END}\\n*`,
+  "g",
+);
+
+/**
+ * Drop the delimited AGENTS.md greeting fallback while the plugin greeting is
+ * enabled: root sessions receive the resolved plugin block instead, and child
+ * or headless sessions must not greet at all. Unmarked text is unchanged.
+ */
+export function stripGreetingFallback(text) {
+  if (typeof text !== "string" || !text.includes(GREETING_FALLBACK_START)) return text;
+  return text.replace(GREETING_FALLBACK_SECTION, "");
+}
+
 // Comprehensive checks run at most once per 15-minute window. The subprocess
 // times out after 15 seconds, so a lock older than 30 seconds is safe to reap
 // after an abrupt plugin-process exit.
@@ -258,10 +306,11 @@ export function createGreetingHandler({
   now = Date.now,
   initializedAtMs = now(),
   isHeadless = () => false,
+  env = process.env,
 }) {
   let fired = false;
-  const cacheFile = join(cacheDir, CACHE_BASENAME);
-  const lockDir = join(cacheDir, LOCK_BASENAME);
+  const cacheFile = join(cacheDir, greetingCacheBasename(env));
+  const lockDir = join(cacheDir, greetingLockBasename(env));
 
   return async ({ event }) => {
     if (fired) return;

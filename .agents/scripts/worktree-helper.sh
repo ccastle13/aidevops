@@ -23,6 +23,7 @@
 #   clean [--auto] [--force-merged]  Remove worktrees for merged branches
 #   recovery [plan|apply] Inventory archives, write a plan, or explicitly apply
 #                         one exact manifest with a new receipt
+#   adopt <path> <session> <task>  Explicitly claim a registered dead-owner worktree
 #   help                   Show this help
 #
 # Examples:
@@ -136,11 +137,81 @@ source "${SCRIPT_DIR}/worktree-clean-lib.sh"
 # MAIN
 # =============================================================================
 
+# Print one refusal reason for cmd_adopt (GH#33853) and fail.
+_adopt_refuse() {
+	local reason="$1"
+	printf 'adopt refused: %s\n' "$reason" >&2
+	return 1
+}
+
+# Adoption is explicit, never a side effect of verify-owner. Recheck the complete
+# lease and liveness under a SQLite write transaction; preserve task and batch.
+cmd_adopt() {
+	local requested_path="${1:-}" session_id="${2:-}" task_id="${3:-}"
+	[[ $# -eq 3 ]] || { _adopt_refuse "usage: worktree-helper.sh adopt <path> <session> <task>"; return 1; }
+	[[ "$session_id" =~ ^ses_[A-Za-z0-9_-]+$ ]] || { _adopt_refuse "session must be an OpenCode ses_ identifier"; return 1; }
+	[[ -n "$task_id" ]] || { _adopt_refuse "task is empty; adopt requires the registered task ID"; return 1; }
+	_wt_is_trusted_opencode_session "$session_id" || { _adopt_refuse "session does not match the current OPENCODE_SESSION_ID"; return 1; }
+	[[ -d "$requested_path" && ! -L "$requested_path" ]] || { _adopt_refuse "path is not an existing non-symlink directory"; return 1; }
+	local wt_path="" git_dir="" common_dir="" branch="" snapshot=""
+	wt_path=$(_wt_registry_lookup_path "$requested_path") || { _adopt_refuse "path could not be resolved in the worktree registry"; return 1; }
+	[[ "$(git -C "$wt_path" rev-parse --show-toplevel)" == "$wt_path" ]] || { _adopt_refuse "path is not a Git worktree root"; return 1; }
+	git_dir=$(git -C "$wt_path" rev-parse --absolute-git-dir) || { _adopt_refuse "Git directory is unreadable"; return 1; }
+	common_dir=$(git -C "$wt_path" rev-parse --path-format=absolute --git-common-dir) || { _adopt_refuse "Git common directory is unreadable"; return 1; }
+	[[ "$git_dir" != "$common_dir" ]] || { _adopt_refuse "path is a canonical checkout, not a linked worktree"; return 1; }
+	branch=$(git -C "$wt_path" symbolic-ref --quiet --short HEAD) || { _adopt_refuse "worktree HEAD is detached"; return 1; }
+	snapshot=$(check_worktree_owner_snapshot "$wt_path") || { _adopt_refuse "worktree has no registry owner row"; return 1; }
+	local old_pid="" old_session="" old_batch="" old_task="" old_created="" old_start=""
+	IFS='|' read -r old_pid old_session old_batch old_task old_created old_start <<<"$snapshot"
+	[[ "$old_pid" =~ ^[1-9][0-9]*$ ]] || { _adopt_refuse "registry owner PID is invalid"; return 1; }
+	if [[ "$old_task" != "$task_id" ]]; then
+		if [[ -z "$old_task" ]]; then
+			_adopt_refuse "registry task_id is empty; adopt requires a matching task ID. If this worktree belongs to the current session, run pre-edit-check.sh (or aidevops_pre_edit_check) in it to re-claim"
+		else
+			_adopt_refuse "task does not match the registered task ID"
+		fi
+		return 1
+	fi
+	# Permission errors and PID reuse are conservatively treated as live.
+	python3 - "$old_pid" <<'PY' || { _adopt_refuse "registered owner is live or its liveness is unavailable"; return 1; }
+import os
+import sys
+try:
+    os.kill(int(sys.argv[1]), 0)
+except ProcessLookupError:
+    sys.exit(0)
+except OSError:
+    pass
+sys.exit(1)
+PY
+	"${SCRIPT_DIR}/audit-log-helper.sh" log operation.verify \
+		"Explicit worktree adoption requested" "session=$session_id" "task=$task_id" >/dev/null || return 1
+	local new_pid="" new_start="" new_comm=""
+	new_pid=$(_resolve_worktree_owner_pid "") || return 1
+	new_start=$(_wt_process_start_token_for_pid "$new_pid") || return 1
+	new_comm=$(_get_proc_comm "$new_pid")
+	python3 "${SCRIPT_DIR}/shared-worktree-registry-owner.py" adopt \
+		"$WORKTREE_REGISTRY_DB" "$wt_path" "$branch" "$new_pid" "$session_id" \
+		"$old_batch" "$old_task" "$new_comm" "$new_start" \
+		"$old_pid" "$old_session" "$old_batch" "$old_task" "$old_created" "$old_start" || return 1
+	_registry_verify_owner "$wt_path" "$session_id" >/dev/null || return 1
+	"${SCRIPT_DIR}/audit-log-helper.sh" log config.change \
+		"Worktree adoption verified" "session=$session_id" "task=$task_id" >/dev/null || return 1
+	printf 'ADOPTED\n'
+	return 0
+}
+
 main() {
 	local command="${1:-help}"
 	shift || true
 
 	case "$command" in
+	run)
+		python3 "${SCRIPT_DIR}/worktree-managed-run.py" "$@"
+		;;
+	adopt)
+		cmd_adopt "$@"
+		;;
 	add)
 		cmd_add "$@"
 		;;

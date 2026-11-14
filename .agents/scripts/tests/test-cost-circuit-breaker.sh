@@ -49,6 +49,9 @@ TEST_ROOT=$(mktemp -d)
 trap 'rm -rf "$TEST_ROOT"' EXIT
 export HOME="${TEST_ROOT}/home"
 mkdir -p "${HOME}/.aidevops/logs" "${HOME}/.aidevops/.agent-workspace/supervisor"
+mkdir -p "${HOME}/.config/aidevops"
+# Public-write privacy guard requires a readable inventory even with stub gh.
+printf '{"initialized_repos":[]}\n' >"${HOME}/.config/aidevops/repos.json"
 export LOGFILE="${TEST_ROOT}/pulse.log"
 
 # =============================================================================
@@ -62,6 +65,25 @@ mkdir -p "$STUB_DIR"
 # Fixture state files — the stub gh reads these to know what to return.
 FIXTURE_ISSUE_JSON="${TEST_ROOT}/fixture-issue.json"
 FIXTURE_COMMENTS_JSON="${TEST_ROOT}/fixture-comments.json"
+FIXTURE_TIMELINE_JSON="${TEST_ROOT}/fixture-timeline.json"
+FIXTURE_PR_JSON="${TEST_ROOT}/fixture-pr.json"
+FIXTURE_EARLY_PR_JSON="${TEST_ROOT}/fixture-early-pr.json"
+# Collaborator permission verdict for permission lookups: a permission name,
+# "404" (confirmed non-collaborator) or "fail" (API error). Default: 404.
+FIXTURE_PERMISSION="${TEST_ROOT}/fixture-permission"
+printf '404' >"$FIXTURE_PERMISSION"
+FIXTURE_STATUS_JSON="${TEST_ROOT}/fixture-status.json"
+cat >"$FIXTURE_STATUS_JSON" <<'STATUS'
+{"data":{"repository":{
+  "label0":{"name":"status:available","color":"0e8a16","description":"Task is available for claiming"},
+  "label1":{"name":"status:queued","color":"fbca04","description":"Worker dispatched, not yet started"},
+  "label2":{"name":"status:claimed","color":"f9d0c4","description":"Interactive implementation is actively claimed"},
+  "label3":{"name":"status:in-progress","color":"1d76db","description":"Worker actively running"},
+  "label4":{"name":"status:in-review","color":"5319e7","description":"Non-draft PR ready for review/merge"},
+  "label5":{"name":"status:done","color":"6f42c1","description":"Task is complete"},
+  "label6":{"name":"status:blocked","color":"d93f0b","description":"Partial work blocked; inspect reason and next action"}
+}}}
+STATUS
 
 write_stub_gh() {
 	cat >"${STUB_DIR}/gh" <<STUB
@@ -78,8 +100,34 @@ fi
 
 # gh api repos/<slug>/issues/<num>/comments --paginate
 if [[ "\$1" == "api" ]]; then
+	# Exact batched status-label snapshot used by ensure_status_labels_exist.
+	if [[ "\$2" == "graphql" ]]; then
+		cat "${FIXTURE_STATUS_JSON}"
+		exit 0
+	fi
+	if [[ "\$2" == "repos/owner/repo" ]]; then
+		printf 'false\n'
+		exit 0
+	fi
 	if [[ "\$2" == "repos/"*"/issues/"*"/comments" ]]; then
+		if [[ " \$* " == *" --slurp "* ]]; then
+			jq -s '.' "${FIXTURE_COMMENTS_JSON}" 2>/dev/null || exit 1
+			exit 0
+		fi
 		cat "${FIXTURE_COMMENTS_JSON}" 2>/dev/null || echo '[]'
+		exit 0
+	fi
+	if [[ "\$2" == "repos/"*"/issues/"*"/timeline" ]]; then
+		jq -s '.' "${FIXTURE_TIMELINE_JSON}" 2>/dev/null || exit 1
+		exit 0
+	fi
+	[[ " \$* " == *"/collaborators/"*"/permission "* ]] && exec "${STUB_DIR}/gh-permission" "\$@"
+	if [[ "\$2" == "repos/"*"/pulls/"* ]]; then
+		if [[ "\$2" == "repos/owner/repo/pulls/41" ]]; then
+			cat "${FIXTURE_EARLY_PR_JSON}" 2>/dev/null || exit 1
+			exit 0
+		fi
+		cat "${FIXTURE_PR_JSON}" 2>/dev/null || exit 1
 		exit 0
 	fi
 	if [[ "\$2" == "user" ]]; then
@@ -90,11 +138,11 @@ if [[ "\$1" == "api" ]]; then
 		printf '%s\n' \\
 			\$'status:available\t0e8a16\tTask is available for claiming' \\
 			\$'status:queued\tfbca04\tWorker dispatched, not yet started' \\
-			\$'status:claimed\tf9d0c4\tInteractive session claimed this task' \\
+			\$'status:claimed\tf9d0c4\tInteractive implementation is actively claimed' \\
 			\$'status:in-progress\t1d76db\tWorker actively running' \\
-			\$'status:in-review\t5319e7\tPR open, awaiting review/merge' \\
+			\$'status:in-review\t5319e7\tNon-draft PR ready for review/merge' \\
 			\$'status:done\t6f42c1\tTask is complete' \\
-			\$'status:blocked\td93f0b\tWaiting on blocker task'
+			\$'status:blocked\td93f0b\tPartial work blocked; inspect reason and next action'
 		exit 0
 	fi
 	# Keep this circuit-breaker test focused on its historical native mutation
@@ -134,6 +182,31 @@ fi
 exit 0
 STUB
 	chmod +x "${STUB_DIR}/gh"
+	write_stub_gh_permission
+	return 0
+}
+
+# Collaborator permission endpoint, both the shared `gh api -i` lookup form
+# and the bare `--jq .permission` fallback form (GH#34598).
+write_stub_gh_permission() {
+	cat >"${STUB_DIR}/gh-permission" <<STUB
+#!/usr/bin/env bash
+permission=\$(<"${FIXTURE_PERMISSION}")
+[[ "\$permission" == "fail" ]] && exit 1
+if [[ "\$2" == "-i" ]]; then
+	if [[ "\$permission" == "404" ]]; then
+		printf 'HTTP/2.0 404 Not Found\n\n{"message":"Not Found"}\n'
+		exit 1
+	fi
+	printf 'HTTP/2.0 200 OK\n\n{"permission":"%s"}\n' "\$permission"
+	exit 0
+fi
+[[ "\$permission" == "404" ]] && exit 1
+printf '%s\n' "\$permission"
+exit 0
+STUB
+	chmod +x "${STUB_DIR}/gh-permission"
+	return 0
 }
 
 write_fixture_issue() {
@@ -173,6 +246,7 @@ write_fixture_comments_with_existing_cost_marker() {
 	return 0
 }
 
+printf '[]' >"$FIXTURE_TIMELINE_JSON"
 write_stub_gh
 OLD_PATH="$PATH"
 export PATH="${STUB_DIR}:${PATH}"
@@ -425,6 +499,369 @@ else
 	print_result "completed issue skips over-budget breaker side effects" 1 \
 		"(rc=$terminal_rc output='$terminal_output' stub_log=$(tr '\n' ' ' <"$STUB_LOG" 2>/dev/null))"
 fi
+
+# Merged For/Ref/Resolves checkpoints reset spend at merge time, across pages.
+cat >"$FIXTURE_COMMENTS_JSON" <<'JSON'
+[{"created_at":"2026-05-03T19:00:00Z","body":"spent 600000 tokens"}]
+[{"created_at":"2026-05-03T19:30:00Z","body":"spent 300000 tokens"}]
+JSON
+for reference in For Ref Resolves; do
+	cat >"$FIXTURE_TIMELINE_JSON" <<JSON
+[]
+[{"event":"cross-referenced","created_at":"2026-05-03T18:00:00Z","source":{"issue":{"repository":{"full_name":"owner/repo"},"body":"${reference} #18013","pull_request":{"merged_at":"2026-05-03T19:25:00Z"}}}}]
+JSON
+	sum_output=$("$DEDUP_HELPER" sum-issue-token-spend 18013 "owner/repo" 2>/dev/null)
+	if [[ "$sum_output" == "300000|1" ]]; then
+		print_result "merged ${reference} checkpoint resets spend across pages" 0
+	else
+		print_result "merged ${reference} checkpoint resets spend across pages" 1 "(got: '$sum_output')"
+	fi
+done
+run_check_cost_budget 18013 "owner/repo" "standard"
+if [[ "$rc" -eq 1 && -z "$output" ]]; then
+	print_result "merged checkpoint keeps 300K under budget" 0
+else
+	print_result "merged checkpoint keeps 300K under budget" 1 "(rc=$rc output='$output')"
+fi
+
+# Timeline ordering is reference ordering, not necessarily merge ordering.
+cat >"$FIXTURE_TIMELINE_JSON" <<'JSON'
+[
+ {"event":"cross-referenced","source":{"issue":{"repository":{"full_name":"owner/repo"},"body":"For #18013","pull_request":{"merged_at":"2026-05-03T19:25:00Z"}}}},
+ {"event":"cross-referenced","source":{"issue":{"repository":{"full_name":"owner/repo"},"body":"Ref #18013","pull_request":{"merged_at":"2026-05-03T18:25:00Z"}}}}
+]
+JSON
+sum_output=$("$DEDUP_HELPER" sum-issue-token-spend 18013 "owner/repo" 2>/dev/null)
+if [[ "$sum_output" == "300000|1" ]]; then
+	print_result "latest merge wins regardless of timeline order" 0
+else
+	print_result "latest merge wins regardless of timeline order" 1 "(got: '$sum_output')"
+fi
+
+for marker in '<!-- cost-circuit-breaker:reset -->' '<!-- aidevops-signed-approval -->'; do
+	cat >"$FIXTURE_COMMENTS_JSON" <<JSON
+[
+ {"created_at":"2026-05-03T19:26:00Z","body":"spent 600000 tokens"},
+ {"created_at":"2026-05-03T19:28:00Z","body":"${marker}"},
+ {"created_at":"2026-05-03T19:30:00Z","body":"spent 300000 tokens"},
+ {"created_at":"2026-05-03T19:31:00Z","body":"spent 900000 tokens with the user in an interactive session"}
+]
+JSON
+	sum_output=$("$DEDUP_HELPER" sum-issue-token-spend 18013 "owner/repo" 2>/dev/null)
+	if [[ "$sum_output" == "300000|1" ]]; then
+		print_result "newer ${marker} overrides merge; interactive spend excluded" 0
+	else
+		print_result "newer ${marker} overrides merge; interactive spend excluded" 1 "(got: '$sum_output')"
+	fi
+done
+cat >"$FIXTURE_COMMENTS_JSON" <<'JSON'
+[{"created_at":"2026-05-03T19:00:00Z","body":"spent 600000 tokens"}]
+[{"created_at":"2026-05-03T19:30:00Z","body":"spent 300000 tokens"}]
+JSON
+
+# Unmerged PRs, ordinary issues, other repositories and prefix collisions do not reset.
+cat >"$FIXTURE_TIMELINE_JSON" <<'JSON'
+[
+ {"event":"cross-referenced","source":{"issue":{"repository":{"full_name":"owner/repo"},"body":"For #18013","pull_request":{"merged_at":null}}}},
+ {"event":"cross-referenced","source":{"issue":{"repository":{"full_name":"other/repo"},"body":"For #18013","pull_request":{"merged_at":"2026-05-03T19:25:00Z"}}}},
+ {"event":"cross-referenced","source":{"issue":{"repository":{"full_name":"owner/repo"},"body":"For #180130","pull_request":{"merged_at":"2026-05-03T19:25:00Z"}}}},
+ {"event":"cross-referenced","source":{"issue":{"repository":{"full_name":"owner/repo"},"body":"For #18013"}}}
+]
+JSON
+sum_output=$("$DEDUP_HELPER" sum-issue-token-spend 18013 "owner/repo" 2>/dev/null)
+run_check_cost_budget 18013 "owner/repo" "standard"
+if [[ "$sum_output" == "900000|2" && "$rc" -eq 0 && "$output" == *"COST_BUDGET_EXCEEDED"* ]]; then
+	print_result "without delivered checkpoint 900K still trips breaker" 0
+else
+	print_result "without delivered checkpoint 900K still trips breaker" 1 "(sum='$sum_output' rc=$rc output='$output')"
+fi
+
+printf 'not-valid-json' >"$FIXTURE_TIMELINE_JSON"
+run_check_cost_budget 18013 "owner/repo" "standard"
+if [[ "$rc" -eq 1 && -z "$output" ]]; then
+	print_result "timeline lookup/parse failure stays fail-open" 0
+else
+	print_result "timeline lookup/parse failure stays fail-open" 1 "(rc=$rc output='$output')"
+fi
+
+# Missing timeline references must not erase independently verified delivery.
+printf '[]' >"$FIXTURE_TIMELINE_JSON"
+cat >"$FIXTURE_COMMENTS_JSON" <<'JSON'
+[{"created_at":"2026-05-03T19:00:00Z","body":"spent 700000 tokens"}]
+[{"created_at":"2026-05-03T19:26:00Z","author_association":"COLLABORATOR","body":"<!-- PARTIAL_PARENT_CLOSEOUT:PR#42 -->\nCopied summary: spent 700000 tokens"},
+ {"created_at":"2026-05-03T19:30:00Z","body":"spent 300000 tokens"}]
+JSON
+cat >"$FIXTURE_PR_JSON" <<'JSON'
+{"base":{"repo":{"full_name":"owner/repo"}},"body":"For #18013","merged_at":"2026-05-03T19:25:00Z"}
+JSON
+sum_output=$("$DEDUP_HELPER" sum-issue-token-spend 18013 "owner/repo" 2>/dev/null)
+assertion_rc=1
+if [[ "$sum_output" == "300000|1" ]]; then assertion_rc=0; fi
+print_result "verified closeout resets missing timeline; copied footer is not spend" "$assertion_rc" "(got: '$sum_output')"
+
+for invalid_pr in \
+	'{"base":{"repo":{"full_name":"owner/repo"}},"body":"For #18013","merged_at":null}' \
+	'{"base":{"repo":{"full_name":"other/repo"}},"body":"For #18013","merged_at":"2026-05-03T19:25:00Z"}' \
+	'{"base":{"repo":{"full_name":"owner/repo"}},"body":"For #180130","merged_at":"2026-05-03T19:25:00Z"}'; do
+	printf '%s' "$invalid_pr" >"$FIXTURE_PR_JSON"
+	sum_output=$("$DEDUP_HELPER" sum-issue-token-spend 18013 "owner/repo" 2>/dev/null)
+	assertion_rc=1
+	if [[ "$sum_output" == "1000000|2" ]]; then assertion_rc=0; fi
+	print_result "unverified closeout does not reset budget" "$assertion_rc" "(got: '$sum_output')"
+done
+printf 'not-valid-json' >"$FIXTURE_PR_JSON"
+run_check_cost_budget 18013 "owner/repo" "standard"
+assertion_rc=1
+if [[ "$rc" -eq 1 && -z "$output" ]]; then assertion_rc=0; fi
+print_result "closeout PR parse failure stays fail-open" "$assertion_rc"
+
+# GH#34251: four counted footers were two worker reports and two copied
+# closeout summaries, not four consecutive failures. Timeline references were
+# missing. Retain the incident's spend shape without private source data.
+printf '[]' >"$FIXTURE_TIMELINE_JSON"
+cat >"$FIXTURE_COMMENTS_JSON" <<'JSON'
+[
+ {"created_at":"2026-05-03T18:00:00Z","body":"spent 246727 tokens"},
+ {"created_at":"2026-05-03T19:00:00Z","body":"spent 244443 tokens"},
+ {"created_at":"2026-05-03T19:30:00Z","body":"spent 186376 tokens"},
+ {"created_at":"2026-05-03T19:40:00Z","body":"spent 190989 tokens"}
+]
+JSON
+sum_output=$("$DEDUP_HELPER" sum-issue-token-spend 18013 "owner/repo" 2>/dev/null)
+assertion_rc=1
+if [[ "$sum_output" == "868535|4" ]]; then assertion_rc=0; fi
+print_result "unmarked incident control counts 868535 tokens across four footers" "$assertion_rc" "(got: '$sum_output')"
+
+# Put the newer receipt first: comment/candidate order must not pick the older
+# checkpoint. Both receipts copy worker footers and neither is another attempt.
+cat >"$FIXTURE_COMMENTS_JSON" <<'JSON'
+[
+ {"created_at":"2026-05-03T18:00:00Z","body":"spent 246727 tokens"},
+ {"created_at":"2026-05-03T19:40:00Z","body":"spent 190989 tokens"}
+]
+[
+ {"created_at":"2026-05-03T20:01:00Z","author_association":"MEMBER","body":"<!-- PARTIAL_PARENT_CLOSEOUT:PR#42 -->\nCopied summary: spent 186376 tokens"},
+ {"created_at":"2026-05-03T18:26:00Z","author_association":"MEMBER","body":"<!-- PARTIAL_PARENT_CLOSEOUT:PR#41 -->\nCopied summary: spent 244443 tokens"}
+]
+JSON
+cat >"$FIXTURE_EARLY_PR_JSON" <<'JSON'
+{"base":{"repo":{"full_name":"owner/repo"}},"body":"For #18013","merged_at":"2026-05-03T18:25:00Z"}
+JSON
+cat >"$FIXTURE_PR_JSON" <<'JSON'
+{"base":{"repo":{"full_name":"owner/repo"}},"body":"For #18013","merged_at":"2026-05-03T20:00:00Z"}
+JSON
+sum_output=$("$DEDUP_HELPER" sum-issue-token-spend 18013 "owner/repo" 2>/dev/null)
+assertion_rc=1
+if [[ "$sum_output" == "0|0" ]]; then assertion_rc=0; fi
+print_result "latest verified partial delivery clears incident spend without timeline events" "$assertion_rc" "(got: '$sum_output')"
+: >"$STUB_LOG"
+run_check_cost_budget 18013 "owner/repo" "standard"
+if [[ "$rc" -eq 1 && -z "$output" ]] &&
+	! grep -qE '^issue (edit|comment) ' "$STUB_LOG"; then
+	print_result "delivered incident history does not block or file another meta issue" 0
+else
+	print_result "delivered incident history does not block or file another meta issue" 1 "(rc=$rc output='$output')"
+fi
+
+# GH#34342: signature footers report cumulative OpenCode session time and
+# tokens. A continuation dispatch that resumed the 08:00 session posted
+# 89,214 → 217,569 → 356,637; summing every footer counted 809,536 after the
+# 09:22 checkpoint and tripped the breaker. Anonymized incident shape.
+cat >"$FIXTURE_TIMELINE_JSON" <<'JSON'
+[{"event":"cross-referenced","source":{"issue":{"repository":{"full_name":"owner/repo"},"body":"For #18014","pull_request":{"merged_at":"2026-05-03T09:22:30Z"}}}}]
+JSON
+cat >"$FIXTURE_COMMENTS_JSON" <<'JSON'
+[
+ {"created_at":"2026-05-03T08:06:18Z","user":{"login":"runner-b"},"body":"Checkpoint.\n---\nwith model spent 6m and 89,214 tokens on this as a headless worker."},
+ {"created_at":"2026-05-03T12:41:19Z","user":{"login":"runner-c"},"body":"Checkpoint.\n---\nwith model spent 13m and 147,569 tokens on this as a headless worker."},
+ {"created_at":"2026-05-03T14:05:12Z","user":{"login":"runner-b"},"body":"Continuation.\n---\nwith model spent 6h 5m and 217,569 tokens on this as a headless worker."},
+ {"created_at":"2026-05-03T15:19:39Z","user":{"login":"runner-a"},"body":"Blocked.\n---\nwith model spent 4m and 87,761 tokens on this as a headless worker."},
+ {"created_at":"2026-05-03T21:02:24Z","user":{"login":"runner-b"},"body":"Continuation.\n---\nwith model spent 13h 2m and 356,637 tokens on this as a headless worker."}
+]
+JSON
+sum_output=$("$DEDUP_HELPER" sum-issue-token-spend 18014 "owner/repo" 2>/dev/null)
+assertion_rc=1
+if [[ "$sum_output" == "502753|4" ]]; then assertion_rc=0; fi
+print_result "resumed-session footers count increments, pre-window footer is baseline" "$assertion_rc" "(got: '$sum_output')"
+: >"$STUB_LOG"
+run_check_cost_budget 18014 "owner/repo" "standard"
+if [[ "$rc" -eq 1 && -z "$output" ]] && ! grep -qE '^issue (edit|comment) ' "$STUB_LOG"; then
+	print_result "resumed-session incident history stays under budget" 0
+else
+	print_result "resumed-session incident history stays under budget" 1 "(rc=$rc output='$output')"
+fi
+
+# Separate sessions by the same author (different implied start) still sum.
+printf '[]' >"$FIXTURE_TIMELINE_JSON"
+cat >"$FIXTURE_COMMENTS_JSON" <<'JSON'
+[
+ {"created_at":"2026-05-03T10:00:00Z","user":{"login":"runner-b"},"body":"spent 5m and 400,000 tokens"},
+ {"created_at":"2026-05-03T11:00:00Z","user":{"login":"runner-b"},"body":"spent 5m and 500,000 tokens"},
+ {"created_at":"2026-05-03T11:30:00Z","user":{"login":"runner-c"},"body":"spent 1h 35m and 600,000 tokens"}
+]
+JSON
+sum_output=$("$DEDUP_HELPER" sum-issue-token-spend 18014 "owner/repo" 2>/dev/null)
+assertion_rc=1
+if [[ "$sum_output" == "1500000|3" ]]; then assertion_rc=0; fi
+print_result "distinct sessions and other authors are not merged" "$assertion_rc" "(got: '$sum_output')"
+
+# GH#34510: a partial closeout can be the only footer carrying the resumed
+# session baseline. It arrives just after the verified merge, but is neither
+# new spend nor an attempt. Dropping it charges the full session again.
+cat >"$FIXTURE_PR_JSON" <<'JSON'
+{"base":{"repo":{"full_name":"owner/repo"}},"body":"For #18014","merged_at":"2026-05-04T18:44:24Z"}
+JSON
+cat >"$FIXTURE_COMMENTS_JSON" <<'JSON'
+[
+ {"created_at":"2026-05-04T18:44:37Z","user":{"login":"runner-b"},"author_association":"MEMBER","body":"<!-- PARTIAL_PARENT_CLOSEOUT:PR#42 -->\nspent 1d 3h and 1,150,739 tokens as a headless worker"},
+ {"created_at":"2026-05-04T20:06:53Z","user":{"login":"runner-b"},"body":"spent 1d 5h and 1,393,983 tokens as a headless worker"}
+]
+JSON
+sum_output=$("$DEDUP_HELPER" sum-issue-token-spend 18014 "owner/repo" 2>/dev/null)
+assertion_rc=1
+if [[ "$sum_output" == "243244|1" ]]; then assertion_rc=0; fi
+print_result "merged receipt preserves resumed-session baseline without another attempt" "$assertion_rc" "(got: '$sum_output')"
+: >"$STUB_LOG"
+run_check_cost_budget 18014 "owner/repo" "thinking"
+assertion_rc=1
+if [[ "$rc" -eq 1 && -z "$output" ]] && ! grep -qE '^issue (edit|comment) ' "$STUB_LOG"; then assertion_rc=0; fi
+print_result "resumed worker after merged receipt does not falsely trip thinking budget" "$assertion_rc" "(rc=$rc output='$output')"
+
+# Receipt metadata cannot reduce a different session or an unverified delivery.
+receipt_fixture=$(<"$FIXTURE_COMMENTS_JSON")
+for receipt_filter in \
+	'.[0].author_association = "NONE"' \
+	'.[0].user.login = "other-runner"' \
+	'.[0].created_at = "2026-05-04T18:47:37Z"' \
+	'.[0].body |= sub("1d 3h"; "5m")'; do
+	printf '%s' "$receipt_fixture" | jq "$receipt_filter" >"$FIXTURE_COMMENTS_JSON"
+	sum_output=$("$DEDUP_HELPER" sum-issue-token-spend 18014 "owner/repo" 2>/dev/null)
+	assertion_rc=1
+	if [[ "$sum_output" == "1393983|1" ]]; then assertion_rc=0; fi
+	print_result "receipt baseline rejects $receipt_filter" "$assertion_rc" "(got: '$sum_output')"
+done
+printf '%s' "$receipt_fixture" >"$FIXTURE_COMMENTS_JSON"
+for invalid_pr in \
+	'{"base":{"repo":{"full_name":"owner/repo"}},"body":"For #18014","merged_at":null}' \
+	'{"base":{"repo":{"full_name":"other/repo"}},"body":"For #18014","merged_at":"2026-05-04T18:44:24Z"}' \
+	'{"base":{"repo":{"full_name":"owner/repo"}},"body":"For #180140","merged_at":"2026-05-04T18:44:24Z"}'; do
+	printf '%s' "$invalid_pr" >"$FIXTURE_PR_JSON"
+	sum_output=$("$DEDUP_HELPER" sum-issue-token-spend 18014 "owner/repo" 2>/dev/null)
+	assertion_rc=1
+	if [[ "$sum_output" == "1393983|1" ]]; then assertion_rc=0; fi
+	print_result "unverified receipt cannot supply a session baseline" "$assertion_rc" "(got: '$sum_output')"
+done
+
+# GH#34598: installation-authenticated REST reports private org members as
+# CONTRIBUTOR. Association-only trust dropped every closeout receipt, the
+# timeline lacked the cross-references, and delivered work was re-charged
+# (incident: 931421|6 instead of 0|0). Write permission must restore the
+# receipt; a confirmed non-collaborator must not; lookup failure fails open.
+printf '[]' >"$FIXTURE_TIMELINE_JSON"
+cat >"$FIXTURE_PR_JSON" <<'JSON'
+{"base":{"repo":{"full_name":"owner/repo"}},"body":"For #18015","merged_at":"2026-05-05T12:00:00Z"}
+JSON
+cat >"$FIXTURE_COMMENTS_JSON" <<'JSON'
+[
+ {"created_at":"2026-05-05T10:00:00Z","user":{"login":"runner-a"},"author_association":"CONTRIBUTOR","body":"spent 5m and 500,000 tokens"},
+ {"created_at":"2026-05-05T11:00:00Z","user":{"login":"runner-a"},"author_association":"CONTRIBUTOR","body":"spent 5m and 450,000 tokens"},
+ {"created_at":"2026-05-05T12:00:20Z","user":{"login":"runner-a"},"author_association":"CONTRIBUTOR","body":"<!-- PARTIAL_PARENT_CLOSEOUT:PR#42 -->\nspent 5m and 100,000 tokens"},
+ {"created_at":"2026-05-05T13:00:00Z","user":{"login":"runner-b"},"author_association":"CONTRIBUTOR","body":"spent 5m and 120,000 tokens"}
+]
+JSON
+printf 'write' >"$FIXTURE_PERMISSION"
+: >"$STUB_LOG"
+sum_output=$("$DEDUP_HELPER" sum-issue-token-spend 18015 "owner/repo" 2>/dev/null)
+assertion_rc=1
+if [[ "$sum_output" == "120000|1" ]] && grep -q 'collaborators/runner-a/permission' "$STUB_LOG" &&
+	! grep -q 'collaborators/runner-b/permission' "$STUB_LOG"; then
+	assertion_rc=0
+fi
+print_result "write-permission CONTRIBUTOR receipt resets delivered spend" "$assertion_rc" "(got: '$sum_output')"
+run_check_cost_budget 18015 "owner/repo" "thinking"
+assertion_rc=1
+if [[ "$rc" -eq 1 && -z "$output" ]]; then assertion_rc=0; fi
+print_result "permission-verified receipt prevents false thinking-budget trip" "$assertion_rc" "(rc=$rc output='$output')"
+printf '404' >"$FIXTURE_PERMISSION"
+sum_output=$("$DEDUP_HELPER" sum-issue-token-spend 18015 "owner/repo" 2>/dev/null)
+assertion_rc=1
+if [[ "$sum_output" == "1070000|3" ]]; then assertion_rc=0; fi
+print_result "non-collaborator receipt cannot reset spend" "$assertion_rc" "(got: '$sum_output')"
+printf 'read' >"$FIXTURE_PERMISSION"
+sum_output=$("$DEDUP_HELPER" sum-issue-token-spend 18015 "owner/repo" 2>/dev/null)
+assertion_rc=1
+if [[ "$sum_output" == "1070000|3" ]]; then assertion_rc=0; fi
+print_result "read-permission receipt cannot reset spend" "$assertion_rc" "(got: '$sum_output')"
+printf 'fail' >"$FIXTURE_PERMISSION"
+run_check_cost_budget 18015 "owner/repo" "thinking"
+assertion_rc=1
+if [[ "$rc" -eq 1 && -z "$output" ]]; then assertion_rc=0; fi
+print_result "permission lookup failure stays fail-open" "$assertion_rc" "(rc=$rc output='$output')"
+printf '404' >"$FIXTURE_PERMISSION"
+
+# Merged checkpoints reported only as "PR #N" in trusted signed worker comments
+# are verified through REST; unreadable mentions are skipped, never fail-open.
+cat >"$FIXTURE_COMMENTS_JSON" <<'JSON'
+[
+ {"created_at":"2026-05-03T18:00:00Z","body":"spent 700000 tokens"},
+ {"created_at":"2026-05-03T19:26:00Z","author_association":"MEMBER","body":"Checkpoint merged in PR #43.\n<!-- aidevops:sig -->\n---\nspent 200000 tokens"},
+ {"created_at":"2026-05-03T19:30:00Z","body":"spent 300000 tokens"}
+]
+JSON
+cat >"$FIXTURE_PR_JSON" <<'JSON'
+{"base":{"repo":{"full_name":"owner/repo"}},"body":"For #18014","merged_at":"2026-05-03T19:25:00Z"}
+JSON
+sum_output=$("$DEDUP_HELPER" sum-issue-token-spend 18014 "owner/repo" 2>/dev/null)
+assertion_rc=1
+if [[ "$sum_output" == "500000|2" ]]; then assertion_rc=0; fi
+print_result "verified PR mention in signed worker report resets spend" "$assertion_rc" "(got: '$sum_output')"
+printf 'not-valid-json' >"$FIXTURE_PR_JSON"
+sum_output=$("$DEDUP_HELPER" sum-issue-token-spend 18014 "owner/repo" 2>/dev/null)
+assertion_rc=1
+if [[ "$sum_output" == "1200000|3" ]]; then assertion_rc=0; fi
+print_result "unreadable PR mention is skipped without failing open" "$assertion_rc" "(got: '$sum_output')"
+
+# =============================================================================
+# t18729 — repository budget override from a committed
+# .aidevops/dispatch-cost-budgets.conf (parsed as data, clamped, never sourced)
+# =============================================================================
+printf '[]' >"$FIXTURE_TIMELINE_JSON"
+BUDGET_REPO="${TEST_ROOT}/repos/budgeted"
+BUDGET_MARKER="${TEST_ROOT}/sourced-marker"
+mkdir -p "${BUDGET_REPO}/.aidevops"
+jq -n --arg path "$BUDGET_REPO" \
+	'{initialized_repos: [{slug: "owner/budgeted", path: $path}]}' \
+	>"${HOME}/.config/aidevops/repos.json"
+cat >"${BUDGET_REPO}/.aidevops/dispatch-cost-budgets.conf" <<CONF
+# Repository budget override
+COST_BUDGET_STANDARD=2000000
+COST_BUDGET_THINKING=1; touch ${BUDGET_MARKER}
+COST_BUDGET_SIMPLE=5
+CONF
+
+write_fixture_issue '[{"name":"tier:standard"}]'
+write_fixture_comments "500000,400000"
+run_check_cost_budget 18101 "owner/budgeted" "standard"
+assertion_rc=1
+if [[ "$rc" -eq 1 && -z "$output" ]]; then assertion_rc=0; fi
+print_result "repository override raises standard budget (900K < 2M)" "$assertion_rc" "(rc=$rc output='$output')"
+
+run_check_cost_budget 18102 "owner/repo" "standard"
+assertion_rc=1
+if [[ "$rc" -eq 0 && "$output" == *"budget=800K"* ]]; then assertion_rc=0; fi
+print_result "repository without override keeps 800K budget" "$assertion_rc" "(rc=$rc output='$output')"
+
+run_check_cost_budget 18103 "owner/budgeted" "thinking"
+assertion_rc=1
+if [[ "$rc" -eq 0 && "$output" == *"budget=800K"* && ! -e "$BUDGET_MARKER" ]]; then assertion_rc=0; fi
+print_result "malformed override line is ignored and never executed" "$assertion_rc" "(rc=$rc output='$output' marker=$([[ -e "$BUDGET_MARKER" ]] && printf present || printf absent))"
+
+write_fixture_comments "150000"
+run_check_cost_budget 18104 "owner/budgeted" "simple"
+assertion_rc=1
+if [[ "$rc" -eq 0 && "$output" == *"budget=100K"* ]]; then assertion_rc=0; fi
+print_result "override below the minimum is clamped to 100K" "$assertion_rc" "(rc=$rc output='$output')"
+printf '{"initialized_repos":[]}\n' >"${HOME}/.config/aidevops/repos.json"
 
 export PATH="$OLD_PATH"
 

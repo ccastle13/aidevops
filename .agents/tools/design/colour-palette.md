@@ -67,7 +67,7 @@ curl -s -X POST http://colormind.io/api/ \
 | Colormind Bootstrap | http://colormind.io/bootstrap/ | Live Bootstrap theme preview with AI palettes |
 | Colormind Dashboard | http://colormind.io/template/paper-dashboard/ | Live dashboard template preview with AI palettes |
 | Huemint | https://huemint.com/ | AI colour for brand identity, logos, and web mockups |
-| Fontjoy | https://fontjoy.com/ | AI font pairing generator (heading + body + accent) |
+| Fontjoy | https://fontjoy.com/ | AI font pairing generator (three faces ending in a body face); method, limits and licence checks: `tools/design/font-pairing.md` |
 | Poolors | https://poolors.com/ | Discover colour combinations that stand out |
 | Coolors | https://coolors.co/ | Interactive palette generator with lock/shuffle |
 | Realtime Colors | https://realtimecolors.com/ | See palette applied to a live UI mockup instantly |
@@ -142,23 +142,37 @@ Shadow:            shadow tint colours (usually dark with low opacity)
 
 ### Step 4: Contrast Validation
 
-Every text/background pair must pass WCAG 2.1 AA:
+Validate applicable foreground/background pairs against WCAG AA thresholds:
 
 | Pair | Minimum Ratio |
 |------|---------------|
 | Body text on background | 4.5:1 |
-| Large text (18px+ or 14px bold) on background | 3:1 |
-| UI component borders | 3:1 against adjacent colours |
-| Focus indicators | 3:1 against background |
+| Large text (at least 18pt / 24 CSS px, or 14pt / approximately 18.67 CSS px bold) | 3:1 |
+| Visual information needed to identify controls/states and meaningful graphics | 3:1 against adjacent colours; not every decorative border |
+| Custom focus indicators | Check non-text contrast against adjacent colours and visible focus; ratio alone does not prove compliance |
 
-**Quick contrast check formula** (approximate):
+**Relative luminance for opaque sRGB** (8-bit channels):
 
 ```text
-luminance(colour) = 0.2126 * R/255 + 0.7152 * G/255 + 0.0722 * B/255
+c = channel / 255
+linear(c) = c / 12.92                         when c <= 0.04045
+            ((c + 0.055) / 1.055) ^ 2.4       otherwise
+luminance = 0.2126 * linear(R/255) + 0.7152 * linear(G/255) + 0.0722 * linear(B/255)
 contrast = (lighter_luminance + 0.05) / (darker_luminance + 0.05)
 ```
 
-Flag any pair below 4.5:1 and suggest adjustment.
+Compare the unrounded ratio to the applicable threshold; rounding 4.4976 to 4.50
+does not earn a pass. AAA requires 7:1 for normal text and 4.5:1 for large text.
+Use `scripts/accessibility-helper.sh contrast '#6e7978' '#ffffff'` for an example
+that displays 4.50 but fails normal-text AA. The CLI exit code is tied to normal
+text AA; inspect the separate large-text/AAA results for those contexts.
+
+The hex calculator handles opaque sRGB only. For alpha, gradients, images and
+other colour spaces, inspect actual compositing/rendered contrast rather than
+sampling a concept image or treating raw channel values as luminance. Use
+`tools/accessibility/accessibility-audit.md` and `workflows/ui-verification.md` for
+rendered evidence. Document applicable exemptions/unknowns rather than passing
+untested pairs, and suggest adjustments without losing semantic roles.
 
 ## Palette Spinning
 

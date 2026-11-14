@@ -141,15 +141,34 @@ _remove_show_guard_error() {
 		printf '%s\n' "Reason: git-metadata-unreadable — the guard could not prove the exact worktree registration is readable and unlocked." >&2
 		printf '%s\n' "Recovery: repair Git metadata access and verify the exact worktree block is unlocked before retrying. --force cannot bypass this protection." >&2
 		;;
+	git-worktree-identity-changed)
+		printf '%s\n' "Reason: git-worktree-identity-changed — the worktree path, Git administration or HEAD changed or became unreadable during the archive/removal step." >&2
+		printf '%s\n' "Recovery: the source was preserved; verify 'git worktree list --porcelain' still lists the exact path, then retry. --force cannot bypass this protection." >&2
+		;;
+	compact-recovery-capture-failed)
+		printf '%s\n' "Reason: compact-recovery-capture-failed — the recoverable archive could not be captured or verified; the source was preserved." >&2
+		printf '%s\n' "Recovery: read the capture diagnostic above or ${AIDEVOPS_CLEANUP_LOG:-${HOME}/.aidevops/logs/cleanup_worktrees.log}, resolve it, then retry. --force cannot bypass this protection." >&2
+		;;
 	cwd-visibility-degraded)
-		printf '%s\n' "Reason: cwd-visibility-degraded — targeted recovery could not prove a clean, unowned exact-head merged-PR worktree." >&2
-		printf '%s\n' "Recovery: resolve dirty, claim, ownership, open-PR, or GitHub-proof state and retry. --force cannot bypass live-CWD protection." >&2
+		printf '%s\n' "Reason: cwd-visibility-degraded — targeted recovery could not prove a clean, unowned worktree merged (exact-head merged PR, or local default-branch ancestry for local_only repos)." >&2
+		printf '%s\n' "Recovery: resolve dirty, claim, ownership, open-PR, or merge-proof state and retry. --force cannot bypass live-CWD protection." >&2
 		;;
 	*)
 		printf '%s\n' "Reason: ${guard_reason:-guard-refused} — the shared safety guard did not authorize removal." >&2
 		printf '%s\n' "Recovery: inspect the cleanup audit log, resolve the safety condition, then retry." >&2
 		;;
 	esac
+	return 0
+}
+
+# Preserve a specific post-archive refusal, falling back to the generic notice.
+_remove_show_archive_failure() {
+	local path_to_remove="$1"
+	if [[ -n "${WORKTREE_REMOVAL_GUARD_REASON:-}" ]]; then
+		_remove_show_guard_error "$path_to_remove" "$WORKTREE_REMOVAL_GUARD_REASON"
+	else
+		printf '%b\n' "${YELLOW}Cleanup stopped: the source remains protected and its recoverable archive was retained.${NC}"
+	fi
 	return 0
 }
 
@@ -240,13 +259,65 @@ _remove_degraded_fallback_allowed() {
 		is_worktree_owned_by_others "$path_to_remove" && return 1
 	fi
 	head_sha=$(git -C "$path_to_remove" rev-parse --verify HEAD 2>/dev/null) || return 1
-	pr_number=$(_remove_exact_head_merged_pr "$path_to_remove" "$branch_name" "$head_sha") || return 1
+	local proof_kind="merged_pr"
+	local branch_preserved="true"
+	if _remove_is_local_only_worktree "$path_to_remove"; then
+		# local_only repo (no origin): local default-branch ancestry is the proof.
+		_remove_local_only_merged_proof "$path_to_remove" "$head_sha" || return 1
+		pr_number="local-ancestry"
+		proof_kind="local_ancestry"
+		branch_preserved="false"
+	else
+		pr_number=$(_remove_exact_head_merged_pr "$path_to_remove" "$branch_name" "$head_sha") || return 1
+	fi
 	head_after_proof=$(git -C "$path_to_remove" rev-parse --verify HEAD 2>/dev/null) || return 1
 	[[ "$head_after_proof" == "$head_sha" ]] || return 1
 
 	_WT_REMOVE_DEGRADED_BRANCH="$branch_name"
 	_WT_REMOVE_DEGRADED_PR="$pr_number"
-	_WT_REMOVE_DEGRADED_AUDIT_CONTEXT="recovery_path=manual-archive-first visibility=degraded branch=${branch_name} head=${head_sha} merged_pr=${pr_number} branch_preserved=true"
+	_WT_REMOVE_DEGRADED_AUDIT_CONTEXT="recovery_path=manual-archive-first visibility=degraded branch=${branch_name} head=${head_sha} proof=${proof_kind} merged_pr=${pr_number} branch_preserved=${branch_preserved}"
+	return 0
+}
+
+# True when the worktree's repository has no origin remote AND its canonical
+# checkout is registered `local_only: true` in repos.json.
+# Args: $1=path_to_remove
+_remove_is_local_only_worktree() {
+	local path_to_remove="$1"
+	local repos_json="${AIDEVOPS_REPOS_JSON:-${HOME}/.config/aidevops/repos.json}"
+	local porcelain=""
+	local main_worktree=""
+
+	git -C "$path_to_remove" remote get-url origin >/dev/null 2>&1 && return 1
+	[[ -f "$repos_json" ]] && command -v jq >/dev/null 2>&1 || return 1
+	porcelain=$(git -C "$path_to_remove" worktree list --porcelain 2>/dev/null) || return 1
+	main_worktree="${porcelain%%$'\n'*}"
+	main_worktree="${main_worktree#worktree }"
+	[[ -n "$main_worktree" ]] || return 1
+	jq -e --arg p "$main_worktree" \
+		'any(.initialized_repos[]?; (.path // "") == $p and (.local_only // false) == true)' \
+		"$repos_json" >/dev/null 2>&1
+	return $?
+}
+
+# Local ancestry proof for remote-less repos: HEAD must be an ancestor of the
+# primary (canonical) checkout's current local default branch.
+# Args: $1=path_to_remove, $2=head_sha
+_remove_local_only_merged_proof() {
+	local path_to_remove="$1"
+	local head_sha="$2"
+	local porcelain=""
+	local main_worktree=""
+	local default_branch=""
+
+	[[ "$head_sha" =~ ^[0-9a-fA-F]{40,64}$ ]] || return 1
+	porcelain=$(git -C "$path_to_remove" worktree list --porcelain 2>/dev/null) || return 1
+	main_worktree="${porcelain%%$'\n'*}"
+	main_worktree="${main_worktree#worktree }"
+	[[ -n "$main_worktree" && "$main_worktree" != "$path_to_remove" ]] || return 1
+	default_branch=$(git -C "$main_worktree" symbolic-ref --quiet --short HEAD 2>/dev/null) || return 1
+	[[ -n "$default_branch" ]] || return 1
+	git -C "$path_to_remove" merge-base --is-ancestor "$head_sha" "refs/heads/${default_branch}" 2>/dev/null || return 1
 	return 0
 }
 
@@ -269,12 +340,23 @@ _remove_validate_path() {
 	else
 		guard_status=$?
 	fi
+	# Preserve the guard reason: fallback predicates may clobber it, and a
+	# degraded-visibility refusal must never print an empty reason.
+	local guard_reason="${WORKTREE_REMOVAL_GUARD_REASON:-}"
+	if [[ -z "$guard_reason" && "$guard_status" -eq "${_WT_CWD_CAPTURE_DEGRADED_RC:-2}" ]]; then
+		guard_reason="${_WT_CWD_REASON_DEGRADED:-cwd-visibility-degraded}"
+		WORKTREE_REMOVAL_GUARD_REASON="$guard_reason"
+	fi
 	if [[ "$guard_status" -eq "${_WT_CWD_CAPTURE_DEGRADED_RC:-2}" ]] &&
 		_remove_degraded_fallback_allowed "$path_to_remove"; then
 		_WT_REMOVE_DEGRADED_RECOVERY=1
-		printf '%s\n' "Targeted recovery: exact merged PR #${_WT_REMOVE_DEGRADED_PR}; using archive-first removal with branch preservation."
+		if [[ "$_WT_REMOVE_DEGRADED_PR" == "local-ancestry" ]]; then
+			printf '%s\n' "Targeted recovery: local_only repo, HEAD is an ancestor of the local default branch; using archive-first removal."
+		else
+			printf '%s\n' "Targeted recovery: exact merged PR #${_WT_REMOVE_DEGRADED_PR}; using archive-first removal with branch preservation."
+		fi
 	elif [[ "$guard_status" -ne 0 ]]; then
-		_remove_show_guard_error "$path_to_remove" "${WORKTREE_REMOVAL_GUARD_REASON:-}"
+		_remove_show_guard_error "$path_to_remove" "${guard_reason:-${WORKTREE_REMOVAL_GUARD_REASON:-}}"
 		return 1
 	fi
 
@@ -309,6 +391,17 @@ _remove_validate_path() {
 		echo -e "${YELLOW}--force specified, proceeding with removal${NC}"
 	fi
 
+	# GH#35224: fail before any recovery archive or producer reservation exists.
+	# Without --force Git refuses a dirty tree only after the archive is made,
+	# and a later clean retry then hits permanent producer:source-drift.
+	if [[ "${WORKTREE_FORCE_REMOVE:-}" != "1" ]] && worktree_has_changes "$path_to_remove"; then
+		printf '%b\n' "${RED}Error: Worktree removal refused: ${path_to_remove}${NC}" >&2
+		printf '%s\n' "Reason: worktree has uncommitted changes; re-run with --force to archive and remove." >&2
+		printf '%s\n' "Recovery: commit or discard the changes, or run 'worktree-helper.sh remove <path> --force' to archive them and remove the worktree." >&2
+		log_worktree_removal_event "$_WTAR_SKIPPED" "$_WTAR_WH_CALLER" "$path_to_remove" "dirty-requires-force" "skipped"
+		return 1
+	fi
+
 	return 0
 }
 
@@ -336,9 +429,21 @@ _remove_finalize_post_removal() {
 	local cleanup_receipt="$2"
 	local path_to_remove="$3"
 
+	# GH#34285: remove aidevops-labelled Docker resources for this worktree.
+	if declare -F docker_resource_auto_teardown >/dev/null 2>&1; then
+		docker_resource_auto_teardown "$path_to_remove"
+	fi
 	if [[ -n "$removed_branch" ]]; then
 		localdev_auto_branch_rm "$removed_branch"
 		preview_proxy_auto_free "$removed_branch"
+		if [[ "${AIDEVOPS_WORKTREE_MAINTENANCE_KEEP_BRANCH:-}" == 1 ]]; then
+			printf 'branch preserved: explicit worker archive plan for %s\n' "$removed_branch"
+		elif [[ -f "${SCRIPT_DIR}/local-branch-cleanup-helper.sh" ]]; then
+			bash "${SCRIPT_DIR}/local-branch-cleanup-helper.sh" --repo "$(get_repo_root)" --branch "$removed_branch" --apply ||
+				printf 'branch preserved: local branch cleanup failed for %s\n' "$removed_branch" >&2
+		else
+			printf 'branch preserved: local branch cleanup helper unavailable for %s\n' "$removed_branch" >&2
+		fi
 	fi
 	if [[ -z "$cleanup_receipt" ]]; then
 		return 0
@@ -390,6 +495,9 @@ _remove_cleanup_and_execute() {
 		completed_mode="recoverable-trash"
 		audit_context="$_WT_REMOVE_DEGRADED_AUDIT_CONTEXT"
 	elif [[ "$guard_status" -ne 0 ]]; then
+		if [[ -z "${WORKTREE_REMOVAL_GUARD_REASON:-}" && "$guard_status" -eq "${_WT_CWD_CAPTURE_DEGRADED_RC:-2}" ]]; then
+			WORKTREE_REMOVAL_GUARD_REASON="${_WT_CWD_REASON_DEGRADED:-cwd-visibility-degraded}"
+		fi
 		_remove_show_guard_error "$path_to_remove" "${WORKTREE_REMOVAL_GUARD_REASON:-}"
 		return 1
 	fi
@@ -404,6 +512,7 @@ _remove_cleanup_and_execute() {
 		return 1
 	fi
 	recoverable_archive="$WORKTREE_RECOVERABLE_ARCHIVE_PATH"
+	printf 'Recovery archive: %s\n' "$recoverable_archive"
 	if [[ "$degraded_recovery" == "$_WT_BOOL_TRUE" ]] && ! _remove_degraded_fallback_allowed "$path_to_remove" "$$"; then
 		_clean_release_removal_lease "$path_to_remove" || true
 		printf '%s\n' "Cleanup stopped: the source remains intact and its archive was retained because merge or activity evidence changed." >&2
@@ -411,14 +520,14 @@ _remove_cleanup_and_execute() {
 	fi
 
 	echo -e "${BLUE}Removing worktree: $path_to_remove${NC}"
-	# Copy first, then let native Git perform the final source removal. A lock
+	# Verify compact recovery first, then let native Git remove the source. A lock
 	# acquired at any point before that command keeps the registered source
 	# intact, while an interruption after it still leaves the archive.
 	if ! remove_archived_worktree_path "$path_to_remove" "$recoverable_archive" \
 		"${SCRIPT_NAME:-worktree-helper.sh}" "$_WT_REMOVE_MODE_MANUAL" \
 		"$audit_context" "$allow_degraded" "$force_remove"; then
 		[[ "$cleanup_lease_acquired" != "$_WT_BOOL_TRUE" ]] || _clean_release_removal_lease "$path_to_remove" || true
-		printf '%b\n' "${YELLOW}Cleanup stopped: the source remains protected and its recoverable archive was retained.${NC}"
+		_remove_show_archive_failure "$path_to_remove"
 		return 1
 	fi
 	if ! prune_missing_worktree_metadata "$repo_context" "$path_to_remove"; then
@@ -451,11 +560,6 @@ _remove_cleanup_and_execute() {
 # Remove a worktree by branch name or path, with optional --force.
 cmd_remove() {
 	local target=""
-	local force_remove=0
-	_WT_REMOVE_DEGRADED_RECOVERY=0
-	_WT_REMOVE_DEGRADED_BRANCH=""
-	_WT_REMOVE_DEGRADED_PR=""
-	_WT_REMOVE_DEGRADED_AUDIT_CONTEXT=""
 
 	# Parse arguments
 	while [[ $# -gt 0 ]]; do
@@ -463,7 +567,8 @@ cmd_remove() {
 		shift
 		case "$_ropt" in
 		--force | -f)
-			force_remove=1
+			# Compatibility spelling; never bypass registry evidence.
+			:
 			;;
 		*)
 			target="$_ropt"
@@ -477,22 +582,24 @@ cmd_remove() {
 		return 1
 	fi
 
-	# Export for ownership check
-	if [[ "$force_remove" -eq 1 ]]; then
-		export WORKTREE_FORCE_REMOVE="1"
-	fi
-
 	# Resolve target to an absolute path
 	local path_to_remove
 	if ! path_to_remove=$(_remove_resolve_path "$target"); then
 		return 1
 	fi
 
-	# Validate path is safe to remove
-	_remove_validate_path "$path_to_remove" || return 1
-
-	# Clean up runtime files and execute removal
-	_remove_cleanup_and_execute "$path_to_remove" || return 1
+	# The registry validates the generation, owners and preservation. Do not
+	# infer authority from legacy ownership, cwd scans or branch/PR status.
+	# shellcheck source=./worker-lifecycle-state.sh
+	source "${BASH_SOURCE[0]%/*}/worker-lifecycle-state.sh" || return 1
+	# GH#36494: an explicit operator request prints the refusal's next step.
+	# GH#37432: an explicit removal may end the calling session's own run.
+	if ! WORKER_LIFECYCLE_EXPLAIN_REFUSAL=1 WORKER_LIFECYCLE_RELINQUISH_CALLER=1 \
+		worker_lifecycle_cleanup_worktree "$path_to_remove"; then
+		printf 'Retirement refused; worktree retained: %s\n' "$path_to_remove" >&2
+		printf '%s\n' '--force cannot override lifecycle registry checks.' >&2
+		return 1
+	fi
 
 	return 0
 }
@@ -571,7 +678,46 @@ cmd_switch() {
 
 # --- cmd_registry ---
 
-# Manage the worktree ownership registry (list or prune stale entries).
+# Verify the caller's live session owns a linked worktree. Read-only: never
+# re-claims or adopts. Prints VERIFIED (0); prints STALE_OWNER_SAME_SESSION and
+# returns 3 when the row names this session but its owner process exited or its
+# PID was recycled (for example after a host reboot, GH#33853), so callers can
+# recommend pre-edit re-claim instead of adopt. Every other failure returns 1
+# without output. Exit 3 is part of the verify-owner CLI contract.
+_registry_verify_owner() {
+	local wt_path="${1:-}"
+	local session_id="${2:-}"
+	[[ -n "$wt_path" && "$session_id" == ses_* ]] || return 1
+
+	local registry_path=""
+	registry_path=$(_wt_registry_lookup_path "$wt_path") || return 1
+	_wt_path_is_canonical "$registry_path" && return 1
+
+	local snapshot="" owner_pid="" owner_session="" owner_process_start=""
+	local owner_batch="" owner_task="" owner_created="" current_process_start=""
+	snapshot=$(check_worktree_owner_snapshot "$registry_path" 2>/dev/null) || return 1
+	IFS='|' read -r owner_pid owner_session owner_batch owner_task owner_created owner_process_start <<<"$snapshot"
+	[[ "$owner_session" == "$session_id" && "$owner_pid" =~ ^[0-9]+$ ]] || return 1
+	if ! kill -0 "$owner_pid" 2>/dev/null; then
+		# kill -0 also fails for a live process owned by another user; only a
+		# process that ps cannot find is reported as exited.
+		if ps -p "$owner_pid" >/dev/null 2>&1; then
+			return 1
+		fi
+		printf 'STALE_OWNER_SAME_SESSION\n'
+		return 3
+	fi
+	current_process_start=$(_wt_process_start_token_for_pid "$owner_pid") || return 1
+	[[ -n "$owner_process_start" ]] || return 1
+	if [[ "$current_process_start" != "$owner_process_start" ]]; then
+		# The recorded owner exited and its PID now names a different process.
+		printf 'STALE_OWNER_SAME_SESSION\n'
+		return 3
+	fi
+	printf 'VERIFIED\n'
+	return 0
+}
+
 cmd_registry() {
 	local subcmd="${1:-list}"
 
@@ -635,8 +781,13 @@ cmd_registry() {
 
 		echo -e "${GREEN}Done: pruned $pruned of $before_count entries ($after_count remaining)${NC}"
 		;;
+	verify-owner)
+		shift
+		_registry_verify_owner "$@"
+		return $?
+		;;
 	*)
-		echo "Usage: worktree-helper.sh registry [list|prune]"
+		echo "Usage: worktree-helper.sh registry [list|prune|verify-owner <path> <session>]"
 		;;
 	esac
 	return 0
@@ -694,6 +845,10 @@ COMMANDS
                  --confirm <manifest-token>
                          Apply only exact candidates from a supported plan after
                          locked revalidation, staging, and receipt publication.
+  recovery unreadable-processes
+                         Read-only: list same-user processes whose CWD cannot be
+                         read (PID and name) to explain
+                         process-evidence-unavailable. Requires /proc.
 
   registry [list|prune]  View or prune the ownership registry (t189, t197)
                          list: Show all registered worktrees with ownership info
@@ -880,6 +1035,16 @@ cmd_recovery() {
 	apply)
 		shift
 		_cmd_recovery_apply "$@" || return 1
+		;;
+	legacy-report)
+		shift
+		python3 "$SCRIPT_DIR/worktree_recovery_legacy_report.py" "$@" || return 1
+		;;
+	unreadable-processes)
+		[[ "$#" -eq 1 ]] || return 1
+		declare -F worktree_recovery_unreadable_processes >/dev/null 2>&1 || return 1
+		worktree_recovery_unreadable_processes
+		return $?
 		;;
 	*) return 1 ;;
 	esac

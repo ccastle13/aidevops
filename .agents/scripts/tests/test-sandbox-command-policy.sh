@@ -145,6 +145,121 @@ test_network_check_command() {
 	return 0
 }
 
+LOCALDEV_REGISTRY="${TEST_ROOT}/ports.json"
+
+expect_local_site() {
+	local expected="$1"
+	local name="$2"
+	local argv_json="$3"
+	local cwd="$4"
+	local registry="${5:-$LOCALDEV_REGISTRY}"
+	local status=0
+	HOME="$TEST_HOME" AIDEVOPS_LOCALDEV_REGISTRY="$registry" \
+		"$NETWORK_HELPER" check-argv "$argv_json" --cwd "$cwd" --worker-id test >/dev/null 2>&1 || status=$?
+	if [[ "$expected" == "allow" && "$status" -eq 0 ]] || [[ "$expected" == "deny" && "$status" -ne 0 ]]; then
+		pass "local site: ${name}"
+	else
+		fail "local site: ${name}" "expected=${expected} status=${status}"
+	fi
+	return 0
+}
+
+# GH#33523: workers may verify only their repository's registered local site.
+test_network_local_site_allowance() {
+	local repo="${TEST_ROOT}/demoapp"
+	local worktree="${TEST_ROOT}/demoapp-feature-x"
+	printf '%s\n' '{"apps":{"demoapp":{"port":3100,"domain":"demoapp.local","branches":{"feature-x":{"port":3101,"subdomain":"feature-x.demoapp.local"}}},"otherapp":{"port":3200,"domain":"otherapp.local"}}}' >"$LOCALDEV_REGISTRY"
+	git init -q "$repo" &&
+		git -C "$repo" -c user.name=test -c user.email=test@example.invalid -c commit.gpgsign=false \
+			commit -q --allow-empty -m init &&
+		git -C "$repo" worktree add -q -b feature-x "$worktree" || {
+		fail "local site fixture repository"
+		return 0
+	}
+
+	expect_local_site allow "registered loopback app port" '["curl","-sI","http://127.0.0.1:3100/wp-admin/"]' "$repo"
+	expect_local_site allow "linked worktree uses canonical app name" '["curl","-sI","http://localhost:3101/"]' "$worktree"
+	expect_local_site allow "registered https domain" '["curl","-sI","https://demoapp.local/"]' "$worktree"
+	expect_local_site allow "registered branch subdomain" '["curl","https://feature-x.demoapp.local/"]' "$worktree"
+	expect_local_site allow "documented --resolve mitigation" '["curl","--resolve","demoapp.local:443:127.0.0.1","https://demoapp.local/"]' "$repo"
+	expect_local_site allow "wget IPv6 loopback app port" '["wget","-q","-O","-","http://[::1]:3100/"]' "$repo"
+	expect_local_site deny "unregistered loopback port" '["curl","http://127.0.0.1:9999/"]' "$repo"
+	expect_local_site deny "another repository's app port" '["curl","http://127.0.0.1:3200/"]' "$repo"
+	expect_local_site deny "proxy port without registered host" '["curl","http://127.0.0.1:443/"]' "$repo"
+	expect_local_site deny "connect-to redirect to unregistered port" '["curl","--connect-to","127.0.0.1:3100:127.0.0.1:22","http://127.0.0.1:3100/"]' "$repo"
+	expect_local_site deny "loopback proxy" '["curl","-x","http://127.0.0.1:3100","https://github.com/"]' "$repo"
+	expect_local_site deny "private raw IP" '["curl","http://10.0.0.5:3100/"]' "$repo"
+	expect_local_site deny "non-HTTP client" '["ssh","-p","3100","127.0.0.1"]' "$repo"
+	expect_local_site deny "cwd outside a repository" '["curl","http://127.0.0.1:3100/"]' "$TEST_HOME"
+	expect_local_site deny "missing registry" '["curl","http://127.0.0.1:3100/"]' "$repo" "${TEST_ROOT}/missing-ports.json"
+	return 0
+}
+
+OWNED_RUNTIME_ID="Thu Oct 8 10:00:00 2026"
+OWNED_ROOTS='[{"pid":200,"identity":"Thu Oct  8 10:05:00 2026"}]'
+
+expect_owned_listener() {
+	local expected="$1"
+	local name="$2"
+	local argv_json="$3"
+	local roots="${4:-$OWNED_ROOTS}"
+	local runtime_id="${5:-$OWNED_RUNTIME_ID}"
+	local status=0
+	HOME="$TEST_HOME" AIDEVOPS_LOCALDEV_REGISTRY="${TEST_ROOT}/missing-ports.json" \
+		"$NETWORK_HELPER" check-argv "$argv_json" --cwd "$TEST_HOME" --worker-id test \
+		--owned-listener-roots "$roots" --runtime-pid 100 --runtime-process-identity "$runtime_id" \
+		--process-table-fixture "${TEST_ROOT}/owned-procs.json" \
+		--listener-table-fixture "${TEST_ROOT}/owned-listeners.json" >/dev/null 2>&1 || status=$?
+	if [[ "$expected" == "allow" && "$status" -eq 0 ]] || [[ "$expected" == "deny" && "$status" -ne 0 ]]; then
+		pass "owned listener: ${name}"
+	else
+		fail "owned listener: ${name}" "expected=${expected} status=${status}"
+	fi
+	return 0
+}
+
+# GH#33969: loopback HTTP to a port served by a descendant of one of the
+# worker's live bounded-operation supervisors (PID 200, child of runtime 100).
+test_network_owned_listener_allowance() {
+	local message=""
+	printf '%s\n' '{"processes":[
+{"pid":1,"ppid":0,"pgid":1,"start":"Thu Oct 8 09:00:00 2026","comm":"launchd"},
+{"pid":100,"ppid":1,"pgid":100,"start":"Thu Oct 8 10:00:00 2026","comm":"opencode"},
+{"pid":200,"ppid":100,"pgid":200,"start":"Thu Oct 8 10:05:00 2026","comm":"node"},
+{"pid":250,"ppid":200,"pgid":250,"start":"Thu Oct 8 10:05:01 2026","comm":"bash"},
+{"pid":300,"ppid":250,"pgid":250,"start":"Thu Oct 8 10:05:02 2026","comm":"node"},
+{"pid":400,"ppid":1,"pgid":400,"start":"Thu Oct 8 08:00:00 2026","comm":"operator-service"},
+{"pid":500,"ppid":100,"pgid":500,"start":"Thu Oct 8 10:01:00 2026","comm":"mcp"}]}' >"${TEST_ROOT}/owned-procs.json"
+	# "system" is the unattributed netstat/ss view; port 8000 has a hidden
+	# (other-user) 127.0.0.1 listener that lsof could not attribute.
+	printf '%s\n' '{"listeners":[{"port":4173,"pid":300},{"port":4096,"pid":400},{"port":5000,"pid":500},{"port":6000,"pid":300},{"port":6000,"pid":400},{"port":8000,"pid":300,"address":"*"}],
+"system":[{"port":4173,"address":"127.0.0.1"},{"port":4096,"address":"127.0.0.1"},{"port":5000,"address":"127.0.0.1"},{"port":6000,"address":"127.0.0.1"},{"port":8000,"address":"*"},{"port":8000,"address":"127.0.0.1"}]}' >"${TEST_ROOT}/owned-listeners.json"
+
+	expect_owned_listener allow "worker-started server port" '["curl","-sI","http://127.0.0.1:4173/"]'
+	expect_owned_listener allow "localhost name" '["curl","-sI","http://localhost:4173/"]'
+	expect_owned_listener allow "wget client" '["wget","-qO-","http://127.0.0.1:4173/"]'
+	expect_owned_listener deny "operator-owned service" '["curl","http://127.0.0.1:4096/"]'
+	expect_owned_listener deny "runtime child outside bounded operations" '["curl","http://127.0.0.1:5000/"]'
+	expect_owned_listener deny "port shared with an unowned listener" '["curl","http://127.0.0.1:6000/"]'
+	expect_owned_listener deny "no listener yet" '["curl","http://127.0.0.1:7000/"]'
+	expect_owned_listener deny "unattributable listener on the port" '["curl","http://127.0.0.1:8000/"]'
+	expect_owned_listener deny "mixed owned and operator endpoints" '["curl","http://127.0.0.1:4173/","http://127.0.0.1:4096/"]'
+	expect_owned_listener deny "stale supervisor generation" '["curl","http://127.0.0.1:4173/"]' '[{"pid":200,"identity":"Thu Oct 8 11:00:00 2026"}]'
+	expect_owned_listener deny "root not a runtime child" '["curl","http://127.0.0.1:4173/"]' '[{"pid":250,"identity":"Thu Oct 8 10:05:01 2026"}]'
+	expect_owned_listener deny "runtime generation mismatch" '["curl","http://127.0.0.1:4173/"]' "$OWNED_ROOTS" "Thu Oct 8 12:00:00 2026"
+	expect_owned_listener deny "malformed roots" '["curl","http://127.0.0.1:4173/"]' '{"pid":200}'
+	expect_owned_listener deny "non-HTTP client" '["ssh","-p","4173","127.0.0.1"]'
+	expect_owned_listener deny "private raw IP" '["curl","http://10.0.0.5:4173/"]'
+
+	message="$(HOME="$TEST_HOME" "$NETWORK_HELPER" check-argv '["curl","http://127.0.0.1:9999/"]' --cwd "$TEST_HOME" --worker-id test 2>&1)"
+	if [[ "$message" == *"aidevops_bounded_operation"* && "$message" == *"localdev-helper.sh add"* && "$message" == *"not a terminal blocker"* ]]; then
+		pass "owned listener: denial names recovery routes"
+	else
+		fail "owned listener: denial names recovery routes" "$message"
+	fi
+	return 0
+}
+
 test_network_policy_fail_closed() {
 	local malformed="${TEST_ROOT}/network-tiers.conf"
 	printf '[tier5\nrequestbin.com\n' >"$malformed"
@@ -159,6 +274,83 @@ test_network_policy_fail_closed() {
 		fail "malformed network policy fails closed"
 	else
 		pass "malformed network policy fails closed"
+	fi
+	return 0
+}
+
+test_network_helper_timeout() {
+	if python3 - "$SCRIPT_DIR" "$TEST_ROOT" <<'PY'
+import os
+import json
+from pathlib import Path
+import subprocess
+import sys
+from unittest.mock import patch
+
+sys.path.insert(0, sys.argv[1])
+from command_policy_evaluation import _evaluate_worker_network
+
+helper = Path(sys.argv[2]) / "delayed-network-helper.sh"
+# exec avoids leaving a child holding captured pipes open after a timeout.
+helper.write_text("exec python3 -c 'import time; time.sleep(11)'\n")
+argv = [["git", "push", "origin", "HEAD"]]
+
+def evaluate():
+    return _evaluate_worker_network(argv, sys.argv[2], helper, "timeout-test")
+
+with patch.dict(os.environ):
+    os.environ.pop("AIDEVOPS_NETWORK_POLICY_TIMEOUT_SECONDS", None)
+    # Deterministically reproduce scheduling delay beyond the old 10s budget
+    # without saturating a shared runner or actually pushing a branch.
+    assert evaluate()["decision"] == "allow"
+    with patch("command_policy_evaluation.subprocess.run") as run:
+        run.return_value = subprocess.CompletedProcess([], 0, "", "")
+        assert evaluate()["decision"] == "allow"
+        assert run.call_args.kwargs["timeout"] == 30
+        os.environ["AIDEVOPS_NETWORK_POLICY_TIMEOUT_SECONDS"] = "45"
+        assert evaluate()["decision"] == "allow"
+        assert run.call_args.kwargs["timeout"] == 45
+        run.return_value = subprocess.CompletedProcess([], 1, "", "policy denied")
+        denied = evaluate()
+        assert denied["decision"] == "forbid"
+        assert denied["rule_id"] == "network.worker-policy"
+        run.side_effect = OSError("helper failed")
+        error = evaluate()
+        assert error["decision"] == "forbid"
+        assert error["rule_id"] == "network.helper-error"
+        run.side_effect = OverflowError("timeout exceeds platform limit")
+        error = evaluate()
+        assert error["decision"] == "forbid"
+        assert error["rule_id"] == "network.helper-error"
+    for invalid in ("", "0", "-1", "nan", "inf", "1.5", "invalid"):
+        os.environ["AIDEVOPS_NETWORK_POLICY_TIMEOUT_SECONDS"] = invalid
+        with patch("command_policy_evaluation.subprocess.run") as run:
+            invalid_result = evaluate()
+            assert invalid_result["decision"] == "forbid"
+            assert invalid_result["rule_id"] == "network.helper-error"
+            run.assert_not_called()
+    os.environ["AIDEVOPS_NETWORK_POLICY_TIMEOUT_SECONDS"] = "1"
+    timed_out = evaluate()
+    assert timed_out["decision"] == "forbid"
+    assert timed_out["rule_id"] == "network.helper-timeout"
+    assert "Transient" in timed_out["reason"]
+    assert "1 seconds" in timed_out["reason"]
+    # Verify classification survives the public worker CLI and its exit status.
+    cli = subprocess.run(
+        [sys.executable, str(Path(sys.argv[1]) / "command-policy-helper.py"),
+         "check-command", "--worker", "--network-helper", str(helper),
+         "--argv-json", '["printf", "safe"]', "--cwd", sys.argv[2]],
+        capture_output=True, text=True, timeout=15, check=False,
+    )
+    assert cli.returncode == 20, cli.stderr
+    decision = json.loads(cli.stdout)
+    assert decision["decision"] == "forbid"
+    assert decision["rule_id"] == "network.helper-timeout"
+PY
+	then
+		pass "network helper tolerates delay and classifies timeouts fail-closed"
+	else
+		fail "network helper tolerates delay and classifies timeouts fail-closed"
 	fi
 	return 0
 }
@@ -219,12 +411,97 @@ test_sandbox_required_policy() {
 	return 0
 }
 
+test_lifecycle_private_workload() {
+	local private_workload=""
+	local state_dir=""
+	local events=""
+	local status=0
+	local canonical_root=""
+	canonical_root=$(cd "$TEST_ROOT" && pwd -P) || return 1
+	for private_workload in 1 0; do
+		state_dir="${canonical_root}/lifecycle-${private_workload}"
+		if ! PYTHONPATH="${SCRIPT_DIR}/../worker-lifecycle" python3 -B -m worker_lifecycle.registry --state-dir "$state_dir" init >/dev/null; then
+			fail "sandbox lifecycle store initialization"
+			return 1
+		fi
+		status=0
+		HOME="$TEST_HOME" AIDEVOPS_PRIVATE_WORKLOAD="$private_workload" \
+			AIDEVOPS_LIFECYCLE_STATE_DIR="$state_dir" AIDEVOPS_LIFECYCLE_WORKTREE="$TEST_ROOT" \
+			"$SANDBOX_HELPER" run true >/dev/null 2>&1 || status=$?
+		events=$(python3 -c 'import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); print(db.execute("SELECT count(*) FROM events").fetchone()[0]); db.close()' "${state_dir}/registry.sqlite3")
+		if [[ "$status" -ne 0 ]]; then
+			fail "sandbox lifecycle private=${private_workload} preserves command success" "status=${status}"
+		elif [[ "$private_workload" == 1 && "$events" == 0 ]]; then
+			pass "sandbox private workload emits no lifecycle events"
+		elif [[ "$private_workload" == 0 && "$events" == 2 ]]; then
+			pass "sandbox non-private workload retains lifecycle observation"
+		else
+			fail "sandbox lifecycle private=${private_workload} store isolation" "events=${events}"
+		fi
+	done
+	return 0
+}
+
+test_lifecycle_defaults() {
+	local canonical_home=""
+	canonical_home=$(cd "$TEST_HOME" && pwd -P) || return 1
+	local state_dir="${canonical_home}/.aidevops/.agent-workspace/worker-lifecycle"
+	local status=0
+	local events=""
+	mkdir -p "${canonical_home}/.aidevops/.agent-workspace"
+	env -u AIDEVOPS_LIFECYCLE_STATE_DIR -u AIDEVOPS_LIFECYCLE_DISABLED -u AIDEVOPS_WORKSPACE_DIR \
+		HOME="$canonical_home" AIDEVOPS_PRIVATE_WORKLOAD=0 AIDEVOPS_LIFECYCLE_WORKTREE="$TEST_ROOT" \
+		"$SANDBOX_HELPER" run true >/dev/null 2>&1 || status=$?
+	if [[ "$status" -ne 0 || ! -f "${state_dir}/registry.sqlite3" ]]; then
+		fail "sandbox lifecycle initializes default state without opt-in" "status=${status}"
+		return 1
+	fi
+	events=$(python3 -c 'import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); print(db.execute("SELECT count(*) FROM events").fetchone()[0]); db.close()' "${state_dir}/registry.sqlite3")
+	if [[ "$events" == 2 ]]; then
+		pass "sandbox lifecycle initializes default state without opt-in"
+	else
+		fail "sandbox lifecycle initializes default state without opt-in" "events=${events}"
+	fi
+	env -u AIDEVOPS_LIFECYCLE_STATE_DIR -u AIDEVOPS_WORKSPACE_DIR HOME="$canonical_home" AIDEVOPS_LIFECYCLE_DISABLED=1 \
+		AIDEVOPS_PRIVATE_WORKLOAD=0 AIDEVOPS_LIFECYCLE_WORKTREE="$TEST_ROOT" \
+		"$SANDBOX_HELPER" run true >/dev/null 2>&1 || status=$?
+	events=$(python3 -c 'import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); print(db.execute("SELECT count(*) FROM events").fetchone()[0]); db.close()' "${state_dir}/registry.sqlite3")
+	if [[ "$status" == 0 && "$events" == 2 ]]; then
+		pass "sandbox lifecycle opt-out preserves native command without new events"
+	else
+		fail "sandbox lifecycle opt-out preserves native command without new events" "status=${status} events=${events}"
+	fi
+	local home_marker="~"
+	local setting="" expected_events=2
+	for setting in AIDEVOPS_WORKSPACE_DIR AIDEVOPS_LIFECYCLE_STATE_DIR; do
+		local configured_path="${home_marker}/.aidevops/.agent-workspace"
+		[[ "$setting" != AIDEVOPS_LIFECYCLE_STATE_DIR ]] || configured_path+="/worker-lifecycle"
+		status=0
+		env -u AIDEVOPS_LIFECYCLE_STATE_DIR -u AIDEVOPS_WORKSPACE_DIR -u AIDEVOPS_LIFECYCLE_DISABLED \
+			HOME="$canonical_home" AIDEVOPS_PRIVATE_WORKLOAD=0 AIDEVOPS_LIFECYCLE_WORKTREE="$TEST_ROOT" \
+			"${setting}=${configured_path}" "$SANDBOX_HELPER" run true >/dev/null 2>&1 || status=$?
+		expected_events=$((expected_events + 2))
+		events=$(python3 -c 'import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); print(db.execute("SELECT count(*) FROM events").fetchone()[0]); db.close()' "${state_dir}/registry.sqlite3")
+		if [[ "$status" == 0 && "$events" == "$expected_events" ]]; then
+			pass "sandbox expands literal home prefix in ${setting}"
+		else
+			fail "sandbox expands literal home prefix in ${setting}" "status=${status} events=${events}"
+		fi
+	done
+	return 0
+}
+
 main() {
 	write_fake_network_tools
 	test_network_check_command
+	test_network_local_site_allowance
+	test_network_owned_listener_allowance
 	test_network_policy_fail_closed
+	test_network_helper_timeout
 	test_sandbox_enforcement
 	test_sandbox_required_policy
+	test_lifecycle_private_workload
+	test_lifecycle_defaults
 	printf '\nTests: %d, Failures: %d\n' "$TESTS" "$FAILURES"
 	[[ "$FAILURES" -eq 0 ]] || return 1
 	return 0

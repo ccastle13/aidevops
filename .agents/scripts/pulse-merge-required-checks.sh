@@ -51,6 +51,21 @@ _pmrc_gh_read() {
 	return "$rc"
 }
 
+_pmrc_required_contexts_timeout_seconds() {
+	local timeout_seconds="${AIDEVOPS_PULSE_REQUIRED_CONTEXTS_TIMEOUT_SECONDS:-30}"
+	local deadline="${_PMP_MERGE_PASS_DEADLINE_EPOCH:-0}"
+	local now_epoch="" remaining_seconds=""
+	[[ "$timeout_seconds" =~ ^[0-9]+$ && "$timeout_seconds" -ge 1 && "$timeout_seconds" -le 120 ]] || timeout_seconds=30
+	if [[ "$deadline" =~ ^[0-9]+$ && "$deadline" -gt 0 ]]; then
+		now_epoch=$(date +%s) || return 1
+		remaining_seconds=$((deadline - now_epoch))
+		[[ "$remaining_seconds" -ge 1 ]] || return 1
+		[[ "$remaining_seconds" -lt "$timeout_seconds" ]] && timeout_seconds="$remaining_seconds"
+	fi
+	printf '%s' "$timeout_seconds"
+	return 0
+}
+
 _pmrc_cache_key() {
 	local raw_key="$1"
 	local safe_key=""
@@ -179,6 +194,18 @@ _ruleset_ref_matches_default_branch() {
 # Stdout: newline-delimited contexts
 # Returns: 0=resolved, 1=API/parse error
 #######################################
+_pmrc_emit_local_deferral() {
+	local diagnostics="$1" line=""
+	while IFS= read -r line; do
+		case "$line" in
+		'[gh-transport] error_kind=github-api-read-deferred attempted=false deferred_by=local_admission '*)
+			printf '%s\n' "$line" >&2
+			;;
+		esac
+	done <<<"$diagnostics"
+	return 0
+}
+
 _required_contexts_from_rulesets_for_default_branch() {
 	local repo_slug="$1"
 	local default_branch="$2"
@@ -186,6 +213,7 @@ _required_contexts_from_rulesets_for_default_branch() {
 
 	rulesets_json=$(_pmrc_gh_read gh api "repos/${repo_slug}/rulesets" 2>&1) || rulesets_rc=$?
 	if [[ "$rulesets_rc" -ne 0 ]]; then
+		_pmrc_emit_local_deferral "$rulesets_json"
 		if _pmrc_private_plan_feature_unavailable "$rulesets_json"; then
 			aidevops_log_line "[pulse-merge] _required_contexts_from_rulesets_for_default_branch: rulesets unavailable for ${repo_slug} on the private plan (HTTP 403) — empty contexts (GH#29484)"
 			return 0
@@ -218,7 +246,8 @@ _required_contexts_from_rulesets_for_default_branch() {
 	local matches_default=0 excluded_default=0 contexts=""
 	while IFS= read -r id; do
 		[[ -n "$id" ]] || continue
-		detail=$(_pmrc_gh_read gh api "repos/${repo_slug}/rulesets/${id}" 2>/dev/null) || {
+		detail=$(_pmrc_gh_read gh api "repos/${repo_slug}/rulesets/${id}" 2>&1) || {
+			_pmrc_emit_local_deferral "$detail"
 			aidevops_log_line "[pulse-merge] _required_contexts_from_rulesets_for_default_branch: ruleset detail ${id} failed for ${repo_slug} — caller will fail closed (GH#23019)"
 			rm -f "$contexts_tmp"
 			return 1
@@ -276,6 +305,135 @@ _required_contexts_from_rulesets_for_default_branch() {
 }
 
 #######################################
+# Extract a bounded HTTP status hint from captured gh diagnostics. Only the
+# three-digit status is returned so logs never carry response bodies.
+#
+# Args: $1=captured stdout+stderr of a failed read
+# Stdout: status code, or "none"
+#######################################
+_pmrc_http_status_hint() {
+	local response="$1"
+	local status="none"
+	if [[ "$response" =~ \(HTTP\ ([1-5][0-9][0-9])\) ]]; then
+		status="${BASH_REMATCH[1]}"
+	elif [[ "$response" =~ HTTP(/[0-9.]+)?[[:space:]:]+([1-5][0-9][0-9]) ]]; then
+		status="${BASH_REMATCH[2]}"
+	elif [[ "$response" =~ \"status\"[[:space:]]*:[[:space:]]*\"?([1-5][0-9][0-9]) ]]; then
+		status="${BASH_REMATCH[1]}"
+	fi
+	printf '%s' "$status"
+	return 0
+}
+
+#######################################
+# Resolve classic requirements from the readable branch metadata endpoint after
+# the classic settings read failed. Settings may be hidden from a collaborator
+# even on a protected branch, and rulesets alone cannot prove classic
+# requirements are absent (GH#34965). The branch read is independent evidence:
+# any non-authoritative shape fails closed.
+#
+# Args: $1=repo_slug, $2=default_branch, $3=classified (1|0),
+#       $4=sanitized failure detail for unclassified settings failures
+# Stdout: compact classic requirements JSON ({contexts:[...]} / {checks:[...]})
+# Returns: 0=resolved, 1=unresolved (caller fails closed)
+#######################################
+_pmrc_classic_requirements_from_branch_metadata() {
+	local repo_slug="$1"
+	local default_branch="$2"
+	local classified="$3"
+	local failure_detail="$4"
+	local branch_resp="" requirements=""
+	local unresolved_prefix="branch protection API failed for ${repo_slug} (${failure_detail}) and"
+	local unresolved_suffix="caller will fail closed (t2922, GH#37026)"
+	if [[ "$classified" == 1 ]]; then
+		unresolved_prefix="branch metadata"
+		unresolved_suffix="caller will fail closed (GH#34965)"
+	fi
+
+	branch_resp=$(_pmrc_gh_read gh api "repos/${repo_slug}/branches/${default_branch}" 2>&1) || {
+		_pmrc_emit_local_deferral "$branch_resp"
+		if [[ "$classified" == 1 ]]; then
+			aidevops_log_line "[pulse-merge] _required_contexts_for_default_branch: branch metadata unavailable for ${repo_slug} — ${unresolved_suffix}"
+		else
+			aidevops_log_line "[pulse-merge] _required_contexts_for_default_branch: ${unresolved_prefix} branch metadata unavailable — ${unresolved_suffix}"
+		fi
+		return 1
+	}
+	requirements=$(printf '%s' "$branch_resp" | jq -ce \
+		--arg array "$PMRC_JSON_ARRAY" --arg obj "$PMRC_JSON_OBJECT" --arg string "$PMRC_JSON_STRING" '
+		if type != $obj then error("invalid branch")
+		elif .protected == false then {contexts: []}
+		elif .protected == true then
+			.protection.required_status_checks |
+			if type == $obj and
+				((.contexts | type == $array) or (.checks | type == $array)) and
+				(.contexts == null or (.contexts | type == $array and all(.[]; type == $string and length > 0))) and
+				(.checks == null or (.checks | type == $array and all(.[]; type == $obj and (.context | type == $string and length > 0))))
+			then . else error("unknown classic requirements") end
+		else error("unknown protection state") end
+	' 2>/dev/null) || {
+		if [[ "$classified" == 1 ]]; then
+			aidevops_log_line "[pulse-merge] _required_contexts_for_default_branch: branch metadata cannot resolve classic requirements for ${repo_slug} — ${unresolved_suffix}"
+		else
+			aidevops_log_line "[pulse-merge] _required_contexts_for_default_branch: ${unresolved_prefix} branch metadata cannot resolve classic requirements — ${unresolved_suffix}"
+		fi
+		return 1
+	}
+	if [[ "$classified" != 1 ]]; then
+		aidevops_log_line "[pulse-merge] _required_contexts_for_default_branch: branch protection settings read failed for ${repo_slug} (${failure_detail}); branch metadata resolved classic requirements (GH#37026)"
+	fi
+	printf '%s\n' "$requirements"
+	return 0
+}
+
+#######################################
+# Classify a failed classic settings read and recover classic requirements from
+# branch metadata when that is safe.
+#
+# Local admission/cooldown deferrals (exit 75) and timeouts (exit 124) never
+# reached a classifiable HTTP response: log them as deferrals and spend no
+# further read. Every other failure falls back to branch metadata. GH#37026:
+# the production transport stack can return exit 1 without the 404 markers
+# GH#36866 matched, so the fallback must not depend on matching error text.
+#
+# Args: $1=repo_slug, $2=default_branch, $3=settings read exit code,
+#       $4=captured stdout+stderr of the settings read
+# Stdout: compact classic requirements JSON
+# Returns: 0=resolved, 1=unresolved (caller fails closed)
+#######################################
+_pmrc_classic_requirements_after_settings_failure() {
+	local repo_slug="$1"
+	local default_branch="$2"
+	local protection_rc="$3"
+	local protection_resp="$4"
+	local http_status="" classified=0
+
+	_pmrc_emit_local_deferral "$protection_resp"
+	http_status=$(_pmrc_http_status_hint "$protection_resp")
+	case "$protection_rc" in
+	75)
+		aidevops_log_line "[pulse-merge] _required_contexts_for_default_branch: branch protection read deferred locally for ${repo_slug} (exit 75, no HTTP response) — caller will fail closed until the next cycle (GH#37026)"
+		return 1
+		;;
+	124)
+		aidevops_log_line "[pulse-merge] _required_contexts_for_default_branch: branch protection read timed out for ${repo_slug} (exit 124) — caller will fail closed until the next cycle (GH#37026)"
+		return 1
+		;;
+	esac
+
+	# GH#36866: accept the JSON body's own 404 markers as well as gh's stderr.
+	if [[ "$http_status" == 404 ]] ||
+		grep -qiE 'HTTP 404|Not Found|Branch not protected' <<<"$protection_resp"; then
+		classified=1
+	elif _pmrc_private_plan_feature_unavailable "$protection_resp"; then
+		classified=1
+	fi
+	_pmrc_classic_requirements_from_branch_metadata "$repo_slug" "$default_branch" "$classified" \
+		"exit ${protection_rc}, http_status=${http_status}"
+	return $?
+}
+
+#######################################
 # Resolve required status check contexts for a repository's default branch from
 # classic branch protection plus active matching repository rulesets.
 #
@@ -286,9 +444,10 @@ _required_contexts_from_rulesets_for_default_branch() {
 _required_contexts_for_default_branch_uncached() {
 	local repo_slug="$1"
 	local default_branch="" default_branch_rc=0
-	default_branch=$(_pmrc_gh_read gh api "repos/${repo_slug}" --jq '.default_branch' 2>/dev/null) || default_branch_rc=$?
+	default_branch=$(_pmrc_gh_read gh api "repos/${repo_slug}" --jq '.default_branch' 2>&1) || default_branch_rc=$?
 	if [[ "$default_branch_rc" -ne 0 || -z "$default_branch" ]]; then
-		aidevops_log_line "[pulse-merge] _required_contexts_for_default_branch: failed to resolve default branch for ${repo_slug} — caller will fail closed (t2922)"
+		_pmrc_emit_local_deferral "$default_branch"
+		aidevops_log_line "[pulse-merge] _required_contexts_for_default_branch: failed to resolve default branch for ${repo_slug} (read_exit=${default_branch_rc}, output_bytes=${#default_branch}) — caller will fail closed (t2922)"
 		return 1
 	fi
 
@@ -299,25 +458,8 @@ _required_contexts_for_default_branch_uncached() {
 		"repos/${repo_slug}/branches/${default_branch}/protection/required_status_checks" \
 		2>&1) || protection_rc=$?
 	if [[ "$protection_rc" -ne 0 ]]; then
-		local classic_unavailable_reason=""
-		if grep -qi 'HTTP 404\|Not Found' <<<"$protection_resp"; then
-			classic_unavailable_reason="HTTP 404"
-		elif _pmrc_private_plan_feature_unavailable "$protection_resp"; then
-			classic_unavailable_reason="private-plan unavailable (HTTP 403)"
-		fi
-		if [[ -n "$classic_unavailable_reason" ]]; then
-			local ruleset_contexts_unavailable=""
-			ruleset_contexts_unavailable=$(_required_contexts_from_rulesets_for_default_branch "$repo_slug" "$default_branch") || return 1
-			if [[ -n "$ruleset_contexts_unavailable" ]]; then
-				aidevops_log_line "[pulse-merge] _required_contexts_for_default_branch: no classic branch protection on ${repo_slug} (${classic_unavailable_reason}), but active rulesets require contexts (GH#23019, GH#28864)"
-				printf '%s\n' "$ruleset_contexts_unavailable"
-				return 0
-			fi
-			aidevops_log_line "[pulse-merge] _required_contexts_for_default_branch: no classic branch protection or required ruleset contexts on ${repo_slug} default branch (${classic_unavailable_reason}) — empty contexts (t3193, GH#23019, GH#28864)"
-			return 0
-		fi
-		aidevops_log_line "[pulse-merge] _required_contexts_for_default_branch: branch protection API failed for ${repo_slug} (exit ${protection_rc}) — caller will fail closed (t2922)"
-		return 1
+		protection_resp=$(_pmrc_classic_requirements_after_settings_failure \
+			"$repo_slug" "$default_branch" "$protection_rc" "$protection_resp") || return 1
 	fi
 
 	local classic_contexts="" ruleset_contexts=""
@@ -338,7 +480,7 @@ _required_contexts_for_default_branch() {
 	local repo_slug="$1"
 	local cache_dir="${AIDEVOPS_PULSE_REQUIRED_CONTEXTS_CACHE_DIR:-}"
 	local cache_key="" cache_body_file="" cache_rc_file="" cache_rc=""
-	local contexts="" rc=0
+	local contexts="" rc=0 timeout_seconds=""
 
 	if [[ -n "$cache_dir" && -d "$cache_dir" ]]; then
 		cache_key=$(_pmrc_cache_key "$repo_slug")
@@ -347,6 +489,9 @@ _required_contexts_for_default_branch() {
 		if [[ -f "$cache_rc_file" && -f "$cache_body_file" ]]; then
 			cache_rc=$(<"$cache_rc_file")
 			[[ "$cache_rc" =~ ^[0-9]+$ ]] || cache_rc=1
+			if [[ "$cache_rc" -ne 0 && -f "${cache_body_file}.error" ]]; then
+				_pmrc_emit_local_deferral "$(<"${cache_body_file}.error")"
+			fi
 			if [[ "$cache_rc" -eq 0 && -s "$cache_body_file" ]]; then
 				while IFS= read -r contexts; do
 					printf '%s\n' "$contexts"
@@ -356,8 +501,14 @@ _required_contexts_for_default_branch() {
 		fi
 	fi
 
-	contexts=$(_required_contexts_for_default_branch_uncached "$repo_slug") || rc=$?
-	if [[ -n "$cache_body_file" && -n "$cache_rc_file" ]]; then
+	timeout_seconds=$(_pmrc_required_contexts_timeout_seconds) || return 1
+	if [[ -n "$cache_body_file" ]]; then
+		contexts=$(AIDEVOPS_GH_READ_TIMEOUT="$timeout_seconds" _required_contexts_for_default_branch_uncached "$repo_slug" 2>"${cache_body_file}.error") || rc=$?
+		[[ "$rc" -eq 0 ]] || _pmrc_emit_local_deferral "$(<"${cache_body_file}.error")"
+	else
+		contexts=$(AIDEVOPS_GH_READ_TIMEOUT="$timeout_seconds" _required_contexts_for_default_branch_uncached "$repo_slug") || rc=$?
+	fi
+	if [[ "$rc" -eq 0 && -n "$cache_body_file" && -n "$cache_rc_file" ]]; then
 		printf '%s\n' "$rc" >"$cache_rc_file"
 		if [[ -n "$contexts" ]]; then
 			printf '%s\n' "$contexts" >"$cache_body_file"
@@ -390,6 +541,64 @@ _pmrc_snapshot_log_failure() {
 	return 0
 }
 
+_pmrc_snapshot_retry_timeout_seconds() {
+	local timeout_seconds="${AIDEVOPS_PULSE_MERGE_SNAPSHOT_RETRY_TIMEOUT_SECONDS:-10}"
+	local deadline=0 candidate="" now_epoch="" remaining_seconds=""
+	[[ "$timeout_seconds" =~ ^[0-9]+$ && "$timeout_seconds" -ge 1 && "$timeout_seconds" -le 30 ]] || timeout_seconds=10
+	for candidate in "${_PMP_MERGE_PASS_DEADLINE_EPOCH:-0}" "${AIDEVOPS_GH_DEADLINE_EPOCH:-0}"; do
+		[[ "$candidate" =~ ^[0-9]+$ && "$candidate" -gt 0 ]] || continue
+		[[ "$deadline" -eq 0 || "$candidate" -lt "$deadline" ]] && deadline="$candidate"
+	done
+	if [[ "$deadline" -gt 0 ]]; then
+		now_epoch=$(date +%s) || return 1
+		remaining_seconds=$((deadline - now_epoch - 1))
+		[[ "$remaining_seconds" -ge 1 ]] || return 1
+		[[ "$remaining_seconds" -lt "$timeout_seconds" ]] && timeout_seconds="$remaining_seconds"
+	fi
+	printf '%s' "$timeout_seconds"
+	return 0
+}
+
+_pmrc_snapshot_checks_with_retry() {
+	local repo_slug="$1"
+	local head_sha="$2"
+	local checks_json="" snapshot_rc=0 retry_timeout=""
+	local retry_delay="${AIDEVOPS_PULSE_MERGE_SNAPSHOT_RETRY_DELAY_SECONDS:-1}"
+
+	checks_json=$(_pmrc_snapshot_checks_json "$repo_slug" "$head_sha") || snapshot_rc=$?
+	if [[ "$snapshot_rc" -eq 0 ]]; then
+		printf '%s\n' "$checks_json"
+		return 0
+	fi
+	[[ "$snapshot_rc" -eq 75 || "$snapshot_rc" -eq 124 ]] || return "$snapshot_rc"
+	retry_timeout=$(_pmrc_snapshot_retry_timeout_seconds) || return "$snapshot_rc"
+	[[ "$retry_delay" =~ ^[0-9]+$ && "$retry_delay" -le 5 ]] || retry_delay=1
+	echo "[pulse-merge] pre-merge snapshot: transient check-set read rc=${snapshot_rc} for head ${head_sha:0:12} in ${repo_slug}; retrying once with ${retry_timeout}s timeout" >>"$LOGFILE"
+	[[ "$retry_delay" -eq 0 ]] || sleep "$retry_delay"
+
+	snapshot_rc=0
+	checks_json=$(AIDEVOPS_GH_READ_TIMEOUT="$retry_timeout" \
+		_pmrc_snapshot_checks_json "$repo_slug" "$head_sha") || snapshot_rc=$?
+	[[ "$snapshot_rc" -eq 0 ]] || return "$snapshot_rc"
+	printf '%s\n' "$checks_json"
+	return 0
+}
+
+_pmrc_prioritize_snapshot_retry() {
+	local repo_slug="$1"
+	local pr_number="$2"
+	local snapshot_rc="$3"
+	local unavailable="unavailable"
+	local queue_action="$unavailable"
+	if declare -F _pulse_merge_queue_defer >/dev/null 2>&1; then
+		queue_action=$(_pulse_merge_queue_defer "$repo_slug" "$pr_number" 2>>"$LOGFILE") || queue_action="$unavailable"
+	elif declare -F _pulse_merge_queue_enqueue >/dev/null 2>&1; then
+		queue_action=$(_pulse_merge_queue_enqueue "$repo_slug" "$pr_number" 2>>"$LOGFILE") || queue_action="$unavailable"
+	fi
+	echo "[pulse-merge] pre-merge snapshot: transient exact-head read exhausted for PR #${pr_number} in ${repo_slug} (rc=${snapshot_rc}); merge remains blocked and next-cycle priority is preserved (retry_hint=${queue_action})" >>"$LOGFILE"
+	return 0
+}
+
 _pmrc_record_preflight_check_mismatch() {
 	if declare -F gh_record_efficiency_evidence >/dev/null 2>&1; then
 		gh_record_efficiency_evidence guardrails.required_check_merge_preflight_mismatches 1 2>/dev/null || true
@@ -417,8 +626,7 @@ _pmrc_normalize_snapshot_checks_json() {
 		then error("invalid check-runs or commit-status response")
 		else . end |
 		.[0] as $pages | .[1] as $statuses |
-		"pending" as $pending | "in_progress" as $in_progress |
-		"error" as $error |
+		"pending" as $pending | "in_progress" as $in_progress | "error" as $error |
 		[
 			$pages[]?.check_runs[]? | {
 				source: "check_run",
@@ -437,7 +645,8 @@ _pmrc_normalize_snapshot_checks_json() {
 				status: (if $state == $pending then $in_progress else $completed end),
 				conclusion: (if $state == $success then $success elif ($state == $failure or $state == $error) then $failure else "" end),
 				link: (.target_url // ""),
-				observed_at: (.updated_at // .created_at // "")
+				observed_at: (.updated_at // .created_at // ""),
+				description: (.description // "")
 			}
 		]
 		| map(select(.name != ""))
@@ -509,15 +718,18 @@ _pmrc_snapshot_checks_json() {
 	local head_sha="$2"
 	local runs_pages="" statuses_json="" checks_json=""
 
+	local read_rc=0
 	runs_pages=$(_pmrc_gh_read gh api "repos/${repo_slug}/commits/${head_sha}/check-runs?per_page=100" \
-		--paginate --slurp 2>/dev/null) || {
+		--paginate --slurp 2>/dev/null) || read_rc=$?
+	if [[ "$read_rc" -ne 0 ]]; then
 		_pmrc_snapshot_log_failure "$repo_slug" "${PMRC_SUBJECT_HEAD_PREFIX}${head_sha:0:12}" "check-runs fetch"
-		return 1
-	}
-	statuses_json=$(_pmrc_gh_read gh api "repos/${repo_slug}/commits/${head_sha}/status" 2>/dev/null) || {
+		return "$read_rc"
+	fi
+	statuses_json=$(_pmrc_gh_read gh api "repos/${repo_slug}/commits/${head_sha}/status" 2>/dev/null) || read_rc=$?
+	if [[ "$read_rc" -ne 0 ]]; then
 		_pmrc_snapshot_log_failure "$repo_slug" "${PMRC_SUBJECT_HEAD_PREFIX}${head_sha:0:12}" "commit-status fetch"
-		return 1
-	}
+		return "$read_rc"
+	fi
 	# Stream API documents over stdin instead of passing large check-run payloads
 	# through --argjson, which can exceed the OS per-argument limit (GH#28164).
 	checks_json=$(printf '%s\n%s\n' "$runs_pages" "$statuses_json" |
@@ -687,12 +899,77 @@ _pmrc_is_explicit_advisory_failure() {
 	local checks_json="$2"
 	local companion=""
 	case "$check_name" in
+	"qlty check") companion="Qlty Regression Gate" ;;
 	"Qlty Smell Threshold") companion="Qlty Smell Regression" ;;
 	*) return 1 ;;
 	esac
 	jq -e --arg companion "$companion" --arg completed "$PMRC_CHECK_COMPLETED" \
 		--arg success "$PMRC_CHECK_SUCCESS" '[.[]? | select(.name == $companion and .status == $completed and .conclusion == $success)] | length > 0' \
 		<<<"$checks_json" >/dev/null 2>&1
+	return $?
+}
+
+# Billing-only commit statuses cannot be repaired by changing code. Only verified
+# credit-limited repositories qualify; native required checks still block merges.
+# Exact context matching excludes Actions jobs such as Qlty Regression Gate.
+PMRC_QUOTA_EXHAUSTED_DESCRIPTION_RE='out of ((analysis )?minutes|credits)'
+
+_pmrc_repo_has_qlty_credit_limit() {
+	local repo_slug="$1" metadata=""
+	metadata=$(gh api "repos/${repo_slug}" 2>/dev/null) || return 1
+	jq -e '(.private | type) == "boolean"
+		and (.owner.type == "User" or .owner.type == "Organization")
+		and (.private or .owner.type == "Organization")' <<<"$metadata" >/dev/null 2>&1
+	return $?
+}
+
+_pmrc_is_quota_exhausted_status_failure() {
+	local check_name="$1"
+	local checks_json="$2"
+	local repo_slug="$3"
+
+	jq -e --arg name "$check_name" --arg re "$PMRC_QUOTA_EXHAUSTED_DESCRIPTION_RE" '
+		($name | ascii_downcase) == "qlty check"
+		and ([.[]? | select(.name == $name and .source == "commit_status"
+			and ((.description // "") | test($re; "i")))] | length > 0)
+	' <<<"$checks_json" >/dev/null 2>&1 || return 1
+	_pmrc_repo_has_qlty_credit_limit "$repo_slug"
+	return $?
+}
+
+# Some providers publish a non-required commit status as a quota/usage notice
+# and leave it pending forever (for example Qlty's "qlty usage" at 90%+ of
+# analysis minutes). It reports no code result, so waiting for it can never
+# finish and would wedge every PR on the repository. Only these exact contexts,
+# when published as a single non-required commit status that is still pending,
+# are ignored; required contexts, check runs and terminal failures keep their
+# normal handling (see _pmrc_snapshot_checks_acceptable).
+PMRC_INFORMATIONAL_PENDING_STATUS_CONTEXTS_JSON='["qlty usage"]'
+
+# Emit one TSV row per normalized check: name, informational-pending flag,
+# family, status, conclusion, required, members, link. The flag sits beside
+# the name because IFS tab splitting collapses empty fields (a pending check
+# has an empty conclusion).
+_pmrc_snapshot_check_rows() {
+	local checks_json="$1"
+	local required_json="$2"
+
+	jq -r --argjson required "$required_json" --arg failure "$PMRC_CHECK_FAILURE" \
+		--arg completed "$PMRC_CHECK_COMPLETED" \
+		--argjson informational "$PMRC_INFORMATIONAL_PENDING_STATUS_CONTEXTS_JSON" '.[] | . as $check | ($check.members // [$check]) as $members |
+		((($required | index($check.name)) != null) or any($members[]; .name as $member_name | ($required | index($member_name)) != null)) as $is_required | [
+		$check.name,
+		(($is_required | not) and $check.status != $completed
+			and ($informational | index($check.name)) != null
+			and ($members | length) == 1 and $members[0].source == "commit_status"
+			and $members[0].name == $check.name),
+		($check.family // $check.name),
+		$check.status,
+		$check.conclusion,
+		$is_required,
+		($members | map("\(.name)@\(.source)") | join(",")),
+		($check.link // ([$members[] | select(.conclusion == $failure and (.link // "") != "") | .link] | last) // "")
+	] | @tsv' <<<"$checks_json" 2>/dev/null
 	return $?
 }
 
@@ -766,6 +1043,67 @@ _pmrc_rerun_infrastructure_check() {
 	return 0
 }
 
+# Recover cancelled Actions runs without turning infrastructure evidence into
+# code-repair feedback. One reservation per PR/head/run survives restarts and
+# deduplicates multiple cancelled jobs in the same workflow (GH#33780).
+_pmrc_rerun_cancelled_check() {
+	local repo_slug="$1" pr_number="$2" head_sha="$3" check_url="$4"
+	local state_root="${AIDEVOPS_TEMP_DIR:-${HOME:+$HOME/.aidevops/.agent-workspace/tmp}}"
+	local state_dir="${PULSE_MERGE_CANCELLED_RERUN_STATE_DIR:-${state_root:+$state_root/pulse-cancelled-check-reruns}}"
+	local run_id="" run_json="" attempt="" previous_attempt="" reservation=""
+	[[ "$repo_slug" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$pr_number" =~ ^[0-9]+$ ]] || return 1
+	[[ "$head_sha" =~ ^[A-Za-z0-9_-]+$ && "${DRY_RUN:-0}" != 1 ]] || return 1
+	[[ -n "$state_dir" ]] || return 1
+	[[ "$check_url" == "https://github.com/${repo_slug}/actions/runs/"* ]] || return 1
+	run_id="${check_url#*/actions/runs/}"
+	run_id="${run_id%%[/?#]*}"
+	[[ "$run_id" =~ ^[0-9]+$ ]] || return 1
+	if declare -F repo_allows_pulse_write_actions >/dev/null 2>&1 &&
+		! repo_allows_pulse_write_actions "$repo_slug"; then
+		return 1
+	fi
+	_pmrc_actions_incident_blocks_rerun && return 1
+	# A stale check URL must never rerun a different commit or an active run.
+	run_json=$(_pmrc_gh_read gh api "repos/${repo_slug}/actions/runs/${run_id}" 2>/dev/null) || return 1
+	attempt=$(jq -er --arg head "$head_sha" --arg number "$PMRC_JSON_NUMBER" \
+		--arg cancelled cancelled --arg failure "$PMRC_CHECK_FAILURE" '
+		select(.head_sha == $head and .status == "completed"
+			and (.conclusion == $cancelled or .conclusion == $failure))
+		| .run_attempt | select(type == $number and . >= 1)' <<<"$run_json") || return 1
+	[[ "$attempt" =~ ^[1-9][0-9]*$ ]] || return 1
+	mkdir -p "$state_dir" || return 1
+	reservation="${state_dir}/${repo_slug//\//-}-${pr_number}-${head_sha}-${run_id}"
+	if mkdir "$reservation" 2>/dev/null; then
+		# Reserve before the write: concurrent passes and crashes cannot amplify it.
+		printf '%s\n' "$attempt" >"$reservation/attempt" || return 1
+		#aidevops:trust-boundary — repository write policy and the API run SHA
+		# are checked above; gh is the pulse wrapper, not a direct CLI bypass.
+		if gh run rerun "$run_id" --repo "$repo_slug" >/dev/null 2>&1; then
+			: >"$reservation/submitted" || return 1
+			aidevops_log_line "[pulse-merge] requested cancelled workflow rerun for PR #${pr_number} head ${head_sha} run=${run_id}; merge remains blocked pending fresh success (GH#33780)"
+			return 0
+		fi
+		if mkdir "$reservation/escalated" 2>/dev/null; then
+			aidevops_log_line "[pulse-merge] cancelled workflow recovery escalated for PR #${pr_number} head ${head_sha} run=${run_id}: rerun request failed; no further automatic reruns (GH#33780)"
+		fi
+		return 1
+	fi
+	# A reservation with no submission receipt is ambiguous after interruption.
+	# Escalate conservatively, never replay a possibly accepted request.
+	if [[ ! -f "$reservation/submitted" || ! -f "$reservation/attempt" ]]; then
+		if mkdir "$reservation/escalated" 2>/dev/null; then
+			aidevops_log_line "[pulse-merge] cancelled workflow recovery escalated for PR #${pr_number} head ${head_sha} run=${run_id}: incomplete submission receipt; no further automatic reruns (GH#33780)"
+		fi
+		return 1
+	fi
+	IFS= read -r previous_attempt <"$reservation/attempt" || previous_attempt=0
+	[[ "$previous_attempt" =~ ^[1-9][0-9]*$ ]] || previous_attempt=0
+	if [[ "$attempt" -gt "$previous_attempt" ]] && mkdir "$reservation/escalated" 2>/dev/null; then
+		aidevops_log_line "[pulse-merge] cancelled workflow recovery escalated for PR #${pr_number} head ${head_sha} run=${run_id}: attempt ${attempt} cancelled again; no further automatic reruns (GH#33780)"
+	fi
+	return 0
+}
+
 _pmrc_configured_advisory_contexts_json() {
 	local repo_slug="$1"
 	local repos_json="${AIDEVOPS_REPOS_JSON:-$HOME/.config/aidevops/repos.json}"
@@ -821,6 +1159,45 @@ _pmrc_is_configured_advisory_failure() {
 	return $?
 }
 
+#######################################
+# Classify one terminal non-required failure. Logs the reason when advisory.
+# Args: $1=name $2=members $3=link $4=checks_json $5=configured_contexts_json
+#       $6=evidence_json $7=repo_slug $8=pr_number $9=head_sha
+# Returns: 0=advisory (does not block merge), 1=blocking
+#######################################
+_pmrc_nonrequired_failure_is_advisory() {
+	local name="$1"
+	local members="$2"
+	local link="$3"
+	local checks_json="$4"
+	local configured_contexts_json="$5"
+	local evidence_json="$6"
+	local repo_slug="$7"
+	local pr_number="$8"
+	local head_sha="$9"
+	local subject="for PR #${pr_number} in ${repo_slug}"
+
+	if declare -F _ci_check_url_has_infra_failure_log >/dev/null 2>&1 &&
+		_ci_check_url_has_infra_failure_log "$repo_slug" "$link"; then
+		echo "[pulse-merge] pre-merge snapshot: IGNORED non-required infrastructure failure '${name}' ${subject} after failed-log classification (GH#27600)" >>"$LOGFILE"
+		return 0
+	fi
+	if _pmrc_is_explicit_advisory_failure "$name" "$checks_json"; then
+		echo "[pulse-merge] pre-merge snapshot: IGNORED non-required baseline advisory failure '${name}' because its regression companion passed ${subject} (GH#27137)" >>"$LOGFILE"
+		return 0
+	fi
+	if [[ "$members" == "${name}@commit_status" ]] &&
+		_pmrc_is_quota_exhausted_status_failure "$name" "$checks_json" "$repo_slug"; then
+		echo "[pulse-merge] pre-merge snapshot: IGNORED non-required provider status '${name}' that did not run because the provider quota is spent ${subject} (GH#33640)" >>"$LOGFILE"
+		return 0
+	fi
+	if _pmrc_is_configured_advisory_failure "$name" "$configured_contexts_json" "$evidence_json" "$repo_slug" "$pr_number" "$head_sha"; then
+		echo "[pulse-merge] pre-merge snapshot: IGNORED configured non-required review-provider failure '${name}' with typed current-head review evidence ${subject}" >>"$LOGFILE"
+		return 0
+	fi
+	return 1
+}
+
 _pmrc_snapshot_checks_acceptable() {
 	local repo_slug="$1"
 	local pr_number="$2"
@@ -828,7 +1205,7 @@ _pmrc_snapshot_checks_acceptable() {
 	local required_contexts="$4"
 	local evidence_json="${5:-}"
 	local head_sha="${6:-}"
-	local required_json="" configured_contexts_json="" rows="" name="" family="" status="" conclusion="" required="" members="" link=""
+	local required_json="" configured_contexts_json="" rows="" name="" informational="" family="" status="" conclusion="" required="" members="" link=""
 	local blocking_names=""
 	local blockers=0 pending=0 advisory=0
 	_PULSE_MERGE_PREFLIGHT_BLOCKING_CHECKS_JSON="[]"
@@ -840,16 +1217,8 @@ _pmrc_snapshot_checks_acceptable() {
 			"configured advisory-context lookup"
 		return 1
 	}
-	rows=$(jq -r --argjson required "$required_json" --arg failure "$PMRC_CHECK_FAILURE" '.[] | . as $check | ($check.members // [$check]) as $members | [
-		$check.name,
-		($check.family // $check.name),
-		$check.status,
-		$check.conclusion,
-		((($required | index($check.name)) != null) or any($members[]; .name as $member_name | ($required | index($member_name)) != null)),
-		($members | map("\(.name)@\(.source)") | join(",")),
-		($check.link // ([$members[] | select(.conclusion == $failure and (.link // "") != "") | .link] | last) // "")
-	] | @tsv' <<<"$checks_json" 2>/dev/null) || return 1
-	while IFS=$'\t' read -r name family status conclusion required members link; do
+	rows=$(_pmrc_snapshot_check_rows "$checks_json" "$required_json") || return 1
+	while IFS=$'\t' read -r name informational family status conclusion required members link; do
 		[[ -n "$name" ]] || continue
 		if [[ "$family" == "$PMRC_MAINTAINER_GATE" && "$conclusion" == "$PMRC_CHECK_FAILURE" ]]; then
 			if declare -F _ci_check_url_has_infra_failure_log >/dev/null 2>&1 &&
@@ -864,14 +1233,29 @@ _pmrc_snapshot_checks_acceptable() {
 			continue
 		fi
 		if [[ "$status" != "$PMRC_CHECK_COMPLETED" || -z "$conclusion" ]]; then
+			if [[ "$informational" == "$PMRC_BOOL_TRUE" ]]; then
+				echo "[pulse-merge] pre-merge snapshot: IGNORED non-required informational pending status '${name}' for PR #${pr_number} in ${repo_slug} — it never reaches a terminal state" >>"$LOGFILE"
+				continue
+			fi
 			pending=$((pending + 1))
 			continue
 		fi
 		case "$conclusion" in
 		success | neutral | skipped) continue ;;
 		esac
+		if [[ "$conclusion" == cancelled ]]; then
+			_pmrc_rerun_cancelled_check "$repo_slug" "$pr_number" "$head_sha" "$link" || true
+			# Never classify cancellation as advisory or dispatch code repair.
+			# Only a later authoritative successful snapshot can clear this gate.
+			blockers=$((blockers + 1))
+			continue
+		fi
 		if [[ "$family" == "$PMRC_MAINTAINER_GATE" ]]; then
 			echo "[pulse-merge] pre-merge snapshot: maintainer-gate family is terminal-${conclusion} for PR #${pr_number} in ${repo_slug}; aliases=${members}, required=${required} — merge blocked" >>"$LOGFILE"
+			blockers=$((blockers + 1))
+		elif [[ "$required" == "$PMRC_BOOL_TRUE" && "$members" == "${name}@commit_status" ]] &&
+			_pmrc_is_quota_exhausted_status_failure "$name" "$checks_json" "$repo_slug"; then
+			echo "[pulse-merge] pre-merge snapshot: required provider status '${name}' did not run because the provider quota is spent for PR #${pr_number} in ${repo_slug} — code repair suppressed; native required check remains blocking (GH#34089)" >>"$LOGFILE"
 			blockers=$((blockers + 1))
 		elif [[ "$required" == "$PMRC_BOOL_TRUE" ]] &&
 			declare -F _ci_check_url_has_infra_failure_log >/dev/null 2>&1 &&
@@ -883,15 +1267,8 @@ _pmrc_snapshot_checks_acceptable() {
 			echo "[pulse-merge] pre-merge snapshot: required check '${name}' is terminal-${conclusion} for PR #${pr_number} in ${repo_slug} (GH#27137)" >>"$LOGFILE"
 			blocking_names="${blocking_names}${name}"$'\n'
 			blockers=$((blockers + 1))
-		elif declare -F _ci_check_url_has_infra_failure_log >/dev/null 2>&1 &&
-			_ci_check_url_has_infra_failure_log "$repo_slug" "$link"; then
-			echo "[pulse-merge] pre-merge snapshot: IGNORED non-required infrastructure failure '${name}' for PR #${pr_number} in ${repo_slug} after failed-log classification (GH#27600)" >>"$LOGFILE"
-			advisory=$((advisory + 1))
-		elif _pmrc_is_explicit_advisory_failure "$name" "$checks_json"; then
-			echo "[pulse-merge] pre-merge snapshot: IGNORED non-required baseline advisory failure '${name}' because its regression companion passed for PR #${pr_number} in ${repo_slug} (GH#27137)" >>"$LOGFILE"
-			advisory=$((advisory + 1))
-		elif _pmrc_is_configured_advisory_failure "$name" "$configured_contexts_json" "$evidence_json" "$repo_slug" "$pr_number" "$head_sha"; then
-			echo "[pulse-merge] pre-merge snapshot: IGNORED configured non-required review-provider failure '${name}' with typed current-head review evidence for PR #${pr_number} in ${repo_slug}" >>"$LOGFILE"
+		elif _pmrc_nonrequired_failure_is_advisory "$name" "$members" "$link" "$checks_json" \
+			"$configured_contexts_json" "$evidence_json" "$repo_slug" "$pr_number" "$head_sha"; then
 			advisory=$((advisory + 1))
 		else
 			echo "[pulse-merge] pre-merge snapshot: unclassified non-required check '${name}' is terminal-${conclusion} for PR #${pr_number} in ${repo_slug} — merge blocked (GH#27137)" >>"$LOGFILE"
@@ -903,7 +1280,7 @@ _pmrc_snapshot_checks_acceptable() {
 		_PULSE_MERGE_PREFLIGHT_BLOCKING_CHECKS_JSON=$(jq -c --arg names "$blocking_names" '
 			($names | split("\n") | map(select(length > 0))) as $blocking_names
 			| [.[]? | select(.name as $name | $blocking_names | index($name))
-				| {name, bucket: "fail", state: (.conclusion | ascii_upcase), conclusion, link}]
+				| {name, bucket: "fail", state: (.conclusion | ascii_upcase), conclusion, link, source, description}]
 		' <<<"$checks_json" 2>/dev/null) || _PULSE_MERGE_PREFLIGHT_BLOCKING_CHECKS_JSON="[]"
 	fi
 	if [[ "$pending" -gt 0 || "$blockers" -gt 0 ]]; then
@@ -1025,10 +1402,15 @@ _pulse_merge_preflight_snapshot_gate() {
 		_pmrc_snapshot_log_failure "$repo_slug" "${PMRC_SUBJECT_PR_PREFIX}${pr_number}" "required-context lookup"
 		return 1
 	}
-	checks_json=$(_pmrc_snapshot_checks_json "$repo_slug" "$current_head_sha") || {
+	local snapshot_rc=0
+	checks_json=$(_pmrc_snapshot_checks_with_retry "$repo_slug" "$current_head_sha") || snapshot_rc=$?
+	if [[ "$snapshot_rc" -ne 0 ]]; then
 		_PULSE_MERGE_PREFLIGHT_BLOCKER_KIND="$PMRC_BLOCKER_SNAPSHOT_UNAVAILABLE"
+		if [[ "$snapshot_rc" -eq 75 || "$snapshot_rc" -eq 124 ]]; then
+			_pmrc_prioritize_snapshot_retry "$repo_slug" "$pr_number" "$snapshot_rc"
+		fi
 		return 1
-	}
+	fi
 	if declare -F _pmp_record_same_pass_check_evidence >/dev/null 2>&1; then
 		_pmp_record_same_pass_check_evidence "$repo_slug" "$current_head_sha" "$checks_json" || true
 	fi
@@ -1248,12 +1630,23 @@ _ruleset_required_review_policy_for_default_branch() {
 	local repo_slug="$1"
 	local default_branch="$2"
 	local rulesets_json="${3:-}"
+	local rulesets_rc=0
 
 	if [[ -z "$rulesets_json" ]]; then
-		rulesets_json=$(_pmrc_gh_read gh api "repos/${repo_slug}/rulesets" 2>/dev/null) || {
+		rulesets_json=$(_pmrc_gh_read gh api "repos/${repo_slug}/rulesets" 2>&1) || rulesets_rc=$?
+		if [[ "$rulesets_rc" -ne 0 ]]; then
+			_pmrc_emit_local_deferral "$rulesets_json"
+			# GH#32951: private repos on plans without rulesets cannot carry a
+			# ruleset approval policy, so the plan-unsupported 403 is a
+			# definitive "none", matching the required-contexts path (GH#29484).
+			if _pmrc_private_plan_feature_unavailable "$rulesets_json"; then
+				aidevops_log_line "[pulse-merge] _ruleset_required_review_policy_for_default_branch: rulesets unavailable for ${repo_slug} on the private plan (HTTP 403) — no ruleset approval policy (GH#32951)"
+				printf '0\t0'
+				return 0
+			fi
 			aidevops_log_line "[pulse-merge] _ruleset_required_review_policy_for_default_branch: rulesets list failed for ${repo_slug} — caller will fail closed (GH#24577)"
 			return 1
-		}
+		fi
 	fi
 	if ! _pmrc_rulesets_list_schema_valid "$rulesets_json"; then
 		aidevops_log_line "[pulse-merge] _ruleset_required_review_policy_for_default_branch: rulesets list parse failed for ${repo_slug} — caller will fail closed (GH#30638)"
@@ -1349,6 +1742,84 @@ _ruleset_required_review_count_for_default_branch() {
 	return 0
 }
 
+_pmrc_ruleset_review_summary_valid() {
+	local count=""
+	[[ "$#" -eq 6 ]] || return 1
+	for count in "$@"; do
+		[[ "$count" =~ ^[0-9]+$ ]] || return 1
+	done
+	return 0
+}
+
+_pmrc_ruleset_review_summary() {
+	local pr_author="$1"
+	local expected_head_sha="$2"
+	local required_current_head_count="$3"
+	local empty_string=""
+	local summary=""
+
+	summary=$(jq -er --arg author "$pr_author" --arg empty "$empty_string" \
+		--arg expected_head "$expected_head_sha" --argjson required_current_head "$required_current_head_count" \
+		--arg array_type "$PMRC_JSON_ARRAY" --arg object_type "$PMRC_JSON_OBJECT" \
+		--arg number_type "$PMRC_JSON_NUMBER" --arg string_type "$PMRC_JSON_STRING" '
+		def review_state:
+			(.state // $empty) | if type == $string_type then . else error("invalid review state") end;
+		def state_changing:
+			. == "APPROVED" or . == "CHANGES_REQUESTED" or . == "DISMISSED";
+		def known_state:
+			state_changing or . == "COMMENTED" or . == "PENDING";
+		($author | ascii_downcase) as $author_login |
+		if type != $array_type or any(.[]; type != $array_type) or any(.[][]?; type != $object_type) then
+			error("invalid paginated reviews response")
+		elif any(.[][]?;
+			((review_state | known_state) | not)
+			or ((review_state | state_changing) and (
+				(.user | type) != $object_type
+				or (.user.login | type) != $string_type
+				or (.user.login | length) == 0
+				or (.submitted_at | type) != $string_type
+				or (.submitted_at | length) == 0
+				or ((try (.submitted_at | fromdateiso8601) catch null) == null)
+				or (.id | type) != $number_type
+				or .id <= 0
+				or (.id | floor) != .id
+				or ($required_current_head > 0 and (
+					(.commit_id | type) != $string_type
+					or (.commit_id | length) == 0
+				))
+			))
+		) then
+			error("malformed state-changing review")
+		else
+			(length) as $page_count |
+			[.[][]?] as $all_reviews |
+			[$all_reviews[] | review_state as $state | select($state | state_changing) | {
+				login: ((.user.login // $empty) | ascii_downcase),
+				state: $state,
+				submitted_epoch: ((.submitted_at // $empty) | fromdateiso8601),
+				id: (.id // 0),
+				commit_id: (.commit_id // $empty)
+			} | select(.login != $empty)] as $state_changing_reviews |
+			($state_changing_reviews
+				| group_by(.login)
+				| map(max_by([.submitted_epoch, .id]))
+				| map(select(.login != $author_login))
+				| map(select(.state == "APPROVED"))) as $approved_reviews |
+			[
+				($approved_reviews | length),
+				($approved_reviews | map(select(.commit_id == $expected_head)) | length),
+				$page_count,
+				($all_reviews | length),
+				($state_changing_reviews | length),
+				($state_changing_reviews | map(select(.commit_id == $expected_head)) | length)
+			]
+			| @tsv
+		end
+	' 2>/dev/null) || return 1
+	printf '%s' "$summary"
+	return 0
+}
+
 #######################################
 # Verify active ruleset pull_request approval requirements for one PR.
 #
@@ -1383,73 +1854,58 @@ _check_ruleset_required_reviews_passing() {
 		return 1
 	fi
 
-	local reviews_pages="" approval_counts="" approved_count="" current_head_approved_count="" empty_string=""
-	reviews_pages=$(_pmrc_gh_read gh api "repos/${repo_slug}/pulls/${pr_number}/reviews?per_page=100" --paginate --slurp 2>/dev/null) || reviews_pages=""
+	local reviews_pages="" approval_counts="" approved_count="" current_head_approved_count=""
+	local review_page_count="" review_total_count="" state_changing_count="" current_head_state_count="" review_payload_bytes=""
+	reviews_pages=$(AIDEVOPS_GH_ROUTE_DECISION="pulse-ruleset-reviews-rest" \
+		_pmrc_gh_read gh api "repos/${repo_slug}/pulls/${pr_number}/reviews?per_page=100" --paginate --slurp 2>&1) || {
+		_pmrc_emit_local_deferral "$reviews_pages"
+		reviews_pages=""
+	}
 	if [[ -z "$reviews_pages" || "$reviews_pages" == null ]]; then
-		echo "[pulse-merge] _check_ruleset_required_reviews_passing: review fetch failed for PR #${pr_number} in ${repo_slug} with ruleset requiring ${required_count} approval(s) — failing closed (GH#24577)" >>"$LOGFILE"
+		echo "[pulse-merge] _check_ruleset_required_reviews_passing: review fetch failed for PR #${pr_number} in ${repo_slug} with ruleset requiring ${required_count} approval(s) (transport=failed) — failing closed (GH#24577)" >>"$LOGFILE"
 		return 1
 	fi
-	# #aidevops:trust-boundary — count only each reviewer's latest substantive
-	# decision. COMMENTED submissions do not change GitHub's approval state, while
-	# malformed state-changing reviews must keep ruleset admission fail-closed.
-	approval_counts=$(jq -er --arg author "$pr_author" --arg empty "$empty_string" \
-		--arg expected_head "$expected_head_sha" --argjson required_current_head "$required_current_head_count" \
-		--arg array_type "$PMRC_JSON_ARRAY" --arg object_type "$PMRC_JSON_OBJECT" \
-		--arg number_type "$PMRC_JSON_NUMBER" --arg string_type "$PMRC_JSON_STRING" '
-		def review_state:
-			(.state // $empty) | if type == $string_type then . else error("invalid review state") end;
-		def state_changing:
-			. == "APPROVED" or . == "CHANGES_REQUESTED" or . == "DISMISSED";
-		def known_state:
-			state_changing or . == "COMMENTED" or . == "PENDING";
-		($author | ascii_downcase) as $author_login |
-		if type != $array_type or any(.[]; type != $array_type) or any(.[][]?; type != $object_type) then
-			error("invalid paginated reviews response")
-		elif any(.[][]?;
-			((review_state | known_state) | not)
-			or ((review_state | state_changing) and (
-				(.user | type) != $object_type
-				or (.user.login | type) != $string_type
-				or (.user.login | length) == 0
-				or (.submitted_at | type) != $string_type
-				or (.submitted_at | length) == 0
-				or ((try (.submitted_at | fromdateiso8601) catch null) == null)
-				or (.id | type) != $number_type
-				or .id <= 0
-				or (.id | floor) != .id
-				or ($required_current_head > 0 and (
-					(.commit_id | type) != $string_type
-					or (.commit_id | length) == 0
-				))
-			))
-		) then
-			error("malformed state-changing review")
-		else
-			[.[][]? | review_state as $state | select($state | state_changing) | {
-				login: ((.user.login // $empty) | ascii_downcase),
-				state: $state,
-				submitted_epoch: ((.submitted_at // $empty) | fromdateiso8601),
-				id: (.id // 0),
-				commit_id: (.commit_id // $empty)
-			} | select(.login != $empty)]
-			| group_by(.login)
-			| map(max_by([.submitted_epoch, .id]))
-			| map(select(.login != $author_login))
-			| map(select(.state == "APPROVED"))
-			| [length, map(select(.commit_id == $expected_head)) | length]
-			| @tsv
-		end
-	' <<<"$reviews_pages" 2>/dev/null) || approval_counts=""
-	IFS=$'\t' read -r approved_count current_head_approved_count <<<"$approval_counts"
-	if [[ ! "$approved_count" =~ ^[0-9]+$ || ! "$current_head_approved_count" =~ ^[0-9]+$ ]]; then
+	# #aidevops:trust-boundary — the parser returns counters only; raw review
+	# bodies and identities never reach diagnostics.
+	approval_counts=$(printf '%s' "$reviews_pages" |
+		_pmrc_ruleset_review_summary "$pr_author" "$expected_head_sha" "$required_current_head_count") || approval_counts=""
+	IFS=$'\t' read -r approved_count current_head_approved_count review_page_count review_total_count state_changing_count current_head_state_count <<<"$approval_counts"
+	if ! _pmrc_ruleset_review_summary_valid "$approved_count" "$current_head_approved_count" "$review_page_count" \
+		"$review_total_count" "$state_changing_count" "$current_head_state_count"; then
 		echo "[pulse-merge] _check_ruleset_required_reviews_passing: review parse failed for PR #${pr_number} in ${repo_slug} — failing closed (GH#24577)" >>"$LOGFILE"
 		return 1
 	fi
 	if [[ "$approved_count" -lt "$required_count" || "$current_head_approved_count" -lt "$required_current_head_count" ]]; then
-		echo "[pulse-merge] _check_ruleset_required_reviews_passing: PR #${pr_number} in ${repo_slug} has ${approved_count}/${required_count} ruleset-required approval(s), including ${current_head_approved_count}/${required_current_head_count} required on expected head ${expected_head_sha:0:12} — deferring merge (GH#30638)" >>"$LOGFILE"
+		review_payload_bytes=$(printf '%s' "$reviews_pages" | LC_ALL=C wc -c | tr -d '[:space:]') || review_payload_bytes=0
+		[[ "$review_payload_bytes" =~ ^[0-9]+$ ]] || review_payload_bytes=0
+		echo "[pulse-merge] _check_ruleset_required_reviews_passing: PR #${pr_number} in ${repo_slug} has ${approved_count}/${required_count} ruleset-required approval(s), including ${current_head_approved_count}/${required_current_head_count} required on expected head ${expected_head_sha:0:12} — deferring merge; diagnostic transport=success pages=${review_page_count} reviews=${review_total_count} state_changing=${state_changing_count} expected_head_state_changing=${current_head_state_count} payload_bytes=${review_payload_bytes} (GH#31891)" >>"$LOGFILE"
 		return 1
 	fi
 	echo "[pulse-merge] _check_ruleset_required_reviews_passing: PR #${pr_number} in ${repo_slug} satisfies ${approved_count}/${required_count} ruleset-required approval(s), including ${current_head_approved_count}/${required_current_head_count} required on expected head ${expected_head_sha:0:12} (GH#30638)" >>"$LOGFILE"
+	return 0
+}
+
+#######################################
+# Print sorted terminal-failed required contexts; unknown state returns nonzero.
+# Uses the same exact-head REST rollup and terminal states as the predicate below.
+_required_checks_terminal_failure_names() {
+	local repo_slug="$1" pr_number="$2" pr_sha="${3:-}"
+	local required_contexts="" rollup_json="" req_json=""
+	required_contexts=$(_required_contexts_for_default_branch "$repo_slug") || return 1
+	if [[ -z "$pr_sha" ]]; then
+		pr_sha=$(AIDEVOPS_GH_PR_VIEW_CACHE_DISABLE=1 gh_pr_view "$pr_number" --repo "$repo_slug" \
+			--json headRefOid --jq '.headRefOid // ""') || return 1
+	fi
+	[[ -n "$pr_sha" ]] || return 1
+	rollup_json=$(gh_pr_check_runs_rest "$repo_slug" "$pr_sha" 2>/dev/null) || return 1
+	req_json=$(printf '%s' "$required_contexts" | jq -Rsc '[split("\n")[] | select(length > 0)]') || return 1
+	jq -nr --argjson req "$req_json" --argjson checks "$rollup_json" '
+		if ($checks | type) != "array" then error("invalid rollup") else
+		$req | map(. as $ctx |
+			($checks | map(select((.name // "") == $ctx)) | last) as $c |
+			select(($c.conclusion // "" | ascii_downcase) |
+				test("^(failure|cancelled|timed_out)$"))) |
+		unique | sort | .[] end' || return 1
 	return 0
 }
 

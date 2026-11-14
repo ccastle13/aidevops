@@ -38,6 +38,11 @@ if [[ "${1:-}" == issue && "${2:-}" == comment ]]; then exit 0; fi
 [[ "${1:-}" == api ]] || exit 1
 endpoint="${2:-}"
 shift 2
+if [[ "$endpoint" == graphql ]]; then
+	jq -nc --args '$ARGS.positional | map(select(startswith("ids[]=")) |
+		{id:ltrimstr("ids[]="),lastEditedAt:null}) | {data:{nodes:.}}' -- "$@"
+	exit 0
+fi
 if [[ "$endpoint" == repos/*/issues/[0-9]* && "$endpoint" != */comments* ]]; then
 	printf '{"assignees":[]}\n'
 	exit 0
@@ -56,6 +61,10 @@ while [[ $# -gt 0 ]]; do
 	*) shift ;;
 	esac
 done
+if [[ "$method" == POST && -n "${MOCK_GH_POST_FAIL:-}" ]]; then
+	printf 'HTTP 502: synthetic-post-secret-fixture\n' >&2
+	exit 1
+fi
 if [[ "$method" == POST ]]; then
 	lock="$state/lock"
 	while ! mkdir "$lock" 2>/dev/null; do sleep 0.01; done
@@ -64,7 +73,7 @@ if [[ "$method" == POST ]]; then
 	jq -cn --argjson id "$id" --arg body "$body" --arg created "$created" \
 		--arg login "${MOCK_GH_LOGIN:-shared-login}" \
 		--arg association "${MOCK_GH_ASSOCIATION:-MEMBER}" \
-		'{id:$id,body:$body,created_at:$created,user:{login:$login},author_association:$association}' >>"$comments"
+		'{id:$id,node_id:("MOCK_NODE_" + ($id|tostring)),body:$body,created_at:$created,updated_at:$created,user:{login:$login},author_association:$association}' >>"$comments"
 	rmdir "$lock"
 	printf '%s\n' "$id"
 	exit 0
@@ -367,6 +376,120 @@ test_correlated_terminal_before_dispatch_releases_exact_attempt() {
 	return 0
 }
 
+test_generation_bound_releases_and_exact_tokens() {
+	local root="${TMP_DIR}/generation-bound" now expires_at="" claim_a="" claim_b=""
+	local claim_a_id="" claim_b_id="" lease_field=""
+	create_mock_gh "$root"
+	now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	expires_at=$(($(date -u '+%s') + 600))
+	lease_field="lease_""token"
+	claim_a="DISPATCH_CLAIM nonce=generation-a runner=shared-login ts=${now} max_age_s=600 ${lease_field}=generation-a device=device-a session=issue-52 phase=prelaunch expires_at=${expires_at}"
+	claim_b="DISPATCH_CLAIM nonce=generation-b runner=shared-login ts=${now} max_age_s=600 ${lease_field}=generation-b device=device-b session=issue-52 phase=prelaunch expires_at=${expires_at}"
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" \
+		gh api repos/owner/repo/issues/52/comments --method POST --field body="$claim_a" >/dev/null
+	claim_a_id=$(jq -sr 'last.id' "$root/state/comments.jsonl")
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" \
+		gh api repos/owner/repo/issues/52/comments --method POST --field body="$claim_b" >/dev/null
+	claim_b_id=$(jq -sr 'last.id' "$root/state/comments.jsonl")
+
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" \
+		gh api repos/owner/repo/issues/52/comments --method POST \
+		--field body="CLAIM_RELEASED reason=legacy runner=shared-login ts=${now}" >/dev/null
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" "$CLAIM" check 52 owner/repo >/dev/null ||
+		fail "unbound legacy release retired active generations"
+
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" \
+		gh api repos/owner/repo/issues/52/comments --method POST \
+		--field body="CLAIM_RELEASED reason=exact runner=shared-login ts=${now} claim_id=${claim_a_id} nonce=generation-a" >/dev/null
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" "$CLAIM" check 52 owner/repo >/dev/null ||
+		fail "equal-second exact release retired a newer generation"
+
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" MOCK_GH_LOGIN=attacker MOCK_GH_ASSOCIATION=NONE \
+		gh api repos/owner/repo/issues/52/comments --method POST \
+		--field body="CLAIM_RELEASED reason=forged runner=attacker ts=${now} claim_id=${claim_b_id} nonce=generation-b" >/dev/null
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" "$CLAIM" check 52 owner/repo >/dev/null ||
+		fail "untrusted exact release retired active generation"
+
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" \
+		gh api repos/owner/repo/issues/52/comments --method POST \
+		--field body="DISPATCH_LEASE phase=terminal ${lease_field}=generation-b-extra device=device-b session=issue-52 expires_at=0 ts=${now}" >/dev/null
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" "$CLAIM" check 52 owner/repo >/dev/null ||
+		fail "prefix-matched token retired active generation"
+
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" \
+		gh api repos/owner/repo/issues/52/comments --method POST \
+		--field body="CLAIM_RELEASED reason=exact runner=shared-login ts=${now} claim_id=${claim_b_id} nonce=generation-b" >/dev/null
+	if PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" "$CLAIM" check 52 owner/repo >/dev/null 2>&1; then
+		fail "exact release did not retire matching generation"
+	fi
+	pass "releases and transitions bind exact authenticated generations"
+	return 0
+}
+
+test_late_terminal_preserves_new_dispatch() {
+	local root="${TMP_DIR}/late-terminal" now="" expires_at="" token_field=""
+	create_mock_gh "$root"
+	now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	expires_at=$(($(date -u '+%s') + 600))
+	token_field="lease_""token"
+	local generation=""
+	for generation in a b; do
+		PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" \
+			gh api repos/owner/repo/issues/53/comments --method POST \
+			--field body="DISPATCH_CLAIM nonce=late-${generation} runner=shared-login ts=${now} ${token_field}=late-${generation} device=device-${generation} session=issue-53 expires_at=${expires_at}" >/dev/null
+	done
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" \
+		gh api repos/owner/repo/issues/53/comments --method POST \
+		--field body="Dispatching worker (deterministic).
+<!-- aidevops:dispatch ${token_field}=late-b device=device-b session=issue-53 attempt_id=attempt-b claim_id=2 -->" >/dev/null
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" \
+		gh api repos/owner/repo/issues/53/comments --method POST \
+		--field body="DISPATCH_LEASE phase=terminal ${token_field}=late-a device=device-a session=issue-53 expires_at=0 attempt_id=attempt-a" >/dev/null
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" DISPATCH_COMMENT_MAX_AGE=600 \
+		"$DEDUP" has-dispatch-comment 53 owner/repo shared-login >/dev/null ||
+		fail "late terminal lease A retired correlated dispatch B through legacy fallback"
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" \
+		gh api repos/owner/repo/issues/53/comments --method POST \
+		--field body="CLAIM_RELEASED reason=exact runner=shared-login claim_id=1 nonce=late-a" >/dev/null
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" DISPATCH_COMMENT_MAX_AGE=600 \
+		"$DEDUP" has-dispatch-comment 53 owner/repo shared-login >/dev/null ||
+		fail "late exact release A retired correlated dispatch B through prose fallback"
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" \
+		gh api repos/owner/repo/issues/53/comments --method POST \
+		--field body="BLOCKED: old attempt A is complete; MERGE_SUMMARY" >/dev/null
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" DISPATCH_COMMENT_MAX_AGE=600 \
+		"$DEDUP" has-dispatch-comment 53 owner/repo shared-login >/dev/null ||
+		fail "unbound trusted prose retired correlated dispatch B"
+	# Exercise the production abort producer through the same public consumer.
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" HOME="$root/home" \
+		LOGFILE="$root/abort.log" bash -c '
+		source "$1/pulse-dispatch-core.sh"
+		AIDEVOPS_UNKNOWN_VERSION=unknown
+		_claim_comment_id=2
+		_claim_lease_token=""
+		if _release_dispatch_claim_on_abort 53 owner/repo shared-login fixture_abort; then
+			exit 1
+		fi
+		[[ "$_claim_comment_id" == 2 ]] || exit 1
+		_claim_lease_token=late-b
+		_release_dispatch_claim_on_abort 53 owner/repo shared-login fixture_abort
+		[[ -z "$_claim_comment_id" ]]
+	' _ "$SCRIPTS_DIR" || fail "abort producer did not preserve and release its exact generation"
+	if PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" DISPATCH_COMMENT_MAX_AGE=600 \
+		"$DEDUP" has-dispatch-comment 53 owner/repo shared-login >/dev/null 2>&1; then
+		fail "exact claim-ID and nonce release did not retire correlated dispatch B"
+	fi
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" \
+		gh api repos/owner/repo/issues/53/comments --method POST \
+		--field body="Dispatching worker (deterministic).
+<!-- aidevops:dispatch malformed -->" >/dev/null
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" DISPATCH_COMMENT_MAX_AGE=600 \
+		"$DEDUP" has-dispatch-comment 53 owner/repo shared-login >/dev/null ||
+		fail "malformed correlated dispatch fell back to older terminal evidence"
+	pass "late terminals and prose cannot retire a different dispatch generation"
+	return 0
+}
+
 test_large_comment_history_avoids_argv_limits() {
 	local root="${TMP_DIR}/large-history" output="" exit_code=0 dispatch_ts=""
 	create_mock_gh "$root"
@@ -468,6 +591,147 @@ test_prelaunch_renewal_is_monotonic_and_coalesced() {
 	return 0
 }
 
+# GH#36771: a slow consensus that consumes most of the initial lease renews it
+# once before handoff, so the dispatcher's first renewal still matches.
+test_slow_consensus_renews_won_lease_before_handoff() {
+	local root="${TMP_DIR}/slow-consensus" token="" initial_expiry="" renewed_expiry=""
+	create_mock_gh "$root"
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" AIDEVOPS_DEVICE_ID=device-a \
+		DISPATCH_CLAIM_WINDOW=4 DISPATCH_CLAIM_ORPHAN_GRACE=6 \
+		"$CLAIM" claim 56 owner/repo shared-login >"$root/claim.out" 2>"$root/claim.err" ||
+		fail "slow-consensus claim did not win: $(tr '\n' ' ' <"$root/claim.err")"
+	token=$(sed -n 's/.*lease_token=\([^ ]*\).*/\1/p' "$root/claim.out")
+	[[ -n "$token" ]] || fail "slow-consensus claim token missing"
+	grep -q '^CLAIM_LEASE_RENEWED: issue=#56 ' "$root/claim.err" ||
+		fail "slow-consensus winner did not renew its mostly-consumed lease"
+	initial_expiry=$(jq -sr '[.[] | select(.body | contains("DISPATCH_CLAIM nonce="))] | first.body | capture("expires_at=(?<value>[0-9]+)").value | tonumber' \
+		"$root/state/comments.jsonl")
+	renewed_expiry=$(jq -sr '[.[] | select(.body | contains("DISPATCH_LEASE phase=prelaunch"))] | last.body | capture("expires_at=(?<value>[0-9]+)").value | tonumber' \
+		"$root/state/comments.jsonl")
+	[[ "$renewed_expiry" -gt "$initial_expiry" ]] || fail "slow-consensus renewal did not extend expiry"
+	sleep 3
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" AIDEVOPS_DEVICE_ID=device-a \
+		"$CLAIM" transition prelaunch 56 owner/repo "$token" issue-56 30 ||
+		fail "dispatcher renewal after slow consensus saw an unmatched lease"
+	pass "slow consensus renews the won lease once before dispatcher handoff"
+	return 0
+}
+
+expect_transition_denial() {
+	local root="$1" expected="$2" secret="$3"
+	shift 3
+	local rc=0
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" "$@" >"$root/denial.out" 2>"$root/denial.err" || rc=$?
+	[[ "$rc" -eq 1 ]] || fail "transition ${expected} changed its exit code: rc=${rc}"
+	[[ ! -s "$root/denial.out" ]] || fail "transition ${expected} wrote machine-readable stdout"
+	[[ "$(grep -c '^DISPATCH_LEASE_TRANSITION_DENIED ' "$root/denial.err")" == 1 ]] ||
+		fail "transition ${expected} did not emit exactly one denial reason"
+	grep -qx "DISPATCH_LEASE_TRANSITION_DENIED reason=${expected}" "$root/denial.err" ||
+		fail "transition denial was not attributed to ${expected}"
+	! grep -qF -e "$secret" -e 'synthetic-post-secret-fixture' "$root/denial.err" ||
+		fail "transition ${expected} disclosed a secret-like value"
+	return 0
+}
+
+test_transition_denials_are_attributed() {
+	local root="${TMP_DIR}/transition-denials" token="" unmatched="synthetic-unmatched-lease-fixture"
+	local post_count_before="" post_count_after=""
+	create_mock_gh "$root"
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" AIDEVOPS_DEVICE_ID=device-a \
+		DISPATCH_CLAIM_WINDOW=0 DISPATCH_CLAIM_ORPHAN_GRACE=30 \
+		"$CLAIM" claim 54 owner/repo shared-login >"$root/claim.out" 2>&1
+	token=$(claim_token "$root/claim.out")
+	[[ -n "$token" ]] || fail "attribution claim token missing"
+
+	expect_transition_denial "$root" invalid_arguments "$token" \
+		env AIDEVOPS_DEVICE_ID=device-a "$CLAIM" transition prelaunch 54 owner/repo "" issue-54 60
+	expect_transition_denial "$root" lease_unmatched "$unmatched" \
+		env AIDEVOPS_DEVICE_ID=device-a "$CLAIM" transition prelaunch 54 owner/repo "$unmatched" issue-54 60
+	expect_transition_denial "$root" device_mismatch "$token" \
+		env AIDEVOPS_DEVICE_ID=device-b "$CLAIM" transition prelaunch 54 owner/repo "$token" issue-54 60
+	expect_transition_denial "$root" session_mismatch "$token" \
+		env AIDEVOPS_DEVICE_ID=device-a "$CLAIM" transition prelaunch 54 owner/repo "$token" issue-999 60
+	post_count_before=$(grep -c -- '--method POST' "$root/state/calls.log")
+	expect_transition_denial "$root" mutation_failed "$token" \
+		env AIDEVOPS_DEVICE_ID=device-a MOCK_GH_POST_FAIL=1 "$CLAIM" transition prelaunch 54 owner/repo "$token" issue-54 600
+	post_count_after=$(grep -c -- '--method POST' "$root/state/calls.log")
+	[[ "$post_count_after" -eq $((post_count_before + 1)) ]] || fail "failed lease mutation was retried"
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" AIDEVOPS_DEVICE_ID=device-a \
+		"$CLAIM" transition ready 54 owner/repo "$token" issue-54 30 2>"$root/ready.err" ||
+		fail "attribution fixture ready transition failed"
+	! grep -q '^DISPATCH_LEASE_TRANSITION_DENIED ' "$root/ready.err" || fail "successful transition emitted a denial"
+	expect_transition_denial "$root" phase_disallowed "$token" \
+		env AIDEVOPS_DEVICE_ID=device-a "$CLAIM" transition prelaunch 54 owner/repo "$token" issue-54 60
+	pass "transition denials keep exit codes and emit one allowlisted reason without secrets"
+	return 0
+}
+
+# GH#35574: a ready-PR handoff release (worker_ready_missing_linkage/summary)
+# must retire its generation-marked dispatch lock through the real release
+# path, or merged-partial continuation stays blocked for the active window.
+_ready_release_fixture() {
+	local root="$1" issue="$2" claim_helper="$3" token="" claim_id="" token_field="lease_""token"
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" AIDEVOPS_DEVICE_ID=device-a \
+		DISPATCH_CLAIM_WINDOW=0 DISPATCH_CLAIM_ORPHAN_GRACE=30 \
+		"$CLAIM" claim "$issue" owner/repo shared-login >"$root/claim-${issue}.out" 2>&1
+	token=$(claim_token "$root/claim-${issue}.out")
+	[[ -n "$token" ]] || fail "ready-release claim token missing for #${issue}"
+	claim_id=$(jq -sr 'last.id' "$root/state/comments.jsonl")
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" AIDEVOPS_DEVICE_ID=device-a \
+		"$CLAIM" transition ready "$issue" owner/repo "$token" "issue-${issue}" 7200 ||
+		fail "ready-release fixture ready transition failed for #${issue}"
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" \
+		gh api "repos/owner/repo/issues/${issue}/comments" --method POST \
+		--field body="Dispatching worker (deterministic).
+<!-- aidevops:dispatch ${token_field}=${token} device=device-a session=issue-${issue} attempt_id=attempt-${issue} claim_id=${claim_id} -->" >/dev/null
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" DISPATCH_COMMENT_MAX_AGE=600 \
+		"$DEDUP" has-dispatch-comment "$issue" owner/repo shared-login >/dev/null ||
+		fail "ready-release fixture dispatch was not active for #${issue}"
+	PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" HOME="$root/home" \
+		AIDEVOPS_DEVICE_ID=device-a AIDEVOPS_ATTEMPT_ID="attempt-${issue}" \
+		AIDEVOPS_DISPATCH_LEASE_TOKEN="$token" DISPATCH_CLAIM_HELPER="$claim_helper" \
+		DISPATCH_REPO_SLUG=owner/repo WORKER_ISSUE_NUMBER="$issue" WORKER_GITHUB_LOGIN=shared-login \
+		AIDEVOPS_CLAIM_RELEASE_POST_RETRY_DELAY=0 bash -c '
+		print_info() { return 0; }
+		print_warning() { printf "WARN %s\n" "$1" >&2; return 0; }
+		SCRIPT_DIR="$1"
+		source "$1/headless-runtime-failure.sh"
+		_release_dispatch_claim "issue-$2" worker_ready_missing_linkage 0 0
+	' _ "$SCRIPTS_DIR" "$issue" 2>"$root/release-${issue}.err" ||
+		fail "ready-release path failed for #${issue}"
+	[[ "$(grep -c "CLAIM_RELEASED reason=worker_ready_missing_linkage" "$root/state/comments.jsonl")" -ge 1 ]] ||
+		fail "ready-release did not persist CLAIM_RELEASED for #${issue}"
+	! grep -qF "$token" "$root/release-${issue}.err" || fail "ready-release diagnostics disclosed the lease token"
+	return 0
+}
+
+test_ready_handoff_release_retires_marked_dispatch() {
+	local root="${TMP_DIR}/ready-handoff-release"
+	create_mock_gh "$root"
+
+	# The producer now emits an exact claim_id/nonce release. The existing
+	# reader treats that authenticated release as terminal even without a helper.
+	# Unbound-release rejection remains covered by the generation tests above.
+	_ready_release_fixture "$root" 55 "${root}/missing-claim-helper"
+	if PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" DISPATCH_COMMENT_MAX_AGE=600 \
+		"$DEDUP" has-dispatch-comment 55 owner/repo shared-login >/dev/null; then
+		fail "exact bound release left its generation-marked dispatch active"
+	fi
+	grep -q 'Terminal lease helper unavailable for #55' "$root/release-55.err" ||
+		fail "missing terminal lease helper was not surfaced"
+
+	: >"$root/state/comments.jsonl"
+	_ready_release_fixture "$root" 56 "$CLAIM"
+	grep -q 'CLAIM_RELEASED .*claim_id=[0-9]* nonce=[^ ]* .*session=issue-56' "$root/state/comments.jsonl" ||
+		fail "ready-release did not bind its terminal release to the claim generation"
+	if PATH="$root/bin:$PATH" MOCK_GH_STATE="$root/state" DISPATCH_COMMENT_MAX_AGE=600 \
+		"$DEDUP" has-dispatch-comment 56 owner/repo shared-login >/dev/null 2>&1; then
+		fail "ready-handoff release left the generation-marked dispatch active"
+	fi
+	pass "ready-handoff release terminalizes its exact claim with or without a lease helper"
+	return 0
+}
+
 test_takeover_recheck_precedes_mutation() {
 	local root="${TMP_DIR}/takeover"
 	create_mock_gh "$root"
@@ -499,9 +763,14 @@ test_concurrent_same_login_devices
 test_launch_crash_ready_terminal_race
 test_untrusted_dispatch_identity_cannot_replace_active_lock
 test_correlated_terminal_before_dispatch_releases_exact_attempt
+test_generation_bound_releases_and_exact_tokens
+test_late_terminal_preserves_new_dispatch
 test_large_comment_history_avoids_argv_limits
 test_prelaunch_renewal_covers_slow_startup
 test_prelaunch_renewal_is_monotonic_and_coalesced
+test_slow_consensus_renews_won_lease_before_handoff
+test_transition_denials_are_attributed
+test_ready_handoff_release_retires_marked_dispatch
 test_invalid_device_not_public
 test_takeover_recheck_precedes_mutation
 printf '\nAtomic lease concurrency tests passed\n'

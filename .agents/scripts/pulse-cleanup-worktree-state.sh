@@ -181,35 +181,48 @@ _pc_branch_archive_pr_state_clear() {
 }
 
 #######################################
-# Return terminal PR state for a branch head, if GitHub verifies one.
+# Return terminal PR state and identity for a branch head, if GitHub verifies one.
 #
 # Args:
 #   $1 - repo slug (owner/repo)
 #   $2 - branch name
-# Outputs: terminal PR state (CLOSED|MERGED)
+# Outputs: tab-separated terminal PR state (CLOSED|MERGED) and PR number
 # Returns: 0 when terminal PR found, 1 otherwise
 #######################################
-_pc_terminal_pr_state_for_branch() {
+_pc_terminal_pr_for_branch() {
 	local repo_slug="$1"
 	local branch_name="$2"
 	local pr_state=""
+	local pr_number=""
+	local pr_record=""
+	local open_pr=""
 
 	[[ -n "$repo_slug" && -n "$branch_name" ]] || return 1
-	pr_state=$(gh_pr_list --repo "$repo_slug" --head "$branch_name" --state all --limit 1 --json state --jq '.[0].state // empty' 2>/dev/null) || return 1
+	# A branch can have multiple historical PRs: no terminal result may hide a
+	# still-open handoff. Query that veto independently of terminal pagination.
+	open_pr=$(gh_pr_list --repo "$repo_slug" --head "$branch_name" --state open --limit 1 \
+		--json number --jq '.[0].number // empty' 2>/dev/null) || return 1
+	[[ -z "$open_pr" ]] || return 1
+	pr_record=$(gh_pr_list --repo "$repo_slug" --head "$branch_name" --state all --limit 1 --json state,number \
+		--jq '.[0] | select(. != null) | [.state, .number] | @tsv' 2>/dev/null) || return 1
+	IFS=$'\t' read -r pr_state pr_number <<<"$pr_record"
 	case "$pr_state" in
 	CLOSED | MERGED)
-		printf '%s\n' "$pr_state"
+		[[ "$pr_number" =~ ^[1-9][0-9]*$ ]] || return 1
+		printf '%s\t%s\n' "$pr_state" "$pr_number"
 		return 0
 		;;
 	esac
 	# A directly associated OPEN PR outranks any numeric token embedded in the
 	# branch name. Only fall back when the local-only branch has no head PR.
-	[[ -z "$pr_state" ]] || return 1
+	[[ -z "$pr_record" ]] || return 1
 
+	pr_number=$(_pc_pr_from_branch "$branch_name" 2>/dev/null) || return 1
+	[[ "$pr_number" =~ ^[1-9][0-9]*$ ]] || return 1
 	pr_state=$(_pc_pr_state_for_branch_reference "$repo_slug" "$branch_name" 2>/dev/null) || return 1
 	case "$pr_state" in
 	CLOSED | MERGED)
-		printf '%s\n' "$pr_state"
+		printf '%s\t%s\n' "$pr_state" "$pr_number"
 		return 0
 		;;
 	esac
@@ -430,6 +443,8 @@ _pc_recent_worker_metric_exists() {
 #   $2 - issue or PR number
 #   $3 - repository slug
 #   $4 - target type: issue or pr
+#   $5 - optional branch issue whose retention policy must also pass for a PR
+#   $6 - explicit blocked-task archival policy (default false; not permanent deletion)
 # Outputs: a short skip reason when blocked
 # Returns: 0 when archival may proceed, 1 otherwise
 #######################################
@@ -438,6 +453,8 @@ _pc_compact_archive_policy_clear() {
 	local target_number="$2"
 	local repo_slug="$3"
 	local target_type="$4"
+	local branch_issue="${5:-}"
+	local archive_blocked="${6:-false}"
 	local labels=""
 	local label=""
 	local normalized_label=""
@@ -474,7 +491,13 @@ _pc_compact_archive_policy_clear() {
 		[[ -n "$label" ]] || continue
 		normalized_label=$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')
 		case "$normalized_label" in
-		preserve-forensics | security | security-incident | incident:security | status:blocked)
+		status:blocked)
+			if [[ "$archive_blocked" != true ]]; then
+				printf '%s\n' "protected-status-blocked"
+				return 1
+			fi
+			;;
+		preserve-forensics | security | security-incident | incident:security)
 			printf '%s\n' "protected-${normalized_label//:/-}"
 			return 1
 			;;
@@ -486,6 +509,53 @@ _pc_compact_archive_policy_clear() {
 		return 1
 	fi
 
+	if [[ "$target_type" == "pr" && "$branch_issue" =~ ^[1-9][0-9]*$ ]]; then
+		_pc_compact_archive_policy_clear "$wt_path" "$branch_issue" "$repo_slug" "issue" "" "$archive_blocked" || return 1
+	fi
+	return 0
+}
+
+# Verify the local-only vetoes for a worktree with no issue or PR attribution.
+# Remote task labels cannot be consulted without inventing an attribution, so
+# marker files remain the fail-closed forensic protection for this path.
+_pc_unattributed_archive_policy_clear() {
+	local wt_path="$1"
+
+	[[ -n "$wt_path" ]] || return 1
+	if [[ -e "$wt_path/.aidevops-preserve-forensics" ||
+		-e "$wt_path/.preserve-forensics" ||
+		-e "$wt_path/.aidevops-security-incident" ]]; then
+		printf '%s\n' "preserve-forensics"
+		return 1
+	fi
+	return 0
+}
+
+# Activity must come from Git, not the containing directory (which may have
+# been moved in bulk). Fail closed when any of the three probes is unreadable.
+_pc_unregistered_activity_epoch() {
+	local path="$1" newest=0 value="" reflog="" index=""
+	reflog=$(git -C "$path" reflog -1 --date=unix --format=%gd HEAD 2>/dev/null) || return 1
+	[[ "$reflog" =~ @\{([0-9]+)\} ]] || return 1
+	for value in "$(git -C "$path" log -1 --format=%ct 2>/dev/null)" "${BASH_REMATCH[1]}"; do
+		[[ "$value" =~ ^[0-9]+$ ]] || return 1
+		((value > newest)) && newest="$value"
+	done
+	index=$(git -C "$path" rev-parse --git-path index 2>/dev/null) || return 1
+	[[ -f "$index" ]] || return 1
+	value=$(_file_mtime_epoch "$index") || return 1
+	[[ "$value" =~ ^[0-9]+$ ]] || return 1
+	((value > newest)) && newest="$value"
+	printf '%s\n' "$newest"
+	return 0
+}
+
+_pc_unregistered_unique_work() {
+	local path="$1" dirty="" commits=""
+	dirty=$(git -C "$path" status --porcelain --untracked-files=all 2>/dev/null) || return 1
+	commits=$(git -C "$path" rev-list --count HEAD --not --remotes 2>/dev/null) || return 1
+	[[ "$commits" =~ ^[0-9]+$ ]] || return 1
+	[[ -n "$dirty" || "$commits" -gt 0 ]] && printf 'yes\n' || printf 'no\n'
 	return 0
 }
 
@@ -611,6 +681,24 @@ _pc_count_verified_worktree_removals() {
 	return 0
 }
 
+_pc_cleanup_merged_repo() {
+	local helper="$1" repo_path="$2"
+	local clean_result="" count=0 wt_count=0
+	git -C "$repo_path" rev-parse --git-dir >/dev/null 2>&1 || { printf '0\n'; return 0; }
+	wt_count=$(git -C "$repo_path" worktree list | wc -l | tr -d ' ')
+	if [[ "${wt_count:-0}" -le 1 ]]; then
+		printf '0\n'
+		return 0
+	fi
+	clean_result=$(cd "$repo_path" && bash "$helper" clean --auto --force-merged 2>&1) || true
+	count=$(_pc_count_verified_worktree_removals "$clean_result")
+	if [[ "$count" -gt 0 ]]; then
+		echo "[pulse-wrapper] Worktree cleanup ($(basename "$repo_path")): $count worktree(s) removed" >>"$LOGFILE"
+	fi
+	printf '%s\n' "$count"
+	return 0
+}
+
 _cleanup_merged_prs_for_all_repos() {
 	# t2559 Layer 3: fail-loud when git is missing from PATH. This runs before
 	# we invoke worktree-helper.sh clean across every repo — if git isn't
@@ -652,29 +740,13 @@ _cleanup_merged_prs_for_all_repos() {
 		while IFS=$'\t' read -r repo_path repo_slug; do
 			[[ -z "$repo_path" ]] && continue
 			if ! git -C "$repo_path" rev-parse --git-dir >/dev/null 2>&1; then
-				echo "[pulse-cleanup] stage=merged-pr repo=${repo_slug:-unknown} skipping cleanup — invalid repo path configured" >>"${LOGFILE:-/dev/null}"
+				_pc_log_invalid_repo_path_once "${repo_slug:-unknown}"
 				continue
 			fi
-
-			local wt_count
-			wt_count=$(git -C "$repo_path" worktree list | wc -l | tr -d ' ')
-			# Skip repos with only 1 worktree (the main one) — nothing to clean
-			if [[ "${wt_count:-0}" -le 1 ]]; then
-				continue
-			fi
-
-			# Run helper in a subshell cd'd to the repo (it uses git rev-parse --show-toplevel)
-			local clean_result
-			clean_result=$(cd "$repo_path" && bash "$helper" clean --auto --force-merged 2>&1) || true
 
 			local count
-			count=$(_pc_count_verified_worktree_removals "$clean_result")
-			if [[ "$count" -gt 0 ]]; then
-				local repo_name
-				repo_name=$(basename "$repo_path")
-				echo "[pulse-wrapper] Worktree cleanup ($repo_name): $count worktree(s) removed" >>"$LOGFILE"
-				total_removed=$((total_removed + count))
-			fi
+			count=$(_pc_cleanup_merged_repo "$helper" "$repo_path")
+			total_removed=$((total_removed + count))
 		done <<<"$repo_records"
 	else
 		# Fallback: just clean the current repo (legacy behaviour)
@@ -769,35 +841,79 @@ _worktree_owner_alive() {
 }
 
 #######################################
-# Get worktree creation epoch from the .git file's mtime.
+# Resolve a linked worktree's private Git admin directory from its .git file.
 #
-# Uses _file_mtime_epoch from portable-stat.sh. Writes 0 to stdout
-# when the .git file is missing or stat fails, and logs a diagnostic in
-# that case (GH#18346: this path was previously a silent continue).
+# Args:
+#   $1 - wt_path: absolute worktree path
+# Outputs: admin directory path on stdout
+# Returns: 0 when the gitdir line resolves to an existing directory, 1 otherwise
+#######################################
+_worktree_admin_dir() {
+	local wt_path="$1"
+	local gitdir_line="" admin_dir=""
+	[[ -f "$wt_path/.git" && ! -L "$wt_path/.git" ]] || return 1
+	IFS= read -r gitdir_line <"$wt_path/.git" 2>/dev/null || [[ -n "$gitdir_line" ]] || return 1
+	[[ "$gitdir_line" == "gitdir: "* ]] || return 1
+	admin_dir="${gitdir_line#gitdir: }"
+	[[ "$admin_dir" == /* ]] || admin_dir="${wt_path}/${admin_dir}"
+	[[ -d "$admin_dir" ]] || return 1
+	printf '%s\n' "$admin_dir"
+	return 0
+}
+
+#######################################
+# Get the epoch since which a worktree has been confirmed idle (GH#34905).
+#
+# Age thresholds measure inactivity, not creation: the newest mtime of the
+# worktree's .git file and its admin-dir HEAD and HEAD reflog. Commits,
+# checkouts, resets and rebases all append to the HEAD reflog, so an old but
+# recently used worktree is never treated as abandoned. Git appends to an
+# existing reflog even with core.logAllRefUpdates=false; a worktree created
+# with reflogs off has no logs/HEAD and is therefore preserved below.
+# The index is deliberately not a signal: plain `git status` (including
+# pulse's own dirty checks) rewrites it, which would keep every worktree
+# permanently "active". Staged-but-uncommitted work is protected by the
+# separate dirty-worktree guards instead. The value is never older than the
+# previous creation-epoch measure, which keeps every threshold at least as
+# conservative as before.
+#
+# Unknown evidence preserves: every signal is mandatory. When the .git file,
+# a resolvable admin directory, its HEAD or its HEAD reflog is missing or
+# unstattable (including removal mid-check), prints 0 and logs the reason so
+# the caller skips the worktree (GH#18346: never a silent continue).
 #
 # Args:
 #   $1 - wt_path: absolute worktree path
 #   $2 - wt_branch: branch name (for log context; "" = detached)
-# Outputs: epoch seconds on stdout (0 on failure)
+# Outputs: epoch seconds on stdout (0 when idleness cannot be confirmed)
 # Returns: 0 always (caller inspects the printed value)
 #######################################
-_worktree_creation_epoch() {
+_worktree_idle_since_epoch() {
 	local wt_path="$1"
 	local wt_branch="${2:-}"
-	local wt_created=0
+	local idle_since=0 admin_dir="" candidate="" mtime=0
 
-	if [[ -f "$wt_path/.git" ]]; then
-		wt_created=$(_file_mtime_epoch "$wt_path/.git")
+	if admin_dir=$(_worktree_admin_dir "$wt_path"); then
+		for candidate in "$wt_path/.git" "$admin_dir/HEAD" "$admin_dir/logs/HEAD"; do
+			mtime=0
+			[[ -f "$candidate" ]] && mtime=$(_file_mtime_epoch "$candidate")
+			if [[ ! "$mtime" =~ ^[0-9]+$ || "$mtime" -eq 0 || ! -f "$candidate" ]]; then
+				idle_since=0
+				break
+			fi
+			[[ "$mtime" -gt "$idle_since" ]] && idle_since="$mtime"
+		done
 	fi
 
-	if [[ "$wt_created" -eq 0 ]]; then
+	if [[ "$idle_since" -eq 0 ]]; then
 		# GH#18346: previously a silent skip — now logs the reason
-		echo "[pulse-wrapper] Orphan cleanup: skipping ${wt_branch:-detached} ($wt_path) — stat on .git failed (wt_created=0)" >>"$LOGFILE"
+		echo "[pulse-wrapper] Orphan cleanup: skipping ${wt_branch:-detached} ($wt_path) — idle evidence unavailable (.git, admin HEAD or HEAD reflog missing)" >>"$LOGFILE"
 	fi
 
-	echo "$wt_created"
+	echo "$idle_since"
 	return 0
 }
+
 #######################################
 # Decide whether a worktree is eligible for orphan cleanup.
 #

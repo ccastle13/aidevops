@@ -9,6 +9,7 @@ SCRIPTS_DIR="${SCRIPT_DIR}/.."
 ROOT=$(mktemp -d)
 trap 'rm -rf "$ROOT"' EXIT
 mkdir -p "${ROOT}/bin" "${ROOT}/helpers"
+cp "${SCRIPTS_DIR}/project-node-runtime.sh" "${ROOT}/helpers/"
 
 cat >"${ROOT}/helpers/review-bot-gate-helper.sh" <<'STUB'
 #!/usr/bin/env bash
@@ -27,6 +28,19 @@ if [[ "${1:-}" == "api" && "${2:-}" == "graphql" ]]; then
 		draft) is_draft=true ;;
 		changes) review_decision="CHANGES_REQUESTED" ;;
 		closed) state="CLOSED" ;;
+		readiness-cooldown)
+			printf '%s\n' '[gh-cooldown] secondary-rate-limit active=true skip=read expires_at=1893456000' >&2
+			exit 75 ;;
+		readiness-ramp)
+			printf '%s\n' '[gh-cooldown] read-ramp active=true phase=cooldown-recovery budget_per_minute=60 action=defer' >&2
+			exit 75 ;;
+		readiness-local)
+			printf '%s\n' '[gh-transport] error_kind=github-api-read-deferred attempted=false deferred_by=local_admission retry_at=1893456000 reason="fixture wait"' >&2
+			exit 75 ;;
+		readiness-timeout) exit 124 ;;
+		readiness-api-error)
+			printf '%s\n' 'HTTP 503: service unavailable' >&2
+			exit 1 ;;
 		readiness-missing-cost)
 			printf '{"data":{"repository":{"pullRequest":{"state":"OPEN","isDraft":false,"reviewDecision":"APPROVED","headRefOid":"abc123","headRefName":"remote-branch"}}}}\n'
 			exit 0
@@ -53,11 +67,29 @@ if [[ "${1:-}" == "api" && "${2:-}" == *"/protection/required_status_checks" ]];
 		printf '%s\n' 'gh: HTTP 403: branch protection unavailable' >&2
 		exit 1
 	fi
-	if [[ "${GH_TEST_MODE:-pass}" == "no-required" ]]; then
+	if [[ "${GH_TEST_MODE:-pass}" == "no-required" || "${GH_TEST_MODE:-pass}" == protected404-* ]]; then
 		printf '%s\n' 'gh: HTTP 404: Not Found' >&2
 		exit 1
 	fi
 	printf '%s\n' '{"contexts":["required-ci"]}'
+	exit 0
+fi
+if [[ "${1:-}" == "api" && "${2:-}" == "repos/testorg/testrepo/branches/main" ]]; then
+	if [[ "${GH_TEST_MODE:-pass}" == "no-required" ]]; then
+		printf '%s\n' '{"protected":false}'
+	else
+		printf '%s\n' '{"protected":true,"protection":{"required_status_checks":{"contexts":["required-ci"]}}}'
+	fi
+	exit 0
+fi
+if [[ "${1:-}" == "api" && "${2:-}" == "--paginate" && "${3:-}" == "repos/testorg/testrepo/commits/abc123/check-runs"* ]]; then
+	case "${GH_TEST_MODE:-pass}" in
+		rollup-pass) printf '%s\n' '{"id":1,"name":"required-ci","status":"completed","conclusion":"success","head_sha":"abc123"}' ;;
+		rollup-failure) printf '%s\n' '{"id":1,"name":"required-ci","status":"completed","conclusion":"failure","head_sha":"abc123"}' ;;
+		rollup-pending) printf '%s\n' '{"id":1,"name":"required-ci","status":"in_progress","conclusion":null,"head_sha":"abc123"}' ;;
+		rollup-wrong-head) printf '%s\n' '{"id":1,"name":"required-ci","status":"completed","conclusion":"success","head_sha":"other"}' ;;
+		rollup-error) printf '%s\n' 'HTTP 503: service unavailable' >&2; exit 1 ;;
+	esac
 	exit 0
 fi
 if [[ "${1:-}" == "api" && "${2:-}" == "repos/testorg/testrepo/rulesets" ]]; then
@@ -124,7 +156,7 @@ run_gate() {
 set -euo pipefail
 SCRIPT_DIR='${ROOT}/helpers'
 print_error() { printf 'ERROR %s\n' "\$*"; return 0; }
-print_info() { return 0; }
+print_info() { printf 'INFO %s\n' "\$*"; return 0; }
 print_warning() { return 0; }
 print_success() { return 0; }
 source '${SCRIPTS_DIR}/full-loop-helper-commit.sh'
@@ -133,13 +165,45 @@ _merge_collect_external_authority_gaps() {
 	FULL_LOOP_EXTERNAL_AUTHORITY_TARGETS=()
 	return 0
 }
+review_thread_gate_unresolved_bot_count() {
+	printf '0\n'
+	return 0
+}
 gh_pr_checks_exact_json() {
 	local repo_slug="\$1"
 	local pr_number="\$2"
 	local selection_mode="\$3"
 	: "\$repo_slug" "\$pr_number" "\$selection_mode"
 	case "\${GH_TEST_MODE:-pass}" in
-		pending)
+		required-skipped)
+			printf '%s\n' '[{"name":"required-ci","state":"SKIPPED","bucket":"skipping"}]'
+			return 0
+			;;
+		required-cancelled)
+			printf '%s\n' '[{"name":"required-ci","state":"CANCELLED","bucket":"cancel"}]'
+			return 0
+			;;
+		required-failure | protected404-failure)
+			printf '%s\n' '[{"name":"required-ci","state":"FAILURE","bucket":"fail"}]'
+			return 0
+			;;
+		skipped-unknown-state)
+			printf '%s\n' '[{"name":"required-ci","state":"UNKNOWN","bucket":"skipping"}]'
+			return 0
+			;;
+		skipped-missing-state)
+			printf '%s\n' '[{"name":"required-ci","bucket":"skipping"}]'
+			return 0
+			;;
+		skipped-wrong-bucket)
+			printf '%s\n' '[{"name":"required-ci","state":"SKIPPED","bucket":"unknown"}]'
+			return 0
+			;;
+		pending-with-skipped)
+			printf '%s\n' '[{"name":"required-ci","state":"SKIPPED","bucket":"skipping"},{"name":"required-pending","state":"IN_PROGRESS","bucket":"pending"}]'
+			return 8
+			;;
+		pending | protected404-pending)
 			printf '%s\n' '[{"name":"required-ci","state":"IN_PROGRESS","bucket":"pending"}]'
 			return 8
 			;;
@@ -147,7 +211,7 @@ gh_pr_checks_exact_json() {
 			printf '%s\n' 'exact check helper must not run when configuration has no contexts' >&2
 			return 99
 			;;
-		cli-no-required)
+		cli-no-required | rollup-*)
 			printf "%s\n" "no required checks reported on the 'remote-branch' branch" >&2
 			return 1
 			;;
@@ -157,6 +221,10 @@ gh_pr_checks_exact_json() {
 			;;
 		cooldown)
 			printf '%s\n' 'gh_pr_checks_exact_json: error_kind=github-api-cooldown expires_at=1893456000 operation=pull-request-identity-read' >&2
+			return 2
+			;;
+		read-deferred)
+			printf '%s\n' 'gh_pr_checks_exact_json: error_kind=github-api-read-deferred operation=pull-request-identity-read' >&2
 			return 2
 			;;
 		changed-wording)
@@ -177,7 +245,11 @@ gh_pr_checks_exact_json() {
 			;;
 	esac
 }
-cmd_pre_merge_gate 42 testorg/testrepo
+gate_rc=0
+cmd_pre_merge_gate 42 testorg/testrepo || gate_rc=\$?
+printf 'CHECK_STATUS=%s\n' "\${FULL_LOOP_PR_CHECK_STATUS:-unset}"
+printf 'CHECK_EVIDENCE=%s\n' "\${FULL_LOOP_REQUIRED_CHECKS_SUCCESS_EVIDENCE:-unset}"
+exit "\$gate_rc"
 RUNNER
 	chmod +x "$runner"
 	if [[ "$output_mode" == "visible" ]]; then
@@ -190,11 +262,17 @@ RUNNER
 	return $?
 }
 
-run_gate pass || {
+run_gate pass visible || {
 	printf 'FAIL terminal remote evidence was rejected\n'
 	exit 1
 }
 printf 'PASS terminal remote evidence is accepted\n'
+
+run_gate required-skipped || {
+	printf 'FAIL completed skipped required check was rejected\n'
+	exit 1
+}
+printf 'PASS completed skipped required check is accepted\n'
 
 REVIEW_GATE_TEST_RESULT=PASS_ADVISORY run_gate pass || {
 	printf 'FAIL advisory-default review result was rejected\n'
@@ -214,19 +292,68 @@ run_gate no-required || {
 }
 printf 'PASS explicit no-required-checks evidence reaches the review-bot gate\n'
 
-run_gate cli-no-required || {
-	printf 'FAIL canonical CLI no-required-checks evidence was rejected after API failure\n'
+if run_gate cli-no-required; then
+	printf 'FAIL positive requirements with an empty rollup were inferred absent\n'
+	exit 1
+fi
+printf 'PASS positive requirements are not inferred absent from an empty rollup\n'
+
+rollup_output=$(run_gate rollup-pass visible 2>&1) || {
+	printf 'FAIL exact-head check-runs for positive requirements were rejected: %s\n' "$rollup_output"
 	exit 1
 }
-printf 'PASS canonical CLI no-required-checks evidence survives unavailable branch protection\n'
+if [[ "$rollup_output" != *"CHECK_EVIDENCE=required-checks-pass"* || "$rollup_output" == *"no required checks are configured"* ]]; then
+	printf 'FAIL empty-rollup success lost positive evidence: %s\n' "$rollup_output"
+	exit 1
+fi
+printf 'PASS empty rollup with passing exact-head check-runs is ready\n'
 
-for mode in draft pending changes closed api-error changed-wording malformed empty-array readiness-missing-cost readiness-errors; do
+for mode in rollup-failure rollup-pending rollup-wrong-head rollup-error; do
+	if run_gate "$mode"; then
+		printf 'FAIL empty rollup granted readiness: %s\n' "$mode"
+		exit 1
+	fi
+	printf 'PASS empty rollup does not grant readiness: %s\n' "$mode"
+done
+
+for mode in protected404-pass protected404-pending protected404-failure; do
+	fallback_rc=0
+	fallback_output=$(run_gate "$mode" visible 2>&1) || fallback_rc=$?
+	expected_status="terminal-success"
+	case "$mode" in
+	protected404-pending) expected_status="pending" ;;
+	protected404-failure) expected_status="terminal-failure" ;;
+	esac
+	if [[ "$fallback_output" == *"CHECK_EVIDENCE=required-checks-pass"* &&
+		"$fallback_output" == *"CHECK_STATUS=${expected_status}"* &&
+		"$fallback_output" != *"no required checks are configured"* ]] && {
+		[[ "$mode" == protected404-pass && "$fallback_rc" -eq 0 ]] ||
+			[[ "$mode" != protected404-pass && "$fallback_rc" -ne 0 ]];
+	}; then
+		printf 'PASS settings 404 preserves full-loop check evidence: %s\n' "$mode"
+	else
+		printf 'FAIL settings 404 lost check evidence: %s rc=%s output=%s\n' "$mode" "$fallback_rc" "$fallback_output"
+		exit 1
+	fi
+done
+
+for mode in draft pending required-cancelled required-failure skipped-unknown-state skipped-missing-state skipped-wrong-bucket changes closed api-error changed-wording malformed empty-array readiness-missing-cost readiness-errors; do
 	if run_gate "$mode"; then
 		printf 'FAIL unsafe remote state was accepted: %s\n' "$mode"
 		exit 1
 	fi
 	printf 'PASS unsafe remote state is blocked: %s\n' "$mode"
 done
+
+pending_rc=0
+pending_output=$(run_gate pending-with-skipped visible 2>&1) || pending_rc=$?
+if [[ "$pending_rc" -ne 0 && "$pending_output" == *"CHECK_STATUS=pending"* &&
+	"$pending_output" == *"no repair action is eligible"* ]]; then
+	printf 'PASS skipped checks do not turn pending checks into terminal failures\n'
+else
+	printf 'FAIL mixed skipped/pending evidence lost its classification: rc=%s output=%s\n' "$pending_rc" "$pending_output"
+	exit 1
+fi
 
 cooldown_rc=0
 cooldown_output=$(run_gate cooldown visible 2>&1) || cooldown_rc=$?
@@ -236,5 +363,46 @@ else
 	printf 'FAIL cooldown evidence was collapsed: rc=%s output=%s\n' "$cooldown_rc" "$cooldown_output"
 	exit 1
 fi
+
+deferred_rc=0
+deferred_output=$(run_gate read-deferred visible 2>&1) || deferred_rc=$?
+if [[ "$deferred_rc" -ne 0 && "$deferred_output" == *"CHECK_STATUS=api-deferred"* &&
+	"$deferred_output" == *"GitHub API read capacity is deferred"* &&
+	"$deferred_output" != *"required-check evidence is indeterminate"* ]]; then
+	printf 'PASS local read admission deferral stays distinct from CI failure and malformed evidence\n'
+else
+	printf 'FAIL read admission deferral lost its classification: rc=%s output=%s\n' "$deferred_rc" "$deferred_output"
+	exit 1
+fi
+
+for mode in readiness-cooldown readiness-ramp readiness-local readiness-timeout readiness-api-error; do
+	readiness_rc=0
+	readiness_output=$(run_gate "$mode" visible 2>&1) || readiness_rc=$?
+	[[ "$readiness_rc" -ne 0 ]] || {
+		printf 'FAIL readiness failure passed: %s\n' "$mode"
+		exit 1
+	}
+	case "$mode" in
+	readiness-cooldown)
+		[[ "$readiness_output" == *CHECK_STATUS=api-deferred* && "$readiness_output" == *'until epoch 1893456000'* ]]
+		;;
+	readiness-ramp)
+		[[ "$readiness_output" == *CHECK_STATUS=api-deferred* && "$readiness_output" == *'recovery/admission'* ]]
+		;;
+	readiness-local)
+		[[ "$readiness_output" == *CHECK_STATUS=api-deferred* && "$readiness_output" == *retry_at=1893456000* ]]
+		;;
+	readiness-timeout)
+		[[ "$readiness_output" == *CHECK_STATUS=indeterminate* && "$readiness_output" == *'timed out'* ]]
+		;;
+	readiness-api-error)
+		[[ "$readiness_output" == *CHECK_STATUS=indeterminate* && "$readiness_output" == *'exit 1'* ]]
+		;;
+	esac || {
+		printf 'FAIL readiness evidence lost: %s\n' "$readiness_output"
+		exit 1
+	}
+	printf 'PASS readiness preserves typed failure: %s\n' "$mode"
+done
 
 exit 0

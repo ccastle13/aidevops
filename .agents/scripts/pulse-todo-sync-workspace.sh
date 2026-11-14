@@ -25,6 +25,9 @@ _PTSW_LEGACY_COMMAND_STATUS=1
 _PTSW_LEGACY_SNAPSHOTS_READY=0
 _PTSW_LEGACY_CAP_LOGGED=0
 _PTSW_CLONE_DIAGNOSTIC_MAX_CHARS=512
+_PTSW_GITHUB_CREDENTIAL_KEY="credential.https://github.com.helper"
+_PTSW_GITHUB_CREDENTIAL_HELPER="!gh auth git-credential"
+_PTSW_GITHUB_GIT_AUTH_ISOLATED=0
 _PULSE_TODO_SYNC_WORKSPACE=""
 _PULSE_TODO_SYNC_WORKSPACE_ROOT=""
 _PULSE_TODO_SYNC_OWNER_PID=""
@@ -53,6 +56,48 @@ _ptsw_process_start_fingerprint() {
 	process_start="${process_start%"${process_start##*[![:space:]]}"}"
 	[[ -n "$process_start" ]] || return 1
 	printf '%s\n' "$process_start"
+	return 0
+}
+
+_ptsw_append_git_config_env() {
+	local config_key="$1"
+	local config_value="$2"
+	local config_count="${GIT_CONFIG_COUNT:-0}"
+	[[ "$config_count" =~ ^[0-9]+$ ]] || return 1
+	export "GIT_CONFIG_KEY_${config_count}=${config_key}"
+	export "GIT_CONFIG_VALUE_${config_count}=${config_value}"
+	export GIT_CONFIG_COUNT=$((config_count + 1))
+	return 0
+}
+
+#######################################
+# _ptsw_isolate_github_git_auth
+#
+# Route unattended GitHub HTTPS authentication through the gh credential
+# principal for every Git process started by the calling shell (GH#34511).
+# Call only inside the subshell that owns one unattended operation, so the
+# process-scoped configuration never reaches the caller or worker launches.
+#
+# Environment configuration is read after system, global and repository
+# files. The empty URL-scoped value clears every inherited helper selected for
+# https://github.com (osxkeychain, libsecret, GCM, generic or URL-scoped)
+# before the gh helper is added, so get/store/erase never reach an OS
+# credential store and nothing is persisted. Other hosts keep their helpers.
+# No operator is present, so askpass and terminal prompts are disabled.
+# Fails closed when Git does not apply environment configuration (< 2.31).
+#######################################
+_ptsw_isolate_github_git_auth() {
+	local effective_helper=""
+	[[ "$_PTSW_GITHUB_GIT_AUTH_ISOLATED" == "1" ]] && return 0
+	_ptsw_append_git_config_env "$_PTSW_GITHUB_CREDENTIAL_KEY" "" || return 1
+	_ptsw_append_git_config_env "$_PTSW_GITHUB_CREDENTIAL_KEY" "$_PTSW_GITHUB_CREDENTIAL_HELPER" || return 1
+	_ptsw_append_git_config_env "core.askPass" "" || return 1
+	unset GIT_ASKPASS SSH_ASKPASS
+	export GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never
+	effective_helper=$(git config --show-scope --get-all "$_PTSW_GITHUB_CREDENTIAL_KEY" 2>/dev/null |
+		tail -n 1) || effective_helper=""
+	[[ "$effective_helper" == "command"$'\t'"$_PTSW_GITHUB_CREDENTIAL_HELPER" ]] || return 1
+	_PTSW_GITHUB_GIT_AUTH_ISOLATED=1
 	return 0
 }
 
@@ -199,6 +244,7 @@ _ptsw_create_workspace() {
 	local clone_error_file=""
 	local clone_error=""
 	local clone_rc=0
+	local auth_hint=""
 	local owner_pid="${BASHPID:-}"
 	local owner_start=""
 	local owner_created=""
@@ -249,8 +295,14 @@ _ptsw_create_workspace() {
 	if [[ "$clone_rc" -ne 0 ]]; then
 		clone_error=$(dd if="$clone_error_file" bs=512 count=2 2>/dev/null || true)
 		rm -f "$clone_error_file" 2>/dev/null || true
+		# Missing or unusable managed credentials fail once with guidance; the
+		# isolated auth context has no OS-helper fallback to retry (GH#34511).
+		if [[ "$remote_url" == https://github.com/* ]] &&
+			grep -qiE 'could not read (username|password)|terminal prompts disabled|authentication failed' <<<"$clone_error"; then
+			auth_hint=" reason=github_auth_unavailable action=run_gh_auth_status"
+		fi
 		clone_error=$(_ptsw_sanitize_clone_diagnostic "$clone_error") || clone_error="clone diagnostic unavailable"
-		printf '[pulse-wrapper] TODO ref sync clone failed detail=%s\n' "$clone_error" >&2
+		printf '[pulse-wrapper] TODO ref sync clone failed%s detail=%s\n' "$auth_hint" "$clone_error" >&2
 		return 1
 	fi
 	rm -f "$clone_error_file" 2>/dev/null || true
@@ -338,6 +390,26 @@ _ptsw_log_sweep_outcome() {
 	local identity="$3"
 	local detail="${4:-}"
 	local log_file="${WRAPPER_LOGFILE:-${LOGFILE:-/dev/null}}"
+	local dedup_dir=""
+	local dedup_file=""
+	local today=""
+
+	# Legacy-shape and invalid-candidate entries recur for each pulse while a
+	# retained workspace remains. Keep their diagnostic value without turning a
+	# persistent malformed workspace into an unbounded wrapper log.
+	case "$reason" in
+	legacy-shape-mismatch | invalid-candidate)
+		today=$(date -u '+%Y-%m-%d' 2>/dev/null) || today=""
+		dedup_dir="${AIDEVOPS_LOG_DIR:-${HOME:-}/.aidevops/logs}/todo-sync-stale-dedup"
+		dedup_file="${dedup_dir}/${reason}-${identity}"
+		if [[ -n "$today" ]] && mkdir -p "$dedup_dir" 2>/dev/null; then
+			if [[ -f "$dedup_file" ]] && IFS= read -r previous_day <"$dedup_file" && [[ "$previous_day" == "$today" ]]; then
+				return 0
+			fi
+			printf '%s\n' "$today" >"$dedup_file" 2>/dev/null || true
+		fi
+		;;
+	esac
 	printf '[pulse-wrapper] TODO ref sync stale cleanup outcome=%s reason=%s workspace=%s%s\n' \
 		"$outcome" "$reason" "$identity" "${detail:+ ${detail}}" >>"$log_file" 2>/dev/null || true
 	return 0
@@ -365,13 +437,25 @@ _ptsw_move_to_recoverable_trash() {
 	[[ ! -e "$destination" && ! -L "$destination" ]] || return 1
 	mv "$workspace_root" "$destination" 2>/dev/null || return 1
 	[[ ! -e "$workspace_root" && ! -L "$workspace_root" ]] || return 1
+	_ptsw_bound_recoverable_trash
+	return 0
+}
+
+# Apply age/count retention to trashed TODO-sync buckets right after adding one,
+# so the recoverable trash stays bounded even when no cleanup command runs
+# (GH#37214). Best effort: a retention failure never fails the sweep.
+_ptsw_bound_recoverable_trash() {
+	local retention="${_PTSW_SCRIPT_DIR}/todo-sync-trash-retention.sh"
+	[[ -f "$retention" ]] || return 0
+	bash "$retention" prune --apply >/dev/null 2>&1 || true
 	return 0
 }
 
 _ptsw_remove_stale_workspace() {
 	local workspace_root="$1"
 	local identity="$2"
-	local mode="${PULSE_TODO_SYNC_STALE_CLEANUP_MODE:-delete}"
+	# Interrupted TODO-sync clones remain recoverable unless direct deletion is explicit.
+	local mode="${PULSE_TODO_SYNC_STALE_CLEANUP_MODE:-trash}"
 	case "$mode" in
 	delete | direct)
 		_ptsw_validate_workspace_path "$workspace_root" 1 || return 1
@@ -424,11 +508,21 @@ _ptsw_effective_recovery_cap() {
 	[[ "$count_threshold" =~ ^[1-9][0-9]*$ ]] || count_threshold=50
 	[[ "$size_threshold_mib" =~ ^[1-9][0-9]*$ ]] || size_threshold_mib=10240
 	candidate_count=$(_ptsw_count_workspace_candidates "$temp_root") || candidate_count=0
+	# Both pressure rules only ever raise the cap to candidate_count, so the
+	# size of the shared temp root matters only when count pressure has not
+	# already decided. The worker launch path runs this sweep for every
+	# candidate, and a full-tree du there stalled dispatch for minutes.
+	if [[ "$candidate_count" -le "$configured_cap" ]]; then
+		printf '%s\n' "$configured_cap"
+		return 0
+	fi
+	if [[ "$candidate_count" -ge "$count_threshold" ]]; then
+		printf '%s\n' "$candidate_count"
+		return 0
+	fi
 	usage_kib=$(_ptsw_temp_root_usage_kib "$temp_root") || usage_kib=0
 	size_threshold_kib=$((size_threshold_mib * 1024))
-	if [[ "$candidate_count" -gt "$configured_cap" && "$candidate_count" -ge "$count_threshold" ]]; then
-		configured_cap="$candidate_count"
-	elif [[ "$usage_kib" -ge "$size_threshold_kib" && "$candidate_count" -gt "$configured_cap" ]]; then
+	if [[ "$usage_kib" -ge "$size_threshold_kib" ]]; then
 		configured_cap="$candidate_count"
 	fi
 	printf '%s\n' "$configured_cap"
@@ -631,6 +725,11 @@ _ptsw_remove_dead_owner_workspace() {
 		remove_mode="${_PTSW_REMOVE_MODE:-unknown}"
 		_ptsw_log_sweep_outcome "removed" "dead-owner" "$identity" "age=${age_secs}s owner_pid=${owner_pid} mode=${remove_mode}"
 		return 0
+	fi
+	if [[ "${PULSE_TODO_SYNC_STALE_CLEANUP_MODE:-trash}" == "trash" ||
+		"${PULSE_TODO_SYNC_STALE_CLEANUP_MODE:-trash}" == "recoverable" ]]; then
+		_ptsw_log_sweep_outcome "failure" "trash-move-failed" "$identity" "$owner_detail"
+		return 1
 	fi
 	_ptsw_log_sweep_outcome "failure" "stale-remove-failed" "$identity" "$owner_detail"
 	return 1

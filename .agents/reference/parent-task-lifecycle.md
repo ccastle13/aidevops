@@ -69,6 +69,27 @@ Env override: `PARENT_DECOMPOSITION_ESCALATION_HOURS` (default 168). Capped at `
   changes the next child to `status:available`; the completing worker closes
   only its own issue and does not remove successor blockers or labels manually.
 
+## Child Link Contract (manual decomposition)
+
+Automatic parent close counts only machine-readable child evidence: the GitHub
+sub-issue graph, a `## Children` / `## Child issues` / `## Sub-tasks` section in
+the parent body or a trusted roadmap comment, or the narrow prose patterns
+above. A child that only says "Child A of #NNN", or a bare `- [ ] #NNN`
+checklist with no heading, is invisible. The hourly sub-issue backfill cannot
+recover it either: `_detect_parent_from_gh_state` reads only dotted task-ID
+titles, `Parent:` lines, and `Blocked by: tNNN` lines that name a parent-task.
+The parent then stays open after every child merges.
+
+When filing children by hand:
+
+- Create each child with `claim-task-id.sh --parent-issue <N>`. This writes a
+  `Parent: #N` body line and links the sub-issue. When using `gh_create_issue`
+  directly, include a literal `Parent: #N` line.
+- Put any roadmap comment under a `## Children` heading.
+- Verify with `aidevops parent-status <N>`: every child must be listed before
+  the decomposition is done. Repair missed links with the `addSubIssue` GraphQL
+  mutation (GH#36561).
+
 ## Sequential Phase Auto-File (t2740, enabled by default since t2787)
 
 The sequential phase auto-file mechanism reads phase declarations from the parent-task issue body and files the **next unfiled phase** as a child issue automatically once the prior phase's PR merges.
@@ -120,6 +141,27 @@ The `<!-- phase-auto-fire:on -->` HTML comment is the opt-in for narrative phase
 ### Close Guard
 
 The close guard (t2755 Phase 2) prevents premature parent-task closure while any declared phase is still unfiled or open. If a PR uses a closing keyword (`Closes #NNN`) on a parent-task issue that still has pending phases, the merge is accepted but the issue is re-opened with an explanatory comment. Deterministic incomplete close-contract repairs use `hold-for-review`; the ordinary 7-day decomposition escalation remains advisory-only.
+
+## Close Contract Markers
+
+Parent creation through the issue wrappers (`_gh_ci_prepare_parent_close_contract` in `shared-gh-wrappers-create.sh`) appends one machine-readable marker. Reconciliation (`_parent_close_contract_incomplete` in `pulse-issue-reconcile-actions-parent.sh`) and `aidevops parent-status` read it after every known child is terminal:
+
+| Marker | Meaning | Closure |
+|--------|---------|---------|
+| `<!-- parent-close-contract: needs-decomposition -->` | Provisional default: no decomposition was declared at creation. | Blocks only until the decomposition is declared: a `## Children` / `## Child issues` / `## Sub-tasks` section in the body, or in a trusted (OWNER/MEMBER/COLLABORATOR) roadmap comment, lists child references; every known child is terminal; and every native sub-issue appears in that list. Graph-only children never satisfy it. (GH#37679) |
+| `<!-- parent-close-contract: keep-open -->` | Explicit hold. | Always blocks. |
+| `<!-- parent-close-contract: expected-children=N -->` | N children are planned. | Blocks while fewer than N children are known. |
+| `<!-- parent-close-contract: phase-plan -->` | The `## Phases` section is the plan. | Blocks while phases are unfiled or no phase line parses. |
+| `<!-- parent-close-contract: complete -->` | No more children are planned. | Closes once every known child is terminal. |
+
+Unchecked `- [ ]` criteria also block closure unless a complete native sub-issue graph exists.
+
+**Closing a finished parent from an interactive session:**
+
+1. Run `aidevops parent-status <N> --repo <owner/repo>`; every child must be closed.
+2. Add a `## Children` section to the parent body listing every child (`- #NNN`), including every native sub-issue.
+3. Replace `needs-decomposition` with `expected-children=N` (N = the number of children), or with `complete` if no more children are planned. Leave `keep-open` only on a parent that must stay open.
+4. Rerun `parent-status`; when it reports "close the parent issue", close it as completed. Reconciliation does not reopen a parent whose contract is satisfied.
 
 ## Use Cases
 

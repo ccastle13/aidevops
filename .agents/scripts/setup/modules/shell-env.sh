@@ -118,6 +118,7 @@ _omz_offer_shell_change() {
 	fi
 
 	echo ""
+	local change_shell=""
 	setup_prompt change_shell "Change default shell to zsh? [y/N]: " "n"
 	if [[ "$change_shell" =~ ^[Yy]$ ]]; then
 		if chsh -s "$(command -v zsh)"; then
@@ -182,6 +183,7 @@ setup_oh_my_zsh() {
 	echo "  This is optional - plain zsh works fine without it."
 	echo ""
 
+	local install_omz=""
 	setup_prompt install_omz "Install Oh My Zsh? [y/N]: " "n"
 
 	if [[ "$install_omz" =~ ^[Yy]$ ]]; then
@@ -518,7 +520,7 @@ setup_shell_compatibility() {
 	local counts
 	counts=$(_shell_compat_count_customizations "${bash_files[@]}")
 	local total_exports total_aliases total_paths
-	read -r total_exports total_aliases total_paths <<<"$counts"
+	IFS=' ' read -r total_exports total_aliases total_paths <<<"$counts"
 
 	if [[ $total_exports -eq 0 && $total_aliases -eq 0 && $total_paths -eq 0 ]]; then
 		print_info "No bash customizations detected - skipping cross-shell setup"
@@ -553,6 +555,7 @@ check_optional_deps() {
 		pkg_manager=$(detect_package_manager)
 
 		if [[ "$pkg_manager" != "unknown" ]]; then
+			local install_optional=""
 			setup_prompt install_optional "Install optional dependencies using $pkg_manager? [Y/n]: " "Y"
 
 			if [[ "$install_optional" =~ ^[Yy]?$ ]]; then
@@ -955,6 +958,11 @@ setup_shellcheck_wrapper() {
 	local wrapper_path="$HOME/.aidevops/agents/scripts/shellcheck-wrapper.sh"
 
 	_shellcheck_wrapper_verify "$wrapper_path" || return 0
+	# Keep the original executable on PATH for the wrapper's real-binary lookup.
+	# Never replace it, even when writable: package ownership is not permission
+	# to mutate it. Existing .real installations remain supported by the wrapper.
+	print_info "Configuring user-local ShellCheck wrapper; original binary is preserved"
+	print_info "Absolute-path ShellCheck callers bypass the shim; use SHELLCHECK_PATH where supported"
 
 	local env_line
 	# shellcheck disable=SC2016 # env_line is written to rc files; must expand at shell startup
@@ -1133,6 +1141,7 @@ setup_aliases() {
 	alias_block_fish=$(_aliases_build_fish_block)
 
 	print_info "Detected default shell: $default_shell"
+	local add_aliases=""
 	setup_prompt add_aliases "Add shell aliases? [Y/n]: " "Y"
 
 	if [[ "$add_aliases" =~ ^[Yy]?$ ]]; then
@@ -1198,6 +1207,7 @@ _terminal_title_prompt_and_install() {
 	local setup_script="$1"
 
 	echo ""
+	local install_title=""
 	setup_prompt install_title "Install terminal title integration? [Y/n]: " "Y"
 
 	if [[ "$install_title" =~ ^[Yy]?$ ]]; then
@@ -1236,5 +1246,43 @@ setup_terminal_title() {
 	_terminal_title_show_status
 	_terminal_title_prompt_and_install "$setup_script"
 
+	return 0
+}
+
+# Tabby gives a live OpenCode tab's recovery-marker directory (reported with
+# OSC 1337) to new tabs and restored plain-shell tabs. This sources a guard
+# from interactive bash/zsh startup that moves such shells to the session's
+# project directory. See reference/tabby-profiles.md. Idempotent.
+setup_tabby_recovery_shell_guard() {
+	local guard_file="$HOME/.aidevops/agents/scripts/tabby-recovery-shell-guard.sh"
+	local marker="# aidevops tabby-recovery shell guard"
+	local rc_file=""
+	local added_to=""
+	# shellcheck disable=SC2016 # Expanded by the user's shell at startup.
+	local source_line='if [ -f "$HOME/.aidevops/agents/scripts/tabby-recovery-shell-guard.sh" ]; then . "$HOME/.aidevops/agents/scripts/tabby-recovery-shell-guard.sh"; fi'
+
+	if [[ ! -f "$guard_file" ]]; then
+		print_skip "Tabby recovery shell guard" "guard not deployed" "Deploy agents first (setup.sh), then re-run"
+		return 0
+	fi
+
+	while IFS= read -r rc_file; do
+		[[ -n "$rc_file" ]] || continue
+		case "$rc_file" in
+		*.fish) continue ;;
+		esac
+		[[ -f "$rc_file" ]] || continue
+		grep -Fq "$marker" "$rc_file" && continue
+		{
+			echo ""
+			echo "$marker (leave Tabby OpenCode recovery-marker directories)"
+			echo "$source_line"
+		} >>"$rc_file" || continue
+		added_to="${added_to:+$added_to, }$rc_file"
+	done < <(get_all_shell_rcs)
+
+	if [[ -n "$added_to" ]]; then
+		print_success "Added Tabby recovery shell guard to: $added_to"
+	fi
 	return 0
 }

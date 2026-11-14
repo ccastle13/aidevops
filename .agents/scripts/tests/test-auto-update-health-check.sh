@@ -30,6 +30,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit
 AGENT_SCRIPT_DIR="${SCRIPT_DIR}/.."
 HELPER="${AGENT_SCRIPT_DIR}/auto-update-helper.sh"
+CHECK_LIBRARY="${AGENT_SCRIPT_DIR}/auto-update-helper-check.sh"
 CONFIG_DEFAULTS_SOURCE="${SCRIPT_DIR}/../../configs/aidevops.defaults.jsonc"
 CONFIG_SCHEMA_SOURCE="${SCRIPT_DIR}/../../configs/aidevops-config.schema.json"
 
@@ -159,6 +160,22 @@ if [[ ! -x "$HELPER" ]]; then
 fi
 print_result "auto-update-helper.sh exists and executable" "PASS"
 
+for updater_source in "$HELPER" "$CHECK_LIBRARY"; do
+	if grep -Fq -- "fast-forward-current --repo \"\$INSTALL_DIR\" --branch main" "$updater_source" &&
+		grep -q -- '--reason aidevops-update --confirm FAST_FORWARD_CANONICAL_BRANCH' "$updater_source"; then
+		print_result "$(basename "$updater_source") delegates canonical maintenance" "PASS"
+	else
+		print_result "$(basename "$updater_source") delegates canonical maintenance" "FAIL"
+	fi
+
+	if grep -Fq -- "git -C \"\$INSTALL_DIR\" fetch origin main" "$updater_source" ||
+		grep -Fq -- "git -C \"\$INSTALL_DIR\" merge --ff-only" "$updater_source"; then
+		print_result "$(basename "$updater_source") avoids direct canonical mutation" "FAIL"
+	else
+		print_result "$(basename "$updater_source") avoids direct canonical mutation" "PASS"
+	fi
+done
+
 if grep -q '^cmd_health_check()' "$HELPER"; then
 	print_result "cmd_health_check function defined" "PASS"
 else
@@ -190,6 +207,39 @@ if grep -q 'health-check' "$HELPER" && grep -q 'idempotent' "$HELPER"; then
 	else
 		print_result "help text mentions health-check" "FAIL"
 	fi
+fi
+
+# Test (GH#37751): _resolve_status_backend reports systemd when the timer is
+# enabled even though detection fell back to cron. Platform-independent.
+_resolve_body=$(sed -n '/^_resolve_status_backend() {/,/^}/p' "$HELPER")
+_resolve_shim_dir=$(mktemp -d)
+cat >"${_resolve_shim_dir}/systemctl" <<'EOF'
+#!/usr/bin/env bash
+case "$2" in
+is-enabled) printf '%s\n' "${FAKE_TIMER_STATE:-disabled}"; [[ "${FAKE_TIMER_STATE:-disabled}" == enabled ]] ;;
+is-active) [[ "${3:-}" == --quiet ]] || printf '%s\n' "${FAKE_TIMER_ACTIVE:-inactive}"; [[ "${FAKE_TIMER_ACTIVE:-inactive}" == active ]] ;;
+show) printf '%s\n' 'NextElapseUSecRealtime=tomorrow' ;;
+esac
+EOF
+chmod +x "${_resolve_shim_dir}/systemctl"
+_resolve_cron=$(PATH="${_resolve_shim_dir}:$PATH" AIDEVOPS_SCHEDULER='' FAKE_TIMER_STATE=enabled bash -c "SYSTEMD_UNIT_NAME=aidevops-auto-update; ${_resolve_body}; _resolve_status_backend cron")
+_resolve_off=$(PATH="${_resolve_shim_dir}:$PATH" AIDEVOPS_SCHEDULER='' FAKE_TIMER_STATE=disabled bash -c "SYSTEMD_UNIT_NAME=aidevops-auto-update; ${_resolve_body}; _resolve_status_backend cron")
+_resolve_active=$(PATH="${_resolve_shim_dir}:$PATH" AIDEVOPS_SCHEDULER='' FAKE_TIMER_ACTIVE=active bash -c "SYSTEMD_UNIT_NAME=aidevops-auto-update; ${_resolve_body}; _resolve_status_backend cron")
+_resolve_explicit=$(PATH="${_resolve_shim_dir}:$PATH" AIDEVOPS_SCHEDULER=cron FAKE_TIMER_STATE=enabled bash -c "SYSTEMD_UNIT_NAME=aidevops-auto-update; ${_resolve_body}; _resolve_status_backend cron")
+_resolve_launchd=$(PATH="${_resolve_shim_dir}:$PATH" AIDEVOPS_SCHEDULER='' FAKE_TIMER_STATE=enabled bash -c "SYSTEMD_UNIT_NAME=aidevops-auto-update; ${_resolve_body}; _resolve_status_backend launchd")
+_status_body=$(sed -n '/^_cmd_status_scheduler() {/,/^}/p' "$HELPER")
+_status_output=$(PATH="${_resolve_shim_dir}:$PATH" FAKE_TIMER_ACTIVE=active bash -c "SYSTEMD_UNIT_NAME=aidevops-auto-update; SYSTEMD_SERVICE_DIR=/unused; CRON_MARKER=unused; GREEN=; YELLOW=; NC=; _print_linger_status() { return 0; }; ${_status_body}; _cmd_status_scheduler systemd")
+rm -rf "$_resolve_shim_dir"
+if [[ "$_resolve_cron" == "systemd" && "$_resolve_off" == "cron" && "$_resolve_active" == "systemd" && "$_resolve_explicit" == "cron" && "$_resolve_launchd" == "launchd" ]]; then
+	print_result "status resolves systemd when timer enabled but detection says cron" "PASS"
+else
+	print_result "status resolves systemd when timer enabled but detection says cron" "FAIL" \
+		"got '$_resolve_cron' / '$_resolve_off' / '$_resolve_active' / '$_resolve_explicit' / '$_resolve_launchd'"
+fi
+if [[ "$_status_output" == *'Status:    disabled'* && "$_status_output" == *'Active:    active'* && "$_status_output" == *'Next fire: tomorrow'* ]]; then
+	print_result "systemd status distinguishes active from enabled and shows next fire" "PASS"
+else
+	print_result "systemd status distinguishes active from enabled and shows next fire" "FAIL" "$_status_output"
 fi
 
 # Skip platform-specific runtime tests on non-macOS for now: the launchctl

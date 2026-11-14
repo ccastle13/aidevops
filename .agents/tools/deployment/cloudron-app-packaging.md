@@ -25,7 +25,7 @@ tools:
 - **Source Code**: [git.cloudron.io/packages](https://git.cloudron.io/packages) (200+ official app packages) | [By Technology](https://git.cloudron.io/explore/projects/topics)
 - **Forum**: [forum.cloudron.io/category/96](https://forum.cloudron.io/category/96/app-packaging-development)
 - **Base Image Tags**: https://hub.docker.com/r/cloudron/base/tags
-- **Sub-docs**: [addons-ref.md](cloudron-app-packaging-skill/addons-ref.md) | [manifest-ref.md](cloudron-app-packaging-skill/manifest-ref.md) | [cloudron-git-reference.md](cloudron-git-reference.md)
+- **Sub-docs**: [addons-ref.md](cloudron-app-packaging-skill/addons-ref.md) | [manifest-ref.md](cloudron-app-packaging-skill/manifest-ref.md) | [cloudron-git-reference.md](cloudron-git-reference.md) | [cloudron-package-onboarding.md](cloudron-package-onboarding.md) (new package repos)
 
 **Golden Rules** (violations cause package failure):
 
@@ -39,13 +39,13 @@ tools:
 
 **File Structure**: `CloudronManifest.json`, `Dockerfile`, `start.sh`, `logo.png` (256×256). Independently distributed packages also keep `CloudronVersions.json`, a Cloudron-format changelog, a publishing runbook, keyless image/catalog provenance, and at least one privacy-reviewed screenshot or 3:1 hero; follow `cloudron-app-publishing-skill.md`.
 
-**CLI Workflow**:
+**CLI Workflow**: For registry builds, use `cloudron builder login` and `cloudron builder build` before install or update. The current CLI no longer provides `cloudron build`; inspect the installed builder's help before use.
 
 ```bash
-npm install -g cloudron
+npm install -g cloudron   # once installed, aidevops update-tools and auto-update keep it current
 cloudron login my.cloudron.example && cloudron init
-cloudron build && cloudron install --location testapp
-cloudron build && cloudron update --app testapp  # iterate
+cloudron install --location testapp  # on-server build
+cloudron update --app testapp        # iterate; a previously built image may be reused instead of edited source, so select an on-server build or rebuild and pass the new image explicitly
 cloudron logs -f --app testapp
 cloudron exec --app testapp   # shell into container
 cloudron debug --app testapp  # pause app, writable fs
@@ -114,13 +114,21 @@ Use the subtotals to calibrate the first packaging round (excluding assessment r
 
 ## Base Image
 
-**Always `FROM cloudron/base:5.1.0@sha256:1c0666c9abe9e2090d33686826d4e97769b799124573118d41e0d7485135748e`.** The final stage MUST use the SHA-pinned `cloudron/base` — platform tooling (file manager, web terminal, log viewer) depends on utilities in this image. Never start from upstream images — monolithic images bundle databases, reverse proxies, and init systems that conflict with Cloudron (e.g., docassemble: 25 symlinks, 15-20 min boot). Read upstream `docker-compose.yml` for dependencies, then install on `cloudron/base` via package manager. Current SHA tracked at [hub.docker.com/r/cloudron/base/tags](https://hub.docker.com/r/cloudron/base/tags) and in [`cloudron-app-packaging-skill.md`](cloudron-app-packaging-skill.md).
+**Recommend `FROM cloudron/base:6.0.1@sha256:7b1e729960c3ca312d26e886917ba89483241bba0219ff292858e10d9d5768ee`.** The final stage MUST use the SHA-pinned Cloudron base or the applicable Node/PHP runtime variant in [`cloudron-app-packaging-skill.md`](cloudron-app-packaging-skill.md) — platform tooling (file manager, web terminal, log viewer) depends on utilities in these images. Never use an upstream image as the final stage: monolithic images bundle databases, reverse proxies, and init systems that conflict with Cloudron. Read upstream `docker-compose.yml` for dependencies, then install them on the applicable Cloudron image.
 
 **Multi-stage builds**: Only when build toolchain is exotic. Build in upstream image, `COPY --from` artifacts into final `cloudron/base` stage. **Alpine/musl warning**: musl-compiled binaries won't run on `cloudron/base` (Ubuntu/glibc) — always use glibc builder stage.
 
-**Base image contents (Cloudron 5.1.0, verified 2026-08-07)**: Ubuntu 24.04.4 LTS, Node.js 24.19.0 at `/usr/local/node-24.19.0/bin/node`, Python 3.12.3, Nginx 1.24.0, Apache 2.4.58, Supervisor 4.2.5, gosu 1.19, gcc 13.3.0, ImageMagick 6.9.12, ffmpeg 6.1.1, psql 16.14, mysql 8.0.46, redis-cli 8.10.0, mongosh 2.9.2, yq 4.53.3. Reviewed `cloudron/base:5.1.0` tag digest is `sha256:1c0666c9abe9e2090d33686826d4e97769b799124573118d41e0d7485135748e`. **Not included** (install if needed): PHP, Ruby, Go, Java, Rust, pandoc, wkhtmltopdf.
+**6.0.0 migration (verified 2026-10-08)**: Ubuntu 26.04; no PHP, Node, Apache, Python pip/venv, or mongosh. Use the dated PHP/Node images for those runtimes, explicitly install Apache or mongosh when needed, and provision Python tooling (or select Cloudron's Python runtime image and review its pin policy). Node is now at `/usr/local/node/bin` on `cloudron/node-base` and already on `PATH`; remove the old `/usr/local/node-24.19.0` override. A build-stage Node image does not provide Node in a plain-base final stage.
 
-**Community assessment intake (reviewed at `ad446c4136a7`)**: import packaging lessons from the assessment corpus rather than copying whole assessments. Its live-tool findings now define evidence boundaries, scoring-target selection, compound-axis tie-breakers, and effort calibration above. Good follow-up candidates include Huginn (medium structural, moderate maintenance, viable), while AppFlowy Cloud and ejabberd remain poor fits because of multi-service/auth/storage or network-port constraints. Prosody is the stronger XMPP path when raw TCP/TLS/DNS requirements are acceptable.
+**6.0.1 adoption (reviewed 2026-10-21)**: upstream `v6.0.0..v6.0.1` (`d52c466b6e11`) adds `shared-mime-info` for extension-to-MIME mappings, refreshes Ubuntu to `resolute-20261006`, and requires `ca-certificates >= 20260816ubuntu0.26.04.1` for the emSign removal (USN-8944-1). Adopt this security refresh; the runtime exclusions above are unchanged. Docker Hub and `docker manifest inspect` resolve the recommended digest for Linux amd64. The release helper and existing fixtures use the same pin; dated Node/PHP variants remain separately reviewed and are not implicitly upgraded by changing the general base.
+
+**Platform floor and transition**: official RustFS and SeaweedFS packages using 6.0.0 declare `minBoxVersion: "9.1.0"`. Use that as the recommended qualification baseline, not proof of a universal base-image minimum; verify the package's addons and runtime on its declared platform before migrating. The exact SHA-pinned 5.1.0 image remains accepted by release preparation/check/preflight during transition, so unrelated upstream upgrades are not blocked. `check-compatibility` and the weekly audit report one actionable upgrade finding; unpinned or unknown digests still fail.
+
+**Avoid stale pins**: compare the reviewed pin with [Docker Hub tags](https://hub.docker.com/r/cloudron/base/tags) and the official [base-image source](https://git.cloudron.io/platform/docker-base-image), then verify the candidate with `docker buildx imagetools inspect "$image" --format '{{json .Manifest.MediaType}}'` before updating policy. Release preflight uses the same OCI-aware inspection for every tag-and-digest source, falling back to `docker manifest inspect` only when Buildx is unavailable (`docker buildx version` fails). An inspection failure with Buildx present is terminal, not a reason to retry with the legacy command, which can reject valid OCI index digests. Check dated PHP/Node tags too; floating PHP tags are stale. This is a maintainer review step rather than an automatic network-dependent release gate. Current official examples: [RustFS](https://git.cloudron.io/packages/rustfs-app) and [SeaweedFS](https://git.cloudron.io/packages/seaweedfs-app).
+
+**Community assessment intake (reviewed at `a07cbb499107`)**: import packaging lessons from the [community assessment corpus](https://forgejo.wanderingmonster.dev/WanderingMonster/cloudron-packaging) rather than copying whole assessments. Its live-tool findings define evidence boundaries, scoring-target selection, compound-axis tie-breakers, and effort calibration above. Good follow-up candidates include Huginn (medium structural, moderate maintenance, viable), while AppFlowy Cloud and ejabberd remain poor fits because of multi-service/auth/storage or network-port constraints. Prosody is the stronger XMPP path when raw TCP/TLS/DNS requirements are acceptable.
+
+The reviewed tip adds Markdown normalization and repository-local housekeeping, not new scoring rules, assessed apps, or base-image findings. The substantive assessment-agent refinements in `5cceb4e6039b` are already reflected in **Pre-Packaging Research** and **Scoring Interpretation**; ReleaseBell contribution notes do not change packaging policy. No additional runtime or scoring adoption is needed for this revision. The corpus's March 2026 inventory describes `cloudron/base:5.0.0` on Cloudron 9.1.3, not the current 6.0.0 image; retain the newer verified pins and migration guidance above.
 
 ## CloudronManifest.json
 
@@ -150,11 +158,20 @@ workers=$(( workers < 1 ? 1 : workers ))    # floor at 1
 
 ## Dockerfile Patterns
 
+**Mail-handling apps** (helpdesks, CRMs, ticketing): see [email addon TLS guidance](cloudron-app-packaging-skill/addons-ref.md#email).
+
+- Keep SSRF guards for all user-supplied IMAP/SMTP hosts; add only an operator-pinned exception for an exact match to the Cloudron public mail host on the approved IMAPS, SMTPS, or submission ports.
+- For that host/port pair only, dial the addon-provided internal `mail` service/port instead of the public IP; public-IP hairpin routing may be unavailable. Never turn this into a general private-address allowlist.
+- In `start.sh`, capture trusted addon env before reading `/app/data/env`, then recompute and overwrite the pinned host, allowed ports, internal destination, and TLS name afterward so user config cannot override them. Refresh on every start; absent addon values mean no exception.
+- Keep TLS verification enabled against the public mail FQDN, including SNI, even when dialing internally; use STARTTLS for submission as appropriate.
+- Hide upstream inbound-only features that require an internet-reachable SMTP listener on port 25 or an unprovisioned webhook relay (for example, forwarding to a token address); these do not work on a standard Cloudron install without that extra infrastructure.
+- Mark IMAP with the mailbox password as the recommended working path, and document unsupported inbound features in the package README's limits section.
+
 ```dockerfile
-FROM cloudron/base:5.1.0@sha256:1c0666c9abe9e2090d33686826d4e97769b799124573118d41e0d7485135748e
+FROM cloudron/php-base:8.5-20260920@sha256:a59a4334fbf50ebfdf8f6cc5527e099e4586349a1aefc546e85f7401ea366d65
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    nginx php8.2-fpm php8.2-mysql \
+    nginx \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app/code
@@ -174,8 +191,8 @@ CMD ["/app/code/start.sh"]
 **Runtime-specific patterns:**
 
 - **PHP**: Redirect temp paths to `/run`: `RUN rm -rf /var/lib/php/sessions && ln -s /run/php/sessions /var/lib/php/sessions`. FPM pool: `php_value[session.save_path] = /run/php/sessions`. In start.sh: `mkdir -p /run/php/sessions /run/php/uploads /run/php/tmp`.
-- **Node.js**: `RUN npm ci --production && npm cache clean --force` + `ENV NODE_ENV=production`. Keep `node_modules` in `/app/code`.
-- **Python**: `ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1` + `RUN pip install --no-cache-dir -r requirements.txt`.
+- **Node.js**: use the pinned `cloudron/node-base` from the skill table; `RUN npm ci --omit=dev && npm cache clean --force` + `ENV NODE_ENV=production`. Keep `node_modules` in `/app/code`.
+- **Python**: provision pip/venv explicitly before `RUN pip install --no-cache-dir -r requirements.txt`; plain 6.0.0 no longer supplies them. Set `ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1`.
 
 **nginx** — writable temp paths required (fails to start without):
 
@@ -286,6 +303,18 @@ Track version in `/app/data/.app_version`; compare on start to run per-version m
 
 ## Managed Package Lifecycle
 
+Keep detailed human/operator guides in `docs/`, conventional root entrypoints
+(README, AGENTS, SECURITY, CHANGELOG), and AI-only working context in `.agents/`.
+Root AGENTS should link the canonical architecture and operational contracts.
+When moving guides, update relative links, package-test assertions and generator
+paths; preserve existing repository conventions and do not overwrite custom docs.
+
+Cloudron terminates ordinary web TLS. A manifest-declared dedicated native TCP
+listener may terminate addon TLS inside the app when required by its protocol;
+document the trust boundary and verify the actual native transport. This is not
+permission to replace Cloudron nginx or claim native VPN-provider support.
+
+New package repositories: complete `cloudron-package-onboarding.md`.
 `aidevops init` detects `CloudronManifest.json`, records
 `app_type: cloudron-package` in local `repos.json`, and installs the thin
 `.github/workflows/cloudron-package-release.yml` caller when no file already
@@ -308,12 +337,17 @@ Prepare and validate releases without publishing:
 cloudron-package-helper.sh prepare-release 1.2.0 4.5.6 release-notes.md
 cloudron-package-helper.sh check-compatibility
 cloudron-package-helper.sh check-release v1.2.0
+cloudron-package-helper.sh preflight-release v1.2.0
 ```
 
 `prepare-release` validates first, then updates `CloudronManifest.json` and
 inserts a non-empty `CHANGELOG.md` section with rollback on a partial write.
 `check-release` requires a matching `vX.Y.Z` tag, valid manifest, non-empty
 changelog entry, and the exact pinned final Cloudron base image.
+`preflight-release` additionally resolves every tag-and-digest `FROM` source
+without building, pushing, tagging, publishing, or deploying. Run it before
+merge: metadata validity alone does not prove the pinned build sources remain
+available.
 
 Core routines provide ongoing reporting:
 
@@ -324,15 +358,69 @@ Core routines provide ongoing reporting:
 Both routines deduplicate package-local issues, require maintainer-equivalent
 issue authority, and fail closed on GitHub/API errors. They never execute
 upstream instructions or modify package source.
+After filing a newer upstream release or commit finding, the applied monitor
+supersedes older trusted monitor findings in the same package repository. It
+closes only unassigned findings without `status:in-progress` or `status:claimed`
+labels and without an open linked PR, posting a signed comment linking the new
+issue. Active findings remain open and receive one consolidated note on the new
+issue instead. Release findings are compared by version; commit findings use
+issue creation order. Failed API reads never authorize closure, and subsequent
+deduplicated runs retry cleanup. Compatibility findings are not superseded.
+Applied upstream findings read the package manifest from the target repository's
+remote default branch at a captured commit SHA. The generated schema-v2 brief
+includes a canonical Files Scope; a detected upstream release is only a finding,
+not a prepared, build-verified, or published Cloudron update.
+For upstreams whose desktop release tag is a release-only commit while the
+packaged relay image comes from its immediate parent, configure
+`cloudron_package.upstream_image` as described in
+`reference/repos-json-fields.md`. The optional gate resolves that exact parent,
+requires a qualified multi-architecture index and source-bound upstream
+attestation (plus the signed deployment-eligibility predicate when configured),
+and defers worker dispatch while the image is missing. It can
+re-arm one previously blocked, unclaimed package issue on new positive proof,
+without treating a later `main` image as the released artifact.
 When GitHub reports a primary or secondary rate limit, `r916` stops before the
 next package registration and records a reset-aware deferred attempt. Pulse
 retries after the shared cooldown boundary plus bounded jitter instead of using
 the generic 15-minute failure retry.
 
-**Publication boundary:** pushing a `vX.Y.Z` tag is the explicit trigger for the
-managed caller to validate and create a GitHub release. Tag creation, image
-pushes, Cloudron catalog publication, and deployment remain separate operator
-actions and require explicit authorization.
+**Publication boundary:** managed catalog packages follow **upstream detected →
+release PR ready → release approval requested → approved → published**. A worker
+updates the manifest and both changelogs, runs package tests and
+`preflight-release`, and waits for green PR preflight (including its no-push image
+build). It then runs `cloudron-release-approval-helper.sh request <repo> <pr>`
+instead of merging. This places a PR hold and creates a deduplicated
+`Release <package> v<version>` issue with `release-approval-required` and
+`no-auto-dispatch`. The issue records the exact head, package/upstream versions,
+changelog and check evidence. New requests supersede older unsigned requests.
+If the request fails, leave **both** `release-approval-required` and
+`hold-for-review` on the PR, never a bare `hold-for-review`. Exit code 4 means
+the API failed before the helper could establish that state; after API recovery,
+apply exactly those two labels using the command in its error message. Do not
+remove an unrelated bare hold to force a request through. Routine `r924` retries
+labelled interrupted requests without an open approval issue, including PRs
+without `origin:worker`, once checks pass. An existing request for a different
+head is retained for explicit re-approval, never silently rewritten.
+
+The maintainer's single action is `sudo aidevops approve issue <N> <repo>`.
+Routine `r924` runs `cloudron-release-approval-helper.sh process --apply` every
+30 minutes. Only `approval-helper.sh verify issue <N> <repo> --require-authority`
+returning `VERIFIED` can release this helper's PR hold and merge the approved
+head through the normal full-loop gates. Head drift requests re-approval;
+verification/API errors fail closed. The helper waits boundedly for the main
+catalog run, resumes on subsequent invocations, and closes the release issue
+only after the catalog version, `v<version>` tag and GitHub release are verified.
+Catalog race recovery/reconciliation remains owned by the publishing workflow
+and upstream monitor (GH#35649). Optionally, one signed `release-standing-policy`
+issue (`policy-request <repo>`) lets `r924` publish unsigned requests that
+`cloudron_routine_bump.py` proves are routine upstream-only bumps; every other
+change keeps per-release signing (see `cloudron-app-publishing-skill.md`).
+
+This dedicated label does not change `needs-maintainer-review` semantics and
+trusted authors alone cannot satisfy it. Signing authorizes only this release's
+merge and already-configured catalog publication, not deployment, changing
+publication credentials/settings, or unrelated external publication. Legacy
+tag-only packages still require separate explicit operator publication authority.
 
 ## Troubleshooting
 
@@ -343,6 +431,7 @@ actions and require explicit authorization.
 | DB connection fails | Verify addon in manifest; `cloudron exec --app testapp` → `env \| grep CLOUDRON` |
 | Health check fails | `curl -v http://localhost:8000/health` — verify app listens on httpPort |
 | Memory exceeded | Increase `memoryLimit`; check for leaks; optimize worker counts |
+| 502 instead of 413 on an oversized upload | nginx with `proxy_request_buffering off` hits `writev() failed (32: Broken pipe)` when the app rejects the body early and closes the connection. `proxy_request_buffering on` only reduces it (live test: 413 twice, 502 once in three tries) and adds disk I/O. Accept 502 for streamed uploads and document it; probe with `cloudron-app-qa-helper.sh upload-probe --allow-502` |
 
 ## Validation Checklist
 
@@ -356,6 +445,47 @@ actions and require explicit authorization.
 [ ] Backup/restore cycle works
 [ ] Auto-updater disabled; logs stream to stdout/stderr
 ```
+
+### Qualifying Tailscale-compatible packages
+
+For Headscale or any package exposing a Tailscale `--login-server`, prove real
+client behaviour on a Cloudron test install with
+`.agents/scripts/tailscale-client-qa-helper.sh`:
+
+```bash
+tailscale-client-qa-helper.sh run <app-location>                 # direct paths
+tailscale-client-qa-helper.sh run <app-location> --force-derp    # relay-only
+tailscale-client-qa-helper.sh cleanup [<app-location>]           # manual teardown
+```
+
+It starts two disposable official Tailscale containers (`hs-qa-a`, `hs-qa-b`),
+registers them with an ephemeral 30-minute pre-auth key (never printed), then
+prints `PASS:`/`FAIL:` lines for registration, server view, netcheck, peer ping
+and DERP, exiting non-zero on failure. Containers and the `qa` user's nodes are
+removed on exit. Override the server CLI with
+`--server-cmd 'ssh host headscale'` for non-Cloudron servers. Needs `docker`
+and `jq`. Attach the output to release evidence for each package update.
+
+### Qualifying a package on a live install
+
+`cloudron-app-qa-helper.sh help` lists every subcommand. Each takes
+`--server <cloudron-host>` (the CLI default server is never used); locations
+must look disposable (`*-test`, `*-qa`, `*-clone`) unless `--force-location`.
+
+```bash
+H=cloudron-app-qa-helper.sh; S="--server my.example.com"
+$H install myapp-test $S --image REGISTRY/IMAGE:TAG   # or --versions-url / --build
+$H health myapp-test $S; $H mailbox create qa@example.com $S; $H memory myapp-test $S
+$H upload-probe --url https://myapp-test.example.com/upload --sizes 20M,30M --limit 25M
+$H oauth-probe --url https://myapp-test.example.com --resource-path /mcp --adapter a.mjs $S
+$H realtime --url https://myapp-test.example.com --adapter a.mjs --idle 330 $S
+$H restart-persist myapp-test $S; $H backup-clone myapp-test $S; $H update myapp-test $S; $H cleanup myapp-test $S   # `run` = core checks + cleanup on exit
+```
+
+Output is `PASS:`/`FAIL:` lines; exit is non-zero on failure. Tokens, setup links,
+mail bodies and query strings are never printed. `cleanup` removes apps, clone,
+QA mailbox, 0700 profiles and scratch. Adapter (ES module): `login(page, role)`,
+`realtime(pageA, pageB)` (required for realtime); optional `coedit`, `consent(page)`.
 
 ## Publishing
 

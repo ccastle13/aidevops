@@ -10,6 +10,14 @@
 
 set -u
 
+# Resolve native Git once from the system default PATH (portable to non-FHS
+# hosts such as NixOS); fixtures must bypass the aidevops git wrapper.
+TEST_NATIVE_GIT=$(command -p -v git) || {
+	printf '%s\n' 'Native Git is unavailable on the system PATH' >&2
+	exit 1
+}
+export TEST_NATIVE_GIT
+
 # Isolate fixture repositories from the developer's global hooksPath and
 # signing policy; the test installs its own bare-remote protection hook.
 export GIT_CONFIG_GLOBAL=/dev/null
@@ -17,8 +25,9 @@ export GIT_CONFIG_NOSYSTEM=1
 
 # Fixture setup uses disposable repositories; helper subprocesses still resolve
 # the guarded Git shim from PATH because shell functions are not exported.
+# Allow runners without native Git to select their system Git for fixtures.
 git() {
-	/usr/bin/git "$@"
+	"${TEST_GIT_BINARY:-${TEST_NATIVE_GIT}}" "$@"
 	return $?
 }
 
@@ -118,12 +127,24 @@ if [[ "${1:-}" == "api" && "${2:-}" == "repos/example/repo" ]]; then
 fi
 
 if [[ "${1:-}" == "api" && "${2:-}" == "/repos/example/repo/issues/1" ]]; then
-	printf 'origin:interactive\n'
+	if grep -q '<!-- aidevops:origin:worker -->' "${GH_STUB_BODY:?}"; then
+		printf 'origin:worker\n'
+	else
+		printf 'origin:interactive\n'
+	fi
 	exit 0
 fi
 
 if [[ "${1:-}" == "api" ]]; then
 	exit 1
+fi
+
+if [[ "${1:-}" == "pr" && "${2:-}" == "view" ]]; then
+	case "$*" in
+	*"--jq .state") printf 'MERGED\n' ;;
+	*"--jq .mergedAt") printf '2026-10-17T00:00:00Z\n' ;;
+	esac
+	exit 0
 fi
 
 if [[ "${1:-}" == "pr" && "${2:-}" == "create" ]]; then
@@ -230,8 +251,8 @@ test_protected_default_creates_planning_pr() {
 		fail "$name" "source worktree dirty after PR fallback: $status"
 		return 0
 	fi
-	if ! grep -q $'gh\tpr\tcreate' "$log_file" 2>/dev/null; then
-		fail "$name" "gh pr create was not called"
+	if ! grep -q $'gh\tpr\tcreate.*\t--label\tallow-auto-merge' "$log_file" 2>/dev/null; then
+		fail "$name" "planning PR creation did not include merge-throughput opt-in"
 		return 0
 	fi
 	head_branch=$(cat "$head_file" 2>/dev/null || true)
@@ -269,8 +290,8 @@ test_protected_default_creates_planning_pr() {
 		return 0
 	fi
 	pr_title=$(<"$title_file")
-	if [[ "$pr_title" != "plan(t999): add t999 protected planning" ]]; then
-		fail "$name" "single-task PR title is not task-aware: $pr_title"
+	if [[ "$pr_title" != "t999: plan: add t999 protected planning" ]]; then
+		fail "$name" "single-task PR title is not a merge-safe task subject: $pr_title"
 		return 0
 	fi
 	pass "$name"
@@ -307,7 +328,7 @@ test_multi_task_manifest_is_deterministic() {
 	body=$(<"${tmpdir}/body")
 	title=$(<"${tmpdir}/title")
 	for_31_count=$(printf '%s\n' "$body" | grep -c '^- For #31$' || true)
-	if [[ "$rc" -eq 0 && "$title" == "plan: publish planning batch" &&
+	if [[ "$rc" -eq 0 && "$title" == "chore: publish planning batch" &&
 		"$body" == *"task=t2001 issue=31"* && "$body" == *"task=t2002 issue=32"* &&
 		"$body" == *"task=t2003 issue=31"* && "$for_31_count" -eq 1 &&
 		"$body" == *$'- For #31\n- For #32'* ]]; then
@@ -345,6 +366,104 @@ test_ambiguous_task_mapping_fails_before_push() {
 		pass "$name"
 	else
 		fail "$name" "rc=$rc refs=$remote_refs status=$status output=$output"
+	fi
+	rm -rf "$tmpdir"
+	return 0
+}
+
+# GH#37002: seed padded legacy rows (no ref:GH#, one duplicated) plus a padded
+# brief, then stage a task-id-normalize style rewrite with a `git mv`.
+seed_padded_legacy_rows() {
+	local work_dir="$1"
+	local second_row="$2"
+	printf -- '- [x] t038.21 Old completed task #bug\n- [x] t038.21 Duplicate history row\n%s\n' \
+		"$second_row" >>"${work_dir}/TODO.md"
+	printf 'What: legacy brief\n' >"${work_dir}/todo/tasks/t038.21-brief.md"
+	git -C "$work_dir" add TODO.md todo/ &&
+		git -C "$work_dir" commit -m "plan: seed legacy rows" >/dev/null 2>&1 &&
+		git -C "$work_dir" push origin fixture-default >/dev/null 2>&1 || return 1
+	return 0
+}
+
+normalize_padded_legacy_rows() {
+	local work_dir="$1"
+	local second_row="$2"
+	printf '# Tasks\n\n- [x] t38.21 Old completed task #bug\n- [x] t38.21 Duplicate history row\n%s\n' \
+		"$second_row" >"${work_dir}/TODO.md"
+	git -C "$work_dir" mv todo/tasks/t038.21-brief.md todo/tasks/t38.21-brief.md || return 1
+	git -C "$work_dir" add TODO.md || return 1
+	return 0
+}
+
+run_forced_pr_fallback() {
+	local tmpdir="$1"
+	local work_dir="$2"
+	local message="$3"
+	(cd "$work_dir" && PATH="${tmpdir}/bin:$PATH" \
+		GH_STUB_LOG="${tmpdir}/gh.log" GH_STUB_BODY="${tmpdir}/body" \
+		GH_STUB_HEAD="${tmpdir}/head" GH_STUB_TITLE="${tmpdir}/title" \
+		AIDEVOPS_PLANNING_FORCE_PR_FALLBACK=1 AIDEVOPS_PLANNING_PR_REPO_SLUG="example/repo" \
+		"$PLANNING_HELPER" "$message" 2>&1)
+	return $?
+}
+
+test_padding_normalization_publishes_rename_without_manifest() {
+	local name="padding-only normalization publishes rename deletions with an empty manifest (GH#37002)"
+	local tmpdir work_dir output rc head_branch tree body status
+	tmpdir=$(mktemp -d) || {
+		fail "$name" "mktemp failed"
+		return 0
+	}
+	write_fake_gh "${tmpdir}/bin" || return 0
+	work_dir=$(setup_repo "$tmpdir" false) || return 0
+	seed_padded_legacy_rows "$work_dir" '- [x] t038.22 Second legacy row' &&
+		normalize_padded_legacy_rows "$work_dir" '- [x] t38.22 Second legacy row' || {
+		fail "$name" "fixture setup failed"
+		rm -rf "$tmpdir"
+		return 0
+	}
+	: >"${tmpdir}/gh.log"
+	rc=0
+	output=$(run_forced_pr_fallback "$tmpdir" "$work_dir" "plan: normalize legacy task IDs") || rc=$?
+	head_branch=$(cat "${tmpdir}/head" 2>/dev/null || true)
+	tree=$(git --git-dir="${tmpdir}/remote.git" ls-tree -r --name-only "refs/heads/${head_branch}" -- todo/tasks 2>/dev/null || true)
+	body=$(cat "${tmpdir}/body" 2>/dev/null || true)
+	status=$(git -C "$work_dir" status --short)
+	if [[ "$rc" -eq 0 && "$output" == *"AIDEVOPS_PLANNING_COMMIT_RESULT=pr"* &&
+		"$tree" == "todo/tasks/t38.21-brief.md" && "$body" != *"aidevops:planning-task:v1"* &&
+		-z "$status" ]]; then
+		pass "$name"
+	else
+		fail "$name" "rc=$rc tree=[$tree] status=[$status] output=$output body=$body"
+	fi
+	rm -rf "$tmpdir"
+	return 0
+}
+
+test_normalization_with_state_change_still_requires_mapping() {
+	local name="renamed row whose status also changes still requires ref:GH# mapping (GH#37002)"
+	local tmpdir work_dir output rc remote_refs
+	tmpdir=$(mktemp -d) || {
+		fail "$name" "mktemp failed"
+		return 0
+	}
+	write_fake_gh "${tmpdir}/bin" || return 0
+	work_dir=$(setup_repo "$tmpdir" false) || return 0
+	seed_padded_legacy_rows "$work_dir" '- [ ] t038.22 Open legacy row' &&
+		normalize_padded_legacy_rows "$work_dir" '- [x] t38.22 Open legacy row' || {
+		fail "$name" "fixture setup failed"
+		rm -rf "$tmpdir"
+		return 0
+	}
+	: >"${tmpdir}/gh.log"
+	rc=0
+	output=$(run_forced_pr_fallback "$tmpdir" "$work_dir" "plan: normalize and complete") || rc=$?
+	remote_refs=$(git --git-dir="${tmpdir}/remote.git" for-each-ref --format='%(refname)' refs/heads/planning/)
+	if [[ "$rc" -ne 0 && -z "$remote_refs" &&
+		"$output" == *"cannot safely map t38.22: expected one same-repository ref:GH#NNN field"* ]]; then
+		pass "$name"
+	else
+		fail "$name" "rc=$rc refs=$remote_refs output=$output"
 	fi
 	rm -rf "$tmpdir"
 	return 0
@@ -552,6 +671,88 @@ test_unprotected_default_from_linked_branch_publishes_default() {
 	return 0
 }
 
+test_complete_from_linked_branch() {
+	local protected_default="$1"
+	local name="complete from linked branch publishes completion (protected=$protected_default)"
+	local tmpdir fake_bin work_dir output rc remote_todo head_branch before_head remote_branch
+	tmpdir=$(mktemp -d) || {
+		fail "$name" "mktemp failed"
+		return 0
+	}
+	fake_bin="${tmpdir}/bin"
+	write_fake_gh "$fake_bin" || return 0
+	# Seed the open task on the remote before enabling branch protection.
+	work_dir=$(setup_repo "$tmpdir" false) || return 0
+	append_planning_change "$work_dir" "t34880" "34880"
+	git -C "$work_dir" add TODO.md todo/ &&
+		git -C "$work_dir" commit -m "plan: seed open task" >/dev/null 2>&1 &&
+		git -C "$work_dir" push origin fixture-default >/dev/null 2>&1 &&
+		git -C "$work_dir" switch -c fixture-linked >/dev/null 2>&1 || {
+		fail "$name" "task setup failed"
+		return 0
+	}
+	before_head=$(git -C "$work_dir" rev-parse HEAD)
+	: >"${tmpdir}/gh.log"
+	rc=0
+	output=$(cd "$work_dir" && PATH="${fake_bin}:$PATH" \
+		GH_STUB_LOG="${tmpdir}/gh.log" GH_STUB_BODY="${tmpdir}/body" \
+		GH_STUB_HEAD="${tmpdir}/head" GH_STUB_TITLE="${tmpdir}/title" \
+		AIDEVOPS_PLANNING_FORCE_PR_FALLBACK="$protected_default" AIDEVOPS_PLANNING_PR_REPO_SLUG="example/repo" \
+		"$PLANNING_HELPER" complete t34880 --pr 42 2>&1) || rc=$?
+	remote_branch=$(git --git-dir="${tmpdir}/remote.git" for-each-ref --format='%(refname)' refs/heads/fixture-linked)
+	if [[ "$rc" -ne 0 || -n "$remote_branch" || "$(git -C "$work_dir" rev-parse HEAD)" != "$before_head" ]]; then
+		fail "$name" "rc=$rc source branch pushed or HEAD changed; output=$output"
+		rm -rf "$tmpdir"
+		return 0
+	fi
+	remote_todo=$(git --git-dir="${tmpdir}/remote.git" show fixture-default:TODO.md)
+	if [[ "$protected_default" == "1" ]]; then
+		head_branch=$(<"${tmpdir}/head")
+		if [[ "$head_branch" != planning/* || "$remote_todo" != *"- [ ] t34880 "* ||
+			"$output" != *"Task completion submitted via planning PR: https://github.com/example/repo/pull/1"* ]]; then
+			fail "$name" "missing planning PR or default changed; output=$output"
+			rm -rf "$tmpdir"
+			return 0
+		fi
+		remote_todo=$(git --git-dir="${tmpdir}/remote.git" show "${head_branch}:TODO.md")
+	elif [[ "$output" != *"AIDEVOPS_PLANNING_COMMIT_RESULT=direct"* ||
+		"$output" != *"Task completion committed and pushed"* ]]; then
+		fail "$name" "missing direct result; output=$output"
+		rm -rf "$tmpdir"
+		return 0
+	fi
+	if [[ "$remote_todo" == *"- [x] t34880 "* && "$remote_todo" == *"pr:#42 completed:"* ]]; then
+		pass "$name"
+	else
+		fail "$name" "remote destination does not contain completion: $remote_todo"
+	fi
+	rm -rf "$tmpdir"
+	return 0
+}
+
+test_complete_verified_without_tty_fails_before_edit() {
+	local name="complete --verified without a TTY fails before editing TODO.md"
+	local tmpdir work_dir before_todo output rc
+	tmpdir=$(mktemp -d) || {
+		fail "$name" "mktemp failed"
+		return 0
+	}
+	work_dir=$(setup_repo "$tmpdir" false fixture-linked) || return 0
+	append_planning_change "$work_dir" "t34880" "34880"
+	before_todo=$(git -C "$work_dir" hash-object TODO.md)
+	rc=0
+	# Even a piped 'y' must not substitute for interactive confirmation.
+	output=$(cd "$work_dir" && printf 'y\n' | "$PLANNING_HELPER" complete t34880 --verified 2>&1) || rc=$?
+	if [[ "$rc" -ne 0 && "$before_todo" == "$(git -C "$work_dir" hash-object TODO.md)" &&
+		"$output" == *"--verified requires interactive confirmation on a TTY"* ]]; then
+		pass "$name"
+	else
+		fail "$name" "rc=$rc output=$output"
+	fi
+	rm -rf "$tmpdir"
+	return 0
+}
+
 test_pr_unavailable_fails_before_commit() {
 	local name="PR fallback unavailable fails before local commit"
 	local tmpdir work_dir before_head after_head output rc status
@@ -605,10 +806,15 @@ main() {
 	test_protected_default_creates_planning_pr
 	test_multi_task_manifest_is_deterministic
 	test_ambiguous_task_mapping_fails_before_push
+	test_padding_normalization_publishes_rename_without_manifest
+	test_normalization_with_state_change_still_requires_mapping
 	test_post_push_failure_is_recoverable_and_idempotent
 	test_unprotected_default_keeps_direct_push
 	test_protected_default_from_linked_branch_creates_planning_pr
 	test_unprotected_default_from_linked_branch_publishes_default
+	test_complete_from_linked_branch 0
+	test_complete_from_linked_branch 1
+	test_complete_verified_without_tty_fails_before_edit
 	test_pr_unavailable_fails_before_commit
 	printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 	[[ "$FAIL" -eq 0 ]] || return 1

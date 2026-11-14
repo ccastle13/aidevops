@@ -210,24 +210,8 @@ export interface CommandDefinition {
 // Leak Detection Types
 // =============================================================================
 
-/** Named leak pattern identifiers */
-export type LeakPatternName =
-  | "aws_access_key"
-  | "aws_secret_key"
-  | "github_token"
-  | "github_fine_grained"
-  | "gitlab_token"
-  | "slack_token"
-  | "discord_token"
-  | "generic_api_key"
-  | "bearer_token"
-  | "jwt"
-  | "database_url"
-  | "private_ip"
-  | "file_path"
-  | "private_key"
-  | "password_in_url"
-  | "high_entropy";
+import type { LeakPatternName } from "./leak-patterns";
+export type { LeakPatternName } from "./leak-patterns";
 
 /** A single leak match found by the scanner */
 export interface LeakMatch {
@@ -283,7 +267,7 @@ export interface ExecApprovalConfig {
   allowlist: string[];
   /** Commands that are always rejected (e.g., "rm -rf", "shutdown") */
   blocklist: string[];
-  /** Timeout in ms before a pending approval is auto-rejected (default: 60000) */
+  /** Timeout in ms before a pending approval is auto-rejected (default: 12 hours) */
   approvalTimeoutMs: number;
   /** Whether to require approval for commands not in allowlist or blocklist (default: true) */
   requireApprovalByDefault: boolean;
@@ -305,7 +289,7 @@ export const DEFAULT_EXEC_APPROVAL_CONFIG: ExecApprovalConfig = {
     "> /dev/",
     ":(){ :|:& };:",
   ],
-  approvalTimeoutMs: 60_000,
+  approvalTimeoutMs: 12 * 60 * 60 * 1000,
   requireApprovalByDefault: true,
 };
 
@@ -379,6 +363,8 @@ export interface BotConfig {
   useIntelligentThresholds?: boolean;
   /** Data directory for bot state (default: ~/.aidevops/.agent-workspace/simplex-bot) */
   dataDir?: string;
+  /** Optional session-bus integration, disabled by default. */
+  sessionBus?: { enabled: boolean };
 }
 
 /** Default bot configuration */

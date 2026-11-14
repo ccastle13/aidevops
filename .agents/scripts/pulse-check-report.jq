@@ -1,4 +1,6 @@
 def number_or_zero: (tonumber? // 0);
+def capacity_number:
+  (tonumber? // null) | if type == "number" and . >= 0 and floor == . then . else null end;
 
 def finding($id; $severity; $title; $evidence; $recommendation; $autofile): {
   id: $id,
@@ -9,18 +11,33 @@ def finding($id; $severity; $title; $evidence; $recommendation; $autofile): {
   autofile: $autofile
 };
 
-(if ($current.active_worker_processes // $current.pulse_health.workers_active // null) == null then null else ($current.active_worker_processes // $current.pulse_health.workers_active | number_or_zero) end) as $active_worker_processes |
-($current.pulse_gauges.dispatch_capacity_final_max_workers // $current.pulse_health.workers_max // null) as $raw_max_workers |
+def non_failure_handoff_family:
+  (.results // {}) as $results
+  | ($results | keys_unsorted) as $result_names
+  | ($result_names | length) == 1
+  and $result_names[0] == "post_pr_handoff"
+  and ((.examples // []) | length) > 0
+  and all(.examples[]?; .result == "post_pr_handoff" and (.exit_code // 1) == 0);
+
+(try ($window | capture("^(?<value>[0-9]+)(?<unit>[smhd])$")
+  | (.value | tonumber) * ({s:1,m:60,h:3600,d:86400}[.unit])) catch null) as $window_seconds |
+(try ($current.pulse_health.timestamp | fromdateiso8601) catch null) as $health_timestamp |
+(if $health_timestamp == null then null else now - $health_timestamp end) as $health_age |
+($health_age != null and $window_seconds != null and $health_age >= 0 and $health_age <= $window_seconds) as $health_fresh |
+($current.active_worker_processes | capacity_number) as $process_workers |
+((if $health_fresh then $current.pulse_health.workers_active else null end) | capacity_number) as $health_workers |
+($process_workers // $health_workers) as $active_worker_processes |
+(($current.pulse_gauges.dispatch_capacity_final_max_workers // $current.pulse_health.workers_max // null) | capacity_number) as $raw_max_workers |
 ($current.current_state_guardrails.available_slots_last // $current.pulse_gauges.pulse_dispatch_guardrail_available_slots // (if ($current.pulse_health.workers_max // null) == null or $active_worker_processes == null then null else ([($current.pulse_health.workers_max | number_or_zero) - $active_worker_processes, 0] | max) end)) as $raw_available_slots |
-($raw_available_slots // 0 | number_or_zero) as $available_slots |
+($raw_available_slots | capacity_number) as $available_slots |
 (if $raw_max_workers == null then
-  (if $active_worker_processes == null then $available_slots else ($active_worker_processes + $available_slots) end)
+  (if $active_worker_processes == null or $available_slots == null then null else ($active_worker_processes + $available_slots) end)
 else
-  ($raw_max_workers | number_or_zero)
+  $raw_max_workers
 end) as $max_workers |
-([$max_workers - $available_slots, 0] | max) as $inferred_active_workers |
+(if $max_workers == null or $available_slots == null then null else ([$max_workers - $available_slots, 0] | max) end) as $inferred_active_workers |
 (if $active_worker_processes == null then $inferred_active_workers else $active_worker_processes end) as $active_workers |
-(if $active_worker_processes == null then $available_slots else ([$max_workers - $active_worker_processes, 0] | max) end) as $effective_available_slots |
+(if $active_worker_processes == null or $max_workers == null then $available_slots else ([$max_workers - $active_worker_processes, 0] | max) end) as $effective_available_slots |
 ($queue.aggregate.available_unassigned // 0 | number_or_zero) as $available_issues |
 ($queue.aggregate.eligible_available_unassigned // $queue.aggregate.available_unassigned // 0 | number_or_zero) as $eligible_issues |
 ($queue.aggregate.excluded_persistent_dashboard // 0 | number_or_zero) as $excluded_persistent_dashboard |
@@ -42,16 +59,26 @@ end) as $max_workers |
 ($summary.metrics.total // 0 | number_or_zero) as $hist_total |
 ($summary.metrics.terminal_session_total // $summary.metrics.total // 0 | number_or_zero) as $hist_terminal_total |
 ($summary.metrics.runtime_handoffs // $summary.metrics.succeeded // 0 | number_or_zero) as $hist_handoffs |
-($summary.delivery_stages // {}) as $hist_delivery |
+(if ($delivery._collection.state // "") == "ok" then ($delivery.delivery_stages // {}) else ($summary.delivery_stages // {}) end) as $hist_delivery |
 (if $hist_delivery.delivered_successes == null then null else ($hist_delivery.delivered_successes | number_or_zero) end) as $hist_delivered |
-($summary.metrics.failure_families // []) as $failure_families |
-($recent_summary.metrics.failure_families // []) as $recent_failure_families |
+($summary.metrics.failure_families // [] | map(select(non_failure_handoff_family | not))) as $failure_families |
+($recent_summary.metrics.failure_families // [] | map(select(non_failure_handoff_family | not))) as $recent_failure_families |
+# Summary and actionable findings must use the same recurrence criteria.
+# Historical-only samples remain in remediation evidence, not current alerts.
+([$failure_families[] as $family
+  | $family
+  | select((.count // 0) >= $failure_threshold and (.distinct_sessions // 0) >= 2 and (.confidence // "low") == "high" and (.family // "") != "other-failure")
+  | select((([$recent_failure_families[] | select(.fingerprint == $family.fingerprint)] | first | .count) // 0) >= $failure_threshold)
+]) as $recurrent_failure_families |
 ($summary.progress_blockers // {}) as $progress_blockers |
 ($current.canonical_reconciliation.refusal_count // 0 | number_or_zero) as $canonical_reconciliation_refusal_count |
 ($current.canonical_reconciliation.classification // "none") as $canonical_reconciliation_classification |
 ($current.canonical_reconciliation.canonical_recovery_advisory_observed // false) as $canonical_recovery_advisory_observed |
 ($current.active_claim_state // {}) as $active_claim_state |
 ($active_claim_state.zero_worker_actionable // false) as $zero_worker_active_claim_actionable |
+($current.zero_worker_underutilization // {}) as $zero_worker_underutilization |
+($zero_worker_underutilization.actionable // false) as $sustained_zero_worker_underutilization |
+($active_claim_state.durable_launch_count // 0 | number_or_zero) as $fresh_cross_runner_claims |
 ([$progress_blockers.retained_unverified[]?
   | select(((.reason // "") | contains("permission"))
     and ((((.session_key // "") | startswith("supervisor-pulse")))
@@ -65,35 +92,60 @@ end) as $max_workers |
 {
   generated_at: (now | todateiso8601),
   inputs: {current_window: $window, historical_window: $since, recent_window: $recent},
+  collection: {
+    current: ($current._collection // {state:"unknown"}),
+    history: ($summary._collection // {state:"unknown"}),
+    recent: ($recent_summary._collection // {state:"unknown"}),
+    api: ($api._collection // {state:"unknown"}),
+    queue: ($queue._collection // {state:"unknown"}),
+    delivery: ($delivery._collection // {state:"not_requested"}),
+    providers: ($providers._collection // {state:"unknown"}),
+    runner: ($runner._collection // {state:"unknown"})
+  },
   summary: {
     max_workers: $max_workers,
     active_workers: $active_workers,
-    active_workers_source: (if $active_worker_processes == null then "capacity_gauge" else "process_scan" end),
+    local_active_worker_processes: $active_workers,
+    fresh_cross_runner_durable_claims: $fresh_cross_runner_claims,
+    fleet_activity_state: (if ($active_workers // 0) > 0 or $fresh_cross_runner_claims > 0 then "observed" elif $active_workers == null then "unknown" else "none_observed" end),
+    active_workers_source: (if $process_workers != null then "process_scan" elif $health_workers != null then "pulse_health_snapshot" elif $active_workers != null then "capacity_gauge" else "unavailable" end),
+    max_workers_source: (if ($current.pulse_gauges.dispatch_capacity_final_max_workers | capacity_number) != null then "capacity_gauge" elif ($current.pulse_health.workers_max | capacity_number) != null then "pulse_health_configured_snapshot" elif $max_workers != null then "inferred_from_observed_slots" else "unavailable" end),
+    health_snapshot_fresh: $health_fresh,
+    health_snapshot_age_seconds: (if $health_age == null then null else ($health_age | floor) end),
     inferred_active_workers: $inferred_active_workers,
     available_slots: $effective_available_slots,
-    dispatch_alive: $dispatch_alive,
-    dispatch_stage_events: ($current.dispatch_stage_events // 0),
-    worker_launches_in_window: $spawned,
-    worker_terminal_events_in_window: $current_terminal_events,
+    capacity_state: (if $max_workers == null or $effective_available_slots == null then "unknown" elif $raw_max_workers != null and ($current.pulse_gauges.dispatch_capacity_final_max_workers | capacity_number) == null then "configured_snapshot" else "observed" end),
+    cycle_state_freshness: ($current.cycle_state.availability // "unavailable"),
+    dispatch_alive: (if $current.dispatch_alive == null then null else $dispatch_alive end),
+    dispatch_stage_events: ($current.dispatch_stage_events // null),
+    worker_launches_in_window: (if $current.worker_outcomes.spawned == null then null else $spawned end),
+    worker_terminal_events_in_window: (if $current.worker_terminal_events == null then null else $current_terminal_events end),
     worker_launch_validation_failures_in_window: $launch_validation_failed,
-    recent_worker_events: $recent_total,
-    historical_worker_events: $hist_total,
+    recent_worker_events: (if $recent_summary.metrics.total == null then null else $recent_total end),
+    historical_worker_events: (if $summary.metrics.total == null then null else $hist_total end),
     historical_worker_runtime_handoffs: $hist_handoffs,
     historical_runtime_handoff_rate: (if $hist_terminal_total > 0 then (($hist_handoffs / $hist_terminal_total) * 100 | floor) else null end),
     historical_worker_delivered_successes: $hist_delivered,
-    historical_delivery_success_rate: (if $hist_terminal_total > 0 and $hist_delivered != null then (($hist_delivered / $hist_terminal_total) * 100 | floor) else null end),
+    historical_delivery_success_rate: null,
+    delivery_measurement_state: ($hist_delivery.check_state // $delivery._collection.state // "unavailable"),
+    delivery_rate_basis: "unavailable_without_matched_attempt_cohort",
     historical_worker_successes: $hist_delivered,
-    historical_success_rate: (if $hist_terminal_total > 0 and $hist_delivered != null then (($hist_delivered / $hist_terminal_total) * 100 | floor) else null end),
-    auto_dispatch_open: ($queue.aggregate.auto_dispatch_open // 0),
-    auto_dispatch_available_unassigned: $available_issues,
-    auto_dispatch_eligible_available_unassigned: $eligible_issues,
+    historical_success_rate: null,
+    auto_dispatch_open: ($queue.aggregate.auto_dispatch_open // null),
+    auto_dispatch_available_unassigned: (if $queue.aggregate.available_unassigned == null then null else $available_issues end),
+    auto_dispatch_eligible_available_unassigned: (if $queue.aggregate.available_unassigned == null then null else $eligible_issues end),
     auto_dispatch_excluded_persistent_dashboard: $excluded_persistent_dashboard,
     auto_dispatch_available_old: $old_available,
     auto_dispatch_dependency_inconsistent_available: $dependency_inconsistent,
     auto_dispatch_repos_with_available: ($queue.aggregate.repos_with_available // 0),
     auto_dispatch_scan_errors: $gh_errors,
-    auto_dispatch_scan_state: (if $queue_error == "" then "scanned" else $queue_error end),
+    auto_dispatch_scan_state: (if $queue_error != "" then $queue_error elif $gh_errors > 0 then "partial" else "scanned" end),
+    auto_dispatch_scan_complete: $queue_scan_complete,
+    queue_counts_basis: (if $queue_scan_complete then "complete_inventory" elif $queue.aggregate.auto_dispatch_open == null then "unavailable" else "partial_observation" end),
     graphql_budget_status: ($current.graphql_budget_status // "unknown"),
+    rest_admission: ($api.rest_admission // {state:"unknown"}),
+    eligibility_basis: "labels_and_dependencies_not_launch_admission",
+    parallelism_basis: "issue_entries_not_deduplicated_work_targets",
     secondary_cooldown_state: $secondary_cooldown_state,
     secondary_cooldown_active: $secondary_cooldown_active,
     runner_health: ($runner.finding // "unknown"),
@@ -102,7 +154,8 @@ end) as $max_workers |
     runtime_freshness_status: ($runtime_freshness.status // "unknown"),
     runtime_stale: $runtime_stale,
     zero_worker_active_claim_actionable: $zero_worker_active_claim_actionable,
-    recurrent_failure_families: ([$failure_families[] | select((.count // 0) >= $failure_threshold and (.confidence // "low") == "high" and (.family // "") != "other-failure")] | length)
+    sustained_zero_worker_underutilization: $sustained_zero_worker_underutilization,
+    recurrent_failure_families: ($recurrent_failure_families | length)
   },
   queue: ($queue.aggregate // {}),
   current_state: {
@@ -120,6 +173,7 @@ end) as $max_workers |
     runtime_freshness: $runtime_freshness,
     active_worker_processes: ($current.active_worker_processes // null),
     active_claim_state: $active_claim_state,
+    zero_worker_underutilization: $zero_worker_underutilization,
     top_pre_launch_blockers: ($current.top_pre_launch_blockers // [])
   },
   worker_activity: {
@@ -153,6 +207,9 @@ end) as $max_workers |
     last_ts,
     confidence,
     recovery_outcome,
+    launch_failure_cause,
+    kill_reason,
+    next_action,
     recent_count: (([$recent_failure_families[] | select(.fingerprint == $family.fingerprint)] | first | .count) // 0)
   })),
   runner_health: $runner,
@@ -164,6 +221,27 @@ end) as $max_workers |
     cadence_api_risk: ($api.cadence_api_risk // "unknown")
   },
   findings: ([
+    if ($health_fresh and ($current.pulse_health.auth_error_capacity_zero // null) != null) then
+      finding(
+        "auth-error-capacity-zero";
+        "high";
+        "Provider dispatch capacity is zero from auth-error accounts";
+        ["provider=" + ($current.pulse_health.auth_error_capacity_zero.provider // "unknown"),
+         "consecutive_cycles=" + (($current.pulse_health.auth_error_capacity_zero.cycles // 0) | tostring)];
+        ($current.pulse_health.auth_error_capacity_zero.remedy // "oauth-pool-helper.sh reset-cooldowns <provider>");
+        false
+      )
+    else empty end,
+    if (["reserve", "cooldown"] | index($api.rest_admission.state // "unknown")) != null then
+      finding(
+        "github-rest-admission-held";
+        "high";
+        "Local REST admission is holding work independently of GraphQL";
+        [(($api.rest_admission // {}) | tojson)];
+        "Use the bounded serialized REST revalidation path; preserve real exhaustion and secondary cooldown. A healthy GraphQL or /rate_limit response alone does not clear REST admission. Do not reset the budget database or increase worker concurrency to bypass this hold.";
+        false
+      )
+    else empty end,
     if $secondary_cooldown_active then
       finding(
         "github-secondary-cooldown-active";
@@ -218,7 +296,21 @@ end) as $max_workers |
           ("retained_unverified_blockers_all_sources=" + (($progress_blockers.retained_unverified_total // 0) | tostring)),
           "blocker_evidence=aggregate_redacted"
         ];
-        "Run worker-activity-helper.sh live-workers and worker-activity-helper.sh summary --since 7d to classify retained records. Reconcile only confirmed stale sessions by appending an audited non-blocking terminal event with worker-blocker-cli.mjs resolve-session; do not delete blocker evidence or clear records that still have a live owner.";
+        "Pulse reconciles earlier supervisor-pulse telemetry after each supervisor run. If records persist, run worker-activity-helper.sh reconcile-stale-supervisor; it refuses while a supervisor-pulse owner is live and wraps worker-blocker-cli.mjs resolve-stale-supervisor-session with a computed cutoff. It never deletes blocker evidence or touches labels or grants. Recurring permission_required from supervisor-pulse means the supervisor prompt or allowlist needs a fix; classify the denied commands with worker-activity-helper.sh summary --since 7d.";
+        false
+      )
+    else empty end,
+    if (($current.permission_holds.count // 0) | number_or_zero) > 0 then
+      finding(
+        "maintainer-permission-holds";
+        "low";
+        "Dispatch candidates are held by maintainer permission requests";
+        [
+          ("permission_hold_observations=" + (($current.permission_holds.count // 0) | tostring)),
+          ("last_observed_at=" + (($current.permission_holds.last_observed_at // "unknown") | tostring)),
+          "issue_identity=redacted; see pulse.log DISPATCH_BLOCK_REASON reason=needs_maintainer_permissions|permission_grant_unverified"
+        ];
+        "Run pulse-diagnose-helper.sh issue <N> --repo <owner/repo> for each held issue. It names the request, its age, whether the owning session ended, and both signed exits: grant (sudo aidevops approve permissions ... --request perm-<id>) or withdraw (same command with --withdraw), which grants nothing and resumes dispatch. Requests never expire unsigned.";
         false
       )
     else empty end,
@@ -232,7 +324,7 @@ end) as $max_workers |
         true
       )
     else empty end,
-    if ($queue_scan_complete and $dispatch_alive and $eligible_issues >= $threshold and $active_workers == 0) then
+    if ($queue_scan_complete and $dispatch_alive and $eligible_issues >= $threshold and $active_workers == 0 and $fresh_cross_runner_claims == 0 and $sustained_zero_worker_underutilization) then
       finding(
         "pulse-underfilled-auto-dispatch-queue";
         "high";
@@ -244,13 +336,15 @@ end) as $max_workers |
           ("available_older_than_threshold=" + ($old_available | tostring)),
           "dispatch_alive=true",
           ("dispatch_stage_events=" + (($current.dispatch_stage_events // 0) | tostring)),
+          ("consecutive_no_progress_cycles=" + (($zero_worker_underutilization.consecutive_no_progress_cycles // 0) | tostring)),
+          ("minimum_cycles=" + (($zero_worker_underutilization.minimum_cycles // 0) | tostring)),
           ("zero_worker_active_claim_actionable=" + ($zero_worker_active_claim_actionable | tostring)),
           ("active_claim_classifications=" + (($active_claim_state.classification_counts // {}) | to_entries | map(.key + ":" + (.value | tostring)) | sort | join(",")))
         ];
         (if $zero_worker_active_claim_actionable then
           "Inspect the named zero-worker active-claim state. Preserve live-owner and durable-launch claims; recheck current-cycle suppression or repair the reported infrastructure hold before the next floor refill."
         else
-          "Inspect why the pulse did not retain active workers for visible status:available auto-dispatch issues; start with pulse-current-state-helper, worker-activity-helper, and pulse-diagnose-helper cycle-health."
+          "Inspect the sustained no-progress cycle state and pre-launch classifications before changing dispatch capacity; start with pulse-current-state-helper, worker-activity-helper, and pulse-diagnose-helper cycle-health."
         end);
         true
       )
@@ -266,7 +360,7 @@ end) as $max_workers |
           ("eligible_depth_target=" + ($threshold | tostring)),
           "dispatch_alive=true",
           ("auto_dispatch_open=" + (($queue.aggregate.auto_dispatch_open // 0) | tostring)),
-          ("assigned_in_flight=" + (($queue.aggregate.assigned_in_flight // $queue.aggregate.assigned // 0) | tostring)),
+          ("assigned_or_in_flight=" + (($queue.aggregate.assigned // $queue.aggregate.assigned_in_flight // 0) | tostring)),
           ("blocked_explicit_hold=" + (($queue.aggregate.blocked_explicit_hold // $queue.aggregate.blocked_labels // 0) | tostring)),
           ("excluded_persistent_dashboard=" + ($excluded_persistent_dashboard | tostring)),
           ("needs_maintainer_review=" + (($queue.aggregate.nmr // 0) | tostring)),
@@ -274,6 +368,23 @@ end) as $max_workers |
           ("missing_status=" + ($needs_status | tostring))
         ];
         "Run existing task generators and metadata normalisers for already-authorized work; if no eligible issues remain, request maintainer authorization decisions. Do not add auto-dispatch, clear needs-maintainer-review, or infer dispatch consent from status/origin labels.";
+        false
+      )
+    else empty end,
+    if ($queue_scan_complete and ($queue.aggregate.no_durable_progress_hour // 0) > 0) then
+      finding(
+        "pulse-no-durable-progress-hour";
+        "medium";
+        "Issues need owned progress assessment after at least one hour";
+        [
+          ("issues=" + ($queue.aggregate.no_durable_progress_hour | tostring)),
+          ("owned_without_durable_progress=" + (($queue.aggregate.no_durable_progress_owned // 0) | tostring)),
+          ("unowned_without_durable_progress=" + (($queue.aggregate.no_durable_progress_unowned // 0) | tostring)),
+          ("oldest_issue_age_minutes=" + ($queue.aggregate.oldest_issue_age_min | tostring)),
+          ("oldest_durable_progress_age_minutes=" + ($queue.aggregate.oldest_durable_progress_age_min | tostring)),
+          "clock=creation_linked_pr_commits_terminal_checks_not_comments"
+        ];
+        "Freshly inspect the affected registered queue and choose one evidence-backed recovery per unchanged target. Start with owned targets (assignee or active lifecycle label) and continue only a verified live owner; for unowned targets, route only a released approved draft through dispatch-approved. Send a bounded scope-revision request to the authorised brief owner when neither path applies. Preserve ownership and external waits. Do not create replacement PRs, redispatch unchanged blockers, or post repeated age/status comments; retain the action in the existing recovery receipt.";
         false
       )
     else empty end,
@@ -337,7 +448,7 @@ end) as $max_workers |
         "medium";
         "Auto-dispatch queue scan was skipped or incomplete";
         [("queue_scan_state=" + $queue_error)];
-        "Re-run pulse-check after API cooldown clears before making queue-depth or underfill claims.";
+        "Inspect collection timings and queue coverage; distinguish deadline exhaustion from API cooldown. Retry only missing evidence within an explicit budget before making queue-depth or underfill claims.";
         false
       )
     else empty end,
@@ -361,22 +472,11 @@ end) as $max_workers |
         false
       )
     else empty end,
-    if ($hist_terminal_total >= 10 and $hist_delivered != null and (($hist_delivered * 100) / $hist_terminal_total) < 70) then
-      finding(
-        "worker-delivery-rate-regression";
-        "medium";
-        "Historical worker delivered-success rate is below the productivity target";
-        [("delivered_success_rate_percent=" + (((($hist_delivered * 100) / $hist_terminal_total) | floor) | tostring)), ("delivered_successes=" + ($hist_delivered | tostring)), ("terminal_session_outcomes=" + ($hist_terminal_total | tostring))];
-        "Compare runtime handoffs, opened PRs, merged PRs, and solved issues with worker-activity-helper summary --pr-check before changing dispatch capacity.";
-        false
-      )
-    else empty end
+    empty
     ,
-    ($failure_families[] as $family
+    ($recurrent_failure_families[] as $family
       | $family
-      | select((.count // 0) >= $failure_threshold and (.distinct_sessions // 0) >= 2 and (.confidence // "low") == "high" and (.family // "") != "other-failure")
       | (([$recent_failure_families[] | select(.fingerprint == $family.fingerprint)] | first | .count) // 0) as $family_recent_count
-      | select($family_recent_count >= $failure_threshold)
       | finding(
           ("worker-failure-family-" + (.family // "unknown"));
           "high";
@@ -385,6 +485,10 @@ end) as $max_workers |
             ("fingerprint=" + (.fingerprint // "unknown")),
             ("family=" + (.family // "unknown")),
             ("failures_in_window=" + ((.count // 0) | tostring)),
+            ("recent_failures_in_window=" + ($family_recent_count | tostring)),
+            ("launch_failure_cause=" + (.launch_failure_cause // "unknown")),
+            ("kill_reason=" + (.kill_reason // "unknown")),
+            ("next_action=" + (.next_action // "unknown")),
             ("distinct_sessions=" + ((.distinct_sessions // 0) | tostring)),
             ("confidence=" + (.confidence // "unknown")),
             ("first_observed_epoch=" + ((.first_ts // 0) | tostring)),

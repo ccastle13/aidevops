@@ -28,7 +28,8 @@
 # previously-silent continue paths that now emit diagnostic log entries.
 #
 # GH#18704 refactor: split _cleanup_single_worktree() (125 lines) into three
-# focused private helpers: _worktree_creation_epoch(),
+# focused private helpers: _worktree_creation_epoch() (GH#34905: now
+# _worktree_idle_since_epoch(), measuring confirmed idle time),
 # _evaluate_worktree_removal(), and _record_orphan_crash_classification().
 # The orchestrator now reads as a linear five-step pipeline instead of a
 # single flat function. Preserves identical behaviour including the GH#18346
@@ -66,6 +67,10 @@ if [[ -n "$_PULSE_CLEANUP_SCRIPT_DIR" && -f "$_PULSE_CLEANUP_SCRIPT_DIR/shared-d
 	# shellcheck source=shared-dispatch-label-cleanup.sh
 	source "$_PULSE_CLEANUP_SCRIPT_DIR/shared-dispatch-label-cleanup.sh"
 fi
+if [[ -n "$_PULSE_CLEANUP_SCRIPT_DIR" && -f "$_PULSE_CLEANUP_SCRIPT_DIR/headless-session-locks.sh" ]]; then
+	# shellcheck source=headless-session-locks.sh
+	source "$_PULSE_CLEANUP_SCRIPT_DIR/headless-session-locks.sh"
+fi
 if [[ -n "$_PULSE_CLEANUP_SCRIPT_DIR" && -f "$_PULSE_CLEANUP_SCRIPT_DIR/worktree-paths.sh" ]]; then
 	# shellcheck source=worktree-paths.sh
 	source "$_PULSE_CLEANUP_SCRIPT_DIR/worktree-paths.sh"
@@ -99,6 +104,10 @@ fi
 if [[ -n "$_PULSE_CLEANUP_SCRIPT_DIR" && -f "$_PULSE_CLEANUP_SCRIPT_DIR/pulse-cleanup-worktree-removal.sh" ]]; then
 	# shellcheck source=pulse-cleanup-worktree-removal.sh
 	source "$_PULSE_CLEANUP_SCRIPT_DIR/pulse-cleanup-worktree-removal.sh"
+fi
+if [[ -n "$_PULSE_CLEANUP_SCRIPT_DIR" && -f "$_PULSE_CLEANUP_SCRIPT_DIR/pulse-cleanup-fixture-orphans.sh" ]]; then
+	# shellcheck source=pulse-cleanup-fixture-orphans.sh
+	source "$_PULSE_CLEANUP_SCRIPT_DIR/pulse-cleanup-fixture-orphans.sh"
 fi
 
 #######################################
@@ -388,8 +397,10 @@ _post_launch_recovery_claim_released() {
 	local repo_slug="$2"
 	local self_login="$3"
 	local failure_reason="$4"
+	local claim_id="${5:-}"
+	local claim_nonce="${6:-}"
 
-	local body
+	local body claim_binding=""
 	local aidevops_version="$AIDEVOPS_UNKNOWN_VERSION" opencode_version="$AIDEVOPS_UNKNOWN_VERSION"
 	if declare -F aidevops_find_version >/dev/null 2>&1; then
 		aidevops_version=$(aidevops_find_version 2>/dev/null || printf '%s' "$AIDEVOPS_UNKNOWN_VERSION")
@@ -398,8 +409,11 @@ _post_launch_recovery_claim_released() {
 		opencode_version=$(_detect_opencode_version 2>/dev/null || printf '%s' "")
 		opencode_version="${opencode_version:-$AIDEVOPS_UNKNOWN_VERSION}"
 	fi
+	if [[ "$claim_id" =~ ^[1-9][0-9]*$ && "$claim_nonce" =~ ^[A-Za-z0-9_-]+$ ]]; then
+		claim_binding=" claim_id=${claim_id} nonce=${claim_nonce}"
+	fi
 	body="<!-- ops:start — workers: skip this comment, it is audit trail not implementation context -->
-CLAIM_RELEASED reason=launch_recovery:${failure_reason} runner=${self_login} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ) aidevops_version=${aidevops_version} opencode_version=${opencode_version}"
+CLAIM_RELEASED reason=launch_recovery:${failure_reason} runner=${self_login}${claim_binding} ts=$(date -u +%Y-%m-%dT%H:%M:%SZ) aidevops_version=${aidevops_version} opencode_version=${opencode_version}"
 
 	# t2814: append worker-log tail when available so the failure is
 	# diagnosable from the audit trail alone (no log-file forensics needed).
@@ -548,12 +562,13 @@ _verify_launch_recovery_state() {
 # latest durable dispatch marker must agree on every generated identity field,
 # and the registered PID/start-token pair must no longer identify a live
 # process. Queued issues retain their established recovery path.
-# Args: issue number, repo slug, ledger entry JSON
+# Args: issue number, repo slug, ledger entry JSON, current login
 #######################################
 _launch_recovery_owns_registered_attempt() {
 	local issue_number="$1"
 	local repo_slug="$2"
 	local ledger_entry="$3"
+	local self_login="$4"
 	local fields="" session_key="" attempt_id="" lease_token="" runner_device=""
 	local worker_pid="" owner_process_start="" ledger_status="" lease_phase=""
 
@@ -569,14 +584,38 @@ _launch_recovery_owns_registered_attempt() {
 		[[ -n "$current_start" && "$current_start" != "$owner_process_start" ]] || return 1
 	fi
 
-	local comments_endpoint="" latest_dispatch=""
+	local comments_endpoint="" latest_dispatch="" latest_dispatch_json=""
 	comments_endpoint=$(printf 'repos/%s/issues/%s/comments' "$repo_slug" "$issue_number")
-	latest_dispatch=$(gh api "$comments_endpoint" --paginate --jq \
-		'[.[] | select(.body | contains("<!-- aidevops:dispatch "))] | last | .body // ""' 2>/dev/null) || return 1
+	latest_dispatch_json=$(gh api "$comments_endpoint" --paginate --slurp --jq \
+		'[.[][] | select(.body | contains("<!-- aidevops:dispatch "))] | last \
+		| {body:(.body // ""), author_association:(.author_association // ""), login:(.user.login // "")}' \
+		2>/dev/null) || return 1
+	latest_dispatch=$(printf '%s' "$latest_dispatch_json" | jq -r --arg runner "$self_login" '
+		select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR")
+		| select(.login == $runner)
+		| .body
+	' 2>/dev/null) || return 1
 	[[ "$latest_dispatch" == *"lease_token=${lease_token} "* ]] || return 1
 	[[ "$latest_dispatch" == *"device=${runner_device} "* ]] || return 1
 	[[ "$latest_dispatch" == *"session=${session_key} "* ]] || return 1
 	[[ "$latest_dispatch" == *"attempt_id=${attempt_id} "* ]] || return 1
+	local claim_id="" claim_json="" claim_nonce=""
+	claim_id="${latest_dispatch#* claim_id=}"
+	claim_id="${claim_id%% *}"
+	[[ "$claim_id" =~ ^[1-9][0-9]*$ ]] || return 1
+	claim_json=$(gh api "repos/${repo_slug}/issues/comments/${claim_id}" 2>/dev/null) || return 1
+	claim_nonce=$(printf '%s' "$claim_json" | jq -r --arg runner "$self_login" --arg repo "$repo_slug" \
+		--argjson issue "$issue_number" --argjson claim_id "$claim_id" '
+		select(.id == $claim_id)
+		| select((.issue_url // "") | endswith("/repos/\($repo)/issues/\($issue)"))
+		| select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR")
+		| select((.user.login // "") == $runner)
+		| (.body // "")
+		| capture("(^|[[:space:]])DISPATCH_CLAIM[[:space:]]+nonce=(?<nonce>[A-Za-z0-9_-]+)").nonce
+	' 2>/dev/null) || return 1
+	[[ "$claim_nonce" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+	_LAUNCH_RECOVERY_CLAIM_ID="$claim_id"
+	_LAUNCH_RECOVERY_CLAIM_NONCE="$claim_nonce"
 	return 0
 }
 
@@ -585,6 +624,8 @@ recover_failed_launch_state() {
 	local repo_slug="$2"
 	local failure_reason="${3:-launch_validation_failed}"
 	local crash_type="${4:-}"
+	_LAUNCH_RECOVERY_CLAIM_ID=""
+	_LAUNCH_RECOVERY_CLAIM_NONCE=""
 
 	if [[ ! "$issue_number" =~ ^[0-9]+$ ]] || [[ -z "$repo_slug" ]]; then
 		return 0
@@ -639,7 +680,7 @@ recover_failed_launch_state() {
 		return 0
 	fi
 	if [[ "$has_queued" != "true" ]]; then
-		if [[ "$has_in_progress" != "true" ]] || ! _launch_recovery_owns_registered_attempt "$issue_number" "$repo_slug" "$ledger_entry"; then
+		if [[ "$has_in_progress" != "true" ]] || ! _launch_recovery_owns_registered_attempt "$issue_number" "$repo_slug" "$ledger_entry" "$self_login"; then
 			echo "[pulse-wrapper] Launch recovery skipped for #${issue_number} (${repo_slug}): in-progress ownership does not match the failed registered attempt" >>"$LOGFILE"
 			return 0
 		fi
@@ -670,8 +711,25 @@ recover_failed_launch_state() {
 		"$ledger_helper" "${fail_args[@]}" >/dev/null 2>&1 || true
 	fi
 
+	_record_released_launch_failure "$issue_number" "$repo_slug" "$self_login" "$failure_reason" "$crash_type" \
+		"$_LAUNCH_RECOVERY_CLAIM_ID" "$_LAUNCH_RECOVERY_CLAIM_NONCE"
+	return 0
+}
+
+# Record recovery side effects only after ownership release has been verified
+# and the exact ledger attempt has been marked failed.
+# Args: issue number, repo slug, self login, failure reason, crash type, claim ID, claim nonce
+_record_released_launch_failure() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local self_login="$3"
+	local failure_reason="$4"
+	local crash_type="$5"
+	local claim_id="${6:-}"
+	local claim_nonce="${7:-}"
+
 	# t2394: Invalidate stale cross-runner claims immediately (see helper below).
-	_post_launch_recovery_claim_released "$issue_number" "$repo_slug" "$self_login" "$failure_reason"
+	_post_launch_recovery_claim_released "$issue_number" "$repo_slug" "$self_login" "$failure_reason" "$claim_id" "$claim_nonce"
 	# t3197: Write a per-issue dispatch cooldown marker so other runners
 	# (and this one) skip redispatch for the configured cooldown window.
 	# Only fires for `no_worker_process` — the recurring no-spawn failure mode.
@@ -730,7 +788,7 @@ cleanup_stalled_workers() {
 
 		# Extract issue number and find log file
 		local issue_num
-		issue_num=$(echo "$cmd" | grep -oE 'issue #[0-9]+' | grep -oE '[0-9]+' | head -1)
+		issue_num=$(echo "$cmd" | grep -oE 'issue #[0-9]+' | grep -oE '[0-9]+' | sed -n '1p')
 		[[ -n "$issue_num" ]] || continue
 
 		local log_file="" log_size=""
@@ -767,7 +825,7 @@ cleanup_stalled_workers() {
 
 		# Extract model from the command line for backoff recording
 		local worker_model
-		worker_model=$(echo "$cmd" | grep -oE '\-m [^ ]+' | head -1 | sed 's/-m //')
+		worker_model=$(echo "$cmd" | grep -oE '\-m [^ ]+' | sed -n '1p' | sed 's/-m //')
 
 		# Kill the stalled worker
 		[[ "$rss" =~ ^[0-9]+$ ]] || rss=0
@@ -804,167 +862,380 @@ cleanup_stalled_workers() {
 	return 0
 }
 
-cleanup_orphans() {
+_pulse_process_cgroup_path() {
+	local pid="$1"
+	local proc_root="${AIDEVOPS_PULSE_PROC_ROOT:-/proc}"
+	local cgroup_file="${proc_root%/}/${pid}/cgroup"
+	local line="" path="" fallback=""
 
-	local killed=0
-	local total_mb=0
-
-	while IFS= read -r line; do
-		local pid tty etime rss cmd
-		read -r pid tty etime rss cmd <<<"$line"
-
-		# Skip interactive sessions (has a real TTY).
-		# Exclude both '?' (Linux headless) and '??' (macOS headless) — only
-		# those are headless; anything else (pts/N, ttys00N) is interactive.
-		if [[ "$tty" != "?" && "$tty" != "??" ]]; then
-			continue
-		fi
-
-		# Skip active workers, pulse, strategic reviews, and language servers.
-		# Use case instead of [[ =~ ]] with | alternation — zsh parses the |
-		# as a pipe operator inside [[ ]], causing a parse error. See GH#4904.
-		case "$cmd" in
-		*"/full-loop"* | *"/review-issue-pr"* | *"Supervisor Pulse"* | *"Strategic Review"* | *"language-server"* | *"eslintServer"*)
-			continue
+	[[ -r "$cgroup_file" ]] || return 1
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		path="${line#*:*:}"
+		[[ -z "$fallback" && -n "$path" ]] && fallback="$path"
+		case "$line" in
+		0::* | *:name=systemd:*)
+			printf '%s' "$path"
+			return 0
 			;;
 		esac
+	done <"$cgroup_file"
+	[[ -n "$fallback" ]] || return 1
+	printf '%s' "$fallback"
+	return 0
+}
 
-		# Skip young processes
-		# t2859: ${ORPHAN_MAX_AGE:-7200} fallback (2h) — without this,
-		# unbound expansion to "" makes every process look "older than 0"
-		# and would kill all matched orphans regardless of actual age.
-		local age_seconds
-		age_seconds=$(_get_process_age "$pid")
-		if [[ "$age_seconds" -lt "${ORPHAN_MAX_AGE:-7200}" ]]; then
-			continue
-		fi
+_pulse_orphan_lifecycle_owner() {
+	local pid="$1"
+	local cgroup_path=""
+	cgroup_path=$(_pulse_process_cgroup_path "$pid") || return 1
+	case "$cgroup_path" in
+	*/opencode-web.service | */opencode-web.service/* | */opencode-web-watchdog.service | */opencode-web-watchdog.service/* | */opencode-web@*.service | */opencode-web@*.service/*)
+		printf '%s' 'opencode-web-service'
+		return 0
+		;;
+	*/*.service | */*.service/*)
+		printf '%s' 'managed-service'
+		return 0
+		;;
+	esac
+	return 1
+}
 
-		# This is an orphan — kill it
-		[[ "$rss" =~ ^[0-9]+$ ]] || rss=0
-		local mb=$((rss / 1024))
-		kill "$pid" 2>/dev/null || true
-		killed=$((killed + 1))
-		total_mb=$((total_mb + mb))
-	done < <(ps axwwo pid,tty,etime,rss,command | grep '[.]opencode' | grep -v 'bash-language-server')
+_pulse_orphan_activity_age() {
+	local cmd="$1"
+	local session_id="" db_path=""
+	session_id=$(_resolve_session_id_from_cmd "$cmd")
+	db_path=$(_opencode_db_path)
+	[[ -n "$session_id" && -f "$db_path" ]] || return 1
 
-	# Also kill orphaned node launchers (parent of .opencode processes)
-	while IFS= read -r line; do
-		local pid tty etime rss cmd
-		read -r pid tty etime rss cmd <<<"$line"
+	PULSE_ORPHAN_DB_PATH="$db_path" PULSE_ORPHAN_SESSION_ID="$session_id" python3 - 2>/dev/null <<'PY'
+import os
+import sqlite3
+import time
 
-		[[ "$tty" != "?" && "$tty" != "??" ]] && continue
-		# Use case instead of [[ =~ ]] with | alternation — zsh parse error. See GH#4904.
-		case "$cmd" in
-		*"/full-loop"* | *"/review-issue-pr"* | *"Supervisor Pulse"* | *"Strategic Review"* | *"language-server"* | *"eslintServer"*)
-			continue
-			;;
-		esac
+connection = sqlite3.connect(os.environ["PULSE_ORPHAN_DB_PATH"])
+connection.execute("PRAGMA busy_timeout=5000")
+row = connection.execute(
+    """
+    SELECT MAX(CASE WHEN time_created > 20000000000
+                    THEN time_created / 1000 ELSE time_created END)
+    FROM message WHERE session_id = ?
+    """,
+    (os.environ["PULSE_ORPHAN_SESSION_ID"],),
+).fetchone()
+last_activity = int(row[0] or 0)
+if last_activity <= 0:
+    raise SystemExit(1)
+print(max(0, int(time.time()) - last_activity))
+connection.close()
+PY
+}
 
-		# t2859: ${ORPHAN_MAX_AGE:-7200} fallback (2h) — see comment above.
-		local age_seconds
-		age_seconds=$(_get_process_age "$pid")
-		[[ "$age_seconds" -lt "${ORPHAN_MAX_AGE:-7200}" ]] && continue
-
-		kill "$pid" 2>/dev/null || true
-		[[ "$rss" =~ ^[0-9]+$ ]] || rss=0
-		local mb=$((rss / 1024))
-		killed=$((killed + 1))
-		total_mb=$((total_mb + mb))
-	done < <(ps axwwo pid,tty,etime,rss,command | grep 'node.*opencode' | grep -v '[.]opencode')
-
-	if [[ "$killed" -gt 0 ]]; then
-		echo "[pulse-wrapper] Cleaned up $killed orphaned opencode processes (freed ~${total_mb}MB)" >>"$LOGFILE"
+_pulse_orphan_command_mode() {
+	local cmd="$1"
+	if [[ "$cmd" =~ (^|[[:space:]/])opencode[[:space:]]+serve([[:space:]]|$) ]]; then
+		printf '%s' 'serve'
+	elif [[ "$cmd" =~ (^|[[:space:]/])opencode[[:space:]]+run([[:space:]]|$) ]]; then
+		printf '%s' 'run'
+	else
+		printf '%s' 'ambiguous'
 	fi
 	return 0
 }
 
-cleanup_stale_opencode() {
-	local killed=0
-	local total_mb=0
+_pulse_orphan_decision() {
+	local pid="$1" cmd="$2" age_seconds="$3"
+	local mode="" owner="" inactivity="" tree_cpu=""
+	mode=$(_pulse_orphan_command_mode "$cmd")
 
-	# Get our own PID tree to avoid killing the current session
-	local my_pid="$$"
-	local my_ppid
-	my_ppid=$(ps -p "$my_pid" -o ppid= 2>/dev/null | tr -d ' ') || my_ppid=""
+	if [[ ! "$pid" =~ ^[1-9][0-9]*$ || ! "$age_seconds" =~ ^[0-9]+$ ]]; then
+		printf '%s' 'skip|invalid-process-evidence|ambiguous|unknown|unknown|unknown'
+		return 0
+	fi
+	if [[ "$age_seconds" -lt "${ORPHAN_MAX_AGE:-7200}" ]]; then
+		printf 'skip|process-young|%s|unknown|unknown|unknown' "$mode"
+		return 0
+	fi
+	owner=$(_pulse_orphan_lifecycle_owner "$pid") || owner="unmanaged"
+	if [[ "$owner" != "unmanaged" ]]; then
+		printf 'skip|lifecycle-owned|%s|unknown|cgroup|%s' "$mode" "$owner"
+		return 0
+	fi
+	if [[ "$mode" == "serve" ]]; then
+		printf '%s' 'skip|persistent-command|serve|unknown|command|unmanaged'
+		return 0
+	fi
+	if [[ "$mode" != "run" ]]; then
+		printf 'skip|ambiguous-command|%s|unknown|unknown|unmanaged' "$mode"
+		return 0
+	fi
+	inactivity=$(_pulse_orphan_activity_age "$cmd") || inactivity=""
+	if [[ ! "$inactivity" =~ ^[0-9]+$ ]]; then
+		printf '%s' 'skip|activity-unavailable|run|unknown|session-db|unmanaged'
+		return 0
+	fi
+	if [[ "$inactivity" -lt "${ORPHAN_INACTIVITY_AGE:-259200}" ]]; then
+		printf 'skip|recent-session-activity|run|%s|session-db|unmanaged' "$inactivity"
+		return 0
+	fi
+	tree_cpu=$(_get_process_tree_cpu "$pid")
+	[[ "$tree_cpu" =~ ^[0-9]+$ ]] || tree_cpu=0
+	if [[ "$tree_cpu" -ge "${PULSE_IDLE_CPU_THRESHOLD:-2}" ]]; then
+		printf 'skip|active-process-tree|run|%s|session-db|unmanaged' "$inactivity"
+		return 0
+	fi
+	printf 'kill|verified-stale-session|run|%s|session-db|unmanaged' "$inactivity"
+	return 0
+}
 
+_pulse_list_opencode_candidates() {
+	ps axwwo pid,tty,etime,rss,command | awk '
+		$0 ~ /bash-language-server/ { next }
+		$0 ~ /[.]opencode/ { print; next }
+		$0 ~ /node.*opencode/ { print }
+	'
+	return 0
+}
+
+_pulse_process_command() {
+	local pid="$1"
+	ps -ww -p "$pid" -o command= 2>/dev/null
+	return $?
+}
+
+_pulse_log_orphan_decision() {
+	local pid="$1" tty="$2" age="$3" action="$4" reason="$5" mode="$6" inactivity="$7" source="$8" owner="$9"
+	printf '[pulse-wrapper] orphan-decision pid=%s tty=%s process_age=%s inactivity=%s inactivity_source=%s mode=%s owner=%s action=%s reason=%s\n' \
+		"$pid" "$tty" "$age" "$inactivity" "$source" "$mode" "$owner" "$action" "$reason" >>"$LOGFILE"
+	return 0
+}
+
+cleanup_orphans() {
+	local killed=0 total_mb=0 line=""
 	while IFS= read -r line; do
-		local pid cpu rss
-		read -r pid cpu rss <<<"$line"
+		local pid="" tty="" etime="" rss="" cmd="" age="" decision=""
+		local action="" reason="" mode="" inactivity="" source="" owner="" current_cmd="" recheck=""
+		read -r pid tty etime rss cmd <<<"$line"
+		age=$(_get_process_age "$pid")
+		decision=$(_pulse_orphan_decision "$pid" "$cmd" "$age")
+		IFS='|' read -r action reason mode inactivity source owner <<<"$decision"
+		_pulse_log_orphan_decision "$pid" "$tty" "$age" "$action" "$reason" "$mode" "$inactivity" "$source" "$owner"
+		[[ "$action" == "kill" ]] || continue
 
-		# Skip our own process tree
-		if [[ "$pid" == "$my_pid" || "$pid" == "$my_ppid" ]]; then
+		current_cmd=$(_pulse_process_command "$pid") || current_cmd=""
+		[[ -n "$current_cmd" && "$current_cmd" == "$cmd" ]] || {
+			_pulse_log_orphan_decision "$pid" "$tty" "$age" skip process-identity-changed "$mode" "$inactivity" "$source" "$owner"
 			continue
-		fi
-
-		# Skip interactive sessions — only kill headless workers.
-		# Headless workers are launched via headless-runtime-helper.sh with
-		# --format json in the command line. Interactive sessions (user typing
-		# in a terminal) never have this flag. Without this guard, any idle
-		# interactive session (user stepped away) gets killed along with its
-		# parent shell, closing the terminal tab entirely.
-		local proc_cmd
-		proc_cmd=$(ps -p "$pid" -o command= 2>/dev/null) || proc_cmd=""
-		if [[ "$proc_cmd" != *"--format json"* ]]; then
+		}
+		recheck=$(_pulse_orphan_decision "$pid" "$current_cmd" "$(_get_process_age "$pid")")
+		[[ "$recheck" == kill\|* ]] || {
+			IFS='|' read -r action reason mode inactivity source owner <<<"$recheck"
+			_pulse_log_orphan_decision "$pid" "$tty" "$age" "$action" "$reason" "$mode" "$inactivity" "$source" "$owner"
 			continue
-		fi
+		}
 
-		# Skip young processes
-		local age_seconds
-		age_seconds=$(_get_process_age "$pid")
-		if [[ "$age_seconds" -lt "$STALE_OPENCODE_MAX_AGE" ]]; then
-			continue
-		fi
-
-		# Skip processes with significant CPU usage (actively working)
-		# cpu is a float like "0.0" or "40.3" — compare integer part.
-		# t2859: ${PULSE_IDLE_CPU_THRESHOLD:-2} fallback (2% CPU) — without
-		# this, unbound expansion to "" treated as 0 would make every
-		# process "active" (cpu >= 0) and skip every kill candidate.
-		local cpu_int
-		cpu_int="${cpu%%.*}"
-		[[ "$cpu_int" =~ ^[0-9]+$ ]] || cpu_int=0
-		if [[ "$cpu_int" -ge "${PULSE_IDLE_CPU_THRESHOLD:-2}" ]]; then
-			continue
-		fi
-
-		# This is a stale headless worker — kill it and its parent chain
 		[[ "$rss" =~ ^[0-9]+$ ]] || rss=0
-		local mb=$((rss / 1024))
-
-		# Kill parent (node launcher) and grandparent (zsh tab) first
-		local ppid
-		ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ') || ppid=""
-		if [[ -n "$ppid" && "$ppid" != "1" ]]; then
-			local gppid
-			gppid=$(ps -p "$ppid" -o ppid= 2>/dev/null | tr -d ' ') || gppid=""
-			# Kill grandparent zsh (the terminal tab shell)
-			if [[ -n "$gppid" && "$gppid" != "1" ]]; then
-				local gp_cmd
-				gp_cmd=$(ps -p "$gppid" -o command= 2>/dev/null) || gp_cmd=""
-				# Only kill if it's a shell that launched opencode
-				case "$gp_cmd" in
-				*zsh* | *bash* | *sh*)
-					kill "$gppid" 2>/dev/null || true
-					;;
-				esac
-			fi
-			# Kill parent node launcher
-			kill "$ppid" 2>/dev/null || true
+		if kill "$pid" 2>/dev/null; then
+			killed=$((killed + 1))
+			total_mb=$((total_mb + rss / 1024))
 		fi
-
-		# Kill the .opencode process — SIGTERM first, SIGKILL fallback.
-		# OpenCode's file watcher may ignore SIGTERM.
-		kill "$pid" 2>/dev/null || true
-		sleep 1
-		if kill -0 "$pid" 2>/dev/null; then
-			kill -9 "$pid" 2>/dev/null || true
-		fi
-		killed=$((killed + 1))
-		total_mb=$((total_mb + mb))
-	done < <(ps axwwo pid,%cpu,rss,command | awk '$0 ~ /[.]opencode/ && $0 !~ /bash-language-server/ { print $1, $2, $3 }')
+	done < <(_pulse_list_opencode_candidates)
 
 	if [[ "$killed" -gt 0 ]]; then
-		echo "[pulse-wrapper] Cleaned up $killed stale headless opencode workers (freed ~${total_mb}MB)" >>"$LOGFILE"
+		echo "[pulse-wrapper] Cleaned up $killed verified stale opencode sessions (freed ~${total_mb}MB)" >>"$LOGFILE"
 	fi
+	return 0
+}
+
+#######################################
+# GH#32957: persistent GitHub read caches under ~/.aidevops/cache/ are written
+# by pulse, workers and interactive helpers but nothing pruned them. Every entry
+# older than its maximum TTL is dead weight (PR view/list default 3600s,
+# check-status terminal TTL <= 7 days), and gh_pr_list_cache_invalidate_repo
+# globs the whole snapshot dir on each merge/close, so its cost grows with the
+# backlog. These are private disposable caches: direct deletion, no trash.
+#######################################
+_PC_GH_READ_CACHE_MAX_AGE_DAYS=8
+_PC_GH_READ_CACHE_RM_BATCH=200
+
+# Emit candidate cache dirs, one per line: the four default locations plus any
+# env overrides. Pulse itself overrides the view/list dirs, so defaults are
+# always included to drain caches written by workers and interactive sessions.
+_pulse_gh_read_cache_dirs() {
+	local _root="${HOME}/.aidevops/cache"
+	printf '%s\n' \
+		"${_root}/pulse-pr-view-cache" \
+		"${_root}/gh-pr-list-snapshots" \
+		"${_root}/gh-pr-check-status" \
+		"${_root}/gh-pr-view-snapshots" \
+		"${AIDEVOPS_PULSE_PR_VIEW_CACHE_DIR:-}" \
+		"${AIDEVOPS_GH_PR_VIEW_CACHE_DIR:-}" \
+		"${AIDEVOPS_GH_PR_LIST_CACHE_DIR:-}" \
+		"${AIDEVOPS_GH_CHECK_STATUS_CACHE_DIR:-}"
+	return 0
+}
+
+# Reject broad, relative, symlinked or protected directories so a mistaken
+# env override can never turn the prune into a home/tmp-wide deletion.
+_pulse_gh_read_cache_dir_safe() {
+	local _dir="$1"
+	[[ "$_dir" == /* ]] || return 1
+	[[ -d "$_dir" && ! -L "$_dir" ]] || return 1
+	local _tmp_root="${TMPDIR:-/tmp}"
+	case "$_dir" in
+	/ | /tmp | /private/tmp | /var/tmp | "${_tmp_root%/}" | "${HOME%/}" | "${HOME%/}/.aidevops" | "${HOME%/}/.aidevops/cache") return 1 ;;
+	esac
+	case "${_dir##*/}" in
+	auto-dispatch-locks | bundle) return 1 ;;
+	esac
+	return 0
+}
+
+# Remove one batch of files; prints the number actually removed.
+_pulse_gh_read_cache_rm_batch() {
+	local _count="$#"
+	[[ "$_count" -gt 0 ]] || { printf '0\n'; return 0; }
+	if rm -f -- "$@" 2>/dev/null; then
+		printf '%s\n' "$_count"
+		return 0
+	fi
+	local _file=""
+	_count=0
+	for _file in "$@"; do
+		[[ -e "$_file" ]] || _count=$((_count + 1))
+	done
+	printf '%s\n' "$_count"
+	return 0
+}
+
+#######################################
+# Prune regular files older than 8 days (beyond the 7-day max TTL) from the
+# GitHub read cache dirs only, within PULSE_GH_READ_CACHE_PRUNE_MAX_SECONDS
+# (default 30). Top-level files only; symlinks and lock/lease files are never
+# touched. A large backlog drains incrementally across cycles.
+#######################################
+prune_expired_gh_read_caches() {
+	local _budget="${PULSE_GH_READ_CACHE_PRUNE_MAX_SECONDS:-30}"
+	[[ "$_budget" =~ ^[0-9]+$ ]] || _budget=30
+	local _max_age_min=$((_PC_GH_READ_CACHE_MAX_AGE_DAYS * 1440))
+	local _start="$SECONDS"
+	local _deadline=$((_start + _budget))
+	local _seen=$'\n'
+	local _dir="" _file="" _removed=0
+	local _dirs=0 _deleted=0 _timed_out=0
+	local -a _batch=()
+	while IFS= read -r _dir; do
+		[[ "$_dir" == "/" ]] || _dir="${_dir%/}"
+		[[ -n "$_dir" ]] || continue
+		[[ "$_seen" == *$'\n'"$_dir"$'\n'* ]] && continue
+		_seen="${_seen}${_dir}"$'\n'
+		_pulse_gh_read_cache_dir_safe "$_dir" || continue
+		if [[ "$SECONDS" -ge "$_deadline" ]]; then
+			_timed_out=1
+			break
+		fi
+		_dirs=$((_dirs + 1))
+		_batch=()
+		while IFS= read -r -d '' _file; do
+			_batch+=("$_file")
+			[[ "${#_batch[@]}" -ge "$_PC_GH_READ_CACHE_RM_BATCH" ]] || continue
+			_removed=$(_pulse_gh_read_cache_rm_batch "${_batch[@]}")
+			_deleted=$((_deleted + _removed))
+			_batch=()
+			if [[ "$SECONDS" -ge "$_deadline" ]]; then
+				_timed_out=1
+				break
+			fi
+		done < <(find "$_dir" -mindepth 1 -maxdepth 1 -type f -mmin "+${_max_age_min}" \
+			! -name '*.lock' ! -name '*.lease' ! -name '*.lck' -print0 2>/dev/null)
+		if [[ "${#_batch[@]}" -gt 0 ]]; then
+			_removed=$(_pulse_gh_read_cache_rm_batch "${_batch[@]}")
+			_deleted=$((_deleted + _removed))
+			_batch=()
+		fi
+		[[ "$_timed_out" -eq 0 ]] || break
+	done < <(_pulse_gh_read_cache_dirs)
+	echo "[pulse-wrapper] gh read-cache prune (GH#32957): dirs=${_dirs} deleted=${_deleted} max_age=${_PC_GH_READ_CACHE_MAX_AGE_DAYS}d elapsed=$((SECONDS - _start))s budget=${_budget}s timed_out=${_timed_out}" >>"${LOGFILE:-/dev/null}"
+	return 0
+}
+
+cleanup_stale_opencode() {
+	# GH#32957: this preflight stage also prunes expired GitHub read caches,
+	# reusing the existing scheduler with its own bounded budget.
+	prune_expired_gh_read_caches || true
+	# Consolidated into cleanup_orphans(), whose lifecycle and activity proof now
+	# safely covers eligible no-TTY and TTY-attached `opencode run` sessions.
+	# This stage is scheduled by pulse preflight; prune stale agent scratch here
+	# without introducing a second scheduler. The helper is dry-run by default
+	# for manual use; pulse explicitly opts in to recoverable trash moves.
+	# The scratch backlog can hold tens of thousands of entries; an unbounded
+	# run consumed the full 600s stage timeout every cycle and starved the
+	# stalled-worker, zombie-reap and ledger stages that follow. Bound the
+	# per-cycle budget so the backlog drains incrementally across cycles.
+	local _scratch_budget="${PULSE_SCRATCH_CLEANUP_MAX_SECONDS:-60}"
+	local _scratch_rc=0
+	[[ "$_scratch_budget" =~ ^[0-9]+$ ]] || _scratch_budget=60
+	if [[ -x "${_PULSE_CLEANUP_SCRIPT_DIR}/system-cleanup.sh" ]]; then
+		"${_PULSE_CLEANUP_SCRIPT_DIR}/system-cleanup.sh" --force --max-seconds "$_scratch_budget" >>"${LOGFILE:-/dev/null}" 2>&1 || _scratch_rc=1
+	fi
+	_pulse_reap_docker_resources || true
+	return "$_scratch_rc"
+}
+
+# GH#34285: reap aidevops-labelled (sh.aidevops.owner=1) Docker test stacks
+# whose worktree is gone and issue/PR closed, or whose TTL expired. Report-only
+# until AIDEVOPS_DOCKER_REAP=1. Unlabelled resources are never removed. The
+# helper exits 0 within a short timeout when Docker is absent or stopped.
+_pulse_report_docker_pressure() {
+	local helper="$1" budget="$2"
+	local state="${HOME}/.aidevops/.agent-workspace/tmp/docker-pressure" report warning day rc=0
+	day=$(date -u +%F)
+	# Atomic daily claim, shared by pulse invocations. Only advisory state is written.
+	mkdir -p "$state" 2>/dev/null || return 0
+	mkdir "${state}/${day}" 2>/dev/null || return 0
+	if [[ "$budget" -gt 0 ]]; then
+		report=$(AIDEVOPS_DOCKER_TTL_HOURS=72 timeout_sec "$budget" "$helper" report --max-seconds "$budget" 2>/dev/null) || rc=$?
+	else
+		report=$(AIDEVOPS_DOCKER_TTL_HOURS=72 "$helper" report --max-seconds "$budget" 2>/dev/null) || rc=$?
+	fi
+	if [[ "$rc" -ne 0 || "$report" != *$'\nDocker pressure report complete' ]]; then
+		rmdir "${state}/${day}" 2>/dev/null || true
+		printf '[pulse-wrapper] Docker pressure report unavailable or incomplete (exit=%s, budget=%ss); will retry\n' "$rc" "$budget" >>"${LOGFILE:-/dev/null}"
+		return 0
+	fi
+	warning=$(printf '%s\n' "$report" | awk '
+		/containers: labelled=/ { split($NF, a, "="); containers=a[2] }
+		/networks \(custom\): labelled=/ { split($NF, a, "="); networks=a[2] }
+		/volumes: labelled=/ { split($NF, a, "="); volumes=a[2] }
+		/^Containers stopped longer than/ { stopped=1 }
+		stopped && /total=.*labelled=.*unlabelled=/ { split($NF, a, "="); old=a[2]; stopped=0 }
+		/Local Volumes.*reclaimable=/ {
+			size=$0; sub(/.*reclaimable=/, "", size); sub(/ .*/, "", size)
+			n=size+0; unit=size; sub(/^[0-9.]+/, "", unit)
+			if (unit=="GB") bytes=n*1000000000
+			else if (unit=="TB") bytes=n*1000000000000
+			else if (unit=="GiB") bytes=n*1073741824
+			else if (unit=="TiB") bytes=n*1099511627776
+		}
+		END {
+			if (old>20 || bytes>20000000000)
+				printf "[pulse-wrapper] Docker pressure: unlabelled containers=%s networks=%s volumes=%s stopped_over_72h=%s; reclaimable volumes=%s; inspect docker-resource-helper.sh report (no unlabelled resources removed)", containers+0, networks+0, volumes+0, old+0, size ? size : "unknown"
+		}')
+	[[ -z "$warning" ]] || printf '%s\n' "$warning" >>"${LOGFILE:-/dev/null}"
+	return 0
+}
+
+_pulse_reap_docker_resources() {
+	local _helper="${_PULSE_CLEANUP_SCRIPT_DIR}/docker-resource-helper.sh"
+	local _budget="${PULSE_DOCKER_CLEANUP_MAX_SECONDS:-30}"
+	[[ -x "$_helper" ]] || return 0
+	command -v docker >/dev/null 2>&1 || return 0
+	[[ "$_budget" =~ ^[0-9]+$ ]] || _budget=30
+	if [[ "${AIDEVOPS_DOCKER_REAP:-0}" == "1" ]]; then
+		"$_helper" reap --apply --max-seconds "$_budget" >>"${LOGFILE:-/dev/null}" 2>&1 || true
+	else
+		"$_helper" reap --max-seconds "$_budget" >>"${LOGFILE:-/dev/null}" 2>&1 || true
+	fi
+	_pulse_report_docker_pressure "$_helper" "$_budget"
 	return 0
 }

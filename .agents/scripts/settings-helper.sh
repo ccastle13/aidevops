@@ -81,19 +81,32 @@ _generate_defaults() {
     "sonarcloud_enabled": true,
     "write_time_linting": true
   },
-  "model_routing": {
-    "default_tier": "standard",
-    "budget_tracking_enabled": true,
-    "prefer_subscription": true
+  "runtime": {
+    "opencode": {
+      "astra_context_cap": true,
+      "astra_compaction_target": 240000
+    }
   },
   "onboarding": {
     "completed": false,
     "work_type": "",
     "familiarity": []
   },
+  "wordpress": {
+    "plugin_defaults": {
+      "author": "",
+      "author_uri": "",
+      "contributors": "",
+      "donate": "",
+      "github_owner": ""
+    }
+  },
   "ui": {
     "color_output": true,
     "verbose": false
+  },
+  "browser": {
+    "playwright_executable": ""
   }
 }
 DEFAULTS
@@ -124,6 +137,7 @@ _env_var_for_key() {
 	supervisor.peak_hours_tz) echo "AIDEVOPS_PEAK_HOURS_TZ" ;;
 	supervisor.peak_hours_worker_fraction) echo "AIDEVOPS_PEAK_HOURS_WORKER_FRACTION" ;;
 	repo_sync.enabled) echo "AIDEVOPS_REPO_SYNC" ;;
+	browser.playwright_executable) echo "AIDEVOPS_PLAYWRIGHT_EXECUTABLE" ;;
 	*) echo "" ;;
 	esac
 	return 0
@@ -192,17 +206,18 @@ cmd_get() {
 		local jq_path
 		jq_path=$(_jq_path "$key")
 		local value
-		value=$(jq -r "$jq_path // empty" "$SETTINGS_FILE" 2>/dev/null || echo "")
+		value=$(jq -r "$jq_path | if . == null then empty else . end" "$SETTINGS_FILE" 2>/dev/null || echo "")
 		if [[ -n "$value" ]]; then
 			echo "$value"
 			return 0
 		fi
 	fi
 
-	# Precedence 3: Built-in default
+	# Precedence 3: Built-in default. A known key may default to "" (GH#36357);
+	# only a missing path is unknown — same existence rule as cmd_set.
 	local default_value
-	default_value=$(_generate_defaults | jq -r "$(_jq_path "$key") // empty" 2>/dev/null || echo "")
-	if [[ -n "$default_value" ]]; then
+	default_value=$(_generate_defaults | jq -r --arg k "$key" 'getpath($k | split(".")) | if . == null then "__MISSING__" else . end' 2>/dev/null || echo "__MISSING__")
+	if [[ "$default_value" != "__MISSING__" ]]; then
 		echo "$default_value"
 		return 0
 	fi
@@ -238,7 +253,7 @@ cmd_set() {
 
 	# Validate the key exists in defaults (use getpath with key as data, not code)
 	local default_check
-	default_check=$(_generate_defaults | jq -r --arg k "$key" 'getpath($k | split(".")) // "__MISSING__"' 2>/dev/null || echo "__MISSING__")
+	default_check=$(_generate_defaults | jq -r --arg k "$key" 'getpath($k | split(".")) | if . == null then "__MISSING__" else . end' 2>/dev/null || echo "__MISSING__")
 	if [[ "$default_check" == "__MISSING__" ]]; then
 		print_error "Unknown setting: $key"
 		print_info "Run 'settings-helper.sh list' to see available settings"
@@ -372,7 +387,7 @@ cmd_validate() {
 	fi
 
 	# Check required sections exist
-	local required_sections=("auto_update" "supervisor" "repo_sync" "quality" "model_routing" "onboarding" "ui")
+	local required_sections=("auto_update" "supervisor" "repo_sync" "quality" "onboarding" "ui")
 	for section in "${required_sections[@]}"; do
 		if ! jq -e ".$section" "$SETTINGS_FILE" >/dev/null 2>&1; then
 			print_warning "Missing section: $section"
@@ -410,6 +425,12 @@ cmd_validate() {
 	fi
 	if [[ "$pulse_interval" -lt 30 || "$pulse_interval" -gt 3600 ]]; then
 		print_warning "orchestration.pulse_interval_seconds ($pulse_interval) should be 30-3600"
+		errors=$((errors + 1))
+	fi
+
+	if jq -e 'has("model_routing")' "$SETTINGS_FILE" >/dev/null 2>&1; then
+		print_warning "model_routing is obsolete; routing now uses configs/model-routing-table.json and explicit tier labels"
+		print_info "  Run: aidevops update  (backs up settings and removes the obsolete section)"
 		errors=$((errors + 1))
 	fi
 
@@ -531,24 +552,22 @@ SETTINGS KEYS (dot-notation):
     supervisor.stale_threshold_seconds   Stale worker threshold (default: 1800)
     supervisor.circuit_breaker_max_failures  Max failures before pause (default: 3)
     supervisor.strategic_review_hours    Hours between strategic reviews (default: 4)
-    supervisor.peak_hours_enabled        Cap workers during peak hours (default: false)
-    supervisor.peak_hours_start          Peak window start hour 0-23 (default: 5)
-    supervisor.peak_hours_end            Peak window end hour 0-23 (default: 11)
-    supervisor.peak_hours_tz             Timezone for peak window (default: America/Los_Angeles)
-    supervisor.peak_hours_worker_fraction  Fraction of off-peak MAX_WORKERS during peak (default: 0.2)
+    supervisor.peak_hours_enabled        DEPRECATED: ignored; global clock-based cap retired
+    supervisor.peak_hours_start          DEPRECATED: ignored
+    supervisor.peak_hours_end            DEPRECATED: ignored
+    supervisor.peak_hours_tz             DEPRECATED: ignored
+    supervisor.peak_hours_worker_fraction  DEPRECATED: ignored
     repo_sync.enabled                    Daily repo sync on/off (default: true)
     repo_sync.schedule                   Sync schedule (default: daily)
     quality.shellcheck_enabled           ShellCheck on/off (default: true)
     quality.sonarcloud_enabled           SonarCloud on/off (default: true)
     quality.write_time_linting           Lint on every edit (default: true)
-    model_routing.default_tier           Default model tier (default: standard)
-    model_routing.budget_tracking_enabled Budget tracking on/off (default: true)
-    model_routing.prefer_subscription    Prefer subscription over API (default: true)
     onboarding.completed                 Whether onboarding was completed
     onboarding.work_type                 User's work type from onboarding
     onboarding.familiarity               Concepts user is familiar with
     ui.color_output                      Color terminal output (default: true)
     ui.verbose                           Verbose output (default: false)
+    browser.playwright_executable        System browser for Playwright (default: unset; bundled Chromium)
 
 PRECEDENCE:
     Environment variable > settings.json > built-in default

@@ -7,6 +7,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 1
 MERGE_SCRIPT="${SCRIPT_DIR}/../pulse-merge.sh"
 MERGE_PROCESS="${SCRIPT_DIR}/../pulse-merge-process.sh"
+# PR-list reads moved from pulse-merge-process.sh to this module (GH#27171).
+MERGE_BACKLOG="${SCRIPT_DIR}/../pulse-merge-backlog.sh"
 
 TESTS_RUN=0
 TESTS_FAILED=0
@@ -93,7 +95,7 @@ test_callers_use_shared_field_helper() {
 		print_result "process_pr uses shared PR field helper" 1 "process_pr still has an inline --json field list"
 		return 0
 	fi
-	if ! file_contains "$MERGE_PROCESS" "$shared_field_arg"; then
+	if ! file_contains "$MERGE_BACKLOG" "$shared_field_arg"; then
 		print_result "merge-ready list uses shared PR field helper" 1 "_merge_ready_prs_for_repo still has an inline --json field list"
 		return 0
 	fi
@@ -165,8 +167,14 @@ test_process_pr_runtime_reuses_one_view() {
 }
 
 test_merge_ready_pr_list_failure_logs_error() {
-	if ! file_contains "$MERGE_PROCESS" '|| pr_json=""'; then
-		print_result "merge-ready list failure leaves empty output for error guard" 1 "gh_pr_list failure fallback must be empty so the existing -z guard logs the error"
+	# The list read records its exit status instead of substituting a value,
+	# so the guard sees the failure, logs it and marks the list incomplete
+	# before any [] fallback (an incomplete list never counts as "no PRs").
+	# shellcheck disable=SC2016 # The assertions check literal shell source.
+	if ! file_contains "$MERGE_PROCESS" '|| pr_list_rc=$?' \
+		|| ! file_contains "$MERGE_PROCESS" 'pulse_pr_list_get FAILED for ${repo_slug}: list_state=incomplete' \
+		|| ! file_contains "$MERGE_PROCESS" 'pr_list_complete=0'; then
+		print_result "merge-ready list failure reaches error logging guard" 1 "pulse_pr_list_get failure must keep its exit status, log list_state=incomplete and mark the list incomplete"
 		return 0
 	fi
 	if file_contains "$MERGE_PROCESS" '|| pr_json="[]"'; then
@@ -179,7 +187,7 @@ test_merge_ready_pr_list_failure_logs_error() {
 
 test_merge_ready_pr_list_uses_provider_cache() {
 	# shellcheck disable=SC2016 # The assertion checks literal shell source.
-	if ! file_contains "$MERGE_PROCESS" 'pulse_pr_list_get --repo "$repo_slug" --state open'; then
+	if ! file_contains "$MERGE_BACKLOG" 'pulse_pr_list_get --repo "$repo_slug" --state open'; then
 		print_result "merge-ready PR list uses provider cache" 1 "_merge_ready_prs_for_repo must route through pulse_pr_list_get for per-cycle coalescing"
 		return 0
 	fi

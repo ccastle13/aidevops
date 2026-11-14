@@ -259,6 +259,29 @@ _run_setup_ai_session_with_fallback() {
 }
 
 #######################################
+# Return 0 when a same-version script-drift redeploy should wait because the
+# last successful deploy (the deployed-sha stamp mtime) is inside the batching
+# window. AIDEVOPS_SCRIPT_DRIFT_MIN_INTERVAL_SECONDS=0 disables batching.
+# Args: $1 = deployed-sha stamp file
+#######################################
+_script_drift_redeploy_debounced() {
+	local stamp_file="$1"
+	local min_interval="${AIDEVOPS_SCRIPT_DRIFT_MIN_INTERVAL_SECONDS:-3600}"
+	local stamp_epoch="" now_epoch="" age=0
+	[[ "$min_interval" =~ ^[0-9]+$ ]] || min_interval=3600
+	[[ "$min_interval" -gt 0 ]] || return 1
+	declare -F _file_mtime_epoch >/dev/null 2>&1 || return 1
+	stamp_epoch=$(_file_mtime_epoch "$stamp_file" 2>/dev/null) || return 1
+	[[ "$stamp_epoch" =~ ^[0-9]+$ && "$stamp_epoch" -gt 0 ]] || return 1
+	now_epoch=$(date +%s)
+	age=$((now_epoch - stamp_epoch))
+	# A future-dated stamp is not evidence of a recent deploy.
+	[[ "$age" -ge 0 && "$age" -lt "$min_interval" ]] || return 1
+	log_info "Script drift redeploy batched: last deploy ${age}s ago (< ${min_interval}s window)"
+	return 0
+}
+
+#######################################
 # Handle stale deployed agents when repo version matches remote.
 # Checks VERSION mismatch and sentinel script hash drift; re-deploys if needed.
 # Args: $1 = current version string
@@ -321,13 +344,18 @@ _cmd_check_stale_agent_redeploy() {
 			fi
 			local has_code_drift=0
 			# Per Gemini code-review on PR #20342: use git's path filter +
-			# `grep -q .` to detect drift across the full set of deploy-affecting
+			# a consuming grep to detect drift without SIGPIPE under pipefail across
 			# paths (not just .agents/ subdirs — also setup.sh, .agents/scripts/setup/modules/,
 			# and aidevops.sh itself, which are deployed/sourced by setup).
 			if git -C "$INSTALL_DIR" diff --name-only "$deployed_sha" "$head_sha" -- \
-				.agents/scripts/ .agents/agents/ .agents/workflows/ .agents/prompts/ .agents/hooks/ \
-				setup.sh .agents/scripts/setup/modules/ aidevops.sh 2>/dev/null | grep -q .; then
+				.agents/scripts/ .agents/agents/ .agents/workflows/ .agents/prompts/ .agents/hooks/ .agents/worker-lifecycle/ \
+				setup.sh .agents/scripts/setup/modules/ aidevops.sh 2>/dev/null | grep . >/dev/null; then
 				has_code_drift=1
+			fi
+			# Same-version drift redeploys restart the Pulse; batch them so a busy
+			# main branch cannot keep every runner's cycle from completing.
+			if [[ "$has_code_drift" -eq 1 ]] && _script_drift_redeploy_debounced "$stamp_file"; then
+				has_code_drift=0
 			fi
 			if [[ "$has_code_drift" -eq 1 ]]; then
 				log_warn "Script drift detected (${deployed_sha:0:7}→${head_sha:0:7} at v$current) — re-deploying agents..."
@@ -350,18 +378,32 @@ _cmd_check_stale_agent_redeploy() {
 #######################################
 _cmd_check_git_update() {
 	local remote="$1"
-
-	# Fetch before evaluating local blockers. A same-version release can still
-	# contain merged script fixes, so VERSION equality is not freshness proof.
-	if ! git -C "$INSTALL_DIR" fetch origin main --quiet 2>>"$LOG_FILE"; then
-		log_error "git fetch failed"
-		update_state "update" "$remote" "fetch_failed"
-		return 1
-	fi
+	local recovery_helper="${AIDEVOPS_CANONICAL_RECOVERY_HELPER:-${SCRIPT_DIR}/canonical-recovery-helper.sh}"
+	local fetch_failure_status="fetch_failed"
 	local local_hash=""
 	local remote_hash=""
+	local remote_tip=""
+
+	# The updater runs against a canonical checkout.  Only the recovery helper
+	# may fetch or advance it: it pins aidevops identity, takes the recovery lock,
+	# audits the authorization, and verifies the resulting worktree state.
+	[[ -x "$recovery_helper" ]] || {
+		log_error "Audited canonical maintenance helper is unavailable"
+		update_state "update" "$remote" "$fetch_failure_status"
+		return 1
+	}
 	local_hash=$(git -C "$INSTALL_DIR" rev-parse HEAD 2>>"$LOG_FILE") || return 1
-	remote_hash=$(git -C "$INSTALL_DIR" rev-parse origin/main 2>>"$LOG_FILE") || return 1
+	remote_tip=$(git -C "$INSTALL_DIR" ls-remote origin refs/heads/main 2>>"$LOG_FILE") || {
+		log_error "Unable to inspect origin/main before audited maintenance"
+		update_state "update" "$remote" "$fetch_failure_status"
+		return 1
+	}
+	remote_hash="${remote_tip%%[[:space:]]*}"
+	[[ -n "$remote_hash" ]] || {
+		log_error "origin/main tip could not be resolved"
+		update_state "update" "$remote" "$fetch_failure_status"
+		return 1
+	}
 	# The install checkout may contain deliberate local fixes or diagnostics.
 	# Preserve them and record that they are blocking activation of upstream.
 	if ! git -C "$INSTALL_DIR" diff --quiet 2>/dev/null || ! git -C "$INSTALL_DIR" diff --cached --quiet 2>/dev/null; then
@@ -381,29 +423,16 @@ _cmd_check_git_update() {
 		update_state "update" "$remote" "runtime_stale_branch"
 		return 1
 	fi
-	if [[ "$local_hash" == "$remote_hash" ]]; then
-		return 0
-	fi
-
-	if git -C "$INSTALL_DIR" merge-base --is-ancestor "$remote_hash" "$local_hash" 2>/dev/null; then
-		log_error "Local commits exist on main; refusing unattended update"
-		update_state "update" "$remote" "runtime_stale_local_commits"
-		return 1
-	fi
-	if ! git -C "$INSTALL_DIR" merge-base --is-ancestor "$local_hash" "$remote_hash" 2>/dev/null; then
-		log_error "Canonical main has diverged from origin/main; refusing unattended update"
-		update_state "update" "$remote" "runtime_stale_diverged"
-		return 1
-	fi
-
-	if ! git -C "$INSTALL_DIR" merge --ff-only "$remote_hash" --quiet 2>>"$LOG_FILE"; then
-		log_error "git merge --ff-only failed; preserving local history"
+	if ! bash "$recovery_helper" fast-forward-current --repo "$INSTALL_DIR" --branch main \
+		--reason aidevops-update --confirm FAST_FORWARD_CANONICAL_BRANCH >>"$LOG_FILE" 2>&1; then
+		log_error "Audited canonical fast-forward failed; preserving local history"
 		update_state "update" "$remote" "pull_failed"
 		return 1
 	fi
 	local_hash=$(git -C "$INSTALL_DIR" rev-parse HEAD 2>>"$LOG_FILE") || return 1
+	remote_hash=$(git -C "$INSTALL_DIR" rev-parse origin/main 2>>"$LOG_FILE") || return 1
 	if [[ "$local_hash" != "$remote_hash" ]]; then
-		log_error "Updated HEAD does not match fetched origin/main; refusing to run setup"
+		log_error "Audited update HEAD does not match origin/main; refusing to run setup"
 		update_state "update" "$remote" "history_mismatch"
 		return 1
 	fi

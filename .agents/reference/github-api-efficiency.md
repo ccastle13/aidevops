@@ -12,6 +12,11 @@ The benchmark never reads raw API telemetry and never changes runtime defaults.
 An inconclusive result preserves every rollback control and keeps the rollout
 task open.
 
+For further optimisation, first inspect [transport and freshness](github-api-transport.md).
+Offer [optional webhook onboarding](github-webhook-onboarding.md) only when the
+user accepts ingress operation; polling remains the default and keeps its cadence.
+Webhook setup alone does not establish request savings.
+
 ## Command
 
 ```bash
@@ -42,6 +47,48 @@ JSON output uses `aidevops-github-api-efficiency-benchmark/v1`. Each output file
 is written through a private temporary file and atomically renamed. Re-running
 with identical inputs and options is byte-stable.
 
+## Offline CI quota attribution
+
+`gh-checks-wait-helper.sh quota-report 3600 "$CI_EVIDENCE_JSONL"` reads the local
+transport log and an optional operator-saved CI evidence file. It makes no network
+requests or identity probes. Report JSON stays on stdout; stderr contains one
+`quota-ci-decision` JSON object per evidence input line. Save both streams when
+investigating missing attribution. Diagnostics contain line numbers and validated
+series fingerprints, never raw rows, sample IDs, tokens or logins.
+
+Existing `quota-ci-sample` records still match their exact token fingerprint and
+reset. To credit another token belonging to the same account, include an explicit
+`quota-ci-identity` record for **each** fingerprint in the same saved JSONL file:
+
+```json
+{"event":"quota-ci-identity","auth_fingerprint":"<64-lowercase-hex-fingerprint>","host":"github.com","login":"<verified-login>","pool":"rest-core"}
+```
+
+Replace the placeholders with existing verified evidence, not credentials. Use
+the transport/audit fingerprint (SHA-256 of host, unit separator, token), not a
+hash of the login. Host and login comparisons are case-insensitive. Conflicting
+identity records disable cross-token joins for that fingerprint for the whole
+file, regardless of order. Identity record order relative to sample rows does not
+matter. A sample's `login` field alone, matching counters, or matching reset
+epochs do **not** prove a shared host/login/REST-core pool. Missing or mismatched
+identity evidence leaves other-token samples uncredited; exact-token matching
+remains backward-compatible. The saved file is operator-controlled evidence, not
+an authentication or authorization mechanism; retain it privately.
+
+Only independently known request counts inside the report's time, reset and
+observed counter bounds are eligible. Local overlap is subtracted conservatively;
+overlapping CI intervals cannot be credited twice, even across tokens. Shared
+counter deltas are never substituted for known costs. Unknown local costs still
+prevent a proven accounted fraction. Each output series is a separate observation
+of a quota window: do not sum same-login token series as independent spend.
+
+Decision reasons include `invalid_sample`, `unsupported_event`, `outside_window`,
+`duplicate`, `conflicting_id`, `identity_record` and
+`unmatched_identity_or_reset`. Evaluated samples include per-series results:
+`outside_observed_interval`, `overlapping_ci`, `locally_covered` or `credited`,
+with the credited cost. A rejected sample is not evidence of zero CI consumption.
+This report does not itself establish the full-active-hour coverage benchmark.
+
 ## Input contract
 
 ### Transport aggregate
@@ -60,6 +107,21 @@ The benchmark validates:
 
 Any unknown quota cost or unclassified transport attempt prevents `PASS`.
 Never derive a benchmark by reading the raw JSONL/log source directly.
+
+### Live diagnostics versus completed-cycle proof
+
+`gh-api-instrument.sh report` now writes `gh-api-calls-by-stage-live.json` by
+default (override `AIDEVOPS_GH_API_LIVE_REPORT`). It does not replace the canonical
+completed-cycle report or its digest-bound evidence sidecar. Explicit output
+paths remain supported. Batch prefetch no longer publishes a partial-cycle
+aggregate: `pulse-wrapper-cycle-gates.sh` owns the exact completed cutoff.
+
+### Native transport boundary
+
+Read [GitHub API transport and freshness](github-api-transport.md) for the shared
+cooldown, bounded authenticated REST-read admission, native compatibility limits,
+query-shape optimisations, and generation-fenced event queue. These controls do
+not relax this benchmark's completeness or correctness requirements.
 
 ### Quota-cost attribution
 
@@ -94,6 +156,16 @@ Do not assign a larger GraphQL cost by subtracting cumulative rate-limit
 headers: a delta above one cannot distinguish the operation from another client.
 Partial attribution does not relax the benchmark's zero-unknown-cost
 comparability gate.
+
+Exact-capture v2 rows append `request_method` (column 23) and `endpoint_class`
+(column 24) after the cumulative used counter; existing columns and quota-cost
+semantics are unchanged. Methods are standard uppercase HTTP verbs. Endpoint
+classes are static labels such as `repos-issues`, `repos-pulls`, `repos-actions`,
+`repos-commits`, `repos-checks`, `search`, `users`, and `rate-limit`, not raw paths.
+Other repository routes use `repos-other`; other roots use `other`. Neither
+repository names, IDs, query strings nor payloads are retained. Overlapping or
+unterminated request streams, opaque capture and legacy callers use `unknown`.
+Readers must continue accepting older rows without these optional columns.
 
 ### Pinning Pulse during controlled windows
 

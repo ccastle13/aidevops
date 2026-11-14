@@ -22,6 +22,8 @@
 [[ -n "${_GENERATE_RUNTIME_CONFIG_AGENTS_LIB_LOADED:-}" ]] && return 0
 _GENERATE_RUNTIME_CONFIG_AGENTS_LIB_LOADED=1
 _GENERATE_RUNTIME_CONFIG_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/opencode-agent-ownership.sh
+source "${_GENERATE_RUNTIME_CONFIG_SCRIPT_DIR}/lib/opencode-agent-ownership.sh"
 
 # Defensive SCRIPT_DIR fallback
 if [[ -z "${SCRIPT_DIR:-}" ]]; then
@@ -64,6 +66,9 @@ _run_agent_discovery_python() {
 
 # Shared helper: write ~/.config/<runtime>/AGENTS.md with the authoritative
 # plugin-injection precedence and cache/VERSION greeting fallback.
+# The greeting-fallback markers must match GREETING_FALLBACK_START/END in
+# .agents/plugins/opencode-aidevops/greeting.mjs: while the plugin greeting is
+# enabled, the plugin removes the delimited section (GH#32592).
 # Arguments:
 #   $1 - runtime_id (e.g. "opencode", "claude-code")
 #   $2 - config_dir (e.g. "$HOME/.config/opencode")
@@ -110,6 +115,7 @@ Add ~/.aidevops/agents/AGENTS.md to context for AI DevOps capabilities.
 
 **Runtime**: You are running in ${display_name}. Global config: \`${global_config_path}\`.
 
+<!-- aidevops:greeting-fallback:start -->
 ## aidevops Framework Status
 
 The ${plugin_name} renders session-start framework status (versions,
@@ -120,8 +126,8 @@ NOT repeat toast content in the chat.
 
 **On interactive conversation start** (skip only when the runtime is actually headless; a slash-command name such as \`/full-loop\` does not make an interactive session headless):
 
-1. If an earlier system instruction declares itself the authoritative plugin-injected greeting block and supplies exact version values, follow it. Its first-visible-text requirement does not prevent task tool calls from running first. Do not read the cache or VERSION first.
-2. Otherwise, the plugin injection is unavailable. Read line 1 of \`${cache_path}\`. Format: \`aidevops v{X} running in ${display_name} v{Y} | ...\`. Extract \`{X}\` and \`{Y}\`, then make the first visible text in your first assistant response exactly this template — no extra prose, no status dump:
+1. If another system instruction declares itself the authoritative plugin-injected greeting block and supplies exact version values, follow it. Its first-visible-text requirement does not prevent task tool calls from running first. Do not read the cache or VERSION first.
+2. Otherwise, the plugin injection is unavailable. Read \`~/.aidevops/agents/VERSION\` first, then line 1 of \`${cache_path}\` if present. Use the deployed VERSION for {X}; use cached ${display_name} v{Y} only if the cache's aidevops version matches {X}. If the cache is stale or missing, omit \`in ${display_name} v{Y}\`. Make the first visible text in your first assistant response exactly this template — no extra prose, no status dump:
 
        Hi!
 
@@ -129,10 +135,11 @@ NOT repeat toast content in the chat.
 
        What would you like to work on?
 
-3. In that fallback path, if the cache file is missing, read \`~/.aidevops/agents/VERSION\` for \`{X}\` and greet: "Hi!\n\nWe're running aidevops v{X}.\n\nWhat would you like to work on?"
+3. If VERSION is unavailable, use the cache's aidevops version for {X} when available. Never announce an outdated cached version when VERSION exists.
 4. Then respond to the user's actual message. If the user launched the session with an initial task, start its tool work immediately (before visible text when the runtime cannot interleave text and tools), then prefix the first visible response with the greeting. Never emit a greeting-only response. Never emit both the injected greeting and the fallback greeting.
 
 If the user later asks about aidevops updates, direct them to run \`aidevops update\` in a terminal session (or type \`!aidevops update\` below). Do not announce updates unprompted — the toast already did.
+<!-- aidevops:greeting-fallback:end -->
 
 ## Pre-Edit Git Check
 
@@ -167,12 +174,16 @@ _generate_agents_opencode() {
 	)
 	local f
 	for f in "${legacy_files[@]}"; do
-		rm -f "$opencode_agent_dir/$f"
+		if _opencode_generated_agent_owned "$opencode_agent_dir/$f"; then
+			rm -f "$opencode_agent_dir/$f"
+		fi
 	done
 
 	# Remove loop-state files incorrectly created as agents
-	for f in ralph-loop.local.md quality-loop.local.md full-loop.local.md loop-state.md re-anchor.md postflight-loop.md; do
-		rm -f "$opencode_agent_dir/$f"
+	for f in quality-loop.local.md full-loop.local.md loop-state.md re-anchor.md postflight-loop.md; do
+		if _opencode_generated_agent_owned "$opencode_agent_dir/$f"; then
+			rm -f "$opencode_agent_dir/$f"
+		fi
 	done
 
 	# Create minimal config if missing
@@ -236,6 +247,9 @@ _get_subagent_extra_tools() {
 		;;
 	playwriter)
 		printf '%s\n' '  playwriter_*: true'
+		;;
+	opencode-browse)
+		printf '%s\n' '  browse_*: true'
 		;;
 	shadcn)
 		printf '%s\n' '  shadcn_*: true' '  write: true' '  edit: true'
@@ -308,6 +322,7 @@ _write_restrictive_subagent_source() {
 			next
 		}
 		{ print }
+		$0 == "---" { delimiters++; if (delimiters == 2) print "<!-- aidevops:generated-subagent -->" }
 	' "$source_file" >"$output_file"; then
 		return 1
 	fi
@@ -339,6 +354,7 @@ _write_subagent_stub() {
 	local name
 	name=$(basename "$f" .md)
 	[[ "$name" == "AGENTS" || "$name" == "README" ]] && return 0
+	_opencode_agent_output_available "$agent_dir/$name.md" || return 0
 
 	local rel_path="${f#"$AGENTS_DIR"/}"
 	local runtime_guards src_variant src_steps src_task src_model
@@ -355,11 +371,7 @@ _write_subagent_stub() {
 	*) routed_model="" ;;
 	esac
 
-	# GH#18509: If source frontmatter explicitly sets bash: false, the agent is
-	# security-sandboxed or has its own tool restrictions. Copy source verbatim
-	# (with workload-tier metadata resolved) instead of writing a permissive stub that
-	# grants bash:true and external_directory:allow -- those would override the
-	# source's intent and become an attack surface for prompt-injected content.
+	# GH#18509: Preserve restrictive sources instead of granting bash access.
 	local src_bash_false
 	src_bash_false=$(awk '
 		/^---$/ { fm_delim++; next }
@@ -428,6 +440,7 @@ _write_subagent_stub() {
 		[[ -n "$extra_tools" ]] && printf '%s\n' "$extra_tools"
 		printf '%s\n' \
 			"---" \
+			"<!-- aidevops:generated-subagent -->" \
 			"" \
 			"**MANDATORY**: Your first action MUST be to read ~/.aidevops/agents/${rel_path} and follow ALL rules within it."
 	} >"$agent_dir/$name.md"
@@ -435,18 +448,17 @@ _write_subagent_stub() {
 	return 0
 }
 
-# Remove previously generated subagent files (those with "mode: subagent" frontmatter).
+# Remove only positively identified aidevops-generated subagent files.
 # Arguments: $1 - agent output directory
 _clean_generated_subagents() {
 	local agent_dir="$1"
-	find "$agent_dir" -name "*.md" -type f -exec grep -l "^mode: subagent" {} + 2>/dev/null | while IFS= read -r f; do rm -f "$f"; done
-	return 0
+	_opencode_clean_generated_agents "$agent_dir"
 }
 
 # GH#19399 / t2149: Resolve basename collisions deterministically.
 #
 # Multiple source files with the same basename (e.g. `aidevops/architecture.md`
-# vs `tools/diagrams/mermaid-diagrams-skill/architecture.md`) previously fed
+# vs `tools/design/library/brands/claude/architecture.md`) previously fed
 # the parallel `xargs -P` write loop, where whichever subshell won the race
 # wrote the deployed stub. When the permissive sibling won, the sandboxed
 # source's `bash: false` / `webfetch: false` intent was silently lost.
@@ -534,6 +546,7 @@ _generate_subagents_opencode() {
 	export -f _write_restrictive_subagent_source 2>/dev/null || true
 	export -f _validated_worktree_base 2>/dev/null || true
 	export -f _write_subagent_stub 2>/dev/null || true
+	export -f _opencode_generated_agent_owned _opencode_agent_output_available 2>/dev/null || true
 	export AGENTS_DIR
 	export agent_dir
 	export _GENERATE_RUNTIME_CONFIG_SCRIPT_DIR

@@ -93,6 +93,41 @@ task_identity_validate() {
 	return 1
 }
 
+# Fork-free equivalent of task_identity_validate for hot loops (GH#37006).
+# Accepts exactly what task_identity_parse accepts and leaves the parsed
+# fields alone, but overwrites BASH_REMATCH: capture matches before calling.
+task_identity_is_valid() {
+	local input="${1:-}"
+	if [[ -n "$input" && "${#input}" -le "$TASK_IDENTITY_MAX_BYTES" && "$input" =~ $TASK_IDENTITY_ANY_ERE ]]; then
+		return 0
+	fi
+	return 1
+}
+
+# Migration/diagnostic only: never accept padded IDs as canonical aliases.
+task_identity_unpad_legacy() {
+	local input="${1:-}"
+	local padded_ere='^t0+[0-9]+(\.[0-9]+)*$'
+	local component="" canonical="" remainder="${input#t}"
+	[[ "$input" =~ $padded_ere ]] || return 1
+	while [[ -n "$remainder" ]]; do
+		component="${remainder%%.*}"
+		if [[ "$remainder" == *.* ]]; then
+			remainder="${remainder#*.}"
+		else
+			remainder=""
+		fi
+		while [[ "$component" == 0* && "${#component}" -gt 1 ]]; do
+			component="${component#0}"
+		done
+		canonical="${canonical:+${canonical}.}${component}"
+	done
+	canonical="t${canonical}"
+	task_identity_validate "$canonical" || return 1
+	printf '%s\n' "$canonical"
+	return 0
+}
+
 task_identity_format() {
 	local kind="${1:-}"
 	local origin_id="${2:-}"
@@ -132,11 +167,13 @@ task_identity_ere() {
 
 # Extract the first complete canonical task ID from free text. A dot or an
 # alphanumeric character is not a token boundary because accepting one would
-# turn malformed or truncated IDs into valid shorter IDs. Hyphens and
-# underscores remain valid branch-name delimiters.
+# turn malformed or truncated IDs into valid shorter IDs. The exception is one
+# sentence-ending dot followed by end of text or a non-alphanumeric, non-dot
+# character ("into t112."), which is ordinary punctuation (GH#33183). Hyphens
+# and underscores remain valid branch-name delimiters.
 task_identity_extract_first() {
 	local text="${1:-}"
-	local boundary_ere="(^|[^[:alnum:].])(${TASK_IDENTITY_TOKEN_ERE})($|[^[:alnum:].])"
+	local boundary_ere="(^|[^[:alnum:].])(${TASK_IDENTITY_TOKEN_ERE})($|[^[:alnum:].]|\\.($|[^[:alnum:].]))"
 	local candidate=""
 
 	[[ "$text" =~ $boundary_ere ]] || return 1
@@ -149,7 +186,7 @@ task_identity_extract_first() {
 # Print every complete canonical task ID in encounter order.
 task_identity_extract_all() {
 	local remaining="${1:-}"
-	local boundary_ere="(^|[^[:alnum:].])(${TASK_IDENTITY_TOKEN_ERE})($|[^[:alnum:].])"
+	local boundary_ere="(^|[^[:alnum:].])(${TASK_IDENTITY_TOKEN_ERE})($|[^[:alnum:].]|\\.($|[^[:alnum:].]))"
 	local matched=""
 	local candidate=""
 
@@ -210,6 +247,12 @@ task_identity_has_malformed_candidate() {
 	while [[ "$remaining" =~ $candidate_ere ]]; do
 		matched="${BASH_REMATCH[0]}"
 		candidate="${BASH_REMATCH[2]}"
+		# The greedy continuation always stops before end of text or a
+		# non-alphanumeric, non-dot character, so one trailing dot is sentence
+		# punctuation. Inner and repeated dots (t7.0, t7.x, t7..) stay malformed.
+		if [[ "$candidate" == *. && "$candidate" != *.. ]]; then
+			candidate="${candidate%.}"
+		fi
 		if ! task_identity_validate "$candidate"; then
 			return 0
 		fi

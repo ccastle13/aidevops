@@ -11,6 +11,9 @@
 
 [[ -n "${_GH_NATIVE_TRANSPORT_LIB_LOADED:-}" ]] && return 0
 _GH_NATIVE_TRANSPORT_LIB_LOADED=1
+if ! declare -F _shim_timing >/dev/null 2>&1; then
+	_shim_timing() { return 0; }
+fi
 
 if [[ -z "${_SHIM_DIR:-}" ]]; then
 	_gh_native_transport_path="${BASH_SOURCE[0]%/*}"
@@ -39,10 +42,6 @@ _shim_canonical_path() {
 	local candidate_dir=""
 	local candidate_name=""
 	local link_dir=""
-	if command -v python3 >/dev/null 2>&1; then
-		python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$candidate" 2>/dev/null
-		return $?
-	fi
 	while [[ -L "$candidate" ]]; do
 		link_dir=$(cd "$(dirname "$candidate")" 2>/dev/null && pwd -P) || return 1
 		candidate=$(readlink "$candidate") || return 1
@@ -84,14 +83,23 @@ _find_real_gh() {
 	return 1
 }
 
+# Explain a missing native GitHub CLI (GH#34415). The shim is on PATH, so
+# `command -v gh` succeeds; tell the user the CLI itself must be installed.
+_shim_report_missing_native_gh() {
+	local reason="$1"
+	printf '[aidevops] gh shim: %s\n' "$reason" >&2
+	printf '[aidevops] GitHub CLI (gh) is not installed. Install it (macOS: brew install gh; Linux: the official GitHub CLI package repository at https://cli.github.com/), then run: gh auth login\n' >&2
+	return 0
+}
+
 # _shim_classify_endpoint <sub1> [<sub2>]
 # Classify a gh invocation for instrumentation. Returns one of:
-#   graphql | rest | search-graphql | other
+#   graphql | rest | search-rest | other
 _shim_classify_endpoint() {
 	local sub1="${1:-}" sub2="${2:-}"
 	case "$sub1" in
 	search)
-		printf 'search-graphql'
+		printf 'search-rest'
 		return 0
 		;;
 	api)
@@ -136,26 +144,22 @@ _shim_framework_caller_label() {
 	return 0
 }
 
-_shim_parent_framework_caller() {
-	local parent_command=""
+# Resolve a framework script from one process command line: either the command
+# itself or the first script operand of a shell/env launcher.
+_shim_command_framework_caller() {
 	local word=""
-	local executable_name=""
 	local caller=""
-	local -a parent_words=()
-	parent_command=$(ps -p "$PPID" -o command= 2>/dev/null) || parent_command=""
-	[[ -n "$parent_command" ]] || return 1
-	read -r -a parent_words <<<"$parent_command"
-	[[ ${#parent_words[@]} -gt 0 ]] || return 1
-	if caller=$(_shim_framework_caller_label "${parent_words[0]}"); then
+	local -a words=("$@")
+	[[ ${#words[@]} -gt 0 ]] || return 1
+	if caller=$(_shim_framework_caller_label "${words[0]}"); then
 		printf '%s' "$caller"
 		return 0
 	fi
-	executable_name="${parent_words[0]##*/}"
-	case "$executable_name" in
+	case "${words[0]##*/}" in
 	env | bash | dash | ksh | sh | zsh) ;;
 	*) return 1 ;;
 	esac
-	for word in "${parent_words[@]:1}"; do
+	for word in "${words[@]:1}"; do
 		case "$word" in
 		-* | *=*) continue ;;
 		esac
@@ -170,6 +174,104 @@ _shim_parent_framework_caller() {
 	return 1
 }
 
+# GH#33068: process wrappers whose argv names only the wrapped command. Framework
+# scripts commonly run `timeout 30 gh api ...`; without walking past the wrapper
+# ~44% of REST-core attempts were logged under the generic gh_api_rest label.
+_shim_is_transparent_process_wrapper() {
+	case "${1##*/}" in
+	timeout | gtimeout | nice | nohup | stdbuf | caffeinate) return 0 ;;
+	esac
+	return 1
+}
+
+# Pulse repository auth re-enters this shim through
+# `exec python3 github_auth_runtime.py exec-gh <shim> ...`, so the child shim's
+# parent is the resolver (macOS framework builds show `Python`), not the
+# framework script that called gh. Without walking past exactly this hop, ~82%
+# of REST-core attempts were logged under the generic gh_api_rest label.
+_shim_is_auth_runtime_hop() {
+	local -a words=("$@")
+	local index=1
+	local resolver=""
+	local resolver_dir="" shim_dir=""
+	case "${words[0]##*/}" in
+	python | python3 | python3.* | Python) ;;
+	*) return 1 ;;
+	esac
+	while [[ "$index" -lt ${#words[@]} && "${words[index]}" == -* ]]; do
+		index=$((index + 1))
+	done
+	resolver="${words[index]:-}"
+	if [[ "$resolver" != */github_auth_runtime.py && "$resolver" != github_auth_runtime.py ]]; then
+		# ps flattens argv, so read splits resolver paths containing spaces.
+		# Reassemble only the known resolver path, not arbitrary Python args.
+		while [[ "$resolver" != */github_auth_runtime.py ]]; do
+			index=$((index + 1))
+			[[ "$index" -lt ${#words[@]} ]] || return 1
+			resolver+=" ${words[index]}"
+		done
+		# The resolver launches the child through a resolved shim path. Compare
+		# physical directories so a spaced directory symlink is the same hop.
+		resolver_dir=$(cd -- "${resolver%/*}" 2>/dev/null && pwd -P) || return 1
+		shim_dir=$(cd -- "$_SHIM_DIR" 2>/dev/null && pwd -P) || return 1
+		[[ "$resolver_dir" == "$shim_dir" ]] || return 1
+	fi
+	[[ "${words[index + 1]:-}" == exec-gh ]] || return 1
+	return 0
+}
+
+_shim_parent_framework_caller() {
+	local pid="$PPID"
+	local depth=0
+	local line=""
+	local next_pid=""
+	local parent_command=""
+	local word=""
+	local -a parent_words=()
+	# Bounded walk: the direct parent plus at most two wrapper or auth-hop levels.
+	while [[ "$depth" -lt 3 ]]; do
+		[[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] || return 1
+		if [[ "$OSTYPE" == linux* ]]; then
+			IFS= read -r line <"/proc/$pid/stat" || return 1
+			# comm can contain spaces and parentheses; fields start after its last ')'.
+			line="${line##*) }"
+			read -r _ next_pid _ <<<"$line"
+			parent_command=""
+			while IFS= read -r -d '' word; do
+				parent_command+="${parent_command:+ }${word}"
+			done <"/proc/$pid/cmdline" || return 1
+		else
+			line=$(command ps -p "$pid" -o ppid=,command= 2>/dev/null) || return 1
+			read -r next_pid parent_command <<<"$line"
+		fi
+		[[ -n "$parent_command" ]] || return 1
+		read -r -a parent_words <<<"$parent_command"
+		[[ ${#parent_words[@]} -gt 0 ]] || return 1
+		if _shim_is_transparent_process_wrapper "${parent_words[0]}" ||
+			_shim_is_auth_runtime_hop "${parent_words[@]}"; then
+			pid="$next_pid"
+			depth=$((depth + 1))
+			continue
+		fi
+		_shim_command_framework_caller "${parent_words[@]}"
+		return $?
+	done
+	return 1
+}
+
+# GH#33068: bounded session-role label for model-driven or ad-hoc calls whose
+# parent is a runtime shell, not a framework script. Values come only from this
+# allowlist, never verbatim from the environment, so telemetry cannot be injected.
+_shim_session_caller_label() {
+	case "${AIDEVOPS_SESSION_ORIGIN:-}" in
+	worker | interactive | pulse | routine | conversation)
+		printf 'session-%s' "$AIDEVOPS_SESSION_ORIGIN"
+		return 0
+		;;
+	esac
+	return 1
+}
+
 _shim_transport_caller_label() {
 	local sub1="${1:-}"
 	local sub2="${2:-}"
@@ -179,6 +281,10 @@ _shim_transport_caller_label() {
 		return 0
 	fi
 	if caller=$(_shim_parent_framework_caller); then
+		printf '%s' "$caller"
+		return 0
+	fi
+	if caller=$(_shim_session_caller_label); then
 		printf '%s' "$caller"
 		return 0
 	fi
@@ -407,6 +513,19 @@ _shim_run_single_transport() {
 	local path="$1"; shift
 	local caller="$1"; shift
 	local retry="$1"; shift
+	if declare -F _ghqa_command_is_local_only >/dev/null 2>&1 && _ghqa_command_is_local_only "$executable" "$@"; then
+		"$executable" "$@"
+		return $?
+	fi
+	if declare -F _gh_transport_preflight >/dev/null 2>&1; then
+		_gh_transport_preflight "$@" || return $?
+	fi
+	_shim_timing transport_preflight
+	if declare -F _gh_transport_run_rest >/dev/null 2>&1; then
+		local governed_rc=0
+		_gh_transport_run_rest "$executable" "$path" "$caller" "$retry" "$@" || governed_rc=$?
+		[[ "${_GHGT_HANDLED:-0}" -eq 0 && "$governed_rc" -eq 125 ]] || return "$governed_rc"
+	fi
 	local page=1
 	local decision="${AIDEVOPS_GH_ROUTE_DECISION:-}"
 	local exact_success_cost=""

@@ -23,6 +23,11 @@ tools:
 
 ## Auth
 
+For rate-limit/efficiency work, read [transport and freshness](../../reference/github-api-transport.md).
+[Optional webhook onboarding](../../reference/github-webhook-onboarding.md) covers
+Cloudflare Tunnel and NetBird/public gateways. Ordinary polling requires no public
+ingress; repository Webhooks secrets are separate from Actions secrets and CLI auth.
+
 ```bash
 gh auth login -s workflow   # Always include workflow scope
 gh auth refresh -s workflow # Add scope to existing token
@@ -50,7 +55,8 @@ gh pr view 123 && full-loop-helper.sh merge 123 owner/repo --squash
 gh release create v1.2.3 --generate-notes [--draft]
 
 # CI Runs
-gh run list && gh run view 123456 && gh run watch
+gh run list && gh run view 123456 --json status,conclusion   # one-shot; the aidevops shim refuses `gh run watch`
+gh-checks-wait-helper.sh wait 123 --repo owner/repo --all    # governed PR check wait (not `gh pr checks --watch`)
 gh run rerun 123456 --failed
 
 # API
@@ -102,6 +108,21 @@ YAML issue forms (`.yml`) map each `label:` to a `### Label` header in the body.
 3. `CONTRIBUTING.md` exists? Follow its guidelines (CLA, branch naming)
 4. PRs: check for signed commits, branch targets, linked issue requirements
 5. If bot closes: read its comment for what's missing; resubmit (don't edit closed issues)
+
+### Screenshots and Images
+
+GitHub has no issue/PR attachment API. Inspect every screenshot for secrets,
+private repo names and local private paths before publishing
+([pre-push guards](../../reference/pre-push-guards.md)). Resize large captures
+first ([screenshot limits](../../reference/screenshot-limits.md)). Run
+`forge-image-embed-helper.sh publish --repo OWNER/REPO FILE.png` against your
+push fork for upstream PRs, or the target repo for owned threads. Paste its
+commit-pinned Markdown embeds into the `--body-file` content. It refuses the
+default branch, open PR head branches, non-image files, and private repos unless
+`--allow-private` is passed (private embeds render only for repo readers). Never
+add images to the PR branch. Keep the asset branch while the thread matters; deleting it
+may eventually break embeds. Cleanup when safe:
+`gh api -X DELETE repos/OWNER/REPO/git/refs/heads/aidevops-assets`.
 
 ## See Also
 

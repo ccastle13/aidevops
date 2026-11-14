@@ -59,6 +59,8 @@
 #   21. missing gh authentication aborts before the first API request
 #   22. standalone runs initialise a durable cross-process PR-view cache
 #   23. inherited oversized PR batches are clamped for standalone runs
+#   24-28. (GH#35349) due routines start once while another process holds the
+#      Pulse instance lock, under the budget gate and routines.lockdir
 
 set -uo pipefail
 
@@ -145,7 +147,9 @@ fi
 # =============================================================================
 # Pre-fix, sourcing pulse-merge.sh emitted 'unlock_issue_after_worker: command
 # not found' and 'fast_fail_reset: command not found' on every PR processed.
-if printf '%s\n' "$help_stderr" | grep -q 'command not found'; then
+# Here-strings, not `printf | grep -q`: under pipefail the early-exit reader
+# races the writer into SIGPIPE false results on Linux (GH#35943).
+if grep -q -- 'command not found' <<<"$help_stderr"; then
 	fail "2: no 'command not found' errors" \
 		"stderr: $help_stderr"
 else
@@ -157,7 +161,7 @@ fi
 # =============================================================================
 # Pre-fix, line 326 of pulse-merge.sh (_merge_elapsed=$(($(date +%s) -
 # PULSE_START_EPOCH))) failed under `set -u` when PULSE_START_EPOCH was unset.
-if printf '%s\n' "$help_stderr" | grep -q 'unbound variable'; then
+if grep -q -- 'unbound variable' <<<"$help_stderr"; then
 	fail "3: no 'unbound variable' errors" \
 		"stderr: $help_stderr"
 else
@@ -213,11 +217,29 @@ auth_output=$(HOME="$auth_test_home" GH_TOKEN="" GITHUB_TOKEN="" \
 	LC_ALL=C timeout 30 "$ROUTINE_FILE" --repo example/repo 2>&1) || auth_exit=$?
 rm -rf "$auth_test_home"
 
-if [[ "$auth_exit" -ne 0 ]] && printf '%s\n' "$auth_output" | grep -qF 'refusing unauthenticated API access'; then
+if [[ "$auth_exit" -ne 0 ]] && grep -qF -- 'refusing unauthenticated API access' <<<"$auth_output"; then
 	pass "6c: missing gh authentication aborts before API access"
 else
 	fail "6c: missing gh authentication aborts before API access" \
 		"exit=$auth_exit, output=$auth_output"
+fi
+
+# Test 6c-2 (GH#37232): a locked keychain skips the cycle without `gh auth token`
+kc_test_home=$(mktemp -d)
+kc_output=""
+kc_exit=0
+kc_output=$(HOME="$kc_test_home" GH_TOKEN="" GITHUB_TOKEN="" AIDEVOPS_KEYCHAIN_FORCE_STATE=locked \
+	LC_ALL=C timeout 30 "$ROUTINE_FILE" --repo example/repo 2>&1) || kc_exit=$?
+kc_marker_ok=0
+[[ -f "$kc_test_home/.aidevops/.agent-workspace/tmp/keychain-locked.marker" ]] && kc_marker_ok=1
+rm -rf "$kc_test_home"
+
+if [[ "$kc_exit" -ne 0 && "$kc_marker_ok" -eq 1 ]] && grep -qF -- 'skipping cycle without prompting' <<<"$kc_output" &&
+	! grep -qF -- 'refusing unauthenticated API access' <<<"$kc_output"; then
+	pass "6c-2: locked keychain skips cycle with backoff marker"
+else
+	fail "6c-2: locked keychain skips cycle with backoff marker" \
+		"exit=$kc_exit, marker=$kc_marker_ok, output=$kc_output"
 fi
 
 # =============================================================================
@@ -242,7 +264,7 @@ bounded_output=""
 bounded_exit=0
 bounded_output=$(PULSE_MERGE_BATCH_LIMIT=310 PULSE_MERGE_ROUTINE_BATCH_LIMIT_MAX=50 \
 	"$ROUTINE_FILE" help 2>&1) || bounded_exit=$?
-if [[ "$bounded_exit" -eq 0 ]] && printf '%s\n' "$bounded_output" | grep -qF 'PULSE_MERGE_BATCH_LIMIT=50'; then
+if [[ "$bounded_exit" -eq 0 ]] && grep -qF -- 'PULSE_MERGE_BATCH_LIMIT=50' <<<"$bounded_output"; then
 	pass "6e: standalone bootstrap clamps oversized PR batches"
 else
 	fail "6e: standalone bootstrap clamps oversized PR batches" \
@@ -678,6 +700,279 @@ if [[ "$source_chain_rc" -eq 0 && "$source_chain_output" != *"command not found"
 else
 	fail "20: post-merge providers run without missing-function diagnostics" \
 		"harness rc=${source_chain_rc}, output=${source_chain_output}"
+fi
+
+# =============================================================================
+# Tests 24-28: routines run while another process holds the instance lock
+# =============================================================================
+# GH#35349: a long refill-only drain or full cycle held the Pulse instance lock
+# and every scheduler tick skipped, so routines (evaluated only at full-cycle
+# start) missed calendar slots. Busy ticks now run a routines-only pass under
+# routines.lockdir. This harness holds the instance lock with a live process,
+# runs the production refill busy hook and wrapper busy pass, and checks that a
+# due script routine starts exactly once.
+printf '\n=== Routines while the instance lock is held (GH#35349) ===\n'
+
+WRAPPER_FILE="${SCRIPTS_DIR}/pulse-wrapper.sh"
+BUSY_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/pmr-busy-routines-XXXXXX")
+BUSY_HARNESS="${BUSY_ROOT}/harness.sh"
+trap 'rm -f "$PARSER_HARNESS" "$SCOPE_HARNESS" "$BUDGET_HARNESS" "$SOURCE_CHAIN_HARNESS"; rm -rf "$SOURCE_CHAIN_TEST_HOME" "$BUSY_ROOT"' EXIT
+
+cat >"$BUSY_HARNESS" <<'BUSY_HARNESS_EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+
+root="${BUSY_ROOT:?}"
+export HOME="${root}/home"
+fake_scripts="${HOME}/.aidevops/agents/scripts"
+repo_dir="${root}/routines-repo"
+mkdir -p "$fake_scripts" "$repo_dir" "${HOME}/.aidevops/logs"
+cat >"${fake_scripts}/queue-refill.sh" <<'ROUTINE_SCRIPT'
+#!/usr/bin/env bash
+printf 'run\n' >>"${BUSY_RUN_LOG:?}"
+sleep 1
+exit 0
+ROUTINE_SCRIPT
+cat >"${root}/always-due.sh" <<'SCHEDULE_SCRIPT'
+#!/usr/bin/env bash
+[[ "${1:-}" == "is-due" ]] || exit 2
+exit 0
+SCHEDULE_SCRIPT
+chmod +x "${fake_scripts}/queue-refill.sh" "${root}/always-due.sh"
+printf '# Tasks\n\n## Routines\n\n%s\n\n## Ready\n' \
+	'- [x] r-queue-refill Queue refill repeat:cron(15,45 * * * *) ~1m run:scripts/queue-refill.sh' \
+	>"${repo_dir}/TODO.md"
+printf '{"initialized_repos":[{"slug":"example/routines","path":"%s","pulse":true,"local_only":true}]}\n' \
+	"$repo_dir" >"${root}/repos.json"
+
+export BUSY_RUN_LOG="${root}/runs.log"
+SCRIPT_DIR="${ROUTINE_TEST_SCRIPTS_DIR:?}"
+ROUTINE_SCHEDULE_HELPER="${root}/always-due.sh"
+ROUTINE_STATE_FILE="${root}/routine-state.json"
+ROUTINE_LOG_HELPER="${root}/missing-routine-log-helper.sh"
+HEADLESS_RUNTIME_HELPER="${root}/missing-headless-helper.sh"
+REPOS_JSON="${root}/repos.json"
+LOGFILE="${root}/pulse.log"
+WRAPPER_LOGFILE="${root}/pulse-wrapper.log"
+STOP_FLAG="${root}/stop"
+PRE_RUN_STAGE_TIMEOUT=60
+PULSE_DIR="$root"
+LOCKDIR="${root}/pulse-wrapper.lockdir"
+
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/pulse-routines.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/pulse-event-refill.sh"
+# Extract the production busy pass without bootstrapping the whole wrapper.
+# shellcheck disable=SC1090
+source <(awk '
+	/^_pulse_run_routines_while_busy\(\)/ { capture=1 }
+	capture { print }
+	capture && /^}/ { exit }
+' "${WRAPPER_FILE:?}")
+check_session_gate() { return 0; }
+# Supply quota evidence for this scheduler harness: production fails closed
+# when neither REST quota checker is available. Budget decisions are covered
+# by the selector and pulse-budget-priority suites, not by live API calls here.
+pulse_rest_core_priority_allows_next() { return 0; }
+# The stage gate itself is covered by pulse-budget-priority tests; record the
+# stage name so the harness proves the busy pass goes through it.
+_pulse_run_budget_priority_stage_with_timeout() {
+	local stage_name="$1"
+	printf 'stage:%s\n' "$stage_name" >>"${root}/stages.log"
+	shift 2
+	"$@"
+	return $?
+}
+
+wait_for_success() {
+	local attempt=0
+	while [[ "$attempt" -lt 100 ]]; do
+		if jq -e '."r-queue-refill".last_status == "success"' "$ROUTINE_STATE_FILE" >/dev/null 2>&1; then
+			return 0
+		fi
+		sleep 0.1
+		attempt=$((attempt + 1))
+	done
+	return 1
+}
+
+# A live long-running process holds the Pulse instance lock.
+sleep 300 &
+holder_pid=$!
+mkdir -p "$LOCKDIR"
+printf '%s\n' "$holder_pid" >"${LOCKDIR}/pid"
+
+# A worker-exit refill wake evaluates routines before waiting for the lock;
+# a second busy scheduler tick in the same slot must not start it again.
+_pulse_event_refill_run_routines_if_busy worker-exit
+_pulse_run_routines_while_busy lock-busy
+wait_for_success || printf 'routine did not finish\n'
+grep -q 'routine r-queue-refill is due' "$LOGFILE" && printf 'due-logged\n'
+grep -q 'routine r-queue-refill: dispatching script' "$LOGFILE" && printf 'dispatch-logged\n'
+grep -q 'Routines-only pass: instance lock busy (refill-only:worker-exit)' "$WRAPPER_LOGFILE" && printf 'refill-pass-logged\n'
+grep -q '^stage:evaluate_routines$' "${root}/stages.log" && printf 'budget-gated\n'
+printf 'runs=%s\n' "$(grep -c '^run$' "$BUSY_RUN_LOG" 2>/dev/null || printf 0)"
+
+# A live evaluator holding routines.lockdir makes a concurrent pass skip.
+mkdir -p "${root}/routines.lockdir"
+: >"${root}/routines.lockdir/pid-${holder_pid}"
+before=$(grep -c 'is due' "$LOGFILE")
+_pulse_run_routines_while_busy rate-limited
+after=$(grep -c 'is due' "$LOGFILE")
+[[ "$before" == "$after" ]] && grep -q 'another evaluator holds routines.lockdir' "$LOGFILE" &&
+	printf 'concurrent-skip\n'
+kill "$holder_pid" 2>/dev/null || true
+wait "$holder_pid" 2>/dev/null || true
+exit 0
+BUSY_HARNESS_EOF
+
+busy_output=$(BUSY_ROOT="$BUSY_ROOT" ROUTINE_TEST_SCRIPTS_DIR="$SCRIPTS_DIR" \
+	WRAPPER_FILE="$WRAPPER_FILE" timeout 120 bash "$BUSY_HARNESS" 2>&1)
+busy_rc=$?
+
+if [[ "$busy_rc" -eq 0 && "$busy_output" == *"due-logged"* && "$busy_output" == *"dispatch-logged"* && "$busy_output" == *"refill-pass-logged"* ]]; then
+	pass "24: due script routine starts while another process holds the instance lock"
+else
+	fail "24: due script routine starts while another process holds the instance lock" \
+		"harness rc=${busy_rc}, output=${busy_output}"
+fi
+
+if [[ "$busy_output" == *"runs=1"* ]]; then
+	pass "25: overlapping busy passes start the routine once per slot"
+else
+	fail "25: overlapping busy passes start the routine once per slot" "output=${busy_output}"
+fi
+
+if [[ "$busy_output" == *"budget-gated"* ]]; then
+	pass "26: busy routines pass keeps the REST budget stage gate"
+else
+	fail "26: busy routines pass keeps the REST budget stage gate" "output=${busy_output}"
+fi
+
+if [[ "$busy_output" == *"concurrent-skip"* ]]; then
+	pass "27: a live routines.lockdir holder makes a concurrent evaluator skip"
+else
+	fail "27: a live routines.lockdir holder makes a concurrent evaluator skip" "output=${busy_output}"
+fi
+
+# Every path that skips a full cycle for a live lock holder runs the pass.
+busy_hooks=0
+for busy_context in bootstrap is-running rate-limited lock-busy; do
+	grep -qF "_pulse_run_routines_while_busy \"${busy_context}\"" "$WRAPPER_FILE" && busy_hooks=$((busy_hooks + 1))
+done
+if [[ "$busy_hooks" -eq 4 ]] && grep -qF 'evaluate_routines_locked || true' "$WRAPPER_FILE"; then
+	pass "28: wrapper busy-skip paths run routines and the in-cycle backstop shares the lock"
+else
+	fail "28: wrapper busy-skip paths run routines and the in-cycle backstop shares the lock" \
+		"busy hooks found=${busy_hooks}/4"
+fi
+
+# =============================================================================
+# Tests 29-32: cycle-owned routines ticker (GH#37914)
+# =============================================================================
+# launchd and systemd timers start no second invocation while the cycle runs,
+# so the busy pass above never fired during long cycles. The cycle now owns a
+# child that runs the routines-only pass every tick until the cycle exits.
+printf '\n=== Cycle-owned routines ticker (GH#37914) ===\n'
+
+TICK_HARNESS="${BUSY_ROOT}/tick-harness.sh"
+cat >"$TICK_HARNESS" <<'TICK_HARNESS_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+root="${BUSY_ROOT:?}/tick"
+mkdir -p "$root"
+LOGFILE="${root}/pulse.log"
+STOP_FLAG="${root}/stop"
+ticks="${root}/ticks.log"
+: >"$ticks"
+# shellcheck disable=SC1091
+source "${ROUTINE_TEST_SCRIPTS_DIR:?}/pulse-routines-tick.sh"
+_pulse_run_routines_while_busy() {
+	printf '%s clamp=%s lock=%s\n' "$1" "${AIDEVOPS_PULSE_STAGE_CYCLE_CLAMP:-1}" "${_LOCK_OWNED:-}" >>"$ticks"
+	return 0
+}
+count_ticks() { wc -l <"$ticks" | tr -d ' '; return 0; }
+wait_ticks() {
+	local want="$1" attempt=0
+	while [[ "$attempt" -lt 60 ]]; do
+		[[ "$(count_ticks)" -ge "$want" ]] && return 0
+		sleep 0.1
+		attempt=$((attempt + 1))
+	done
+	return 1
+}
+wait_gone() {
+	local pid="$1" attempt=0
+	while [[ "$attempt" -lt 40 ]]; do
+		kill -0 "$pid" 2>/dev/null || return 0
+		sleep 0.1
+		attempt=$((attempt + 1))
+	done
+	return 1
+}
+_LOCK_OWNED=true
+export AIDEVOPS_PULSE_ROUTINES_TICK_SECONDS=1
+
+_pulse_start_routines_ticker
+ticker="$_PULSE_ROUTINES_TICKER_PID"
+_pulse_start_routines_ticker
+[[ "$_PULSE_ROUTINES_TICKER_PID" == "$ticker" ]] && printf 'idempotent\n'
+wait_ticks 2 && printf 'ticked\n'
+grep -q '^cycle-tick clamp=0 lock=false$' "$ticks" && printf 'unclamped-unowned\n'
+# An inherited subshell copy must never stop the owner's ticker.
+(_pulse_stop_routines_ticker)
+kill -0 "$ticker" 2>/dev/null && printf 'subshell-ignored\n'
+_pulse_stop_routines_ticker
+wait_gone "$ticker" && printf 'stopped\n'
+before=$(count_ticks)
+sleep 1.5
+[[ "$(count_ticks)" == "$before" ]] && printf 'no-tick-after-stop\n'
+
+# A ticker whose owning cycle died exits at its next tick.
+orphan_pid=$(
+	_pulse_start_routines_ticker
+	printf '%s\n' "$_PULSE_ROUTINES_TICKER_PID"
+)
+wait_gone "$orphan_pid" && printf 'owner-exit\n'
+
+# The disable switch starts nothing.
+AIDEVOPS_PULSE_ROUTINES_TICK=0 _pulse_start_routines_ticker
+[[ -z "$_PULSE_ROUTINES_TICKER_PID" ]] && printf 'disabled\n'
+exit 0
+TICK_HARNESS_EOF
+
+tick_output=$(BUSY_ROOT="$BUSY_ROOT" ROUTINE_TEST_SCRIPTS_DIR="$SCRIPTS_DIR" \
+	timeout 60 bash "$TICK_HARNESS" 2>&1)
+tick_rc=$?
+
+if [[ "$tick_rc" -eq 0 && "$tick_output" == *"idempotent"* && "$tick_output" == *"ticked"* && "$tick_output" == *"unclamped-unowned"* ]]; then
+	pass "29: ticker runs the routines-only pass every tick, unclamped and without lock ownership"
+else
+	fail "29: ticker runs the routines-only pass every tick, unclamped and without lock ownership" \
+		"harness rc=${tick_rc}, output=${tick_output}"
+fi
+
+if [[ "$tick_output" == *"subshell-ignored"* && "$tick_output" == *"stopped"* && "$tick_output" == *"no-tick-after-stop"* ]]; then
+	pass "30: only the owning cycle stops the ticker, and no pass runs after stop"
+else
+	fail "30: only the owning cycle stops the ticker, and no pass runs after stop" "output=${tick_output}"
+fi
+
+if [[ "$tick_output" == *"owner-exit"* && "$tick_output" == *"disabled"* ]]; then
+	pass "31: ticker exits with its owning cycle and honours AIDEVOPS_PULSE_ROUTINES_TICK=0"
+else
+	fail "31: ticker exits with its owning cycle and honours AIDEVOPS_PULSE_ROUTINES_TICK=0" "output=${tick_output}"
+fi
+
+LOCK_FILE="${SCRIPTS_DIR}/pulse-instance-lock.sh"
+if grep -qF '_pulse_start_routines_ticker || true' "$WRAPPER_FILE" &&
+	grep -qF '_pulse_stop_routines_ticker || true' "$WRAPPER_FILE" &&
+	grep -qF '_pulse_stop_routines_ticker || true' "$LOCK_FILE" &&
+	grep -qF 'pulse-routines-tick.sh' "$WRAPPER_FILE"; then
+	pass "32: the cycle starts the ticker and stops it on exit and before re-exec"
+else
+	fail "32: the cycle starts the ticker and stops it on exit and before re-exec"
 fi
 
 # =============================================================================

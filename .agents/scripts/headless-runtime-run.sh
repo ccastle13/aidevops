@@ -93,7 +93,7 @@ _prepare_cmd_run_environment() {
 		unset AIDEVOPS_WORKER_PREWARM_DIR
 		unset AIDEVOPS_ATTEMPT_ID AIDEVOPS_ATTEMPT_STARTED_AT AIDEVOPS_CORRELATION_ID
 		unset AIDEVOPS_ATTEMPT_STATE_ROOT AIDEVOPS_ATTEMPT_STATE_FILE
-		unset AIDEVOPS_DISPATCH_LEASE_DEVICE AIDEVOPS_DISPATCH_LEASE_TOKEN
+		unset AIDEVOPS_DISPATCH_LEASE_DEVICE AIDEVOPS_DISPATCH_LEASE_TOKEN AIDEVOPS_DISPATCH_LEASE_SESSION
 		unset AIDEVOPS_PARENT_WORKER_ID AIDEVOPS_ROOT_WORKER_ID AIDEVOPS_RUN_ID
 		unset AIDEVOPS_VERBOSE_LIFECYCLE AIDEVOPS_WORKER_ID AIDEVOPS_WORKER_PREFLIGHT_SENTINEL
 		unset DISPATCH_REPO_SLUG WORKER_ISSUE_NUMBER WORKER_REPO_SLUG WORKER_TARGET_BRANCH
@@ -119,15 +119,23 @@ _prepare_cmd_run_environment() {
 		print_error "Repository-bound worker Git authentication failed prelaunch validation"
 		return 1
 	fi
+	# Manual dispatch runs this identical consumer gate before spawning. Return
+	# before detach, model selection, ownership transfer, or credential cleanup:
+	# the dispatcher retains the token until readiness transfers it to the worker.
+	if [[ "${AIDEVOPS_GIT_AUTH_PREFLIGHT_ONLY:-0}" == "1" ]]; then
+		_cmd_run_stop=1
+		_cmd_run_return_status=0
+		return 0
+	fi
 	_ensure_valid_launch_cwd "$work_dir" || return 1
-	_validate_issue_worker_env_contract "$role" "$session_key" "$work_dir" "$title" "$prompt" || return 1
+	_validate_issue_worker_env_contract "$role" "$session_key" "$work_dir" "$title" "$prompt" "${standalone_prompt:-0}" || return 1
 	_recover_deleted_cwd_before_launch "$work_dir" "cmd_run" || return 1
 	aidevops_init_temp_workspace || {
 		print_error "Could not initialize aidevops temporary workspace"
 		return 1
 	}
 	if [[ "$detach" -eq 1 ]]; then
-		_detach_worker "$session_key" "$@"
+		_detach_worker "$session_key" "$@" || return 1
 		_cmd_run_stop=1
 		_cmd_run_return_status=0
 	fi
@@ -155,7 +163,7 @@ _select_cmd_run_model() {
 	tier_override=$(_normalize_headless_tier "${tier_override:-standard}")
 	print_info "[lifecycle] pre_model_select session=$session_key role=$role tier=${tier_override:-auto} pid=$$"
 	local choose_exit=0
-	selected_model=$(choose_model "$role" "${model_override:-$initial_model}" "$tier_override") || {
+	selected_model=$(choose_model "$role" "$model_override" "$tier_override" "adaptive" "$initial_model") || {
 		choose_exit=$?
 		_hrff_write_external_outcome "$session_key" "model_selection_failed" "0" "$_HRFF_RETRY_CLASS_INFRASTRUCTURE" || true
 		_cmd_run_finish "$session_key" "$_HRW_STATUS_FAIL"
@@ -163,7 +171,9 @@ _select_cmd_run_model() {
 	}
 	if [[ -z "${model_override:-$initial_model}" ]]; then
 		local selected_tier=""
-		selected_tier=$(model_tier_for_model "$selected_model" 2>/dev/null || true)
+		# A model can serve several tiers (e.g. Sol: standard low, thinking
+		# medium). Keep the requested tier when it lists the selected model.
+		selected_tier=$(model_tier_for_model "$selected_model" "$tier_override" 2>/dev/null || true)
 		if [[ -n "$selected_tier" && "$selected_tier" != "$tier_override" ]]; then
 			print_info "[routing] adaptive tier selection ${tier_override}->${selected_tier} model=$selected_model"
 			tier_override="$selected_tier"
@@ -231,16 +241,46 @@ _prepare_cmd_run_dispatch() {
 _resolve_capability_escalation() {
 	local role="$1"
 	local current_tier="$2"
+	local current_model="${3:-}"
+	local current_variant="${4:-}"
 	_capability_escalation_model=""
 	_capability_escalation_variant=""
 	_capability_escalation_label=""
 	_capability_escalation_tier=""
 	[[ "$role" == "worker" ]] || return 1
-	_capability_escalation_tier=$(model_tier_next "$current_tier" 2>/dev/null) || return 1
-	_capability_escalation_model=$(choose_model "$role" "" "$_capability_escalation_tier" "exact-tier") || return 1
-	_capability_escalation_variant=$(resolve_headless_variant "$role" "$_capability_escalation_tier" "$_capability_escalation_model")
-	_capability_escalation_label="${current_tier} tier reported BLOCKED — escalating to ${_capability_escalation_tier} (${_capability_escalation_model}${_capability_escalation_variant:+ ${_capability_escalation_variant}})"
-	return 0
+	if [[ -n "$current_model" && -n "$current_variant" ]] &&
+		_capability_escalation_variant=$(model_tier_next_variant "$current_tier" "$current_model" "$current_variant"); then
+		_capability_escalation_tier="$current_tier"
+		_capability_escalation_model="$current_model"
+		_capability_escalation_label="${current_tier} capability limit — increasing ${current_model} reasoning from ${current_variant} to ${_capability_escalation_variant}"
+		return 0
+	fi
+	# GH#32929: never re-run the identical route. Tiers may share a model and
+	# reasoning (standard and thinking both start at Sol medium), so an identical
+	# next-tier route tries that tier's explicit ladder, then its next healthy
+	# distinct candidate, then the following tier. Nothing distinct is terminal.
+	local target_tier="$current_tier" target_model="" target_variant="" next_route=""
+	while target_tier=$(model_tier_next "$target_tier" 2>/dev/null); do
+		target_model=$(choose_model "$role" "" "$target_tier" "exact-tier") || return 1
+		target_variant=$(resolve_headless_variant "$role" "$target_tier" "$target_model")
+		if [[ "$target_model" == "$current_model" && "$target_variant" == "$current_variant" ]]; then
+			if [[ -n "$target_variant" ]] &&
+				next_route=$(model_tier_next_variant "$target_tier" "$target_model" "$target_variant"); then
+				target_variant="$next_route"
+			elif next_route=$(_first_healthy_configured_model "$target_tier" "exact-tier" "" "$current_model"); then
+				target_model="$next_route"
+				target_variant=$(resolve_headless_variant "$role" "$target_tier" "$target_model")
+			else
+				continue
+			fi
+		fi
+		_capability_escalation_tier="$target_tier"
+		_capability_escalation_model="$target_model"
+		_capability_escalation_variant="$target_variant"
+		_capability_escalation_label="${current_tier} tier reported BLOCKED — escalating to ${_capability_escalation_tier} (${_capability_escalation_model}${_capability_escalation_variant:+ ${_capability_escalation_variant}})"
+		return 0
+	done
+	return 1
 }
 
 # Handle attempt results that always terminate or immediately escalate.
@@ -301,15 +341,21 @@ _handle_cmd_run_terminal_attempt() {
 			capability_blocked=1
 		fi
 		if [[ "$capability_blocked" -eq 1 && -z "$model_override" ]] &&
-			_resolve_capability_escalation "$role" "$tier_override"; then
+			_resolve_capability_escalation "$role" "$tier_override" "$selected_model" "$variant_override"; then
+			# Same-tier reasoning consumes the existing route budget: availability
+			# fallback may revisit a model at its default effort, never reset retries.
+			if [[ "$tier_override" == "$_capability_escalation_tier" ]]; then
+				attempt=$((attempt + 1))
+			else
+				attempt=1
+				max_attempts=$(_headless_route_attempt_budget "$_capability_escalation_tier")
+			fi
 			tier_override="$_capability_escalation_tier"
 			selected_model="$_capability_escalation_model"
 			variant_override="$_capability_escalation_variant"
 			routing_reason="capability_escalation"
 			routing_escalated=1
-			attempt=1
-			max_attempts=$(_headless_route_attempt_budget "$tier_override")
-			prompt="The previous attempt reported a model capability limit after working on the task. Resume the existing session and worktree at the next authorized capability tier (${tier_override}: ${selected_model}${variant_override:+ ${variant_override}}), challenge the blocker using the accumulated evidence, and continue autonomously through implementation and verification. Do not request broader permissions or bypass policy, authentication, trust, or secret-handling boundaries. If model capability remains the only blocker, emit the exact marker BLOCKED: capability limit - <evidence> so runtime routing can evaluate the next configured tier. Use generic BLOCKED only for concrete terminal non-capability blockers. Stop at FULL_LOOP_COMPLETE or a supported BLOCKED outcome."
+			prompt="The previous attempt reported a model capability limit after working on the task. Resume the existing session and worktree at the next authorized capability tier or reasoning level (${tier_override}: ${selected_model}${variant_override:+ ${variant_override}}), challenge the blocker using the accumulated evidence, and continue autonomously through implementation and verification. Do not request broader permissions or bypass policy, authentication, trust, or secret-handling boundaries. If model capability remains the only blocker, emit the exact marker BLOCKED: capability limit - <evidence> so runtime routing can evaluate the next configured tier or reasoning level. Use generic BLOCKED only for concrete terminal non-capability blockers. Stop at FULL_LOOP_COMPLETE or a supported BLOCKED outcome."
 			print_warning "$_capability_escalation_label"
 			_cmd_run_disposition="$_CMD_RUN_DISPOSITION_CONTINUE"
 		else
@@ -332,6 +378,22 @@ _handle_cmd_run_terminal_attempt() {
 
 # Handle service, premature-exit, and brief-recovery continuation budgets.
 _handle_cmd_run_continuation_attempt() {
+	if [[ "$attempt_exit" -eq 88 ]]; then
+		if [[ "${integration_recovery_count:-0}" -ge 1 ]]; then
+			_run_result_label="$_RUN_RESULT_BLOCKED"
+			_run_failure_reason="$_run_result_label"
+			_run_classification_pattern="integration_recovery_exhausted"
+			_cmd_run_finish "$session_key" "$completion_state" "$work_dir"
+			_cmd_run_disposition="$_CMD_RUN_DISPOSITION_RETURN"
+			_cmd_run_return_status=0
+			return 0
+		fi
+		integration_recovery_count=1
+		routing_reason="integration_recovery_retry"
+		prompt="Resume the existing owned session/worktree and PR. The runtime has durably queued the integration request with Pulse and permits one local recovery attempt for this unchanged brief/evidence. Apply reference/worker-discipline.md Integration scope recovery: independently verify trusted outcome, explicit exclusions, unchanged brief and live claim; inspect the actual caller and check collisions; correct only the minimal canonical Files Scope and matching local brief before editing, then re-read and verify the persisted revision. This continuation grants no authority to revise an explicit hard boundary, secrets, permissions, spending, destructive/external actions, trust exceptions or security guarantees. If local recovery is unsafe, emit the structured INTEGRATION_RECOVERY_REQUEST in the final BLOCKED message for the AI brief owner, preserving exact PR identity and proposed verification. Do not repeat an unchanged request or ask a human to perform ordinary analysis. Otherwise continue through local verification, push, ready PR, MERGE_SUMMARY and the guarded merge attempt; no release is authorized by recovery."
+		_cmd_run_disposition="$_CMD_RUN_DISPOSITION_CONTINUE"
+		return 0
+	fi
 	if [[ "$attempt_exit" -eq 81 ]]; then
 		if [[ "$service_interruption_continue_count" -lt "$max_service_interruption_continue_retries" ]]; then
 			service_interruption_continue_count=$((service_interruption_continue_count + 1))
@@ -442,12 +504,58 @@ _handle_cmd_run_watchdog_attempt() {
 	return 0
 }
 
+# Print 1 when this worker dispatch is a cross-dispatch tier handoff: the
+# issue's earlier runs (metrics, last 30 days) used a lower tier than the one
+# now dispatched, as after escalate_issue_tier's simple -> standard -> thinking
+# cascade. In-run escalation already sets routing_escalated; without this, the
+# re-dispatched higher-tier worker logged routing_escalated=false.
+# Args: role tier
+_headless_dispatch_tier_handoff() {
+	local role="$1"
+	local tier="$2"
+	local issue_number="${WORKER_ISSUE_NUMBER:-}"
+	local repo_slug="${DISPATCH_REPO_SLUG:-${WORKER_REPO_SLUG:-}}"
+	local metrics_file="${METRICS_FILE:-}"
+	[[ "$role" == "$_CMD_RUN_ROLE_WORKER" && "$issue_number" =~ ^[0-9]+$ && -n "$repo_slug" ]] || return 0
+	[[ "$tier" == "standard" || "$tier" == "thinking" ]] || return 0
+	[[ -f "$metrics_file" ]] || return 0
+	ROLE="$role" ISSUE_NUMBER="$issue_number" REPO_SLUG="$repo_slug" TIER="$tier" python3 - "$metrics_file" <<'PY' 2>/dev/null || true
+import json
+import os
+import sys
+import time
+from collections import deque
+
+rank = {"simple": 0, "standard": 1, "thinking": 2}
+issue = int(os.environ["ISSUE_NUMBER"])
+repo = os.environ["REPO_SLUG"]
+current = rank[os.environ["TIER"]]
+cutoff = time.time() - 30 * 86400
+lowest = None
+with open(sys.argv[1], errors="ignore") as handle:
+    for line in deque(handle, maxlen=50000):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if (record.get("issue_number") != issue or record.get("repo_slug") != repo
+                or record.get("role") != os.environ["ROLE"] or record.get("ts", 0) < cutoff):
+            continue
+        prior = rank.get(record.get("routing_tier"))
+        if prior is not None and (lowest is None or prior < lowest):
+            lowest = prior
+print("1" if lowest is not None and current > lowest else "0")
+PY
+	return 0
+}
+
 # Execute bounded attempts and route each result through focused policies.
 _cmd_run_attempt_loop() {
 	local max_continuation_retries="${HEADLESS_CONTINUATION_MAX_RETRIES:-10}" continuation_count=0
 	local max_watchdog_continue_retries="${HEADLESS_WATCHDOG_CONTINUE_MAX_RETRIES:-2}" watchdog_continue_count=0
 	local max_service_interruption_continue_retries="${HEADLESS_SERVICE_INTERRUPTION_CONTINUE_MAX_RETRIES:-2}" service_interruption_continue_count=0
 	local max_brief_recovery_retries="${HEADLESS_BRIEF_RECOVERY_MAX_RETRIES:-1}" brief_recovery_count=0
+	local integration_recovery_count=0
 	if _headless_run_is_ephemeral "$role"; then
 		max_continuation_retries=0 max_watchdog_continue_retries=0
 		max_service_interruption_continue_retries=0 max_brief_recovery_retries=0
@@ -470,6 +578,11 @@ _cmd_run_attempt_loop() {
 	local _run_metric_output_file="" _run_metric_session_id="" completion_state="complete"
 	local _cmd_run_disposition="" _cmd_run_return_status=1
 	local routing_attempt=0 routing_reason="headless_dispatch" routing_escalated=0 routing_candidate_index=-1
+	if [[ "$(_headless_dispatch_tier_handoff "$role" "$tier_override")" == "1" ]]; then
+		routing_escalated=1
+		routing_reason="tier_escalation_handoff"
+	fi
+	_HRW_PRIOR_ATTEMPT_ACTIVITY=0
 	while [[ "$attempt" -le "$max_attempts" ]]; do
 		routing_attempt=$((routing_attempt + 1))
 		routing_candidate_index=$(model_tier_candidate_index "$tier_override" "$selected_model" 2>/dev/null) || routing_candidate_index=-1
@@ -479,6 +592,7 @@ _cmd_run_attempt_loop() {
 		export AIDEVOPS_ROUTING_REASON="$routing_reason"
 		export AIDEVOPS_ROUTING_ESCALATED="$routing_escalated"
 		export AIDEVOPS_ROUTING_VARIANT="$variant_override"
+		export AIDEVOPS_ROUTING_MODEL="$selected_model"
 		_run_failure_reason="" _run_should_retry=0 _run_result_label="failed" _run_activity_detected="0"
 		local attempt_exit=0
 		if _execute_run_attempt "$role" "$session_key" "$work_dir" "$title" "$prompt" \
@@ -486,6 +600,11 @@ _cmd_run_attempt_loop() {
 			attempt_exit=0
 		else
 			attempt_exit=$?
+		fi
+		# GH#37597: process-scoped proof that a runtime attempt already ran with
+		# activity, read by the EXIT trap's runner-health attribution.
+		if [[ "${_run_activity_detected:-0}" == "1" ]]; then
+			_HRW_PRIOR_ATTEMPT_ACTIVITY=1
 		fi
 		_cmd_run_disposition=""
 		_handle_cmd_run_terminal_attempt

@@ -63,7 +63,7 @@ For aidevops-managed GitHub PRs, create and sign the body file before the
 `gh pr create --body-file` Bash tool call. Same-command heredoc and
 command-substitution `--body` patterns are blocked by the signature gate.
 
-Interactive aidevops PRs default to draft until the user explicitly asks to finalise/ready the PR or invokes `/pr-loop`. To permit pulse merge throughput after finalisation, also opt in with `allow-auto-merge`, `AIDEVOPS_INTERACTIVE_PR_AUTO_MERGE=1`, global `orchestration.interactive_pr_auto_merge=true`, or per-repo `repos.json` `interactive_pr_auto_merge=true`.
+Interactive aidevops PRs open as drafts so work survives interruption. In a maintainer repository, implementation intent is the finalise/ready consent; `workflows/full-loop.md` Step 4.2 is the canonical trigger list (including issue-started implementations) and its draft-retention exceptions. Once verification passes and the remote head matches, run `gh pr ready` and merge through `full-loop-helper.sh merge`. Otherwise the PR stays a draft until the user asks to finalise it or invokes `/pr-loop`. To permit pulse merge throughput for a ready interactive PR, also opt in with `allow-auto-merge`, `AIDEVOPS_INTERACTIVE_PR_AUTO_MERGE=1`, global `orchestration.interactive_pr_auto_merge=true`, or per-repo `repos.json` `interactive_pr_auto_merge=true`.
 
 When a PR is approved, mergeable, non-draft, and not blocked by review/security/
 maintainer labels, prefer `full-loop-helper.sh merge NUMBER OWNER/REPO --auto` or the host platform's merge queue
@@ -126,10 +126,9 @@ Report structure: `## PR Review: #NNN - Title` with sections: **Quality Checks**
 ## Post-Merge Actions
 
 1. Add `pr:NNN` to task line, move to `## In Review`; on merge mark `[x]`, add `completed:` timestamp, move to `## Done`
-2. Sync: `~/.aidevops/agents/scripts/beads-sync-helper.sh push`
-3. Delete branch: `git branch -d feature/xyz && git push origin --delete feature/xyz`
-4. Leave the human canonical checkout unchanged by default. Authority-aware full-loop is the exception: after merging a maintained non-aidevops PR, use the audited canonical fast-forward in `workflows/git-workflow.md` for the PR's verified base branch; never pull directly or switch the canonical checkout.
-5. Create release if applicable: see `workflows/release.md`
+2. Delete branch: `git branch -d feature/xyz && git push origin --delete feature/xyz`
+3. Leave the human canonical checkout unchanged by default. Authority-aware full-loop is the exception: after merging a maintained non-aidevops PR, use the audited canonical fast-forward in `workflows/git-workflow.md` for the PR's verified base branch; never pull directly or switch the canonical checkout.
+4. Create release if applicable: see `workflows/release.md`
 
 ## Fork Workflow (Non-Owner Repositories)
 

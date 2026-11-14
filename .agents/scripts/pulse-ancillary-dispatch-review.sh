@@ -688,7 +688,7 @@ _triage_review_shape_failure_reason() {
 		return 0
 	fi
 	if ! printf '%s\n' "$review_text" \
-		| grep -qxF -- "- **Recommendation:** ${expected_recommendation}" 2>/dev/null; then
+		| grep -xF -- "- **Recommendation:** ${expected_recommendation}" >/dev/null 2>&1; then
 		printf '%s\n' 'recommendation-mismatch'
 		return 0
 	fi
@@ -862,7 +862,7 @@ _extract_and_post_triage_review() {
 
 	# NEVER post raw sandbox/infrastructure output. A failed runtime may mix
 	# startup logs, execution metadata, or internal paths into model text.
-	if printf '%s\n' "$review_text" | grep -qE '\[SANDBOX\]|\[INFO\] Executing|timeout=[0-9]+s|network_blocked=|sandbox-exec-helper|/opt/homebrew/|opencode run ' 2>/dev/null; then
+	if printf '%s\n' "$review_text" | grep -E '\[SANDBOX\]|\[INFO\] Executing|timeout=[0-9]+s|network_blocked=|sandbox-exec-helper|/opt/homebrew/|opencode run ' >/dev/null 2>&1; then
 		echo "[pulse-wrapper] SECURITY: triage review for #${issue_num} contained raw sandbox output — suppressed (${#review_text} chars)" >>"$LOGFILE"
 		_log_suppressed_triage_output "$issue_num" "$repo_slug" \
 			"raw-sandbox-output" "$output_chars"
@@ -891,17 +891,16 @@ _extract_and_post_triage_review() {
 		return 0
 	fi
 
-	if ! _set_triage_recommendation_label "$issue_num" "$repo_slug" "$review_text"; then
-		echo "[pulse-wrapper] Triage advisory label write failed for #${issue_num} in ${repo_slug} — comment suppressed, will retry" >>"$LOGFILE"
-		printf 'FAILED:github-review-label-write-failed\n'
-		return 0
-	fi
-
 	local comment_failure_detail=""
 	if ! comment_failure_detail=$(_post_triage_review_comment "$issue_num" "$repo_slug" "$review_text"); then
 		echo "[pulse-wrapper] Triage review comment write failed for #${issue_num} in ${repo_slug}: ${comment_failure_detail:-rc=unknown category=unknown} — infrastructure failure, will retry" >>"$LOGFILE"
 		printf 'FAILED:github-comment-write-failed\n'
 		return 0
+	fi
+	# Advisory labels describe a durable review, never an attempted post. A label
+	# failure must not turn a posted comment into a retry that reposts the review.
+	if ! _set_triage_recommendation_label "$issue_num" "$repo_slug" "$review_text"; then
+		echo "[pulse-wrapper] Triage advisory label write failed for #${issue_num} in ${repo_slug} — review posted; leaving label reconciliation to a later cycle" >>"$LOGFILE"
 	fi
 	echo "[pulse-wrapper] Posted sandboxed triage review for #${issue_num} in ${repo_slug} (${output_chars} extracted chars)" >>"$LOGFILE"
 	printf 'POSTED\n'

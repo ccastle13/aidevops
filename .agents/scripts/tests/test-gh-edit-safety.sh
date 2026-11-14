@@ -69,9 +69,18 @@ SCRIPTS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)" || exit 1
 # ── Stub externals so we can source shared-constants.sh in isolation ──
 
 # Stub gh so it never hits the network
+# Privacy probes must use the stub, not an inherited runner gh transport.
+export PRIVACY_GH_BIN=gh
 gh() {
 	# Record what was called for assertions
 	GH_CALLS+=("$*")
+	if [[ "$*" == "pr edit "* && "${TEST_PR_EDIT_FAIL:-0}" == 1 ]]; then
+		return 1
+	fi
+	if [[ "$*" == "api repos/test/repo --jq .private | tostring" ]]; then
+		printf 'false\n'
+		return 0
+	fi
 	echo "https://github.com/test/repo/issues/999"
 	return 0
 }
@@ -115,6 +124,8 @@ gh() {
 	printf "%s\n" "$*" >>"$calls_file"
 	if [[ "$arg1 $arg2" == "issue view" || "$arg1 $arg2" == "pr view" ]]; then
 		printf "%s\n" "{\"title\":\"Existing\",\"body\":\"Existing\",\"labels\":[]}"
+	elif [[ "$arg1 $arg2" == "api repos/test/repo" ]]; then
+		printf "false\n"
 	fi
 	return 0
 }
@@ -359,6 +370,102 @@ if [[ -z "$_GH_EDIT_REJECTION_REASON" ]]; then
 else
 	fail "rejection reason should be cleared on success" "got: '${_GH_EDIT_REJECTION_REASON}'"
 fi
+
+section "11. GH#33539 — negated closing keywords in PR bodies"
+
+for negated_body in "Do not close #123 from this PR" "Do not resolve #123" "Never fixes #123" \
+	"This PR doesn't fix owner/repo#123." "We won't close: #123 yet" \
+	"For #123. Merge records retry evidence only and must not close #123" \
+	$'```\n~~~\n```\nDo not close #123' \
+	$'````\n```\n````\nDo not close #123' \
+	$'~~~\n~~~ example\n~~~\nDo not close #123'; do
+	_gh_validate_pr_closing_keywords --repo "test/repo" --body "$negated_body" 2>/dev/null
+	if [[ $? -eq 1 ]]; then
+		pass "rejects negated closing keyword: '${negated_body}'"
+	else
+		fail "should reject negated closing keyword: '${negated_body}'"
+	fi
+done
+
+for safe_body in "Ref #123. The parent issue remains open." "Resolves #123" \
+	"For #123 — do not close the parent until phase 3 merges." \
+	$'Example only:\n```\nDo not close #123\n```\nRef #123' "Docs mention \`Do not close #123\` as a trap. Ref #123"; do
+	_gh_validate_pr_closing_keywords --repo "test/repo" --body "$safe_body" 2>/dev/null
+	if [[ $? -eq 0 ]]; then
+		pass "accepts safe PR body: '${safe_body%%$'\n'*}'"
+	else
+		fail "should accept safe PR body: '${safe_body%%$'\n'*}'"
+	fi
+done
+
+NEG_BODY_FILE="${TEST_ROOT}/negated-pr-body.md"
+printf '## Summary\n\nPartial work. Do not close #123 from this PR.\n' >"$NEG_BODY_FILE"
+for body_source_form in long equals short; do
+	case "$body_source_form" in
+	long) body_source_args=(--body "Ref #123" --body-file "$NEG_BODY_FILE") ;;
+	equals) body_source_args=("--body-file=$NEG_BODY_FILE" "--body=Ref #123") ;;
+	short) body_source_args=(-bRef -F"$NEG_BODY_FILE") ;;
+	esac
+	if _gh_validate_pr_closing_keywords "${body_source_args[@]}" 2>/dev/null; then
+		fail "should reject simultaneous body sources ($body_source_form)"
+	else
+		pass "rejects simultaneous body sources ($body_source_form)"
+	fi
+done
+GH_CALLS=()
+gh_pr_edit_safe 456 --repo "test/repo" --body-file "$NEG_BODY_FILE" 2>/dev/null
+if [[ $? -eq 1 && ${#GH_CALLS[@]} -eq 0 ]]; then
+	pass "gh_pr_edit_safe rejects negated closing keyword body-file before any gh call"
+else
+	fail "gh_pr_edit_safe should reject negated closing keyword body-file before gh" "calls: ${GH_CALLS[*]:-none}"
+fi
+
+GH_CALLS=()
+gh_create_pr --repo "test/repo" --title "t003: Partial docs" --body "Do not close #123 from this PR" 2>/dev/null
+if [[ $? -eq 1 && ${#GH_CALLS[@]} -eq 0 ]]; then
+	pass "gh_create_pr rejects negated closing keyword before any gh call"
+else
+	fail "gh_create_pr should reject negated closing keyword before gh" "calls: ${GH_CALLS[*]:-none}"
+fi
+
+# Later wrapper stages (e.g. the public-write privacy guard) are environment
+# dependent, so assert only that the closing-keyword check did not reject.
+GH_CALLS=()
+gh_pr_edit_safe 456 --repo "test/repo" --body "Resolves #123" >/dev/null 2>&1
+if [[ "${_GH_EDIT_REJECTION_REASON:-}" != *"closing keyword"* ]]; then
+	pass "gh_pr_edit_safe does not reject legitimate leaf closure 'Resolves #123'"
+else
+	fail "gh_pr_edit_safe should not reject 'Resolves #123'" "reason: ${_GH_EDIT_REJECTION_REASON}"
+fi
+
+GH_CALLS=()
+gh_issue_edit_safe 123 --repo "test/repo" --body "Do not close #123 until the parent completes" >/dev/null 2>&1
+if [[ "${_GH_EDIT_REJECTION_REASON:-}" != *"closing keyword"* ]]; then
+	pass "issue body edits are not subject to the PR closing-keyword check"
+else
+	fail "issue body edits should not be subject to the PR closing-keyword check" "reason: ${_GH_EDIT_REJECTION_REASON}"
+fi
+
+# Successful edits invalidate only the matching REST cache entry; failures retain it.
+export AIDEVOPS_GH_PR_VIEW_CACHE_DIR="${TEST_ROOT}/pr-cache"
+mkdir -p "$AIDEVOPS_GH_PR_VIEW_CACHE_DIR"
+printf '{}' >"${AIDEVOPS_GH_PR_VIEW_CACHE_DIR}/test_repo__456.json"
+printf '{}' >"${AIDEVOPS_GH_PR_VIEW_CACHE_DIR}/test_repo__457.json"
+gh_pr_edit_safe 456 --repo test/repo --title 'Updated title' >/dev/null 2>&1
+if [[ $? -eq 0 && ! -e "${AIDEVOPS_GH_PR_VIEW_CACHE_DIR}/test_repo__456.json" && -e "${AIDEVOPS_GH_PR_VIEW_CACHE_DIR}/test_repo__457.json" ]]; then
+	pass 'successful PR edit invalidates only its REST cache entry'
+else
+	fail 'successful PR edit should invalidate only its REST cache entry'
+fi
+printf '{}' >"${AIDEVOPS_GH_PR_VIEW_CACHE_DIR}/test_repo__456.json"
+TEST_PR_EDIT_FAIL=1
+gh_pr_edit_safe 456 --repo test/repo --title 'Updated title' >/dev/null 2>&1
+if [[ $? -ne 0 && -e "${AIDEVOPS_GH_PR_VIEW_CACHE_DIR}/test_repo__456.json" ]]; then
+	pass 'failed PR edit preserves its REST cache entry'
+else
+	fail 'failed PR edit should preserve its REST cache entry'
+fi
+unset TEST_PR_EDIT_FAIL
 
 # ── Summary ──
 

@@ -4,11 +4,20 @@
 
 set -uo pipefail
 
+# Resolve native Git once from the system default PATH (portable to non-FHS
+# hosts such as NixOS); fixtures must bypass the aidevops git wrapper.
+TEST_NATIVE_GIT=$(command -p -v git) || {
+	printf '%s\n' 'Native Git is unavailable on the system PATH' >&2
+	exit 1
+}
+export TEST_NATIVE_GIT
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 1
 REPO_ROOT="${SCRIPT_DIR}/../../.."
 SETUP_SH="${REPO_ROOT}/setup.sh"
 AIDEVOPS_SH="${REPO_ROOT}/aidevops.sh"
 RUNTIME_BUNDLE_VERIFIER="${REPO_ROOT}/.agents/scripts/runtime-bundle-verifier.sh"
+POST_SETUP_MODULE="${REPO_ROOT}/.agents/scripts/setup/modules/post-setup.sh"
 PACKAGE_JSON="${REPO_ROOT}/package.json"
 GUI_WEB_PACKAGE_JSON="${REPO_ROOT}/packages/gui-web/package.json"
 
@@ -94,12 +103,17 @@ PY
 test_setup_stage_contract() {
 	local text=""
 	local verifier_text=""
+	local post_setup_text=""
 	text="$(file_text "$SETUP_SH")" || {
 		print_result "setup.sh is readable" 1 "$SETUP_SH"
 		return 0
 	}
 	verifier_text="$(file_text "$RUNTIME_BUNDLE_VERIFIER")" || {
 		print_result "runtime bundle verifier is readable" 1 "$RUNTIME_BUNDLE_VERIFIER"
+		return 0
+	}
+	post_setup_text="$(file_text "$POST_SETUP_MODULE")" || {
+		print_result "post-setup module is readable" 1 "$POST_SETUP_MODULE"
 		return 0
 	}
 
@@ -121,6 +135,17 @@ test_setup_stage_contract() {
 	# shellcheck disable=SC2016 # Match literal setup.sh expressions.
 	assert_contains "ai-session resolves linked worktree common git dir" "$text" 'git -C "$checkout_root" rev-parse --git-common-dir'
 	assert_contains "ai-session verifies deployed sha" "$text" "_setup_ai_session_verify_deploy \"\$current_sha\""
+	# shellcheck disable=SC2016 # Match literal setup.sh expressions.
+	assert_occurrence_count "ai-session and setup paths reconcile Tabby automatically" "$text" \
+		'_time_step "$SETUP_STAGE_TABBY" setup_tabby' 4
+	# shellcheck disable=SC2016 # Match literal post-setup expressions.
+	assert_contains "non-interactive Tabby setup runs transactional sync first" "$post_setup_text" \
+		'if bash "$tabby_helper" sync >/dev/null 2>&1; then'
+	# shellcheck disable=SC2016 # Match literal post-setup expressions.
+	assert_contains "non-interactive Tabby setup applies shell repair after sync" "$post_setup_text" \
+		'bash "$tabby_helper" fix-shell >/dev/null 2>&1 || true'
+	assert_not_contains "non-interactive Tabby failure does not defer manual repair" "$post_setup_text" \
+		'run manually: aidevops tabby sync'
 	assert_contains "setup sources the authoritative runtime bundle verifier" "$text" '.agents/scripts/runtime-bundle-verifier.sh'
 	assert_contains "ai-session delegates to the authoritative verifier" "$text" 'verify_aidevops_runtime_bundle_convergence'
 	# shellcheck disable=SC2016 # Match literal verifier expressions.
@@ -140,9 +165,9 @@ test_setup_stage_contract() {
 	assert_contains "gui desktop app dir can be configured" "$text" "AIDEVOPS_GUI_DESKTOP_APP_DIR"
 	assert_contains "existing gui desktop app refreshes during update" "$text" "Refreshing existing macOS"
 	assert_contains "gui desktop scoped stage runs installer" "$text" "_time_step \"\$SETUP_STAGE_GUI_DESKTOP\" setup_gui_desktop_app"
-	assert_contains "agents scoped stage registers opencode plugin" "$text" "_time_step \"\$SETUP_STAGE_OPENCODE_PLUGINS\" setup_opencode_plugins"
-	assert_occurrence_count "scoped, ai-session, and noninteractive setup register opencode plugin" "$text" \
-		"_time_step \"\$SETUP_STAGE_OPENCODE_PLUGINS\" setup_opencode_plugins" 3
+	assert_contains "agents scoped stage registers both opencode runtime plugins" "$text" "_time_step \"\$SETUP_STAGE_OPENCODE_PLUGINS\" setup_opencode_runtime_plugins"
+	assert_occurrence_count "scoped, ai-session, and noninteractive setup register both opencode runtime plugins" "$text" \
+		"_time_step \"\$SETUP_STAGE_OPENCODE_PLUGINS\" setup_opencode_runtime_plugins" 3
 	assert_contains "unknown stages print actionable help" "$text" "Unknown setup stage/scope"
 	return 0
 }
@@ -158,14 +183,14 @@ test_linked_worktree_checkout_contract() {
 	}
 	source_repo="$tmp_dir/repo"
 	linked_worktree="$tmp_dir/linked"
-	/usr/bin/git init -q "$source_repo" &&
-		/usr/bin/git -C "$source_repo" config user.email "test@example.invalid" &&
-		/usr/bin/git -C "$source_repo" config user.name "Test" &&
-		/usr/bin/git -C "$source_repo" config commit.gpgsign false &&
+	"$TEST_NATIVE_GIT" init -q "$source_repo" &&
+		"$TEST_NATIVE_GIT" -C "$source_repo" config user.email "test@example.invalid" &&
+		"$TEST_NATIVE_GIT" -C "$source_repo" config user.name "Test" &&
+		"$TEST_NATIVE_GIT" -C "$source_repo" config commit.gpgsign false &&
 		printf 'fixture\n' >"$source_repo/file" &&
-		/usr/bin/git -C "$source_repo" add file &&
-		/usr/bin/git -C "$source_repo" commit -qm fixture &&
-		/usr/bin/git -C "$source_repo" worktree add -q -b linked-test "$linked_worktree" || {
+		"$TEST_NATIVE_GIT" -C "$source_repo" add file &&
+		"$TEST_NATIVE_GIT" -C "$source_repo" commit -qm fixture &&
+		"$TEST_NATIVE_GIT" -C "$source_repo" worktree add -q -b linked-test "$linked_worktree" || {
 		print_result "linked worktree fixture created" 1
 		rm -rf "$tmp_dir"
 		return 0
@@ -193,6 +218,111 @@ PY
 		print_result "ai-session checkout detection accepts linked worktree .git files" 1
 	fi
 	rm -rf "$tmp_dir"
+	return 0
+}
+
+test_shellcheck_wrapper_preserves_executable() {
+	# Extend the existing isolated setup fixture without touching the host store.
+	python3 - "$REPO_ROOT" <<'PY'
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+root = pathlib.Path(sys.argv[1]).resolve()
+# PATH may already contain the aidevops wrapper: prefer a declared real path
+# or a legacy .real executable before copying the candidate.
+candidates = [os.environ.get("SHELLCHECK_REAL_PATH"), shutil.which("shellcheck.real"),
+              shutil.which("shellcheck.real", path=os.defpath),
+              shutil.which("shellcheck", path=os.defpath), shutil.which("shellcheck")]
+native = next((p for p in candidates if p and pathlib.Path(p).read_bytes()[:2] != b"#!"), None)
+if not native:
+    raise SystemExit("Native ShellCheck is required for the setup wrapper fixture")
+modules = root / ".agents/scripts/setup/modules"
+setup = (root / "setup.sh").read_text()
+assert setup.index('source "${SETUP_IMPL_MODULES_DIR}/shell-env.sh"') < setup.index(
+    'source "${SETUP_IMPL_MODULES_DIR}/tool-install.sh"'
+)
+assert "setup_shellcheck_wrapper()" not in (modules / "tool-install-discovery.sh").read_text()
+script = r'''
+set -euo pipefail
+print_info() { printf '%s\n' "$*"; return 0; }
+print_success() { printf '%s\n' "$*"; return 0; }
+print_warning() { printf '%s\n' "$*"; return 0; }
+record_mutation() { printf '%s\n' "$*" >>"$MUTATION_LOG"; return 0; }
+# Block mutations as well as recording them: a regressed setup must never
+# reach the host Nix store, even with our simulated absolute resolution.
+mv() { record_mutation "mv $*"; return 1; }
+cp() { record_mutation "cp $*"; return 1; }
+chmod() { record_mutation "chmod $*"; return 1; }
+sudo() { record_mutation "sudo $*"; return 1; }
+realpath() {
+    local target="$1"
+    if [[ "$FIXTURE_KIND" == nix && "$target" == "$FIXTURE_BIN/shellcheck" ]]; then
+        printf '%s\n' /nix/store/fixture-shellcheck/bin/shellcheck
+        return 0
+    fi
+    command realpath "$target"
+    return 0
+}
+source "$MODULES/shell-env.sh"
+source "$MODULES/tool-install.sh"
+setup_shellcheck_wrapper
+[[ "$(command -v shellcheck)" == "$HOME/.aidevops/bin/shellcheck" ]]
+shellcheck --version
+bash -x "$SHELLCHECK_PATH" --version
+# Idempotency with the shim already first on PATH must not recurse.
+setup_shellcheck_wrapper
+shellcheck --version
+'''
+temp_parent = pathlib.Path(os.environ.get("AIDEVOPS_TEMP_DIR", pathlib.Path.home() / ".aidevops/.agent-workspace/tmp"))
+temp_parent.mkdir(parents=True, exist_ok=True)
+with tempfile.TemporaryDirectory(prefix="setup-shellcheck-", dir=temp_parent) as temp:
+    base = pathlib.Path(temp)
+    for kind in ("nix", "user", "legacy"):
+        case = base / kind
+        home = case / "home"
+        deployed = home / ".aidevops/agents/scripts/shellcheck-wrapper.sh"
+        deployed.parent.mkdir(parents=True)
+        shutil.copy2(root / ".agents/scripts/shellcheck-wrapper.sh", deployed)
+        bindir = case / "nix/store/fixture-shellcheck/bin" if kind == "nix" else home / ".local/bin"
+        bindir.mkdir(parents=True)
+        executable = bindir / "shellcheck"
+        shutil.copy2(native, executable)
+        if kind == "legacy":
+            executable.rename(bindir / "shellcheck.real")
+            shutil.copy2(deployed, executable)
+        before = {p: (p.read_bytes(), p.stat().st_mode) for p in bindir.iterdir()}
+        log = case / "mutations"
+        log.touch()
+        env = os.environ.copy()
+        # Inherited overrides must not hide the simulated PATH executable.
+        for key in ("SHELLCHECK_REAL_PATH", "SHELLCHECK_PATH", "_SHELLCHECK_WRAPPER_ACTIVE"):
+            env.pop(key, None)
+        env.update(HOME=str(home), PATH=f"{bindir}:/usr/bin:/bin", PLATFORM_MACOS="false",
+                   MODULES=str(modules), INSTALL_DIR=str(root), FIXTURE_KIND=kind,
+                   FIXTURE_BIN=str(bindir), MUTATION_LOG=str(log), SHELL="/bin/bash")
+        # Explicit forwarding isolates the fixture from host .real installs,
+        # which the production wrapper intentionally searches before PATH.
+        forwarded = bindir / "shellcheck.real" if kind == "legacy" else executable
+        env["SHELLCHECK_REAL_PATH"] = str(forwarded)
+        result = subprocess.run(["bash", "-c", script], env=env, text=True, capture_output=True)
+        assert result.returncode == 0, f"{kind}: {result.stdout}\n{result.stderr}"
+        after = {p: (p.read_bytes(), p.stat().st_mode) for p in bindir.iterdir()}
+        assert before == after, f"{kind}: original executable changed"
+        mutations = log.read_text()
+        assert str(bindir) not in mutations and "/nix/store/" not in mutations, mutations
+        assert "sudo" not in mutations and "sudo" not in result.stdout, result.stdout
+        assert "Absolute-path ShellCheck callers bypass the shim" in result.stdout
+        assert result.stdout.count("ShellCheck - shell script analysis tool") == 3
+        assert f"+ {forwarded} --version" in result.stderr, "wrapper bypassed fixture executable"
+        assert (home / ".aidevops/bin/shellcheck").resolve() == deployed
+        print(f"verified {kind}: original preserved, shim forwards, repeated setup works")
+PY
+	local rc=$?
+	print_result "ShellCheck setup preserves Nix, user-local and legacy executables" "$rc"
 	return 0
 }
 
@@ -305,6 +435,7 @@ PY
 main() {
 	test_setup_stage_contract
 	test_linked_worktree_checkout_contract
+	test_shellcheck_wrapper_preserves_executable
 	test_setup_version_substitution_keeps_syntax
 	test_cli_scope_contract
 	test_gui_desktop_package_contract

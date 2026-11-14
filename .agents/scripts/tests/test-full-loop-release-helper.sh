@@ -3,31 +3,102 @@
 # SPDX-FileCopyrightText: 2025-2026 Marcus Quinn
 
 set -euo pipefail
+trap 'printf "FAIL release fixture at line %s\n" "$LINENO" >&2' ERR
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || exit
 ROOT=$(mktemp -d)
 trap 'rm -rf "$ROOT"' EXIT
+# Explicit platform tools keep the fixture isolated on non-FHS hosts such as NixOS.
+FIXTURE_PATH="$ROOT/bin:${AIDEVOPS_TEST_PATH:-/usr/bin:/bin}"
 mkdir -p "$ROOT/bin" "$ROOT/repo/linked-branch" "$ROOT/repo/.agents/scripts" \
 	"$ROOT/repo/.git" "$ROOT/worktrees" "$ROOT/cleanup" "$ROOT/state"
 export AIDEVOPS_STATE_DIR="$ROOT/state"
+# GH#35024: release worktree removal runs through the audited fence, which
+# resolves native Git via AIDEVOPS_REAL_GIT_BIN. Pin it to the stub so an
+# operator-exported real Git cannot bypass the fixture, and keep the fence's
+# audit log and registry inside the fixture (the managed-lifetime check fails
+# closed without a registry; the host registry must never be touched).
+export AIDEVOPS_REAL_GIT_BIN="$ROOT/bin/git"
+# This suite mocks Git and publication, not managed service completion. Native
+# owner-cgroup creation/removal is covered by test-worktree-owner-lifetime.py.
+export AIDEVOPS_WORKTREE_MANAGER=legacy-guards
+export HOME="$ROOT/home"
+export AIDEVOPS_CLEANUP_LOG="$ROOT/cleanup.log"
+export WORKTREE_REGISTRY_DIR="$ROOT/registry"
+export WORKTREE_REGISTRY_DB="$WORKTREE_REGISTRY_DIR/worktree-registry.db"
+mkdir -p "$HOME"
+(
+	# shellcheck source=../shared-worktree-registry.sh
+	source "$SCRIPT_DIR/shared-worktree-registry.sh" && _init_registry_db
+)
+[[ -f "$WORKTREE_REGISTRY_DB" ]] || {
+	printf 'FAIL fixture worktree registry was not initialised\n'
+	exit 1
+}
 export LANE_HEAD_FILE="$ROOT/lane-head"
 export LANE_STATE_FILE="$ROOT/lane-state.json"
 : >"$ROOT/repo/aidevops.sh"
 : >"$ROOT/repo/.agents/scripts/version-manager.sh"
+ssh-keygen -q -t ed25519 -N '' -f "$ROOT/signing-key"
+SIGNING_PUB_KEY=$(<"$ROOT/signing-key.pub")
+export SIGNING_PUB_KEY
 
 cat >"$ROOT/bin/git" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${GIT_CALL_LOG:?}"
+wt_ctx=""
+[[ "${1:-}" == "-C" ]] && wt_ctx="${2:-}"
+wt_parent="${FAKE_CONTROL_PARENT:-${AIDEVOPS_WORKTREE_BASE_DIR:-/nonexistent}}"
 case "$*" in
-*rev-parse\ --show-toplevel*) printf '%s\n' "${FAKE_REPO_ROOT:?}" ;;
+*rev-parse\ --absolute-git-dir*)
+	printf '%s/.git/worktrees/%s\n' "${FAKE_REPO_ROOT:?}" "${wt_ctx##*/}"
+	;;
+*rev-parse\ --show-toplevel* | *rev-parse*--git-common-dir* | *worktree\ list\ --porcelain*)
+	# Answer the audited removal fence's probes like Git does for an
+	# unlocked, detached linked release worktree (one with a .git marker).
+	case "$wt_ctx" in
+	"$wt_parent"/aidevops-release-*)
+		case "$*" in
+		*--show-toplevel*) printf '%s\n' "$wt_ctx" ;;
+		*--git-common-dir*) printf '%s/.git\n' "${FAKE_REPO_ROOT:?}" ;;
+		*)
+			printf 'worktree %s\0HEAD %040d\0branch refs/heads/main\0\0' "${FAKE_REPO_ROOT:?}" 0
+			for listed in "$wt_parent"/aidevops-release-*; do
+				[[ -d "$listed" && -e "$listed/.git" ]] || continue
+				printf 'worktree %s\0HEAD %040d\0detached\0\0' "$listed" 0
+			done
+			;;
+		esac
+		;;
+	*) [[ "$*" == *--show-toplevel* ]] && printf '%s\n' "${FAKE_REPO_ROOT:?}" ;;
+	esac
+	;;
+*config\ --get\ gpg.format*) printf 'ssh\n' ;;
+*config\ --get\ user.signingkey*) printf 'key::%s\n' "${SIGNING_PUB_KEY:?}" ;;
 *show\ *:VERSION*) printf '2.9.9\n' ;;
 *rev-parse\ refs/tags/v3.0.0*) printf '%040d\n' 0 ;;
 *rev-parse\ HEAD*) printf '%040d\n' 0 ;;
+*rev-parse\ origin/main*) printf '%040d\n' 0 ;;
+*describe\ --tags*) printf 'v2.9.9\n' ;;
+*rev-parse\ refs/tags/v2.9.9*) printf '%040d\n' 1 ;;
+*rev-parse\ --is-shallow-repository*)
+	if [[ -n "${FAKE_UNSHALLOW_MARKER:-}" && -f "$FAKE_UNSHALLOW_MARKER" ]]; then
+		printf 'false\n'
+	else
+		printf '%s\n' "${FAKE_SHALLOW:-false}"
+	fi
+	;;
+*fetch\ --unshallow*)
+	if [[ "${FAKE_UNSHALLOW_EXIT:-0}" -eq 0 && -n "${FAKE_UNSHALLOW_MARKER:-}" ]]; then
+		: >"$FAKE_UNSHALLOW_MARKER"
+	fi
+	exit "${FAKE_UNSHALLOW_EXIT:-0}"
+	;;
 *worktree\ add*)
 	for arg in "$@"; do
 		case "$arg" in
 		*/aidevops-release-*)
-			mkdir -p "$arg"
+			mkdir -p "$arg" "${FAKE_REPO_ROOT:?}/.git/worktrees/${arg##*/}"
 			: >"$arg/.git"
 			;;
 		esac
@@ -45,6 +116,10 @@ chmod +x "$ROOT/bin/git"
 
 cat >"$ROOT/bin/gh" <<'STUB'
 #!/usr/bin/env bash
+if [[ "$*" == 'api --paginate --slurp user/ssh_signing_keys' ]]; then
+	jq -nc --arg key "${SIGNING_PUB_KEY:?}" '[[{key:$key}]]'
+	exit 0
+fi
 if [[ "${1:-}" == "api" ]]; then
 	endpoint=""
 	for api_arg in "$@"; do
@@ -154,9 +229,28 @@ exit 0
 STUB
 chmod +x "$ROOT/source-resolver.sh"
 
+# Fake Git has no worker processes. Isolate its process catalogue from host
+# /proc restrictions without changing the production fence or native tests.
+export RELEASE_FIXTURE_SCRIPT_DIR="$SCRIPT_DIR"
+cat >"$ROOT/process-fixture.sh" <<'STUB'
+if [[ "$0" == "$RELEASE_FIXTURE_SCRIPT_DIR/full-loop-release-helper.sh" ]]; then
+	source "$RELEASE_FIXTURE_SCRIPT_DIR/audit-worktree-removal-helper.sh"
+	capture_worktree_process_cwds() {
+		return 0
+	}
+fi
+STUB
+export BASH_ENV="$ROOT/process-fixture.sh"
+# Sourced helper cases below run in this test shell rather than a new Bash.
+# shellcheck source=../audit-worktree-removal-helper.sh
+source "$SCRIPT_DIR/audit-worktree-removal-helper.sh"
+capture_worktree_process_cwds() {
+	return 0
+}
+
 (
 	cd "$ROOT/repo/linked-branch"
-	PATH="$ROOT/bin:/usr/bin:/bin" \
+	PATH="$FIXTURE_PATH" \
 		GIT_CALL_LOG="$ROOT/git.log" \
 		GH_CALL_LOG="$ROOT/gh.log" \
 		RESOLVER_CALL_LOG="$ROOT/resolver.log" \
@@ -172,7 +266,11 @@ chmod +x "$ROOT/source-resolver.sh"
 )
 
 grep -q 'worktree add --detach' "$ROOT/git.log"
-grep -q 'worktree remove' "$ROOT/git.log"
+if ! grep -q 'worktree remove' "$ROOT/git.log"; then
+	printf 'FAIL release fixture did not remove worktrees; cleanup diagnostics:\n' >&2
+	[[ ! -f "$AIDEVOPS_CLEANUP_LOG" ]] || cat "$AIDEVOPS_CLEANUP_LOG" >&2
+	exit 1
+fi
 grep -qx 'args=release minor --source-pr 42 --expected-sources 42@0000000000000000000000000000000000000000' "$ROOT/vm.log"
 grep -qx 'expected=42' "$ROOT/resolver.log"
 grep -Eq "^cwd=${ROOT}/worktrees/aidevops-release-42-[0-9]+$" "$ROOT/vm.log"
@@ -198,7 +296,18 @@ if compgen -G "$ROOT/worktrees/aidevops-release-42-*" >/dev/null; then
 	printf 'FAIL detached release worktree was not removed\n'
 	exit 1
 fi
+if ! grep -Eq "worktree-removed: ${ROOT}/worktrees/aidevops-release-42-[0-9]+ .*release_worktree=release-exit" "$AIDEVOPS_CLEANUP_LOG" ||
+	! grep -Eq "worktree-removed: ${ROOT}/worktrees/aidevops-release-control-[0-9]+ .*release_worktree=release-control-exit" "$AIDEVOPS_CLEANUP_LOG"; then
+	printf 'FAIL release worktree removal bypassed the audited fence\n'
+	exit 1
+fi
+printf 'PASS release and control worktree removals are audited (GH#35024)\n'
 printf 'PASS detached release runner persists publication receipt after successful gates\n'
+if grep -q 'fetch --unshallow' "$ROOT/git.log"; then
+	printf 'FAIL full-depth store attempted an unnecessary unshallow fetch\n'
+	exit 1
+fi
+printf 'PASS full-depth store skips the new shallow-history preflight step\n'
 
 cp "$ROOT/vm.log" "$ROOT/vm-after-publication.log"
 printf '%s\n' '{"schema_version":1,"repository":"marcusquinn/aidevops","pr_number":42,"release_status":"not-requested"}' \
@@ -206,7 +315,7 @@ printf '%s\n' '{"schema_version":1,"repository":"marcusquinn/aidevops","pr_numbe
 worktree_adds_before=$(grep -c 'worktree add --detach .*/aidevops-release-42-' "$ROOT/git.log")
 (
 	cd "$ROOT/repo/linked-branch"
-	PATH="$ROOT/bin:/usr/bin:/bin" \
+	PATH="$FIXTURE_PATH" \
 		GIT_CALL_LOG="$ROOT/git.log" \
 		VM_CALL_LOG="$ROOT/vm.log" \
 		FAKE_REPO_ROOT="$ROOT/repo" \
@@ -227,7 +336,7 @@ printf 'PASS repeated detached release reconciliation skips duplicate publicatio
 pending_rc=0
 (
 	cd "$ROOT/repo/linked-branch"
-	PATH="$ROOT/bin:/usr/bin:/bin" \
+	PATH="$FIXTURE_PATH" \
 		GIT_CALL_LOG="$ROOT/git.log" \
 		VM_CALL_LOG="$ROOT/pending-vm.log" \
 		VM_EXIT=8 \
@@ -250,7 +359,7 @@ rm -f "$LANE_HEAD_FILE" "$LANE_STATE_FILE"
 
 if (
 	cd "$ROOT/repo/linked-branch"
-	PATH="$ROOT/bin:/usr/bin:/bin" \
+	PATH="$FIXTURE_PATH" \
 		GIT_CALL_LOG="$ROOT/git.log" \
 		VM_CALL_LOG="$ROOT/vm.log" \
 		VM_EXIT=1 \
@@ -270,11 +379,20 @@ jq -e '.status == "failed" and .requested_pr == 43 and .requested_merge == .curr
 	and .attempted_tag == "v2.9.10" and .release_type == "patch"' \
 	"$ROOT/receipts/marcusquinn_aidevops-43.failure.json" >/dev/null
 printf 'PASS failed release persists actionable provenance without publication evidence\n'
+retained_preparation=0
+for retained_path in "$ROOT/worktrees"/aidevops-release-43-*; do
+	[[ -d "$retained_path" ]] && retained_preparation=$((retained_preparation + 1))
+done
+[[ "$retained_preparation" -eq 1 ]] || {
+	printf 'FAIL failed release lost its preparation worktree during EXIT cleanup\n' >&2
+	exit 1
+}
+printf 'PASS failed release retains preparation for guarded recovery\n'
 rm -f "$LANE_HEAD_FILE" "$LANE_STATE_FILE"
 
 if (
 	cd "$ROOT/repo/linked-branch"
-	PATH="$ROOT/bin:/usr/bin:/bin" GIT_CALL_LOG="$ROOT/git.log" VM_CALL_LOG="$ROOT/vm.log" \
+	PATH="$FIXTURE_PATH" GIT_CALL_LOG="$ROOT/git.log" VM_CALL_LOG="$ROOT/vm.log" \
 		FAKE_REPO_ROOT="$ROOT/repo" RESOLVER_MODE=blocked AIDEVOPS_WORKTREE_BASE_DIR="$ROOT/worktrees" \
 		AIDEVOPS_FULL_LOOP_VERSION_MANAGER="../../version-manager.sh" \
 		AIDEVOPS_FULL_LOOP_SOURCE_RESOLVER="$ROOT/source-resolver.sh" \
@@ -295,7 +413,7 @@ printf '%s\n' not-requested >"$ROOT/receipts/marcusquinn_aidevops-44.status"
 cp "$ROOT/vm.log" "$ROOT/vm-before-skipped-release.log"
 (
 	cd "$ROOT/repo/linked-branch"
-	PATH="$ROOT/bin:/usr/bin:/bin" \
+	PATH="$FIXTURE_PATH" \
 		GIT_CALL_LOG="$ROOT/git.log" \
 		VM_CALL_LOG="$ROOT/vm.log" \
 		FAKE_REPO_ROOT="$ROOT/repo" \
@@ -315,7 +433,7 @@ printf 'PASS no-release evidence permits a later explicitly authorized publicati
 
 (
 	cd "$ROOT/repo/linked-branch"
-	PATH="$ROOT/bin:/usr/bin:/bin" \
+	PATH="$FIXTURE_PATH" \
 		GIT_CALL_LOG="$ROOT/git.log" \
 		VM_CALL_LOG="$ROOT/aggregate-vm.log" \
 		FAKE_REPO_ROOT="$ROOT/repo" \
@@ -336,7 +454,7 @@ printf '%s\n' '{"schema_version":1,"repository":"marcusquinn/aidevops","pr_numbe
 	>"$ROOT/cleanup/marcusquinn_aidevops-45.json"
 (
 	cd "$ROOT/repo/linked-branch"
-	PATH="$ROOT/bin:/usr/bin:/bin" \
+	PATH="$FIXTURE_PATH" \
 		GIT_CALL_LOG="$ROOT/git.log" VM_CALL_LOG="$ROOT/aggregate-vm.log" FAKE_REPO_ROOT="$ROOT/repo" \
 		AIDEVOPS_WORKTREE_BASE_DIR="$ROOT/worktrees" AIDEVOPS_FULL_LOOP_RECEIPT_DIR="$ROOT/receipts" \
 		AIDEVOPS_FULL_LOOP_CLEANUP_DIR="$ROOT/cleanup" \
@@ -350,7 +468,7 @@ printf '%s\n' '{"schema_version":1,"repository":"wrong/repo","pr_number":45,"rel
 	>"$ROOT/cleanup/marcusquinn_aidevops-45.json"
 if (
 	cd "$ROOT/repo/linked-branch"
-	PATH="$ROOT/bin:/usr/bin:/bin" GIT_CALL_LOG="$ROOT/git.log" VM_CALL_LOG="$ROOT/aggregate-vm.log" \
+	PATH="$FIXTURE_PATH" GIT_CALL_LOG="$ROOT/git.log" VM_CALL_LOG="$ROOT/aggregate-vm.log" \
 		FAKE_REPO_ROOT="$ROOT/repo" AIDEVOPS_WORKTREE_BASE_DIR="$ROOT/worktrees" \
 		AIDEVOPS_FULL_LOOP_RECEIPT_DIR="$ROOT/receipts" AIDEVOPS_FULL_LOOP_CLEANUP_DIR="$ROOT/cleanup" \
 		AIDEVOPS_FULL_LOOP_REPO=marcusquinn/aidevops \
@@ -365,13 +483,30 @@ printf 'PASS reviewed aggregate source publishes once and truthfully supersedes 
 
 (
 	cd "$ROOT/repo/linked-branch"
-	export PATH="$ROOT/bin:/usr/bin:/bin"
+	export PATH="$FIXTURE_PATH"
 	export GIT_CALL_LOG="$ROOT/git.log"
 	export FAKE_REPO_ROOT="$ROOT/repo"
 	export AIDEVOPS_WORKTREE_BASE_DIR="$ROOT/worktrees"
 	export AIDEVOPS_FULL_LOOP_RECEIPT_DIR="$ROOT/receipts"
 	export AIDEVOPS_FULL_LOOP_REPO=marcusquinn/aidevops
 	source "$SCRIPT_DIR/full-loop-release-helper.sh" help >/dev/null
+	persist_calls=0
+	_full_loop_persist_release_authorization() {
+		persist_calls=$((persist_calls + 1))
+		return 0
+	}
+	if _full_loop_capture_release_authorization marcusquinn/aidevops 48 \
+		"$ROOT/repo/linked-branch" "$ROOT/source-resolver.sh" '48,49'; then
+		printf 'FAIL substituted resolver narrowed the explicit expected set\n'
+		exit 1
+	fi
+	if _full_loop_capture_release_authorization marcusquinn/aidevops 48 \
+		"$ROOT/repo/linked-branch" "$ROOT/source-resolver.sh" '48@1111111111111111111111111111111111111111'; then
+		printf 'FAIL substituted resolver changed the explicit expected merge SHA\n'
+		exit 1
+	fi
+	[[ "$persist_calls" -eq 0 ]]
+	printf 'PASS explicit source assertions are independently checked before persistence\n'
 	persisted_sources=48@0000000000000000000000000000000000000000
 	lane_checks=0
 	expansion_calls=0
@@ -389,8 +524,10 @@ printf 'PASS reviewed aggregate source publishes once and truthfully supersedes 
 		local source_pr="$2"
 		local requested_sources="$3"
 		local release_type="$4"
+		local retry_assertion="$5"
 		[[ "$repo" == "marcusquinn/aidevops" && "$source_pr" == "48" &&
-			"$requested_sources" == "$persisted_sources" && "$release_type" == "patch" ]] || return 1
+			"$requested_sources" == "$persisted_sources" && "$release_type" == "patch" &&
+			-z "$retry_assertion" ]] || return 1
 		expansion_calls=$((expansion_calls + 1))
 		_FULL_LOOP_AGGREGATE_RECOVERY_EXPECTED="$requested_sources"
 		return 0
@@ -400,12 +537,63 @@ printf 'PASS reviewed aggregate source publishes once and truthfully supersedes 
 		"$_FULL_LOOP_RESERVED_RECOVERY_EXPECTED" == "$persisted_sources" &&
 		"$_FULL_LOOP_RESERVED_RECOVERY_COMPLETED" == "true" &&
 		"$_FULL_LOOP_RESERVED_RECOVERY_FAILED_PREPUBLICATION" == "false" ]]
+	lane_checks=0
+	expansion_calls=0
+	_full_loop_recovery_lane_requires_prepublication_transaction() {
+		lane_checks=$((lane_checks + 1))
+		return 1
+	}
+	_full_loop_release_resolve_persisted_intent marcusquinn/aidevops 48 "48" "$persisted_sources" patch
+	[[ "$lane_checks" -eq 1 && "$expansion_calls" -eq 0 &&
+		"$_FULL_LOOP_RESERVED_RECOVERY_EXPECTED" == "$persisted_sources" &&
+		"$_FULL_LOOP_RESERVED_RECOVERY_COMPLETED" == "false" ]]
+	lane_checks=0
+	if _full_loop_release_resolve_persisted_intent marcusquinn/aidevops 48 \
+		'48@1111111111111111111111111111111111111111' "$persisted_sources" patch; then
+		printf 'FAIL conflicting explicit merge SHA was replaced by persisted authorization\n'
+		exit 1
+	fi
+	[[ "$lane_checks" -eq 0 && "$expansion_calls" -eq 0 ]]
 )
-printf 'PASS omitted expected sources still resume a persisted failed pre-publication transaction\n'
+printf 'PASS persisted intent normalizes PR-only retries and rejects conflicting merge SHAs\n'
 
 (
 	cd "$ROOT/repo/linked-branch"
-	export PATH="$ROOT/bin:/usr/bin:/bin"
+	export PATH="$FIXTURE_PATH"
+	export GIT_CALL_LOG="$ROOT/git.log"
+	export FAKE_REPO_ROOT="$ROOT/repo"
+	export AIDEVOPS_WORKTREE_BASE_DIR="$ROOT/worktrees"
+	export AIDEVOPS_FULL_LOOP_REPO=marcusquinn/aidevops
+	source "$SCRIPT_DIR/full-loop-release-helper.sh" help >/dev/null
+	persisted_sources=48@0000000000000000000000000000000000000000
+	recovery_calls=0
+	run_calls=0
+	release_signing_preflight() { return 0; }
+	_full_loop_release_guard_competing_lane() { return 0; }
+	_full_loop_read_release_authorization() { printf '%s\n' "$persisted_sources"; }
+	_full_loop_snapshot_retry_eligible() { return 0; }
+	_full_loop_release_guard_existing() {
+		[[ "$3" == "$persisted_sources" ]] || return 1
+		return 2
+	}
+	_full_loop_recovery_dead_preparing() {
+		[[ "$3" == "$persisted_sources" ]] || return 1
+		recovery_calls=$((recovery_calls + 1))
+		return 0
+	}
+	_full_loop_release_run_new() {
+		[[ "$5" == "$persisted_sources" ]] || return 1
+		run_calls=$((run_calls + 1))
+		return 0
+	}
+	_full_loop_release_start_new marcusquinn/aidevops 48 patch incremental ""
+	[[ "$recovery_calls" -eq 1 && "$run_calls" -eq 1 ]]
+)
+printf 'PASS eligible snapshot retry reuses persisted manifest for fenced recovery\n'
+
+(
+	cd "$ROOT/repo/linked-branch"
+	export PATH="$FIXTURE_PATH"
 	export GIT_CALL_LOG="$ROOT/git.log"
 	export FAKE_REPO_ROOT="$ROOT/repo"
 	export AIDEVOPS_WORKTREE_BASE_DIR="$ROOT/worktrees"
@@ -438,6 +626,11 @@ printf 'PASS omitted expected sources still resume a persisted failed pre-public
 		local option="$1"
 		local repo_path="$2"
 		local operation="$3"
+		# Leave EXIT-trap control-worktree inspection/removal to the Git fixture.
+		if [[ "$option" == "-C" && "$repo_path" == "$ROOT/worktrees/"* ]]; then
+			command git "$@"
+			return $?
+		fi
 		[[ "$option" == "-C" && "$repo_path" == "$ROOT/repo/linked-branch" ]] || return 1
 		case "$operation" in
 		rev-parse) printf '%s\n' "$fixture_blocked_head" ;;
@@ -466,5 +659,272 @@ printf 'PASS omitted expected sources still resume a persisted failed pre-public
 	[[ "$resolve_rc" -ne 0 && "$evidence_writes" -eq 1 ]]
 )
 printf 'PASS recovered retries preserve their original failure evidence until preparing\n'
+
+for temporary_kind in aggregate reconcile; do
+	temporary_path="$ROOT/worktrees/aidevops-release-${temporary_kind}-cleanup-test"
+	cleanup_rc=0
+	(
+		cd "$ROOT/repo/linked-branch"
+		export PATH="$FIXTURE_PATH"
+		export GIT_CALL_LOG="$ROOT/git.log" FAKE_REPO_ROOT="$ROOT/repo"
+		export AIDEVOPS_WORKTREE_BASE_DIR="$ROOT/worktrees"
+		source "$SCRIPT_DIR/full-loop-release-helper.sh" help >/dev/null
+		mkdir -p "$temporary_path"
+		: >"$temporary_path/.git"
+		_FULL_LOOP_RELEASE_PATH="$temporary_path"
+		trap 'cleanup_release_worktree' EXIT
+		exit 7
+	) || cleanup_rc=$?
+	[[ "$cleanup_rc" -eq 7 && ! -d "$temporary_path" ]] || {
+		printf 'FAIL temporary %s checkout retained as preparation\n' "$temporary_kind" >&2
+		exit 1
+	}
+done
+printf 'PASS failed aggregate and reconcile temporary checkouts are still cleaned\n'
+
+(
+	cd "$ROOT/repo/linked-branch"
+	export PATH="$FIXTURE_PATH"
+	export GIT_CALL_LOG="$ROOT/git.log" FAKE_REPO_ROOT="$ROOT/repo"
+	export AIDEVOPS_WORKTREE_BASE_DIR="$ROOT/worktrees"
+	source "$SCRIPT_DIR/full-loop-release-helper.sh" help >/dev/null
+	_full_loop_resolve_repo() { printf 'test/repo\n'; }
+	release_lane_read() {
+		_AIDEVOPS_RELEASE_LANE_JSON='{"active":true,"source_pr":42,"phase":"preparing","tag":null,"operation_token":"fixture-token"}'
+		return 0
+	}
+	release_lane_liveness_report() { return 0; }
+	_full_loop_release_existing_command() {
+		_FULL_LOOP_RELEASE_FOUND_TAG=v1.2.3
+		return 8
+	}
+	updated=0
+	release_lane_update() {
+		[[ "$1" == "test/repo" && "$2" == "42" && "$3" == "remote-publication" && "${4:-}" == "v1.2.3" ]] || return 1
+		updated=1
+		return 0
+	}
+	existing_rc=0
+	_full_loop_release_existing_with_lane reconcile 42 || existing_rc=$?
+	[[ "$existing_rc" -eq 8 && "$updated" -eq 1 ]]
+)
+printf 'PASS pending reconciliation persists its verified discovered tag\n'
+
+(
+	cd "$ROOT/repo/linked-branch"
+	export PATH="$FIXTURE_PATH"
+	export GIT_CALL_LOG="$ROOT/git.log" FAKE_REPO_ROOT="$ROOT/repo"
+	export AIDEVOPS_WORKTREE_BASE_DIR="$ROOT/worktrees"
+	source "$SCRIPT_DIR/full-loop-release-helper.sh" help >/dev/null
+	_AIDEVOPS_RELEASE_LANE_TOKEN="fixture-token"
+	_AIDEVOPS_RELEASE_LANE_HEAD="fixture-head"
+	lane_state='{"active":true,"source_pr":42,"phase":"remote-publication","terminal_receipt":null,"operation_token":"fixture-token"}'
+	release_lane_read() {
+		_AIDEVOPS_RELEASE_LANE_JSON="$lane_state"
+		return 0
+	}
+	_release_lane_write() {
+		lane_state='{"active":false,"source_pr":42,"phase":"terminal","terminal_receipt":"published","operation_token":"fixture-token"}'
+		return 1
+	}
+	release_lane_finalize test/repo 42 published || exit 1
+)
+printf 'PASS terminal lane writes reconcile durable state after transport uncertainty\n'
+
+# GH#33069 (t18554): a shallow control worktree self-heals via
+# `git fetch --unshallow --tags origin` before the release proceeds.
+: >"$ROOT/git.log"
+heal_rc=0
+(
+	cd "$ROOT/repo/linked-branch"
+	export PATH="$FIXTURE_PATH"
+	export GIT_CALL_LOG="$ROOT/git.log" FAKE_REPO_ROOT="$ROOT/repo"
+	export AIDEVOPS_WORKTREE_BASE_DIR="$ROOT/worktrees"
+	export FAKE_SHALLOW=true
+	export FAKE_UNSHALLOW_MARKER="$ROOT/unshallow-marker-heal"
+	rm -f "$FAKE_UNSHALLOW_MARKER"
+	source "$SCRIPT_DIR/full-loop-release-helper.sh" help >/dev/null
+	_full_loop_release_ensure_full_history
+) 2>"$ROOT/ensure-history-heal.err" || heal_rc=$?
+[[ "$heal_rc" -eq 0 ]] || {
+	printf 'FAIL shallow control worktree healing did not succeed\n' >&2
+	exit 1
+}
+grep -q 'fetch --unshallow --tags origin' "$ROOT/git.log"
+grep -qx 'RELEASE_SHALLOW_STORE action=healed' "$ROOT/ensure-history-heal.err"
+printf 'PASS shallow control worktree self-heals via fetch --unshallow before proceeding\n'
+
+# Healable shallow store: full end-to-end run still publishes, and the
+# unshallow fetch happens before worktree add --detach for the release path.
+: >"$ROOT/git.log"
+(
+	cd "$ROOT/repo/linked-branch"
+	PATH="$FIXTURE_PATH" \
+		GIT_CALL_LOG="$ROOT/git.log" \
+		VM_CALL_LOG="$ROOT/shallow-heal-vm.log" \
+		FAKE_REPO_ROOT="$ROOT/repo" \
+		FAKE_SHALLOW=true \
+		FAKE_UNSHALLOW_MARKER="$ROOT/unshallow-marker-run" \
+		AIDEVOPS_WORKTREE_BASE_DIR="$ROOT/worktrees" \
+		AIDEVOPS_FULL_LOOP_VERSION_MANAGER="../../version-manager.sh" \
+		AIDEVOPS_FULL_LOOP_SOURCE_RESOLVER="$ROOT/source-resolver.sh" \
+		AIDEVOPS_FULL_LOOP_RECEIPT_DIR="$ROOT/receipts" \
+		AIDEVOPS_FULL_LOOP_REPO=marcusquinn/aidevops \
+		bash "$SCRIPT_DIR/full-loop-release-helper.sh" patch 60 incremental
+)
+grep -qx 'published' "$ROOT/receipts/marcusquinn_aidevops-60.status"
+fetch_unshallow_line=$(grep -n 'fetch --unshallow --tags origin' "$ROOT/git.log" | head -1 | cut -d: -f1)
+worktree_add_line=$(grep -n 'worktree add --detach .*/aidevops-release-60-' "$ROOT/git.log" | head -1 | cut -d: -f1)
+[[ -n "$fetch_unshallow_line" && -n "$worktree_add_line" && "$fetch_unshallow_line" -lt "$worktree_add_line" ]]
+printf 'PASS healable shallow store unshallows before release worktree add and publishes\n'
+
+# AIDEVOPS_SHALLOW_UNSHALLOW=0: non-zero exit, RELEASE_SHALLOW_STORE
+# action=disabled, no lane write (guard_competing_lane never runs).
+disabled_rc=0
+(
+	cd "$ROOT/repo/linked-branch"
+	export PATH="$FIXTURE_PATH"
+	export GIT_CALL_LOG="$ROOT/git.log" FAKE_REPO_ROOT="$ROOT/repo"
+	export AIDEVOPS_WORKTREE_BASE_DIR="$ROOT/worktrees"
+	export FAKE_SHALLOW=true AIDEVOPS_SHALLOW_UNSHALLOW=0
+	source "$SCRIPT_DIR/full-loop-release-helper.sh" help >/dev/null
+	_full_loop_release_ensure_full_history
+) 2>"$ROOT/ensure-history-disabled.err" || disabled_rc=$?
+[[ "$disabled_rc" -eq 1 ]]
+grep -qx 'RELEASE_SHALLOW_STORE action=disabled' "$ROOT/ensure-history-disabled.err"
+printf 'PASS disabled auto-unshallow blocks with an actionable RELEASE_SHALLOW_STORE error\n'
+
+# A failing unshallow fetch: non-zero exit, action=failed.
+failed_rc=0
+(
+	cd "$ROOT/repo/linked-branch"
+	export PATH="$FIXTURE_PATH"
+	export GIT_CALL_LOG="$ROOT/git.log" FAKE_REPO_ROOT="$ROOT/repo"
+	export AIDEVOPS_WORKTREE_BASE_DIR="$ROOT/worktrees"
+	export FAKE_SHALLOW=true FAKE_UNSHALLOW_EXIT=1
+	source "$SCRIPT_DIR/full-loop-release-helper.sh" help >/dev/null
+	_full_loop_release_ensure_full_history
+) 2>"$ROOT/ensure-history-failed.err" || failed_rc=$?
+[[ "$failed_rc" -eq 1 ]]
+grep -qx 'RELEASE_SHALLOW_STORE action=failed' "$ROOT/ensure-history-failed.err"
+printf 'PASS a failed unshallow fetch blocks with RELEASE_SHALLOW_STORE action=failed\n'
+
+# The preflight gates lane reservation: when it fails, guard_competing_lane
+# (the first step that can observe/mutate the lane) must never run.
+(
+	cd "$ROOT/repo/linked-branch"
+	export PATH="$FIXTURE_PATH"
+	export GIT_CALL_LOG="$ROOT/git.log" FAKE_REPO_ROOT="$ROOT/repo"
+	export AIDEVOPS_WORKTREE_BASE_DIR="$ROOT/worktrees"
+	export AIDEVOPS_FULL_LOOP_REPO=marcusquinn/aidevops
+	source "$SCRIPT_DIR/full-loop-release-helper.sh" help >/dev/null
+	guard_calls=0
+	release_signing_preflight() { return 0; }
+	_full_loop_release_ensure_full_history() { return 1; }
+	_full_loop_release_guard_competing_lane() {
+		guard_calls=$((guard_calls + 1))
+		return 0
+	}
+	start_rc=0
+	_full_loop_release_start_new marcusquinn/aidevops 61 patch incremental "" || start_rc=$?
+	[[ "$start_rc" -eq 1 && "$guard_calls" -eq 0 ]]
+)
+printf 'PASS an unresolved shallow store blocks lane reservation before any lane write\n'
+
+# A competing release can only finalize a published lane through the existing
+# reconcile path, after observing a dead executor. Every uncertain case refuses.
+for scenario in published deployment live unknown unpublished reserved failed deferred lost-cas unfinalized; do
+	(
+		cd "$ROOT/repo/linked-branch"
+		export PATH="$FIXTURE_PATH"
+		export GIT_CALL_LOG="$ROOT/git.log" FAKE_REPO_ROOT="$ROOT/repo"
+		export AIDEVOPS_WORKTREE_BASE_DIR="$ROOT/worktrees"
+		source "$SCRIPT_DIR/full-loop-release-helper.sh" help >/dev/null
+		phase=remote-publication
+		[[ "$scenario" == deployment ]] && phase=exact-tag-deployment
+		[[ "$scenario" == reserved ]] && phase=reserved
+		lane_state=$(jq -cn --arg phase "$phase" \
+			'{active:true,source_pr:42,phase:$phase,tag:"v1.2.3",terminal_receipt:null}')
+		reads=0
+		inspections=0
+		reconciles=0
+		release_lane_read() {
+			_AIDEVOPS_RELEASE_LANE_JSON="$lane_state"
+			reads=$((reads + 1))
+			return 0
+		}
+		_release_lane_abandoned_reservation() { return 1; }
+		_release_lane_executor_observe() {
+			case "$scenario" in
+			live | unknown) printf '{"state":"%s"}\n' "$scenario" ;;
+			*) printf '{"state":"dead"}\n' ;;
+			esac
+			return 0
+		}
+		_full_loop_release_inspect_remote() {
+			inspections=$((inspections + 1))
+			[[ "$1" == test/repo && "$2" == v1.2.3 ]] || return 1
+			[[ "$scenario" != unpublished ]]
+		}
+		_full_loop_release_existing_with_lane() {
+			reconciles=$((reconciles + 1))
+			[[ "$1" == reconcile && "$2" == 42 ]] || return 1
+			case "$scenario" in
+			failed) return 1 ;;
+			deferred) return 8 ;;
+			lost-cas) return 75 ;;
+			unfinalized) return 0 ;;
+			esac
+			lane_state='{"active":false,"source_pr":42,"phase":"terminal","tag":"v1.2.3","terminal_receipt":"published"}'
+			return 0
+		}
+		release_lane_liveness_report() { return 0; }
+		rc=0
+		_full_loop_release_guard_competing_lane test/repo 61 >"$ROOT/competing-output" || rc=$?
+		output=$(<"$ROOT/competing-output")
+		case "$scenario" in
+		published | deployment)
+			[[ "$rc" -eq 0 && "$reads" -eq 2 && "$inspections" -eq 1 && "$reconciles" -eq 1 &&
+				"$output" == *'RELEASE_LANE_FINALIZED source_pr=42 tag=v1.2.3 receipt=published'* ]]
+			;;
+		live | unknown | reserved)
+			[[ "$rc" -eq 75 && "$inspections" -eq 0 && "$reconciles" -eq 0 && "$output" == *'ACTIVE_RELEASE_LANE source_pr=42'* ]]
+			;;
+		unpublished)
+			[[ "$rc" -eq 75 && "$inspections" -eq 1 && "$reconciles" -eq 0 && "$output" == *'ACTIVE_RELEASE_LANE source_pr=42'* ]]
+			;;
+		*) [[ "$rc" -eq 75 && "$inspections" -eq 1 && "$reconciles" -eq 1 && "$output" == *'ACTIVE_RELEASE_LANE source_pr=42'* ]] ;;
+		esac
+	) || { printf 'FAIL competing lane scenario %s\n' "$scenario" >&2; exit 1; }
+done
+printf 'PASS competing published dead lanes finalize; uncertain and failed lanes refuse\n'
+
+# Exercise the CLI twice against the same lane, without advancing its age.
+(
+	cd "$ROOT/repo/linked-branch"
+	export PATH="$FIXTURE_PATH"
+	export GIT_CALL_LOG="$ROOT/git.log" GH_CALL_LOG="$ROOT/gh.log" FAKE_REPO_ROOT="$ROOT/repo"
+	export FAKE_CONTROL_PARENT="$ROOT/worktrees" AIDEVOPS_WORKTREE_BASE_DIR="$ROOT/worktrees"
+	export AIDEVOPS_FULL_LOOP_REPO=marcusquinn/aidevops
+	export AIDEVOPS_FULL_LOOP_SOURCE_RESOLVER="$ROOT/source-resolver.sh"
+	export AIDEVOPS_FULL_LOOP_VERSION_MANAGER="$ROOT/version-manager.sh"
+	export AIDEVOPS_FULL_LOOP_RECEIPT_DIR="$ROOT/retry-receipts"
+	export LANE_HEAD_FILE="$ROOT/retry-lane-head" LANE_STATE_FILE="$ROOT/retry-lane.json"
+	export VM_CALL_LOG="$ROOT/retry-vm.log" AIDEVOPS_TRUSTED_ISSUE_PRIORITY=critical
+	rc=0
+	bash "$SCRIPT_DIR/full-loop-release-helper.sh" patch 61 incremental --expected-sources 61,62 >"$ROOT/retry-first.log" 2>&1 || rc=$?
+	[[ "$rc" -eq 1 && ! -f "$VM_CALL_LOG" ]]
+	grep -q 'release-run-capture-authorization.*result=failed' "$ROOT/retry-first.log"
+	jq -e '.active == false and .terminal_receipt == "abandoned-prepublication"
+		and .reservation_recovery.reason == "owner-preparation-refused"' "$LANE_STATE_FILE" >/dev/null
+	if compgen -G "$ROOT/worktrees/aidevops-release-61-*" >/dev/null; then
+		printf 'FAIL pre-mutation refusal retained its disposable worktree\n'
+		exit 1
+	fi
+	bash "$SCRIPT_DIR/full-loop-release-helper.sh" patch 61 incremental --expected-sources 61 >"$ROOT/retry-second.log" 2>&1
+	grep -q 'release-run-capture-authorization.*result=ok' "$ROOT/retry-second.log"
+	grep -qx 'args=release patch --source-pr 61 --expected-sources 61@0000000000000000000000000000000000000000' "$VM_CALL_LOG"
+)
+printf 'PASS capture mismatch releases its own reservation; immediate corrected same-source patch reaches publication without grace\n'
 
 exit 0

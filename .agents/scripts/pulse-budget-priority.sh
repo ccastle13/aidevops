@@ -8,6 +8,9 @@
 [[ -n "${_PULSE_BUDGET_PRIORITY_LOADED:-}" ]] && return 0
 _PULSE_BUDGET_PRIORITY_LOADED=1
 
+# shellcheck source=./shared-gh-budget-policy.sh
+source "${BASH_SOURCE[0]%/*}/shared-gh-budget-policy.sh"
+
 _PULSE_BUDGET_MODE_UNKNOWN="unknown"
 _PULSE_BUDGET_MODE_RESERVE="reserve"
 _PULSE_BUDGET_PRIORITY_DEFERRABLE="deferrable"
@@ -63,7 +66,10 @@ _pulse_graphql_budget_priority_decision() {
 		printf 'unknown ? ? %s\n' "$threshold"
 		return 0
 	fi
-	if [[ "$remaining" -lt "$threshold" ]]; then
+	local reset=""
+	reset=$(printf '%s' "$rate_json" | jq -r '.resources.graphql.reset // ""') || reset=""
+	threshold=$(gh_budget_window_threshold "$threshold" "$reset") || return 1
+	if [[ "$remaining" -eq 0 || "$remaining" -lt "$threshold" ]]; then
 		printf 'reserve %s %s %s\n' "$remaining" "$limit" "$threshold"
 		return 0
 	fi
@@ -177,7 +183,11 @@ _pulse_set_rest_core_budget_priority() {
 _pulse_stage_priority_class() {
 	local stage="$1"
 	case "$stage" in
-	cache_prime | fix_the_fixer_detector | coderabbit_review | post_merge_scanner | pr_review_thread_response | auto_decomposer_scanner | dedup_cleanup | fast_fail_prune_expired | evaluate_routines | dependabot_alert_monitor | canonical_maintenance | dashboard_freshness_check | llm_supervisor | dirty_pr_sweep | stale_blocked_reconcile | sync_todo_refs_all_repos | build_dependency_graph_cache | refresh_blocked_status_from_graph | preflight_label_maintenance | preflight_trusted_nmr_reconcile | "$_PULSE_BUDGET_PREFETCH_STAGE")
+	evaluate_routines)
+		# Local calendar evaluation spends no API quota; dispatch is gated inside.
+		printf 'critical\n'
+		;;
+	cache_prime | fix_the_fixer_detector | coderabbit_review | post_merge_scanner | pr_review_thread_response | auto_decomposer_scanner | dedup_cleanup | fast_fail_prune_expired | dependabot_alert_monitor | worker_bus_relay | canonical_maintenance | dashboard_freshness_check | llm_supervisor | dirty_pr_sweep | stale_blocked_reconcile | sync_todo_refs_all_repos | build_dependency_graph_cache | refresh_blocked_status_from_graph | release_repaired_brief_holds | preflight_label_maintenance | preflight_trusted_nmr_reconcile | "$_PULSE_BUDGET_PREFETCH_STAGE")
 		printf 'deferrable\n'
 		;;
 	approval_merge_trigger | deterministic_merge_pass | dispatch_max | preflight_early_dispatch | preflight_post_label_refill)
@@ -210,6 +220,9 @@ _pulse_graphql_budget_defers_stage() {
 _pulse_rest_core_budget_defers_priority() {
 	local priority="$1"
 	[[ "$priority" != "critical" ]] || return 1
+	if [[ "$priority" == "deferrable" ]] && declare -F gh_budget_worker_reserve_allows >/dev/null 2>&1; then
+		gh_budget_worker_reserve_allows || return 0
+	fi
 
 	local rest_mode="${AIDEVOPS_PULSE_REST_CORE_BUDGET_CLASS:-$_PULSE_BUDGET_MODE_UNKNOWN}"
 	if declare -F _cb_rest_core_priority_decision_allows >/dev/null 2>&1; then
@@ -263,6 +276,12 @@ _pulse_defer_budget_priority_stage() {
 	priority=$(_pulse_stage_priority_class "$stage")
 	local graphql_mode="${AIDEVOPS_PULSE_GRAPHQL_BUDGET_CLASS:-$_PULSE_BUDGET_MODE_UNKNOWN}"
 	local rest_mode="${AIDEVOPS_PULSE_REST_CORE_BUDGET_CLASS:-$_PULSE_BUDGET_MODE_UNKNOWN}"
+	# Optional housekeeping deferral is not a blocked objective. Progress-stage
+	# deferral is: preserve its cause even when statistics are unavailable.
+	# Keep the identity stable as remaining quota changes within the same mode.
+	if [[ "$priority" == "progress" ]] && declare -F _pulse_cycle_state_note_blocker >/dev/null 2>&1; then
+		_pulse_cycle_state_note_blocker rest-core-quota pulse-budget "$rest_mode" || true
+	fi
 	echo "[pulse-wrapper] budget-priority: deferred ${priority} stage '${stage}' (graphql=${graphql_mode}:${AIDEVOPS_PULSE_GRAPHQL_BUDGET_REMAINING:-?}/${AIDEVOPS_PULSE_GRAPHQL_BUDGET_LIMIT:-?}@${AIDEVOPS_PULSE_GRAPHQL_BUDGET_THRESHOLD:-?}, rest=${rest_mode}:${AIDEVOPS_PULSE_REST_CORE_BUDGET_REMAINING:-?}/${AIDEVOPS_PULSE_REST_CORE_BUDGET_LIMIT:-?}@${AIDEVOPS_PULSE_REST_CORE_BUDGET_ADAPTIVE_THRESHOLD:-?}, hard_floor=${AIDEVOPS_PULSE_REST_CORE_BUDGET_HARD_FLOOR:-?}, progress_start_floor=${AIDEVOPS_PULSE_REST_CORE_BUDGET_PROGRESS_START_FLOOR:-?})" >>"$LOGFILE"
 	if ! declare -F pulse_stats_increment >/dev/null 2>&1; then
 		return 0

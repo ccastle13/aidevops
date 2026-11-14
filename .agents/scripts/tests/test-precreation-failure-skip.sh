@@ -22,6 +22,10 @@
 
 set -uo pipefail
 
+# These mocked trees have no Git identity or lifecycle registry. Exercise the
+# detached compatibility route; native managed creation has its own real fixture.
+export AIDEVOPS_WORKER_BACKEND=detached
+
 SCRIPT_DIR_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 1
 SCRIPTS_DIR="$(cd "${SCRIPT_DIR_TEST}/.." && pwd)" || exit 1
 
@@ -57,10 +61,26 @@ fail() {
 # =============================================================================
 TMP=$(mktemp -d -t t2981.XXXXXX)
 trap 'rm -rf "$TMP"' EXIT
+# The managed-lifetime CLI requires canonical paths; macOS temp dirs sit
+# behind the /var -> /private/var symlink (GH#35781).
+TMP=$(cd "$TMP" && pwd -P)
+
+# Sourced launch helpers reclaim Pulse scratch space. Never scan/reclaim the
+# operator's real workspace (or recursively size it) from an offline fixture.
+export AIDEVOPS_TEMP_DIR="${TMP}/agent-tmp"
+mkdir -p "$AIDEVOPS_TEMP_DIR"
 
 export LOGFILE="${TMP}/test-pulse.log"
 export SCRIPT_DIR="$TMP"
 export PULSE_STATS_FILE="${TMP}/pulse-stats.json"
+# Fake legacy trees must not read the operator's lifecycle registry/config.
+export AIDEVOPS_LIFECYCLE_STATE_DIR="${TMP}/absent-lifecycle"
+# These legacy fixtures have a readable registry with no managed enrollment.
+export WORKTREE_REGISTRY_DB="${TMP}/registry.db"
+python3 -c 'import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); db.execute("CREATE TABLE worktree_owners (worktree_path TEXT PRIMARY KEY, task_id TEXT, owner_session TEXT)"); db.close()' "$WORKTREE_REGISTRY_DB"
+# Python resolves the linked helper's real sibling modules. A partial module
+# copy silently breaks imports whenever the helper gains another dependency.
+ln -s "${SCRIPTS_DIR}/worktree-managed-lifetime.py" "${TMP}/worktree-managed-lifetime.py"
 
 # Seed pulse-stats.json with minimal valid structure
 printf '{"counters":{}}\n' >"$PULSE_STATS_FILE"
@@ -68,6 +88,10 @@ printf '{"counters":{}}\n' >"$PULSE_STATS_FILE"
 # Create a fake repo_path directory
 FAKE_REPO="${TMP}/fake-repo"
 mkdir -p "$FAKE_REPO"
+
+# The pre-claim gate sources runner-capability-helper.sh from SCRIPT_DIR
+# (GH#33404). Use the real helper so its fresh issue-state read stays covered.
+cp "${SCRIPTS_DIR}/runner-capability-helper.sh" "${TMP}/runner-capability-helper.sh"
 
 # =============================================================================
 # Stub: worktree-helper.sh that emits configurable output
@@ -106,6 +130,12 @@ git() {
 			printf 'worktree %s\n' "$STUB_PORCELAIN_WORKTREE_PATH"
 			printf 'HEAD abcdef0123456789\n'
 			printf 'branch refs/heads/%s\n' "$STUB_PORCELAIN_WORKTREE_BRANCH"
+			return 0
+		fi
+		# GH#36132: reuse selection reads porcelain; render "<path> <sha> [<branch>]".
+		if [[ "${5:-}" == "--porcelain" && -n "${STUB_EXISTING_WORKTREE_LINE:-}" ]]; then
+			local _stub_path="${STUB_EXISTING_WORKTREE_LINE%% *}" _stub_branch="${STUB_EXISTING_WORKTREE_LINE##*[}"
+			printf 'worktree %s\nHEAD abcdef\nbranch refs/heads/%s\n\n' "$_stub_path" "${_stub_branch%]}"
 			return 0
 		fi
 		if [[ -n "${STUB_EXISTING_WORKTREE_LINE:-}" ]]; then
@@ -203,8 +233,10 @@ register_worktree() {
 	return 0
 }
 STUB_OWNER_INFO=""
+STUB_OWNER_READ_RC=0
 check_worktree_owner_snapshot() {
 	local wt_path="$1"
+	[[ "$STUB_OWNER_READ_RC" -eq 0 ]] || return "$STUB_OWNER_READ_RC"
 	[[ -n "$wt_path" && -n "$STUB_OWNER_INFO" ]] || return 1
 	printf '%s\n' "$STUB_OWNER_INFO"
 	return 0
@@ -241,6 +273,7 @@ claim_worktree_ownership() {
 # Re-stub launch-orchestrator dependencies after sourcing; the module defines
 # real implementations when loaded, but this test isolates precreation failure.
 _ds_now_ns() { printf '0\n'; return 0; }
+_ds_stage_start() { return 0; }
 _ds_record() { return 0; }
 _dlw_resolve_tier_and_model() {
 	_DLW_DISPATCH_TIER="standard"
@@ -265,8 +298,21 @@ _dlw_exec_detached() {
 STUB_REFRESH_STATE="OPEN"
 
 gh() {
-	if [[ "${1:-}" == "issue" && "${2:-}" == "view" ]]; then
-		printf '%s\n' "$STUB_REFRESH_STATE"
+	# The final assignment fence requests the scalar REST state, not the object.
+	if [[ "${1:-}" == "api" && "${2:-}" == repos/owner/repo/issues/* && "${4:-}" == '.state' ]]; then
+		printf '%s\n' "$STUB_REFRESH_STATE" | tr '[:upper:]' '[:lower:]'
+		return 0
+	fi
+	# The fresh runner-capability gate projects the REST issue object.
+	if [[ "${1:-}" == "api" && "${2:-}" == repos/owner/repo/issues/* && "${4:-}" == '{number, state, body, labels}' ]]; then
+		local issue_ref="${2##*/}" state_lower=""
+		state_lower=$(printf '%s' "$STUB_REFRESH_STATE" | tr '[:upper:]' '[:lower:]')
+		printf '{"number":%s,"state":"%s","body":"","labels":[]}\n' "$issue_ref" "$state_lower"
+		return 0
+	fi
+	# The pre-claim refresh reads the REST issue object, not a scalar state.
+	if [[ "${1:-}" == "api" && "${2:-}" == repos/owner/repo/issues/* ]]; then
+		printf '{"state":"%s","body":""}\n' "$STUB_REFRESH_STATE"
 		return 0
 	fi
 
@@ -386,6 +432,90 @@ if [[ $rc -eq 0 && "$_DLW_WORKTREE_PATH" == "${TMP}/projects/fake-repo-porcelain
 	pass "precreate resolves non-/Git/ path from git porcelain"
 else
 	fail "precreate resolves non-/Git/ path from git porcelain" "rc=$rc path='$_DLW_WORKTREE_PATH'"
+fi
+
+# =============================================================================
+# Test 2c: rejected managed enrollment must not register ownership (GH#35828)
+# =============================================================================
+# Real creation/enrollment and registry in a disposable repository; only the
+# post-enrollment classification is fault-injected. Keep detached stubs outside.
+if (
+	unset -f git register_worktree
+	export HOME="$TMP/managed-home" WORKTREE_REGISTRY_DIR="$TMP/managed-registry"
+	export WORKTREE_REGISTRY_DB="$WORKTREE_REGISTRY_DIR/registry.db"
+	export AIDEVOPS_WORKTREE_BASE_DIR="$TMP/managed-worktrees"
+	export AIDEVOPS_WORKTREE_TRASH_ROOT="$TMP/managed-recovery"
+	export AIDEVOPS_CLEANUP_LOG="$TMP/managed-cleanup.log"
+	export GIT_AUTHOR_NAME=Fixture GIT_AUTHOR_EMAIL=fixture@example.invalid
+	export GIT_COMMITTER_NAME=Fixture GIT_COMMITTER_EMAIL=fixture@example.invalid
+	# GH#36142: enrollment initializes lifecycle state under the temp HOME, so
+	# its parent must exist; never inherit the host's lifecycle state location.
+	unset AIDEVOPS_LIFECYCLE_STATE_DIR AIDEVOPS_WORKSPACE_DIR
+	mkdir -p "$HOME/.aidevops/.agent-workspace" "$WORKTREE_REGISTRY_DIR" "$AIDEVOPS_WORKTREE_BASE_DIR"
+	MANAGED_REPO="$TMP/managed-repo"
+	command -p git init -q "$MANAGED_REPO" || exit 1
+	command -p git -C "$MANAGED_REPO" commit -q --allow-empty -m fixture || exit 1
+	_DLW_SEED_OID=$(command -p git -C "$MANAGED_REPO" rev-parse HEAD)
+	unset _SHARED_WORKTREE_REGISTRY_LOADED
+	# shellcheck source=../shared-worktree-registry.sh
+	source "$SCRIPTS_DIR/shared-worktree-registry.sh"
+	_init_registry_db || exit 1
+	SCRIPT_DIR="$SCRIPTS_DIR"
+	repo_slug="owner/repo"
+	sqlite3 "$WORKTREE_REGISTRY_DB" "INSERT INTO worktree_owners (worktree_path, task_id, owner_session) VALUES ('$MANAGED_REPO', 'existing', 'existing');" || exit 1
+	existing_row=$(sqlite3 "$WORKTREE_REGISTRY_DB" 'SELECT * FROM worktree_owners;')
+	_dlw_select_issue_worktree() { return 1; }
+	_dlw_managed_creation_env() {
+		_DLW_MANAGED_CREATE_MODE="managed"
+		_DLW_MANAGED_CREATE_ENV=(AIDEVOPS_WORKTREE_MANAGER=pulse-cgroup-v1
+			"AIDEVOPS_LAUNCH_TASK=$_DLW_LAUNCH_TASK" "AIDEVOPS_LAUNCH_REPO=$repo_slug")
+		return 0
+	}
+	_dlw_classify_reuse_candidate() {
+		local wt_path="$1"
+		local task="$2" repo="$3" generation=""
+		# Prove the real helper registered AND enrolled before injecting refusal.
+		generation=$(python3 "$SCRIPTS_DIR/worktree-managed-lifetime.py" match "$wt_path" "$task" "$repo") || return 1
+		[[ -n "$(sqlite3 "$WORKTREE_REGISTRY_DB" "SELECT owner_session FROM worktree_owners WHERE worktree_path='$wt_path';")" ]] || return 1
+		if [[ "$STUB_MANAGED_CLASS" == replacement ]]; then
+			register_worktree "$wt_path" "$_DLW_WORKTREE_BRANCH" --task other --session replacement --owner-pid "$$" || return 1
+			printf 'other-task\n'
+			return 0
+		fi
+		[[ "$STUB_MANAGED_CLASS" != "unavailable" ]] || return 1
+		if [[ "$STUB_MANAGED_CLASS" == managed ]]; then
+			printf 'managed %s\n' "${generation%% *}"
+		else
+			printf '%s\n' "$STUB_MANAGED_CLASS"
+		fi
+		return 0
+	}
+	managed_issue=358280
+	for STUB_MANAGED_CLASS in legacy other-task unavailable; do
+		managed_issue=$((managed_issue + 1))
+		_dlw_precreate_worktree "$managed_issue" "$MANAGED_REPO"
+		rc=$?
+		rows=$(sqlite3 "$WORKTREE_REGISTRY_DB" "SELECT count(*) FROM worktree_owners WHERE worktree_path='$_DLW_WORKTREE_PATH';")
+		if [[ "$rc" -ne 1 || "$rows" != 0 || "$_DLW_MANAGED_WORKTREE" -ne 0 || ! -d "$_DLW_WORKTREE_PATH" ]]; then
+			printf 'Rejected class %s: rc=%s ownership rows=%s\n' "$STUB_MANAGED_CLASS" "$rc" "$rows"
+			exit 1
+		fi
+	done
+	STUB_MANAGED_CLASS=replacement
+	_dlw_precreate_worktree 358284 "$MANAGED_REPO"
+	[[ "$?" -eq 1 ]] || exit 1
+	[[ "$(sqlite3 "$WORKTREE_REGISTRY_DB" "SELECT task_id || '|' || owner_session FROM worktree_owners WHERE worktree_path='$_DLW_WORKTREE_PATH';")" == 'other|replacement' ]] || exit 1
+	[[ "$(sqlite3 "$WORKTREE_REGISTRY_DB" "SELECT * FROM worktree_owners WHERE worktree_path='$MANAGED_REPO';")" == "$existing_row" ]] || exit 1
+	STUB_MANAGED_CLASS=managed
+	_dlw_precreate_worktree 358285 "$MANAGED_REPO" || exit 1
+	[[ "$_DLW_MANAGED_WORKTREE" -eq 1 && -n "$_DLW_WORKTREE_GENERATION" ]] || exit 1
+	matched_generation=$(python3 "$SCRIPTS_DIR/worktree-managed-lifetime.py" match "$_DLW_WORKTREE_PATH" 358285 "$repo_slug") || exit 1
+	[[ "$_DLW_WORKTREE_GENERATION" == "${matched_generation%% *}" ]] || exit 1
+	[[ "$(sqlite3 "$WORKTREE_REGISTRY_DB" "SELECT task_id || '|' || owner_session FROM worktree_owners WHERE worktree_path='$_DLW_WORKTREE_PATH';")" == '358285|dispatch-precreate-358285' ]] || exit 1
+); then
+	pass "real managed precreation compensates rejected ownership and preserves existing owners"
+else
+	fail "real managed precreation compensates rejected ownership and preserves existing owners"
 fi
 
 # =============================================================================
@@ -533,6 +663,80 @@ else
 	fail "reused worktree fails closed when its atomic ownership claim is rejected" \
 		"rc=$rc claim='$CLAIMED_WORKTREE_ARGS' registration='$REGISTERED_WORKTREE_ARGS'"
 fi
+if [[ -z "${_DLW_PRECREATE_FAILURE_REASON:-}" ]]; then
+	pass "claim rejection without a live owner stays a generic precreation failure"
+else
+	fail "claim rejection without a live owner stays a generic precreation failure" \
+		"reason='${_DLW_PRECREATE_FAILURE_REASON:-}'"
+fi
+
+# =============================================================================
+# Registry read failures must not reach the atomic-claim fallback or preparation.
+# A claim stub that would succeed ensures this exercises the dispatcher guard.
+STUB_OWNER_READ_RC=2
+STUB_CLAIM_WORKTREE_RC=0
+CLAIMED_WORKTREE_ARGS=""
+REGISTERED_WORKTREE_ARGS=""
+if _dlw_precreate_worktree "66666" "$FAKE_REPO"; then
+	rc=0
+else
+	rc=$?
+fi
+if [[ "$rc" -eq 1 && -z "$CLAIMED_WORKTREE_ARGS" && -z "$REGISTERED_WORKTREE_ARGS" &&
+	"${_DLW_PRECREATE_FAILURE_REASON:-}" == "worktree_owner_unavailable" ]]; then
+	pass "unavailable registry rejects reuse without attempting an ownership mutation"
+else
+	fail "unavailable registry rejects reuse without attempting an ownership mutation" \
+		"rc=$rc claim='$CLAIMED_WORKTREE_ARGS' reason='${_DLW_PRECREATE_FAILURE_REASON:-}'"
+fi
+STUB_OWNER_READ_RC=0
+STUB_CLAIM_WORKTREE_RC=1
+
+# Test 3e (GH#33026): a live mismatched owner's refusal is classified and keyed
+# to its process generation; the owner row is read, never removed or replaced.
+# =============================================================================
+STUB_LIVE_OWNER_TOKEN="Wed Sep 30 10:00:00 2026"
+_wt_process_start_token_for_pid() {
+	[[ "$1" == 4242 && -n "$STUB_LIVE_OWNER_TOKEN" ]] || return 1
+	printf '%s' "$STUB_LIVE_OWNER_TOKEN"
+	return 0
+}
+OWNER_ROW_MUTATIONS=""
+unregister_worktree() { OWNER_ROW_MUTATIONS="${OWNER_ROW_MUTATIONS}unregister "; return 0; }
+release_worktree_ownership() { OWNER_ROW_MUTATIONS="${OWNER_ROW_MUTATIONS}release "; return 0; }
+live_owner_row="4242|interactive-session||t999|2026-09-29T00:00:00Z|Wed Sep 30 10:00:00 2026"
+STUB_OWNER_INFO="$live_owner_row"
+STUB_CLAIM_WORKTREE_RC=1
+: >"$LOGFILE"
+_dlw_precreate_worktree "66666" "$FAKE_REPO"
+rc=$?
+if [[ "$rc" -eq 1 && "${_DLW_PRECREATE_FAILURE_REASON:-}" == "worktree_live_owner_refused" &&
+	"${_DLW_REFUSING_OWNER_PID:-}" == "4242" &&
+	"${_DLW_REFUSING_OWNER_START:-}" == "Wed_Sep_30_10:00:00_2026" &&
+	"$STUB_OWNER_INFO" == "$live_owner_row" && -z "$OWNER_ROW_MUTATIONS" ]]; then
+	pass "live mismatched owner refusal is classified without touching the owner row"
+else
+	fail "live mismatched owner refusal is classified without touching the owner row" \
+		"rc=$rc reason='${_DLW_PRECREATE_FAILURE_REASON:-}' pid='${_DLW_REFUSING_OWNER_PID:-}' start='${_DLW_REFUSING_OWNER_START:-}' mutations='$OWNER_ROW_MUTATIONS'"
+fi
+
+STUB_LIVE_OWNER_TOKEN=""
+_dlw_precreate_worktree "66666" "$FAKE_REPO"
+if [[ -z "${_DLW_PRECREATE_FAILURE_REASON:-}" ]]; then
+	pass "dead owner refusal is not held as a live owner"
+else
+	fail "dead owner refusal is not held as a live owner" "reason='${_DLW_PRECREATE_FAILURE_REASON:-}'"
+fi
+
+STUB_LIVE_OWNER_TOKEN="Wed Sep 30 11:00:00 2026"
+_dlw_precreate_worktree "66666" "$FAKE_REPO"
+if [[ -z "${_DLW_PRECREATE_FAILURE_REASON:-}" ]]; then
+	pass "reused PID with a different process generation is not held"
+else
+	fail "reused PID with a different process generation is not held" "reason='${_DLW_PRECREATE_FAILURE_REASON:-}'"
+fi
+_dlw_reset_precreated_worktree_state
+STUB_OWNER_INFO=""
 STUB_CLAIM_WORKTREE_RC=0
 unset STUB_EXISTING_WORKTREE_LINE
 
@@ -690,7 +894,8 @@ else
 	fail "closed pre-claim refresh does not spawn worker" "setsid was called"
 fi
 
-if grep -q "refreshed issue state before claim is CLOSED" "$LOGFILE" 2>/dev/null; then
+# GH#33404 moved the fresh closed-state read into the runner-capability gate.
+if grep -q "#77778 deferred: runner_capability_unmet source=fresh metadata_unreadable" "$LOGFILE" 2>/dev/null; then
 	pass "closed pre-claim refresh logs blocked state"
 else
 	fail "closed pre-claim refresh logs blocked state" "LOGFILE: $(cat "$LOGFILE")"
@@ -727,7 +932,14 @@ _dlw_precreate_worktree() {
 	_DLW_WORKTREE_PATH=""
 	_DLW_WORKTREE_BRANCH=""
 	_DLW_WORKTREE_REUSED=0
+	_DLW_PRECREATE_FAILURE_REASON=""
 	if [[ "$STUB_PRECREATE_RC" -ne 0 ]]; then
+		if [[ -n "${STUB_PRECREATE_LIVE_OWNER:-}" ]]; then
+			_DLW_WORKTREE_PATH="$ORCHESTRATOR_WORKTREE"
+			_DLW_PRECREATE_FAILURE_REASON="worktree_live_owner_refused"
+			_DLW_REFUSING_OWNER_PID=4242
+			_DLW_REFUSING_OWNER_START="Wed_Sep_30_10:00:00_2026"
+		fi
 		return "$STUB_PRECREATE_RC"
 	fi
 	_DLW_WORKTREE_PATH="$ORCHESTRATOR_WORKTREE"
@@ -754,6 +966,13 @@ _dlw_assign_and_label() {
 }
 lock_issue_for_worker() {
 	printf 'lock\n' >>"$ORCHESTRATOR_CALLS_FILE"
+	if [[ "${STUB_LOCK_RC:-0}" -ne 0 ]]; then
+		# Exercise the real summary allowlist with one known and one
+		# secret-like attribution value (GH#34057).
+		_PULSE_CONVERSATION_LOCK_FAILURE_REASON="verify_not_propagated"
+		_PULSE_CONVERSATION_LOCK_FAILURE_DETAIL="synthetic-lock-secret-fixture"
+		_PULSE_CONVERSATION_LOCK_MUTATION="accepted"
+	fi
 	return "${STUB_LOCK_RC:-0}"
 }
 _dlw_post_launch_hooks() { return 0; }
@@ -784,29 +1003,50 @@ STUB_ASSIGN_RC=0
 : >"$ORCHESTRATOR_CALLS_FILE"
 : >"${TMP}/setsid-calls.txt"
 STUB_LOCK_RC=1
+# Load only the real attribution summary; the lock itself stays stubbed.
+eval "$(awk '/^_PULSE_CONVERSATION_LOCK_UNCLASSIFIED=/ { print } /^(_conversation_lock_allowlisted|conversation_lock_failure_summary)\(\) \{/,/^}$/ { print }' "${SCRIPTS_DIR}/pulse-dispatch-locks.sh")"
+shared_logfile="$LOGFILE"
+LOGFILE="${TMP}/conversation-lock-failure.log"
 lock_failure_rc=0
 _dispatch_launch_worker "77781" "owner/repo" "test-dispatch" "Test Issue" \
 	"testuser" "$FAKE_REPO" "test prompt" "session-key-lock-failure" "" "{}" || lock_failure_rc=$?
+lock_failure_log="$LOGFILE"
+LOGFILE="$shared_logfile"
 actual_calls=$(tr '\n' ' ' <"$ORCHESTRATOR_CALLS_FILE")
 if [[ "$lock_failure_rc" -eq 2 && "$actual_calls" == "hold precreate final-gates prompt lock " && ! -s "${TMP}/setsid-calls.txt" ]]; then
 	pass "conversation-lock failure blocks ownership mutation and worker spawn"
 else
 	fail "conversation-lock failure blocks ownership mutation and worker spawn" "rc=$lock_failure_rc calls='$actual_calls'"
 fi
+if grep -q 'WARN conversation lock failed issue=77781 repo=owner/repo cause=verify_not_propagated detail=unclassified mutation=accepted$' "$lock_failure_log" &&
+	grep -q 'PRE_RUNTIME_FAILURE issue=77781 repo=owner/repo reason=conversation_lock_failed$' "$lock_failure_log" &&
+	! grep -q 'synthetic-lock-secret-fixture' "$lock_failure_log"; then
+	pass "conversation-lock failure logs an allowlisted cause without raw values"
+else
+	fail "conversation-lock failure logs an allowlisted cause without raw values" "log=$(cat "$lock_failure_log")"
+fi
 STUB_LOCK_RC=0
 
-# A repeated-zero-output hold must stop before worktree, ownership, lock, or spawn.
+# GH#36214: the windowed zero-attempt backoff runs before the cross-runner
+# claim, so a held issue posts no DISPATCH_CLAIM/prelaunch lease (each of which
+# used to become fresh orphan evidence) and returns the benign rc 3.
 : >"$ORCHESTRATOR_CALLS_FILE"
 : >"${TMP}/setsid-calls.txt"
+: >"$CLAIM_LOCK_CALLS_FILE"
 STUB_HOLD_RC=0
 hold_rc=0
 _dispatch_launch_worker "77780" "owner/repo" "test-dispatch" "Test Issue" \
 	"testuser" "$FAKE_REPO" "test prompt" "session-key-hold" "" "{}" || hold_rc=$?
 actual_calls=$(tr '\n' ' ' <"$ORCHESTRATOR_CALLS_FILE")
-if [[ "$hold_rc" -eq 2 && "$actual_calls" == "hold " && ! -s "${TMP}/setsid-calls.txt" ]]; then
-	pass "repeated-zero-output hold stops before queued ownership"
+if [[ "$hold_rc" -eq 3 && "$actual_calls" == "hold " && ! -s "${TMP}/setsid-calls.txt" ]]; then
+	pass "zero-attempt backoff stops before queued ownership with benign rc=3"
 else
-	fail "repeated-zero-output hold stops before queued ownership" "rc=$hold_rc calls='$actual_calls'"
+	fail "zero-attempt backoff stops before queued ownership with benign rc=3" "rc=$hold_rc calls='$actual_calls'"
+fi
+if [[ ! -s "$CLAIM_LOCK_CALLS_FILE" ]]; then
+	pass "zero-attempt backoff posts no dispatch claim or prelaunch lease"
+else
+	fail "zero-attempt backoff posts no dispatch claim or prelaunch lease" "claim lock calls: $(cat "$CLAIM_LOCK_CALLS_FILE")"
 fi
 STUB_HOLD_RC=1
 
@@ -854,6 +1094,37 @@ if grep -q '^77777$' "$CLAIM_LOCK_CALLS_FILE" 2>/dev/null; then
 else
 	fail "pre-creation failure happens after claim lock" "claim lock not called"
 fi
+
+# GH#33026: a live-owner refusal emits one structured hold record and a
+# distinct launch-preflight reason instead of the generic infrastructure one.
+: >"$ORCHESTRATOR_CALLS_FILE"
+: >"${TMP}/setsid-calls.txt"
+STUB_PRECREATE_LIVE_OWNER=1
+live_owner_rc=0
+_dispatch_launch_worker "77784" "owner/repo" "test-dispatch" "Test Issue" \
+	"testuser" "$FAKE_REPO" "test prompt" "session-key-live-owner" "" "{}" || live_owner_rc=$?
+if [[ "$live_owner_rc" -eq 2 && ! -s "${TMP}/setsid-calls.txt" &&
+	"${_DLW_LAST_PRE_RUNTIME_FAILURE:-}" == "worktree_live_owner_refused" ]] &&
+	[[ "$(grep -c "WORKTREE_LIVE_OWNER_REFUSED issue=#77784 repo=owner/repo owner_pid=4242 owner_start=Wed_Sep_30_10:00:00_2026 action=hold_until_owner_exits_or_changes worktree=${ORCHESTRATOR_WORKTREE}$" "$LOGFILE")" == 1 ]] &&
+	grep -q "PRE_RUNTIME_FAILURE issue=77784 repo=owner/repo reason=worktree_live_owner_refused" "$LOGFILE" &&
+	! grep -q "Skipping #77784" "$LOGFILE"; then
+	pass "live owner refusal records one classified hold instead of a generic failure"
+else
+	fail "live owner refusal records one classified hold instead of a generic failure" \
+		"rc=$live_owner_rc reason=${_DLW_LAST_PRE_RUNTIME_FAILURE:-unset}"
+fi
+# Runners must not be penalised: the reason stays out of per-issue fast-fail.
+if (
+	# shellcheck source=../worker-lifecycle-common.sh
+	source "${SCRIPTS_DIR}/worker-lifecycle-common.sh" >/dev/null 2>&1
+	_worker_failure_reason_is_launch_preflight "worktree_live_owner_refused" &&
+		_worker_failure_reason_is_launch_preflight "worker_launch_rc_2:worktree_live_owner_refused"
+); then
+	pass "live owner refusal is classified as launch-preflight"
+else
+	fail "live owner refusal is classified as launch-preflight"
+fi
+unset STUB_PRECREATE_LIVE_OWNER
 STUB_PRECREATE_RC=0
 
 # Final dependency/orphan gate failures likewise stop before queued ownership.
@@ -908,6 +1179,79 @@ else
 	fail "successful launch acquires queued ownership at final boundary" "rc=$success_rc calls='$actual_calls'"
 fi
 
+test_bounded_prelaunch_handoff() (
+	# Keep the real orchestrator, early/late renewal and spawn boundary; only
+	# replace GitHub and worktree I/O and advance Bash elapsed time, not sleep.
+	_claim_lease_token="fixture-lease"
+	local preparation_delay=125 lease_rc=0
+	export STUB_RENEW_RC=0
+	eval "$(awk '/^_dlw_prepare_opencode_db\(\) \{/,/^}$/ { print }' "${SCRIPTS_DIR}/pulse-dispatch-worker-launch.sh")"
+	# Sourcing the launcher replaced the early test stub. Keep the actual
+	# renewal path, but do not start a real OpenCode database during this test.
+	_dlw_prewarm_opencode_db() { _DLW_PREWARM_DIR=""; return 0; }
+	cat >"${TMP}/dispatch-claim-helper.sh" <<'LEASE_STUB'
+#!/usr/bin/env bash
+if [[ "$1" == transition ]]; then
+	[[ -n "${AIDEVOPS_ATTEMPT_ID:-}" && "$AIDEVOPS_ATTEMPT_ID" != unknown ]] || exit 1
+	printf 'renew %s\n' "$7" >>"$ORCHESTRATOR_CALLS_FILE"
+	if [[ "${STUB_RENEW_RC:-0}" -ne 0 ]]; then
+		# Raw helper output must never reach diagnostics (GH#34057).
+		printf 'stdout lease=%s\n' "$5"
+		printf 'gh: synthetic-lease-secret-fixture lease=%s (HTTP 401)\n' "$5" >&2
+		printf 'DISPATCH_LEASE_TRANSITION_DENIED reason=device_mismatch\n' >&2
+	fi
+	exit "${STUB_RENEW_RC:-0}"
+fi
+printf 'ownership-guard\n' >>"$ORCHESTRATOR_CALLS_FILE"
+exit 0
+LEASE_STUB
+	_dlw_precreate_worktree() {
+		printf 'precreate\n' >>"$ORCHESTRATOR_CALLS_FILE"
+		SECONDS=$((SECONDS + preparation_delay))
+		_DLW_WORKTREE_PATH="$ORCHESTRATOR_WORKTREE"
+		_DLW_WORKTREE_BRANCH="feature/auto-test"
+		_DLW_WORKTREE_REUSED=0
+		return 0
+	}
+	local scenario="" first_line="" hold_line=""
+	for scenario in slow expired renewal-failed; do
+		SECONDS=0 preparation_delay=125 STUB_RENEW_RC=0 lease_rc=0
+		[[ "$scenario" != expired ]] || preparation_delay=301
+		[[ "$scenario" != renewal-failed ]] || STUB_RENEW_RC=1
+		: >"$ORCHESTRATOR_CALLS_FILE"
+		: >"${TMP}/setsid-calls.txt"
+		LOGFILE="${TMP}/prelaunch-lease-${scenario}.log"
+		_dispatch_launch_worker 77782 owner/repo dispatch issue testuser "$FAKE_REPO" prompt issue-77782 "" '{}' || lease_rc=$?
+		# GH#36214: the zero-attempt backoff precedes the prelaunch lease; the
+		# lease renewal is the first prelaunch-stage action after it.
+		{ IFS= read -r hold_line && IFS= read -r first_line; } <"$ORCHESTRATOR_CALLS_FILE"
+		[[ "$hold_line" == hold && "$first_line" == renew\ * ]] || return 1
+		if [[ "$scenario" == slow ]]; then
+			[[ "$lease_rc" == 0 && -s "${TMP}/setsid-calls.txt" ]] || return 1
+			[[ "$(grep -c '^renew ' "$ORCHESTRATOR_CALLS_FILE")" == 2 ]] || return 1
+			# The later renewal only covers the remaining preparation budget.
+			local last_ttl=""
+			last_ttl=$(awk '/^renew / { ttl=$2 } END { print ttl }' "$ORCHESTRATOR_CALLS_FILE")
+			[[ "$last_ttl" -lt "${first_line#renew }" ]] || return 1
+		else
+			[[ "$lease_rc" == 2 && ! -s "${TMP}/setsid-calls.txt" ]] || return 1
+			! grep -q '^assign$' "$ORCHESTRATOR_CALLS_FILE" || return 1
+		fi
+		if [[ "$scenario" == renewal-failed ]]; then
+			grep -q 'prelaunch lease renewal failed issue=77782 repo=owner/repo session=issue-77782 helper_rc=1 reason=device_mismatch$' \
+				"$LOGFILE" || return 1
+			grep -q 'PRE_RUNTIME_FAILURE issue=77782 repo=owner/repo reason=prelaunch_lease_failed$' "$LOGFILE" || return 1
+			! grep -qF -e "$_claim_lease_token" -e 'synthetic-lease-secret-fixture' -e 'HTTP 401' "$LOGFILE" || return 1
+		fi
+	done
+	return 0
+)
+if test_bounded_prelaunch_handoff; then
+	pass "slow prelaunch is protected early; expired budgets and failed renewals cannot assign/spawn"
+else
+	fail "bounded prelaunch lease handoff" "inspect renewal and preparation stage ordering"
+fi
+
 # =============================================================================
 # Worktree-precreation failure observability remains intact
 # =============================================================================
@@ -953,6 +1297,199 @@ if [[ "$launch_rc" -eq 1 && ! -s "${TMP}/setsid-calls.txt" ]] && \
 	pass "launch boundary rejects a missing worker worktree before setsid"
 else
 	fail "launch boundary rejects a missing worker worktree before setsid" "rc=$launch_rc"
+fi
+
+test_sealed_generation_recovery() (
+	# Real Git state with only lifecycle classification, GitHub and the guarded
+	# removal boundary stubbed. Never touch the runner's registries or caches.
+	local sandbox="${TMP}/sealed-recovery" repo_slug="owner/repo" rc=0
+	mkdir -p "$sandbox/helpers" "$sandbox/repo" || return 1
+	local SCRIPT_DIR="$sandbox/helpers"
+	export AIDEVOPS_DISPATCH_SEALED_HOLD_DIR="$sandbox/holds"
+	local LOGFILE="$sandbox/diagnostic.log" reuse_class="sealed" removal_allowed=1
+	local PATH="$SCRIPT_DIR:$PATH"
+	export PATH SEALED_TEST_PRS='[[]]' SEALED_TEST_UPSTREAM_PRS='[[]]'
+	# The lifecycle PR lookup invokes gh as a process, not a shell function.
+	cat >"$SCRIPT_DIR/gh" <<'SEALED_GH'
+#!/usr/bin/env bash
+case "$*" in
+"api repos/owner/repo") printf '%s\n' '{"fork":true,"parent":{"full_name":"owner/upstream"},"source":{"full_name":"owner/upstream"}}' ;;
+"api --paginate --slurp repos/owner/repo/pulls?state=open&per_page=100") printf '%s\n' "$SEALED_TEST_PRS" ;;
+"api --paginate --slurp repos/owner/upstream/pulls?state=open&per_page=100") printf '%s\n' "$SEALED_TEST_UPSTREAM_PRS" ;;
+*) exit 1 ;;
+esac
+SEALED_GH
+	chmod +x "$SCRIPT_DIR/gh"
+	# Earlier cases deliberately replace these functions. Restore only the
+	# production entry points exercised here, following the lease fixture above.
+	eval "$(awk '/^_dlw_precreate_worktree\(\) \{/,/^}$/ { print }' "${SCRIPTS_DIR}/pulse-dispatch-worker-launch.sh")"
+	eval "$(awk '/^dispatch_with_dedup\(\) \{/,/^}$/ { print } /^_release_dispatch_claim_on_abort\(\) \{/,/^}$/ { print }' "${SCRIPTS_DIR}/pulse-dispatch-core.sh")"
+	git() { command -p git "$@"; return $?; }
+	unset _PULSE_DISPATCH_WORKER_SYSTEMD_LOADED
+	source "${SCRIPTS_DIR}/pulse-dispatch-worker-systemd.sh"
+	_dlw_classify_reuse_candidate() { printf '%s\n' "$reuse_class"; return 0; }
+	git -C "$sandbox/repo" init -q || return 1
+	local tree="" initial="" ahead=""
+	tree=$(git -C "$sandbox/repo" mktree </dev/null) || return 1
+	initial=$(printf 'initial\n' | GIT_AUTHOR_NAME=Test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=Test GIT_COMMITTER_EMAIL=test@example.invalid git -C "$sandbox/repo" commit-tree "$tree") || return 1
+	git -C "$sandbox/repo" update-ref refs/remotes/origin/main "$initial" || return 1
+	git -C "$sandbox/repo" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main || return 1
+	git -C "$sandbox/repo" worktree add -q -b feature/gh37806 "$sandbox/sealed" "$initial" || return 1
+	# Removal spy also emulates the helper's process/ownership safety refusal.
+	export SEALED_TEST_CALLS="$sandbox/calls" SEALED_TEST_REMOVE_ALLOWED="$removal_allowed"
+	cat >"$SCRIPT_DIR/worktree-helper.sh" <<'SEALED_HELPER'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >>"$SEALED_TEST_CALLS"
+if [[ "$1" == remove ]]; then
+	[[ "$SEALED_TEST_REMOVE_ALLOWED" == 1 ]] || exit 1
+	command -p git -C "$2" worktree remove "$2" || exit 1
+	printf '{"status":"retired"}\n'
+else
+	mkdir -p "$STUB_WT_SUCCESS_PATH"
+	printf 'Created worktree at %s\n' "$STUB_WT_SUCCESS_PATH"
+fi
+SEALED_HELPER
+	chmod +x "$SCRIPT_DIR/worktree-helper.sh"
+	# A clean empty generation is retired and fresh creation happens in the
+	# same precreation invocation, rather than returning a reuse refusal.
+	_dlw_restore_worktree_deps() { return 0; }
+	export STUB_WT_SUCCESS_PATH="$sandbox/fresh"
+	_dlw_precreate_worktree 37806 "$sandbox/repo" || return 1
+	[[ ! -d "$sandbox/sealed" && "$_DLW_WORKTREE_PATH" == "$sandbox/fresh" ]] || return 1
+	[[ "$(tr '\n' ' ' <"$SEALED_TEST_CALLS")" == 'remove add ' ]] || return 1
+	# Recreate a sealed checkpoint with a real unpublished commit.
+	ahead=$(printf 'checkpoint\n' | GIT_AUTHOR_NAME=Test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=Test GIT_COMMITTER_EMAIL=test@example.invalid git -C "$sandbox/repo" commit-tree "$tree" -p "$initial") || return 1
+	# Git retains missing worktrees. They must not poison another tree's hold.
+	git -C "$sandbox/repo" worktree add -q -b feature/missing-gh37806 "$sandbox/missing" "$initial" || return 1
+	mv "$sandbox/missing" "$sandbox/moved" || return 1
+	git -C "$sandbox/repo" worktree add -q -b feature/checkpoint-gh37806 "$sandbox/checkpoint" "$ahead" || return 1
+	: >"$SEALED_TEST_CALLS"
+	_dlw_precreate_worktree 37806 "$sandbox/repo" && return 1
+	[[ "$_DLW_PRECREATE_FAILURE_REASON" == worktree_reuse_sealed_generation && -d "$sandbox/checkpoint" && ! -s "$SEALED_TEST_CALLS" ]] || return 1
+	_dlw_sealed_hold_active "$sandbox/repo" 37806 "$repo_slug" || return 1
+	# Direct dispatch must skip before metadata/dedup can claim or spend a slot.
+	_dispatch_load_and_validate_metadata() { return 99; }
+	dispatch_with_dedup 37806 "$repo_slug" title issue user "$sandbox/repo" prompt || rc=$?
+	[[ "$rc" == 1 ]] || return 1
+	# The deterministic pre-publication abort releases its exact claim without
+	# requiring a queued-ownership rollback that never occurred.
+	local _claim_comment_id=123
+	_rollback_prelaunch_ownership() { return 1; }
+	gh() { printf '%s\n' "$*" >>"$sandbox/gh-calls"; return 0; }
+	_release_dispatch_claim_on_abort 37806 "$repo_slug" user worker_launch_rc_2:worktree_reuse_sealed_generation || return 1
+	[[ -z "$_claim_comment_id" ]] || return 1
+	grep -q -- '--method DELETE' "$sandbox/gh-calls" || return 1
+	# Normal default-branch traffic cannot re-arm the same ahead checkpoint.
+	local unrelated=""
+	unrelated=$(printf 'unrelated\n' | GIT_AUTHOR_NAME=Test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=Test GIT_COMMITTER_EMAIL=test@example.invalid git -C "$sandbox/repo" commit-tree "$tree" -p "$initial") || return 1
+	git -C "$sandbox/repo" update-ref refs/remotes/origin/main "$unrelated" || return 1
+	_dlw_sealed_hold_active "$sandbox/repo" 37806 "$repo_slug" || return 1
+	# Advancing the default to include the checkpoint invalidates the hold.
+	git -C "$sandbox/repo" update-ref refs/remotes/origin/main "$ahead" || return 1
+	_dlw_sealed_hold_active "$sandbox/repo" 37806 "$repo_slug" && return 1
+	# Dirty and ignored files are never auto-removed; only the sentinel may be
+	# ignored. Clearing dirt wakes the candidate without a time-based retry.
+	printf 'valuable\n' >"$sandbox/checkpoint/untracked"
+	_dlw_select_issue_worktree "$sandbox/repo" 37806 "$repo_slug" && return 1
+	[[ "$_DLW_SEALED_REASON" == dirty && ! -s "$SEALED_TEST_CALLS" ]] || return 1
+	_dlw_sealed_hold_active "$sandbox/repo" 37806 "$repo_slug" || return 1
+	rm "$sandbox/checkpoint/untracked"
+	_dlw_sealed_hold_active "$sandbox/repo" 37806 "$repo_slug" && return 1
+	# A live owner/process (guard refusal) and an open PR both preserve source.
+	SEALED_TEST_PRS='[[{"head":{"sha":"other","ref":"feature/checkpoint-gh37806","repo":{"full_name":"owner/repo"}}}]]'
+	_dlw_retire_empty_sealed "$sandbox/checkpoint" feature/checkpoint-gh37806 "$repo_slug" && return 1
+	[[ "$_DLW_SEALED_REASON" == open_pr && ! -s "$SEALED_TEST_CALLS" ]] || return 1
+	SEALED_TEST_PRS='[[]]'
+	SEALED_TEST_UPSTREAM_PRS="[[{\"head\":{\"sha\":\"$ahead\",\"ref\":\"another-name\"}}]]"
+	_dlw_retire_empty_sealed "$sandbox/checkpoint" feature/checkpoint-gh37806 "$repo_slug" && return 1
+	[[ "$_DLW_SEALED_REASON" == open_pr && ! -s "$SEALED_TEST_CALLS" ]] || return 1
+	SEALED_TEST_UPSTREAM_PRS='invalid'
+	_dlw_retire_empty_sealed "$sandbox/checkpoint" feature/checkpoint-gh37806 "$repo_slug" && return 1
+	[[ "$_DLW_SEALED_REASON" == evidence_unavailable && ! -s "$SEALED_TEST_CALLS" ]] || return 1
+	SEALED_TEST_UPSTREAM_PRS='[[]]' SEALED_TEST_REMOVE_ALLOWED=0
+	_dlw_retire_empty_sealed "$sandbox/checkpoint" feature/checkpoint-gh37806 "$repo_slug" && return 1
+	[[ -d "$sandbox/checkpoint" && "$_DLW_SEALED_REASON" == guarded_retirement_refused ]] || return 1
+	# A silent classification failure alongside a sealed candidate still logs.
+	git -C "$sandbox/repo" worktree add -q -b feature/unknown-gh37806 "$sandbox/unknown" "$initial" || return 1
+	_dlw_classify_reuse_candidate() {
+		local path="$1"
+		[[ "$path" != "$sandbox/unknown" ]] || return 1
+		printf 'sealed\n'
+		return 0
+	}
+	_dlw_select_issue_worktree "$sandbox/repo" 37806 "$repo_slug" && return 1
+	[[ "$_DLW_REUSE_REFUSAL" == worktree_reuse_evidence_unavailable ]] || return 1
+	grep -q 'worktree_reuse_evidence_unavailable.*sealed=1 unavailable=1' "$LOGFILE" || return 1
+	local sealed_log=""
+	sealed_log=$(grep 'path_class=sealed_issue_generation' "$LOGFILE" || true)
+	[[ "$sealed_log" != *"$sandbox"* ]] || return 1
+	return 0
+)
+if test_sealed_generation_recovery; then
+	pass "sealed empty generation retires and creates fresh; unpublished/dirty checkpoints hold before claim and deterministic refusal releases claim"
+else
+	fail "sealed generation recovery and state-aware preclaim hold"
+fi
+
+test_sealed_evidence_fences() (
+	local stored_record='{"task":{"issue":"99","repo":"owner/repo"}}' python_rc=0
+	local legacy_branch='feature/gh37806'
+	python3() { printf '%s\n' "$stored_record"; return "$python_rc"; }
+	git() { printf '%s\n' "$legacy_branch"; return 0; }
+	[[ -z "$(_dlw_classify_sealed_candidate /fixture 37806 owner/repo)" ]] || return 1
+	stored_record='{"task":{"issue":"37806","repo":"other/repo"}}'
+	[[ -z "$(_dlw_classify_sealed_candidate /fixture 37806 owner/repo)" ]] || return 1
+	stored_record='{"task":{"issue":"37806","repo":"owner/repo"}}'
+	[[ "$(_dlw_classify_sealed_candidate /fixture 37806 owner/repo)" == sealed ]] || return 1
+	python_rc=3
+	[[ "$(_dlw_classify_sealed_candidate /fixture 37806 owner/repo)" == sealed ]] || return 1
+	legacy_branch='feature/gh37806-other-task'
+	[[ -z "$(_dlw_classify_sealed_candidate /fixture 37806 owner/repo)" ]] || return 1
+	# A clean snapshot after a dirty refusal must not acquire a permanent hold.
+	export AIDEVOPS_DISPATCH_SEALED_HOLD_DIR="${TMP}/sealed-fences"
+	local LOGFILE="${TMP}/sealed-fences.log" snapshot_value=clean file=""
+	_dlw_sealed_snapshot() { printf '%s\n' "$snapshot_value"; return 0; }
+	_dlw_sealed_hold_record /fixture 37806 owner/repo dirty dirty && return 1
+	file=$(_dlw_sealed_hold_file 37806 owner/repo)
+	[[ ! -e "$file" ]] || return 1
+	snapshot_value=dirty
+	_dlw_sealed_hold_record /fixture 37806 owner/repo dirty dirty || return 1
+	_dlw_sealed_hold_record /fixture 37806 owner/repo dirty dirty || return 1
+	[[ "$(wc -l <"$LOGFILE" | tr -d ' ')" == 1 ]] || return 1
+	_dlw_sealed_hold_active /fixture 37806 owner/repo || return 1
+	snapshot_value=clean
+	_dlw_sealed_hold_active /fixture 37806 owner/repo && return 1
+	# Missing origin/HEAD is cacheable evidence, never permission for removal.
+	source "${SCRIPTS_DIR}/pulse-dispatch-sealed-worktree.sh"
+	git() {
+		local operation="${3:-}"
+		case "$operation" in
+		worktree) printf 'worktree %s\nHEAD abc\nbranch refs/heads/feature/gh37806\n' "$TMP" ;;
+		rev-parse) [[ "${4:-}" != --verify ]] || return 1; printf 'abc\n' ;;
+		status) printf '?? valuable\n' ;;
+		hash-object) command -p git hash-object --stdin; return $? ;;
+		*) return 1 ;;
+		esac
+		return 0
+	}
+	_dlw_classify_reuse_candidate() { printf 'sealed\n'; return 0; }
+	[[ -n "$(_dlw_sealed_snapshot /fixture 37806 owner/repo)" ]] || return 1
+	# A failed or partial enumeration is not proof that no generation exists.
+	eval "$(awk '/^_dlw_select_issue_worktree\(\) \{/,/^}$/ { print }' "${SCRIPTS_DIR}/pulse-dispatch-worker-systemd.sh")"
+	local partial_output="" selection_rc=0
+	git() { printf '%s' "$partial_output"; return 1; }
+	_dlw_select_issue_worktree /fixture 37806 owner/repo || selection_rc=$?
+	[[ "$selection_rc" == 2 && "$_DLW_REUSE_REFUSAL" == worktree_reuse_evidence_unavailable ]] || return 1
+	partial_output=$'worktree /fixture\nbranch refs/heads/feature/gh37806\n'
+	selection_rc=0
+	_dlw_select_issue_worktree /fixture 37806 owner/repo || selection_rc=$?
+	[[ "$selection_rc" == 2 && -z "$_DLW_REUSE_PATH" ]] || return 1
+	return 0
+)
+if test_sealed_evidence_fences; then
+	pass "sealed identity, refusal/snapshot race, diagnostic dedup and missing-default evidence fences"
+else
+	fail "sealed identity and snapshot evidence fences"
 fi
 
 # =============================================================================

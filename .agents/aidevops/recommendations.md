@@ -20,8 +20,9 @@ tools:
 
 ## Quick Reference
 
-- **Hosting**: Hostinger (managed WordPress convenience/value), Hetzner (self-managed control/price-performance), Cloudflare (edge/static/headless and global delivery); Closte is legacy-only
+- **Hosting**: Hostinger (managed WordPress convenience/value), Hetzner (self-managed control/price-performance), Cloudflare (edge/static/headless and global delivery)
 - **Deployment**: Coolify (self-hosted PaaS), Cloudron (easy app management)
+- **Operating systems**: [Contextual OS selection](../reference/os-selection.md) — opinionated desktop/server/dev/security starting points, gated by workload, vendor support, architecture, actual provider images, licensing, and user priorities
 - **DNS**: Cloudflare (CDN/security), Spaceship (modern), 101domains (large portfolios), Route 53 (AWS)
 - **Security**: API tokens in `~/.config/aidevops/`, never in repo, rotate quarterly
 - **SSH**: Ed25519 keys, standardize across servers, passphrase protection
@@ -38,13 +39,20 @@ desired operating burden, workload shape, budget, traffic geography, data-locati
 needs, support expectations, and existing stack, then verify current plans, limits,
 regions, backups, and pricing before committing.
 
+Apply [OS selection](../reference/os-selection.md) before choosing an image or
+installation command: Omarchy/Kubuntu for suitable desktops, Alpine for minimal
+compatible workloads, Rocky for general servers and supported Coolify deployments,
+vendor-required Ubuntu x64 for Cloudron, AlmaLinux for verified ecosystem fits,
+NixOS for reproducible environments, and Parrot/Kali VM/Tails for distinct security
+or privacy needs. Prefer Hetzner ARM only when every required layer supports it.
+These preferences do not extend aidevops's own platform-support matrix.
+
 For conventional WordPress, start with Hostinger when managed convenience and
 value lead. Prefer Hetzner when server control, custom infrastructure, or
 price-performance justify self-management. Prefer Cloudflare for edge-native,
 static, or headless delivery and as the global performance/security layer; a
 conventional PHP/MySQL WordPress site still needs an origin such as Hostinger or
-Hetzner. Retain Closte guidance only for existing estates, migrations, and
-offboarding—not as a new-deployment recommendation.
+Hetzner.
 
 ### Hosting & Cloud
 
@@ -53,14 +61,13 @@ offboarding—not as a new-deployment recommendation.
 | Hostinger | Conventional managed WordPress | Lower-ops shared/cloud hosting | Convenience and value over low-level server control | [Hostinger guide](../services/hosting/hostinger.md) |
 | Hetzner Cloud | Self-managed WordPress and production apps | VPS/dedicated infrastructure | Strong control and price-performance; operator owns hardening, backups, updates, and monitoring | [Hetzner guide](../services/hosting/hetzner.md) |
 | Cloudflare | Edge/static/headless workloads and global delivery/security | Edge platform or layer in front of an origin | Not a drop-in PHP/MySQL WordPress origin | [Cloudflare guide](../services/hosting/cloudflare.md) |
-| Closte (legacy) | Existing Closte estates and migrations | Legacy managed WordPress operations | Do not recommend for new deployments | [Closte legacy guide](../services/hosting/closte.md) |
 
 ### Deployment Platforms
 
 | Platform | Best For | Complexity | Key Features | Docs |
 |----------|----------|------------|--------------|------|
-| Coolify | Self-hosted PaaS | Medium | Docker-based, full control | [COOLIFY.md](COOLIFY.md) |
-| Cloudron | App management | Low | One-click apps, easy management | [CLOUDRON.md](CLOUDRON.md) |
+| Coolify | Self-hosted PaaS | Medium | Docker-based, full control | [Coolify guide](../tools/deployment/coolify.md) |
+| Cloudron | App management | Low | One-click apps, easy management | [Cloudron guide](../services/hosting/cloudron.md) |
 
 ### DNS & Domain Management
 
@@ -92,6 +99,8 @@ offboarding—not as a new-deployment recommendation.
 | Context7 MCP | Real-time documentation for AI assistants | [CONTEXT7-MCP-SETUP.md](CONTEXT7-MCP-SETUP.md) |
 | MCP Servers | Model Context Protocol configuration | [MCP-SERVERS.md](MCP-SERVERS.md) |
 | Crawl4AI | AI-powered web crawler, LLM-friendly output | [CRAWL4AI.md](CRAWL4AI.md) |
+| Linkup | Paid web search, page fetch and research API for agents; default over Tavily, Exa and Firecrawl for search and single-page fetch | [tools/research/web-search-apis.md](../tools/research/web-search-apis.md) |
+| LibreCrawl | Free, self-hosted SEO crawler (MIT): JS rendering, large crawls, JSON/CSV exports; `site-crawler-helper.sh` engine | [seo/librecrawl.md](../seo/librecrawl.md) |
 
 ## Infrastructure Organization
 
@@ -136,7 +145,7 @@ offboarding—not as a new-deployment recommendation.
 - Standardize keys across all servers with passphrase protection
 - Audit and remove unused keys regularly
 
-### Password Authentication (Hostinger and legacy Closte estates)
+### Password Authentication (Hostinger)
 
 - Prefer `aidevops secret set` and inject passwords only into the command subprocess.
 - Use `sshpass` only with an injected environment variable or a legacy helper's 600-permission compatibility file.
@@ -189,8 +198,7 @@ Map LocalWP ports to custom `.local` domains. Use Traefik reverse proxy for clea
       "hostinger": 8080,
       "hetzner-main": 8081,
       "hetzner-client-project": 8082,
-      "hetzner-storagebox": 8083,
-      "closte": 8084
+      "hetzner-storagebox": 8083
     }
   }
 }

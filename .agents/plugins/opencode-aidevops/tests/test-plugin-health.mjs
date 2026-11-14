@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
+import { primaryDeliveryEvidence } from "../config-agent-profiles.mjs";
 
 import {
   PLUGIN_HEALTH_SCHEMA,
@@ -34,6 +35,52 @@ test("plugin health stages are nonce-bound and atomically accumulated", () => {
   assert.deepEqual(result.stages, ["imported", "config_applied"]);
   assert.equal(result.details.config_applied.gpt56_limits.context, 300000);
   rmSync(root, { recursive: true, force: true });
+});
+
+test("primary delivery evidence distinguishes expanded, missing and shadowed sources", () => {
+  const root = mkdtempSync(join(tmpdir(), "aidevops-primary-delivery-"));
+  try {
+    const agent = {};
+    for (const source of ["build-plus", "seo", "content"]) {
+      const prompt = `# ${source}\nCanonical domain knowledge\n`;
+      writeFileSync(join(root, `${source}.md`), prompt);
+      agent[source] = {
+        mode: "primary", description: `Read ~/.aidevops/agents/${source}.md`,
+        prompt, tools: { read: true, bash: false }, permission: { edit: "deny" },
+      };
+    }
+    writeFileSync(join(root, "VERSION"), "test-version");
+    writeFileSync(join(root, "AGENTS.md"), "Canonical core knowledge");
+    const config = { agent, instructions: [join(root, "AGENTS.md"), "~/.aidevops/agents/AGENTS.md"] };
+    const original = JSON.stringify(config);
+    const evidence = primaryDeliveryEvidence(config, root);
+    assert.deepEqual(evidence.sources.map((item) => item.delivery), Array(3).fill("delivered"));
+    assert.equal(evidence.enforcement, "not_observed");
+    assert.equal(evidence.core.configuredCount, 2, "duplicate core references must be observable");
+    assert.equal(evidence.core.delivery, "not_observed_at_config_stage");
+    assert.match(evidence.core.sha256, /^[a-f0-9]{64}$/);
+    assert.match(evidence.versionSha256, /^[a-f0-9]{64}$/);
+    assert.ok(evidence.sources.every((item) => /^[a-f0-9]{64}$/.test(item.sha256)));
+    assert.equal(JSON.stringify(config), original, "diagnostics must not alter overrides or permissions");
+    assert.ok(!JSON.stringify(evidence).includes("Canonical domain knowledge"));
+
+    agent.seo.prompt = "operator-owned override";
+    agent.content.prompt = "{file:~/.aidevops/agents/content.md}";
+    rmSync(join(root, "build-plus.md"));
+    rmSync(join(root, "AGENTS.md"));
+    rmSync(join(root, "VERSION"));
+    const degraded = primaryDeliveryEvidence(config, root);
+    assert.equal(degraded.core.sha256, null);
+    assert.equal(degraded.versionSha256, null);
+    assert.deepEqual(degraded.sources.map((item) => item.delivery), [
+      "missing", "shadowed_or_unresolved", "shadowed_or_unresolved",
+    ]);
+    assert.equal(degraded.sources[0].sha256, null);
+    assert.equal(recordPluginHealthStage("primary_delivery", degraded, {}), false,
+      "no available probe must not claim a recorded protection receipt");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("plugin health rejects nonce mismatch, loose modes, and symlinks", () => {
@@ -79,6 +126,7 @@ test("probe-only plugin factory registers config and terminal-title health", () 
       env: {
         ...process.env,
         AIDEVOPS_TEMP_DIR: root,
+        AIDEVOPS_SETTINGS_FILE: join(root, "absent-settings.json"),
         AIDEVOPS_PLUGIN_HEALTH_PROBE_FILE: receipt,
         AIDEVOPS_PLUGIN_HEALTH_PROBE_NONCE: nonce,
         AIDEVOPS_PLUGIN_HEALTH_PROBE_ONLY: "1",
@@ -87,12 +135,29 @@ test("probe-only plugin factory registers config and terminal-title health", () 
   );
   assert.equal(child.status, 0, child.stderr);
   const result = JSON.parse(readFileSync(receipt, "utf8"));
-  assert.deepEqual(result.stages, ["imported", "factory_initialized", "config_applied"]);
+  assert.deepEqual(result.stages, ["imported", "factory_initialized", "primary_delivery", "config_applied"]);
+  assert.equal(result.details.primary_delivery.enforcement, "not_observed");
   assert.equal(result.details.factory_initialized.terminal_title_status, true);
   assert.deepEqual(result.details.config_applied.gpt56_limits, {
     output: 128000,
     context: 300000,
     input: 260000,
   });
+  assert.deepEqual(result.details.config_applied.astra_context, {
+    managed: true, target: 240000, auto: true, reserve: 20000,
+    limits: { context: 388000, input: 260000, output: 128000 },
+  });
+  const gpt6 = result.details.config_applied.gpt6_context;
+  assert.equal(gpt6.managed, true);
+  assert.equal(gpt6.target, 240000);
+  assert.equal(gpt6.auto, true);
+  assert.deepEqual(gpt6.customized, []);
+  assert.deepEqual(Object.keys(gpt6.models).sort(), [
+    "gpt-6-luna", "gpt-6-luna-fast", "gpt-6-sol", "gpt-6-sol-fast",
+    "gpt-6.1-sol", "gpt-6.1-sol-fast", "gpt-6.1-terra", "gpt-6.1-terra-fast",
+  ].sort());
+  for (const model of Object.values(gpt6.models)) {
+    assert.equal(model.limits.input - model.reserve, 240000);
+  }
   rmSync(root, { recursive: true, force: true });
 });

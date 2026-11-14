@@ -4,6 +4,14 @@
 
 set -euo pipefail
 
+# Resolve native Git once from the system default PATH (portable to non-FHS
+# hosts such as NixOS); fixtures must bypass the aidevops git wrapper.
+TEST_NATIVE_GIT=$(command -p -v git) || {
+	printf '%s\n' 'Native Git is unavailable on the system PATH' >&2
+	exit 1
+}
+export TEST_NATIVE_GIT
+
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="${TEST_DIR}/.."
 TEST_TMP_PARENT="${AIDEVOPS_TEMP_DIR:-${HOME}/.aidevops/.agent-workspace/tmp}"
@@ -27,6 +35,7 @@ mkdir -p "$HOME" "$AIDEVOPS_TEMP_DIR"
 
 # shellcheck source=../pulse-wrapper-cycle.sh
 source "${SCRIPTS_DIR}/pulse-wrapper-cycle.sh"
+real_sync_definition=$(declare -f sync_todo_refs_for_repo)
 
 repo_json='[]'
 for repo_number in 1 2 3 4 5 6; do
@@ -181,7 +190,7 @@ sync_todo_refs_for_repo() {
 	retry_attempt=$((retry_attempt + 1))
 	if [[ "$retry_attempt" -eq 1 ]]; then
 		TEST_NOW=107
-		return 2
+		return 25
 	fi
 	return 0
 }
@@ -198,8 +207,127 @@ if ! grep -qx 'sync_todo_refs_repo_1|5' "$TIMEOUT_LOG" || ! grep -qx 'sync_todo_
 	printf 'FAIL aggregate retry received a fresh per-repo timeout\n' >&2
 	exit 1
 fi
-grep -q 'status=retrying repo=owner/repo-retry attempt=2 reason=retryable_snapshot timeout=3s' "$WRAPPER_LOGFILE" || {
+grep -q 'status=retrying repo=owner/repo-retry attempt=2 reason=remote_advanced timeout=3s' "$WRAPPER_LOGFILE" || {
 	printf 'FAIL aggregate retry omitted remaining-budget diagnostics\n' >&2
+	exit 1
+}
+
+# An unchanged typed mismatch has no safe recreate action. It must remain a
+# truthful child failure without consuming the bounded remote-advance retry.
+: >"$CALL_LOG"
+: >"$TIMEOUT_LOG"
+sync_todo_refs_for_repo() {
+	local repo_slug="$1"
+	local repo_path="$2"
+	: "$repo_path"
+	printf '%s\n' "$repo_slug" >>"$CALL_LOG"
+	return 24
+}
+unchanged_rc=0
+_pulse_sync_todo_repo_bounded owner/repo-unchanged "${TEST_ROOT}/repo-1" 10 1 || unchanged_rc=$?
+eval "$original_sync_definition"
+[[ "$unchanged_rc" -eq 24 ]] || {
+	printf 'FAIL unchanged snapshot mismatch lost its typed result: rc=%s\n' "$unchanged_rc" >&2
+	exit 1
+}
+[[ $(wc -l <"$CALL_LOG" | tr -d ' ') -eq 1 ]] || {
+	printf 'FAIL unchanged snapshot mismatch consumed a useless recreation retry\n' >&2
+	exit 1
+}
+
+# Absent root TODO.md: skip only when trusted registration metadata says
+# planning is not enabled; every other case stays a visible failure, and a
+# present legacy TODO keeps running all sync stages. Owned workspaces are
+# always cleaned.
+absent_remote="${TEST_ROOT}/absent-remote.git"
+absent_clone="${TEST_ROOT}/absent-clone"
+legacy_remote="${TEST_ROOT}/legacy-remote.git"
+legacy_clone="${TEST_ROOT}/legacy-clone"
+for fixture in "absent:$absent_remote:$absent_clone:README.md" "legacy:$legacy_remote:$legacy_clone:TODO.md"; do
+	IFS=: read -r _fx_name fx_remote fx_clone fx_file <<<"$fixture"
+	"$TEST_NATIVE_GIT" init --bare --quiet --initial-branch=main "$fx_remote"
+	"$TEST_NATIVE_GIT" clone --quiet "$fx_remote" "$fx_clone" 2>/dev/null
+	"$TEST_NATIVE_GIT" -C "$fx_clone" config user.email test@example.com
+	"$TEST_NATIVE_GIT" -C "$fx_clone" config user.name Test
+	"$TEST_NATIVE_GIT" -C "$fx_clone" config commit.gpgsign false
+	printf '%s\n' '- [ ] t1 fixture' >"${fx_clone}/${fx_file}"
+	"$TEST_NATIVE_GIT" -C "$fx_clone" add "$fx_file"
+	"$TEST_NATIVE_GIT" -C "$fx_clone" commit --quiet -m seed
+	"$TEST_NATIVE_GIT" -C "$fx_clone" push --quiet origin main
+	"$TEST_NATIVE_GIT" --git-dir="$fx_remote" symbolic-ref HEAD refs/heads/main
+done
+STAGE_LOG="${TEST_ROOT}/stages.log"
+export REPOS_JSON="${TEST_ROOT}/planning-repos.json"
+eval "$real_sync_definition"
+original_stage_definition=$(declare -f _pulse_run_issue_sync_stage)
+_pulse_run_issue_sync_stage() {
+	printf '%s\n' "$2" >>"$STAGE_LOG"
+	return 1
+}
+write_planning_repos() {
+	local features_json="$1"
+	jq -cn --argjson features "$features_json" --arg path "$absent_clone" \
+		'{initialized_repos:[{slug:"owner/absent",path:$path,pulse:true,features:$features}]}' >"$REPOS_JSON"
+	return 0
+}
+run_absent_case() {
+	local expected_rc="$1" expected_log="$2" case_rc=0
+	: >"$STAGE_LOG"
+	: >"$WRAPPER_LOGFILE"
+	sync_todo_refs_for_repo owner/absent "$absent_clone" || case_rc=$?
+	[[ "$case_rc" -eq "$expected_rc" ]] || {
+		printf 'FAIL absent TODO case expected rc=%s got %s (%s)\n' "$expected_rc" "$case_rc" "$expected_log" >&2
+		exit 1
+	}
+	grep -q "$expected_log" "$WRAPPER_LOGFILE" || {
+		printf 'FAIL absent TODO case missing log %s\n' "$expected_log" >&2
+		exit 1
+	}
+	[[ ! -s "$STAGE_LOG" ]] || {
+		printf 'FAIL absent TODO case ran issue-sync stages\n' >&2
+		exit 1
+	}
+	grep -q 'workspace cleanup outcome=removed' "$WRAPPER_LOGFILE" || {
+		printf 'FAIL absent TODO case did not clean its workspace\n' >&2
+		exit 1
+	}
+	return 0
+}
+write_planning_repos '["code-quality"]'
+run_absent_case 0 'status=skipped reason=planning_not_enabled repo=owner/absent'
+write_planning_repos '["code-quality","planning"]'
+run_absent_case 1 'reason=missing_planning_file repo=owner/absent'
+write_planning_repos '"planning"'
+run_absent_case 1 'reason=planning_intent_unknown repo=owner/absent'
+jq -cn --arg path "$absent_clone" \
+	'{initialized_repos:[{slug:"owner/absent",path:$path,features:["planning"]},{slug:"owner/absent",path:$path,features:[]}]}' >"$REPOS_JSON"
+run_absent_case 1 'reason=planning_intent_contradictory repo=owner/absent'
+rm -f "$REPOS_JSON"
+run_absent_case 1 'reason=planning_intent_unknown repo=owner/absent'
+
+: >"$STAGE_LOG"
+legacy_rc=0
+sync_todo_refs_for_repo owner/legacy "$legacy_clone" || legacy_rc=$?
+[[ "$legacy_rc" -eq 1 && $(wc -l <"$STAGE_LOG" | tr -d ' ') -eq 4 ]] || {
+	printf 'FAIL present legacy TODO did not run all sync stages: rc=%s\n' "$legacy_rc" >&2
+	exit 1
+}
+eval "$original_stage_definition"
+unset -f write_planning_repos run_absent_case
+eval "$original_sync_definition"
+export REPOS_JSON="$retry_repos_json"
+
+# The aggregate deadline is capped before spawning any repository job.
+# shellcheck source=../pulse-watchdog.sh
+source "${SCRIPTS_DIR}/pulse-watchdog.sh"
+PULSE_START_EPOCH=0 PULSE_STALE_THRESHOLD=1800 PULSE_LOCK_MAX_AGE_S=1100
+date() { [[ "${1:-}" == '+%s' ]] || return 1; printf '1000\n'; return 0; }
+_pulse_sync_todo_repo_bounded() { printf '%s\n' "$5" >>"$CALL_LOG"; return 0; }
+: >"$CALL_LOG"
+sync_todo_refs_all_repos
+unset -f date
+[[ "$(<"$CALL_LOG")" == 1010 ]] || {
+	printf 'FAIL TODO aggregate deadline exceeded cycle budget: %s\n' "$(<"$CALL_LOG")" >&2
 	exit 1
 }
 

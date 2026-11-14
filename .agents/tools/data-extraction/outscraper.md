@@ -22,8 +22,8 @@ tools:
 - **Purpose**: Business intelligence from Google Maps, Amazon, reviews, contacts
 - **Auth**: `X-API-KEY` header; key from <https://auth.outscraper.com/profile>
 - **Env Var**: `OUTSCRAPER_API_KEY` in `~/.config/aidevops/credentials.sh` (600 perms)
-- **API Base**: `https://api.app.outscraper.com` (ignore `api.outscraper.cloud` in OpenAPI spec)
-- **Docs**: Live docs require Outscraper login: <https://app.outscraper.com/api-docs>
+- **API Bases**: `https://api.app.outscraper.com` and `https://api.outscraper.cloud` (both supported; authenticated `GET /profile/balance` returned HTTP 200 on both on 2026-10-08)
+- **Docs**: Live docs require Outscraper login: <https://app.outscraper.cloud/api-docs> (SPA; text fetches may return only the title — use SDK sources below)
 - **Context7 OpenAPI snapshot**: <https://context7.com/openapi/uploaded-f547ce23-outscraper-api-docs.json> — user-uploaded convenience copy; may be outdated because the latest Outscraper API docs are only available after login
 - **SDK**: <https://github.com/outscraper/outscraper-python>
 - **Pricing**: Metered per request — <https://outscraper.com/pricing/> (free tier available)
@@ -41,12 +41,14 @@ tools:
 
 ## Installation
 
-Python 3.10+ required. `uv` recommended.
+Python 3.10+ required. `uv` recommended. Keep the `mcp<2` constraint:
+`outscraper-mcp-server` 0.1.2 imports `mcp.server.fastmcp`, which mcp 2.x removed,
+and does not pin `mcp` itself (GH#34620). `setup.sh` installs it pinned.
 
 ```bash
-uvx outscraper-mcp-server          # run via uvx (recommended)
-uv add outscraper-mcp-server       # install permanently
-pip install outscraper-mcp-server  # or via pip
+uvx --with 'mcp<2' outscraper-mcp-server                 # run via uvx (recommended)
+uv tool install --with 'mcp<2' outscraper-mcp-server     # install permanently (upgrade keeps the pin)
+pip install outscraper-mcp-server 'mcp<2'                # or via pip
 ```
 
 ## MCP Server Config
@@ -57,7 +59,7 @@ pip install outscraper-mcp-server  # or via pip
 claude mcp add-json outscraper --scope user '{
   "type": "stdio",
   "command": "uvx",
-  "args": ["outscraper-mcp-server"],
+  "args": ["--with", "mcp<2", "outscraper-mcp-server"],
   "env": {"OUTSCRAPER_API_KEY": "your_api_key_here"}
 }'
 ```
@@ -69,7 +71,7 @@ claude mcp add-json outscraper --scope user '{
   "mcpServers": {
     "outscraper": {
       "command": "uvx",
-      "args": ["outscraper-mcp-server"],
+      "args": ["--with", "mcp<2", "outscraper-mcp-server"],
       "env": { "OUTSCRAPER_API_KEY": "your_api_key_here" }
     }
   }
@@ -86,7 +88,7 @@ Config file locations:
 | VS Code | `.vscode/mcp.json` (use `"type": "stdio"` wrapper) |
 | Kilo Code | MCP server icon > Edit Global MCP (`"alwaysAllow": ["google_maps_search", "google_search"]`) |
 | Kiro | Cmd+Shift+P > "Kiro: Open user MCP config" (`"autoApprove"` instead of `"alwaysAllow"`) |
-| Droid | `droid mcp add outscraper "uvx" outscraper-mcp-server --env OUTSCRAPER_API_KEY=your_api_key_here` |
+| Droid | `droid mcp add outscraper "uvx" --with 'mcp<2' outscraper-mcp-server --env OUTSCRAPER_API_KEY=your_api_key_here` |
 | Smithery | `npx -y @smithery/cli install outscraper-mcp-server --client claude` |
 
 **OpenCode** (`~/.config/opencode/opencode.json`) — `"env"` key not supported, use bash wrapper:
@@ -94,7 +96,7 @@ Config file locations:
 ```json
 "outscraper": {
   "type": "local",
-  "command": ["/bin/bash", "-c", "OUTSCRAPER_API_KEY=$OUTSCRAPER_API_KEY uv tool run outscraper-mcp-server"],
+  "command": ["/bin/bash", "-c", "OUTSCRAPER_API_KEY=$OUTSCRAPER_API_KEY uv tool run --with 'mcp<2' outscraper-mcp-server"],
   "enabled": true
 }
 ```
@@ -112,6 +114,7 @@ OpenCode access: `@outscraper` subagent only (not enabled for main agents).
 | **Amazon** | `GET /amazon/products-v2`, `GET /amazon/reviews` |
 | **Reviews** | `GET /yelp-search`, `GET /yelp/reviews`, `GET /tripadvisor/reviews`, `GET /appstore/reviews`, `GET /youtube-comments`, `GET /g2/reviews`, `GET /trustpilot`, `GET /trustpilot/reviews`, `GET /glassdoor/reviews`, `GET /capterra-reviews` |
 | **Business** | `GET /emails-and-contacts`, `GET /contacts-and-leads`, `GET /phones-enricher`, `GET /company-insights`, `GET /email-validator`, `GET /company-website-finder`, `GET /similarweb`, `GET /yellowpages-search` |
+| **Businesses / POI database** | `POST /businesses` (filtered search), `GET /businesses/{business_id}` (details by `os_id`, `place_id`, or `google_id`) |
 | **Geo** | `GET /geocoding`, `GET /reverse-geocoding` |
 | **Whitepages** | `GET /whitepages-phones`, `GET /whitepages-addresses` |
 
@@ -127,6 +130,53 @@ OpenCode access: `@outscraper` subagent only (not enabled for main agents).
 | `async` | bool | Submit async and retrieve later |
 | `ui` | bool | Execute as UI task |
 | `webhook` | string | Callback URL for completion notification |
+
+### Businesses / POI Database Parameters
+
+`POST /businesses` accepts a JSON body. These parameters are specific to the database API, not the live Google Maps scraper:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `filters` | object | Optional filtering criteria (see below) |
+| `limit` | int | Page size, 1–1000; SDK default: 10 |
+| `cursor` | string | Omit on the first page; pass the previous response's `next_cursor` for the next page |
+| `include_total` | bool | Request the total matching count; default: false; may increase response time |
+| `fields` | list of strings | Select response fields; omit to return all fields |
+| `enrichments` | object | Map enrichment names to parameter objects, e.g. `contacts_n_leads`; the Python SDK also accepts a name string or list and normalizes it to this object |
+
+Supported `filters` include `country_code` (string); `states`, `cities`, `types`, and `business_statuses` (lists of strings); `has_website`, `has_phone`, `verified`, and `area_service` (booleans); and `rating` and `reviews` (string expressions). Consult `outscraper/schema/businesses.py` for the full filter schema.
+
+Example JSON body:
+
+```json
+{
+  "filters": {"country_code": "US", "cities": ["New York"], "has_website": true},
+  "limit": 100,
+  "include_total": false,
+  "fields": ["os_id", "name", "website"],
+  "enrichments": {"contacts_n_leads": {"contacts_per_company": 3, "emails_per_contact": 1}}
+}
+```
+
+Search responses contain `items`, `next_cursor`, and `has_more`. Continue with `next_cursor` while more pages are indicated. `GET /businesses/{business_id}` returns one business and accepts `fields` as a comma-separated query parameter. Python SDK equivalents are `client.businesses.search(...)`, `client.businesses.iter_search(...)`, and `client.businesses.get(business_id, fields=[...])`; PHP equivalents are `businessesSearch`, `businessesIterSearch`, and `businessesGet`.
+
+### Google Maps Enrichments and Async Results
+
+For `POST /google-maps-search`, use `enrichment` (singular), a list of service names: `domains_service`, `emails_validator_service`, `disposable_email_checker`, `whatsapp_checker`, `imessage_checker`, `phones_enricher_service`, `trustpilot_service`, and `companies_data`. This differs from the Businesses API's `enrichments` parameter.
+
+Async results are retained for **2 hours after completion**. Retrieve them via `GET /requests/{id}` (Python: `get_request_archive`) and persist the data within that window; do not treat the request archive as permanent storage.
+
+### SDK Sources When Live Docs Cannot Be Fetched
+
+The docs SPA may return only a title to WebFetch. Context7's uploaded OpenAPI snapshot and SDK docstring URLs may be stale; consult current official SDK source for endpoint payloads and exported methods instead. The Businesses and Maps contracts above were checked against Python SDK 6.0.5 on 2026-10-08.
+
+```bash
+gh api repos/outscraper/outscraper-python/contents/outscraper/businesses.py --jq '.content' | base64 --decode
+gh api repos/outscraper/outscraper-python/contents/outscraper/schema/businesses.py --jq '.content' | base64 --decode
+gh api repos/outscraper/outscraper-python/contents/examples/Businesses.md --jq '.content' | base64 --decode
+gh api repos/outscraper/outscraper-python/contents/outscraper/client.py --jq '.content' | base64 --decode
+gh api repos/outscraper/outscraper-php/contents/outscraper.php --jq '.content' | base64 --decode
+```
 
 ## Python SDK
 
@@ -174,11 +224,12 @@ client.google_maps_reviews(
 | `uvx: command not found` | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | Connection refused / timeout | Check key at <https://auth.outscraper.com/profile>; verify connectivity |
 | Tool not found | Ensure MCP server enabled; restart AI tool; check agent has `outscraper_*: true` |
-| `uvx` conflicts | Use `uv tool run outscraper-mcp-server` instead |
+| `uvx` conflicts | Use `uv tool run --with 'mcp<2' outscraper-mcp-server` instead |
+| `No module named 'mcp.server.fastmcp'` | mcp 2.x resolved; `uv tool install --force --with 'mcp<2' outscraper-mcp-server` |
 | Python version errors | `brew install python@3.12` (macOS) |
 
 ## Related
 
 - [Crawl4AI](../browser/crawl4ai.md) — Web crawling for AI/LLM applications
-- [Stagehand](../browser/stagehand.md) — AI-powered browser automation
+- [Playwright](../browser/playwright.md) — Browser automation
 - [Context7](../context/context7.md) — Library documentation lookup

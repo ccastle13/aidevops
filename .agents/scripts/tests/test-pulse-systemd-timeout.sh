@@ -30,6 +30,11 @@ _scheduler_detect_installed() {
 	return 1
 }
 
+# The Linux fixture has no launchd agents to migrate.
+_launchd_has_agent() {
+	return 1
+}
+
 _systemd_user_available() {
 	return 0
 }
@@ -67,7 +72,8 @@ systemctl() {
 }
 
 export HOME="${TMP_DIR}/home"
-export PATH="/usr/bin:/bin"
+# Keep the caller's toolchain: NixOS does not install coreutils in /usr/bin.
+# External scheduler operations are isolated by the function stubs above.
 export NON_INTERACTIVE="true"
 export AIDEVOPS_SUPERVISOR_PULSE="true"
 mkdir -p "$HOME/.aidevops/agents/scripts" "$HOME/.aidevops/logs"
@@ -115,6 +121,13 @@ if ! grep -q '^Environment=AIDEVOPS_PULSE_ASYNC_POST_DISPATCH_HOUSEKEEPING="0"$'
 	echo "expected async post-dispatch housekeeping disabled in ${SERVICE_FILE}" >&2
 	exit 1
 fi
+
+if ! grep -Fq "Environment=PULSE_DIR=\"${HOME}/.aidevops/.agent-workspace/supervisor\"" "$SERVICE_FILE"; then
+	echo "expected scheduled Pulse project root to use the dedicated supervisor subtree" >&2
+	exit 1
+fi
+
+printf 'PASS %s\n' "scheduled Linux Pulse excludes retained worker trees from its project root"
 
 if [[ "$(_pulse_supervisor_runtime_budget_seconds 1800)" != "3600" ]]; then
 	echo "expected canonical Pulse runtime budget to include the 3600s underfilled recovery ceiling" >&2

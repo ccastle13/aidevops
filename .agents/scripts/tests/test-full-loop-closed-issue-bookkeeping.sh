@@ -45,8 +45,15 @@ extract_function() {
 
 COMMIT_HELPER="${SCRIPTS_DIR}/full-loop-helper-commit.sh"
 MAIN_HELPER="${SCRIPTS_DIR}/full-loop-helper.sh"
+# cmd_commit_and_pr validates the squash subject before any mutation.
+# shellcheck source=../full-loop-helper-subject.sh
+source "${SCRIPTS_DIR}/full-loop-helper-subject.sh"
+# Metadata and bookkeeping share the production merge-base resolver.
+# shellcheck source=../full-loop-helper-risk.sh
+source "${SCRIPTS_DIR}/full-loop-helper-risk.sh"
 
 eval "$(extract_function "$COMMIT_HELPER" _parse_commit_and_pr_args)"
+eval "$(extract_function "$COMMIT_HELPER" _validate_keep_issue_open_request)"
 eval "$(extract_function "$COMMIT_HELPER" _validate_completion_bookkeeping_request)"
 eval "$(extract_function "$COMMIT_HELPER" _completion_bookkeeping_body_has_reference)"
 eval "$(extract_function "$COMMIT_HELPER" _completion_bookkeeping_body_has_closing_reference)"
@@ -55,7 +62,24 @@ eval "$(extract_function "$COMMIT_HELPER" _validate_completion_bookkeeping_paths
 eval "$(extract_function "$COMMIT_HELPER" _validate_completion_bookkeeping_todo)"
 eval "$(extract_function "$COMMIT_HELPER" _validate_completion_bookkeeping_pr_body)"
 eval "$(extract_function "$COMMIT_HELPER" _validate_closed_issue_completion_bookkeeping)"
+eval "$(extract_function "$COMMIT_HELPER" _create_or_continue_pr)"
 eval "$(extract_function "$MAIN_HELPER" cmd_commit_and_pr)"
+eval "$(extract_function "$MAIN_HELPER" _diff_is_planning_only)"
+eval "$(extract_function "$MAIN_HELPER" _commit_and_pr_prepare_metadata)"
+eval "$(extract_function "$MAIN_HELPER" _commit_and_pr_check_readiness)"
+eval "$(extract_function "$MAIN_HELPER" _commit_and_pr_publish)"
+
+_commit_and_pr_privacy_scan() {
+	return 0
+}
+
+macos_checks_evidence() {
+	return 0
+}
+
+macos_checks_route() {
+	return 0
+}
 
 _FULL_LOOP_TRUE="true"
 FULL_LOOP_COMPLETION_BOOKKEEPING_AUDIT=""
@@ -147,6 +171,10 @@ git() {
 	local first_arg="${1:-}"
 	local arguments=" $* "
 	case "$command_name" in
+	merge-base)
+		printf '%s\n' 'fixture-merge-base'
+		return 0
+		;;
 	diff)
 		case "$arguments" in
 		*" --diff-filter=D "*) printf '%s' "$TEST_DELETED_FILES" ;;
@@ -161,10 +189,20 @@ git() {
 			printf '%s\n' "$FIXTURE_ROOT"
 			return 0
 		fi
+		if [[ "$first_arg" == "--verify" ]]; then
+			printf '%s\n' 'fixture-commit'
+			return 0
+		fi
 		return 1
 		;;
 	esac
 	return 0
+}
+
+# GH#34052 PR-only scope has dedicated coverage in
+# test-full-loop-merge-authority-guard.sh; these fixtures carry no marker.
+_issue_pr_only_contract_state() {
+	return 1
 }
 
 _validate_commit_and_pr_inputs() {
@@ -183,6 +221,13 @@ _validate_explicit_pr_metadata() {
 	return 0
 }
 
+_validate_pending_runtime_metadata() {
+	# This harness supplies only low-risk metadata fixtures; runtime-risk
+	# derivation has separate coverage and does not use this synthetic git stub.
+	[[ "$1" == "low" && "$2" == "self-assessed" ]]
+	return $?
+}
+
 _stage_and_commit() {
 	local commit_message="$1"
 	[[ -n "$commit_message" ]] || return 1
@@ -193,6 +238,14 @@ _stage_and_commit() {
 _finalize_wip_history() {
 	local commit_message="$1"
 	[[ -n "$commit_message" ]] || return 1
+	return 0
+}
+
+# GH#33253: no fixture in this suite exercises --replace-pr, so ancestry is
+# always a no-op skip (mirrors the real helper's behavior without a replacement).
+REPLACEMENT_PR_ANCESTRY_VALIDATED=0
+_validate_replacement_pr_ancestry() {
+	REPLACEMENT_PR_ANCESTRY_VALIDATED=0
 	return 0
 }
 
@@ -214,6 +267,13 @@ _resolve_remote_default_branch() {
 	[[ "$remote_name" == "origin" ]] || return 1
 	printf 'main\n'
 	return 0
+}
+_validate_stack_base() {
+	return 0
+}
+_resolve_pr_base_branch() {
+	_resolve_remote_default_branch "$@"
+	return $?
 }
 
 _build_pr_body() {
@@ -244,6 +304,10 @@ _issue_has_parent_task_label() {
 	local repo_slug="$2"
 	[[ -n "$issue_number" && -n "$repo_slug" ]] || return 1
 	return 1
+}
+
+issue_open_pr_guard_check() {
+	return 0
 }
 
 _validate_worker_claim() {
@@ -298,6 +362,7 @@ _label_issue_in_review() {
 	local issue_number="$1"
 	local repo_slug="$2"
 	[[ -n "$issue_number" && -n "$repo_slug" ]] || return 1
+	record_call "issue-in-review"
 	return 0
 }
 
@@ -548,6 +613,101 @@ test_unrelated_todo_change_refusal() {
 	return 0
 }
 
+test_indented_completion() {
+	local indent=""
+	local rc=0
+	for indent in '  ' $'\t'; do
+		reset_case
+		printf '%s- [x] t4242 Child ref:GH#42 pr:#900 completed:2026-08-04\n' "$indent" >"${FIXTURE_ROOT}/TODO.md"
+		printf -v TEST_TODO_PATCH '@@ -1 +1 @@\n-%s- [ ] t4242 Child ref:GH#42\n+%s- [x] t4242 Child ref:GH#42 pr:#900 completed:2026-08-04' "$indent" "$indent"
+		rc=0
+		invoke_bookkeeping >/dev/null || rc=$?
+		if [[ "$rc" -eq 0 && "$(call_count create-pr)" -eq 1 ]]; then
+			pass "indented child completion preserves the bookkeeping contract"
+		else
+			fail "indented child completion preserves the bookkeeping contract" "rc=${rc}"
+		fi
+	done
+	reset_case
+	printf '  - [x] t4242 Duplicate ref:GH#42 pr:#900 completed:2026-08-04\n' >>"${FIXTURE_ROOT}/TODO.md"
+	rc=0
+	invoke_bookkeeping >/dev/null || rc=$?
+	if [[ "$rc" -ne 0 && "$(call_count push)" -eq 0 ]]; then
+		pass "mixed-indent duplicate issue mappings remain rejected"
+	else
+		fail "mixed-indent duplicate issue mappings remain rejected" "rc=${rc}"
+	fi
+	reset_case
+	TEST_TODO_PATCH=$'@@ -1 +1 @@\n-  - [ ] t9999 Other ref:GH#99\n+  - [x] t9999 Other ref:GH#99'
+	rc=0
+	invoke_bookkeeping >/dev/null || rc=$?
+	if [[ "$rc" -ne 0 && "$(call_count push)" -eq 0 ]]; then
+		pass "unrelated indented task changes remain rejected"
+	else
+		fail "unrelated indented task changes remain rejected" "rc=${rc}"
+	fi
+	return 0
+}
+
+# GH#36598: --keep-issue-open links an open, non-parent issue without closing it.
+invoke_keep_open() {
+	cmd_commit_and_pr \
+		--issue 42 \
+		--message "fix: long-running increment" \
+		--summary "Increment for a recurring task" \
+		--testing "fixture" \
+		--risk-level low \
+		--testing-level self-assessed \
+		--keep-issue-open "$@"
+	return $?
+}
+
+test_keep_issue_open() {
+	reset_case
+	TEST_ISSUE_STATE="OPEN"
+	TEST_ISSUE_REASON=""
+	TEST_CHANGED_FILES="src/implementation.sh"
+	local rc=0
+	invoke_keep_open >/dev/null || rc=$?
+	if [[ "$rc" -eq 0 && "$(call_count create-pr)" -eq 1 && "$(call_count issue-in-review)" -eq 0 ]] &&
+		grep -qF 'For #42' "$CREATED_BODY_FILE" && ! grep -qF 'Resolves #42' "$CREATED_BODY_FILE"; then
+		pass "--keep-issue-open uses For #N and skips the issue in-review handoff"
+	else
+		fail "--keep-issue-open uses For #N and skips the issue in-review handoff" "rc=${rc} calls=$(<"$CALL_LOG")"
+	fi
+	reset_case
+	TEST_ISSUE_STATE="OPEN"
+	TEST_CHANGED_FILES="src/implementation.sh"
+	rc=0
+	invoke_default >/dev/null || rc=$?
+	if [[ "$rc" -eq 0 && "$(call_count issue-in-review)" -eq 1 ]] && grep -qF 'Resolves #42' "$CREATED_BODY_FILE"; then
+		pass "default open-issue PR still resolves and hands off the issue"
+	else
+		fail "default open-issue PR still resolves and hands off the issue" "rc=${rc}"
+	fi
+	local case_args=""
+	for case_args in worker --allow-parent-close --completion-bookkeeping; do
+		reset_case
+		TEST_ISSUE_STATE="OPEN"
+		TEST_CHANGED_FILES="src/implementation.sh"
+		rc=0
+		if [[ "$case_args" == "worker" ]]; then
+			TEST_SESSION_ORIGIN="worker"
+			invoke_keep_open >/dev/null || rc=$?
+		else
+			invoke_keep_open "$case_args" >/dev/null || rc=$?
+		fi
+		if [[ "$rc" -ne 0 && "$(call_count stage)" -eq 0 && "$(call_count create-pr)" -eq 0 ]]; then
+			pass "--keep-issue-open refuses ${case_args} before mutation"
+		else
+			fail "--keep-issue-open refuses ${case_args} before mutation" "rc=${rc}"
+		fi
+	done
+	return 0
+}
+
+test_keep_issue_open
+test_indented_completion
 test_completed_success
 test_not_planned_success
 test_default_closed_refusal

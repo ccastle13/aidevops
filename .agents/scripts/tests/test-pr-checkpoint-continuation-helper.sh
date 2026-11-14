@@ -32,15 +32,67 @@ print_result() {
 cat >"${TEST_ROOT}/bin/gh" <<'GH_STUB'
 #!/usr/bin/env bash
 if [[ "$1" == "pr" && "$2" == "view" ]]; then
+	[[ "${STUB_METADATA_FAILURE:-}" != pr || "${7:-}" == author ]] || exit 1
 	printf '%s\n' "${STUB_PR_JSON:-}"
 	exit 0
 fi
 if [[ "$1" == "api" && "$2" == "repos/owner/repo/issues/123" ]]; then
+	[[ "${STUB_METADATA_FAILURE:-}" != issue ]] || exit 1
+	if [[ "${3:-}" == "--jq" ]]; then
+		printf '%s\n' "${STUB_ISSUE_JSON:-}" | jq -r "$4"
+		exit $?
+	fi
 	printf '%s\n' "${STUB_ISSUE_JSON:-}"
 	exit 0
 fi
 if [[ "$1" == "api" && "$2" == "repos/owner/repo/issues/123/comments?per_page=100" ]]; then
+	[[ "${STUB_METADATA_FAILURE:-}" != comments ]] || exit 1
+	if [[ -n "${STUB_CLAIM_FILE:-}" ]]; then
+		own='[]'
+		if [[ -r "${STUB_CLAIM_FILE}.base" && "$(<"${STUB_CLAIM_FILE}.base")" == "${STUB_COMMENTS_JSON:-[]}" ]]; then
+			own="$(<"$STUB_CLAIM_FILE")"
+		fi
+		jq -nc --argjson base "${STUB_COMMENTS_JSON:-[]}" --argjson own "$own" '
+			[($base | flatten) + $own | map(.node_id //= ("fixture-" + (.id | tostring)))]'
+		exit $?
+	fi
 	printf '%s\n' "${STUB_COMMENTS_JSON:-[]}"
+	exit 0
+fi
+if [[ -n "${STUB_CLAIM_FILE:-}" ]]; then
+	if [[ "$1 $2" == "api user" ]]; then
+		printf '%s\n' "$STUB_AUTH_LOGIN"
+		exit 0
+	fi
+	if [[ "$1 $2" == "api graphql" ]]; then
+		for arg in "$@"; do
+			[[ "$arg" != ids\[\]=* ]] || printf '%s\n' "${arg#ids\[\]=}"
+		done | jq -Rsc '{data:{nodes:(split("\n") | map(select(length > 0) | {id:.,lastEditedAt:null}))}}'
+		exit 0
+	fi
+	if [[ "$1" == api && "$2" == repos/owner/repo/collaborators/*/permission ]]; then
+		printf 'write\n'
+		exit 0
+	fi
+	if [[ "$1 $2 $3 $4" == "api repos/owner/repo/issues/123/comments --method POST" &&
+		( "$6" == body=DISPATCH_* || "$6" == *$'\n'DISPATCH_* ) ]]; then
+		if [[ ! -r "${STUB_CLAIM_FILE}.base" || "$(<"${STUB_CLAIM_FILE}.base")" != "${STUB_COMMENTS_JSON:-[]}" ]]; then
+			printf '[]' >"$STUB_CLAIM_FILE"
+			printf '%s' "${STUB_COMMENTS_JSON:-[]}" >"${STUB_CLAIM_FILE}.base"
+		fi
+		jq --arg body "${6#body=}" --arg actor "$STUB_AUTH_LOGIN" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+			((map(.id) + [1000000]) | max + 1) as $id |
+			. + [{id:$id,node_id:("fixture-" + ($id | tostring)),body:$body,user:{login:$actor},
+			author_association:"MEMBER",created_at:$now}]' "$STUB_CLAIM_FILE" >"${STUB_CLAIM_FILE}.next"
+		mv "${STUB_CLAIM_FILE}.next" "$STUB_CLAIM_FILE"
+		jq -r 'last.id' "$STUB_CLAIM_FILE"
+		exit 0
+	fi
+fi
+if [[ "$1" == "api" && "$2" == "repos/owner/repo/issues/123/comments" && "$3" == "--method" && "$4" == "POST" ]]; then
+	[[ -n "${STUB_POST_DIR:-}" ]] || exit 1
+	post_count=$(find "$STUB_POST_DIR" -type f | wc -l | tr -d ' ')
+	printf '%s' "${6#body=}" >"${STUB_POST_DIR}/post-$((post_count + 1))"
 	exit 0
 fi
 exit 1
@@ -50,6 +102,10 @@ export PATH="${TEST_ROOT}/bin:${PATH}"
 
 # shellcheck source=../pr-checkpoint-continuation-helper.sh
 source "$HELPER"
+# Fixture comments carry fixed historical dates, so keep the attention re-arm
+# window closed except in the tests that exercise it.
+ATTENTION_REARM_CLOSED=3153600000
+_PCC_ATTENTION_REARM_SECONDS="$ATTENTION_REARM_CLOSED"
 
 valid_pr_json() {
 	local body="${1:-Resolves #123}"
@@ -67,7 +123,7 @@ valid_issue_json() {
 	local labels="${1:-}"
 	local assignee="${2:-worker-bot}"
 	[[ -n "$labels" ]] || labels='[{"name":"status:in-review"}]'
-	printf '{"number":123,"state":"open","labels":%s,"assignees":[{"login":"%s"}]}\n' "$labels" "$assignee"
+	printf '{"number":123,"body":"Preserve checkpoint scope","state":"open","labels":%s,"assignees":[{"login":"%s"}]}\n' "$labels" "$assignee"
 	return 0
 }
 
@@ -81,255 +137,16 @@ STUB_PR_JSON="$(valid_pr_json)"
 STUB_ISSUE_JSON="$(valid_issue_json)"
 STUB_COMMENTS_JSON='[]'
 export STUB_PR_JSON STUB_ISSUE_JSON STUB_COMMENTS_JSON
-if row=$(_pcc_target_row "owner/repo" "42" "123") && \
-	[[ "$row" == $'Continue existing work\tworker/issue-123\t1111111111111111111111111111111111111111\tworker-bot\tin-review\tworker-bot' ]]; then
-	print_result "accepts exact open worker draft linked to issue" 0
-else
-	print_result "accepts exact open worker draft linked to issue" 1 "row=${row:-missing}"
-fi
 
-STUB_PR_JSON="$(valid_pr_json 'Resolves #1234' '' '[{"number":1234,"repository":{"name":"repo","owner":{"login":"owner"}}}]')"
-if ! _pcc_target_row "owner/repo" "42" "123" >/dev/null; then
-	print_result "rejects issue-number prefix collisions" 0
-else
-	print_result "rejects issue-number prefix collisions" 1
-fi
-
-STUB_PR_JSON="$(valid_pr_json 'unresolved #123' '' '[]')"
-if ! _pcc_target_row "owner/repo" "42" "123" >/dev/null; then
-	print_result "rejects bare issue references" 0
-else
-	print_result "rejects bare issue references" 1
-fi
-
-STUB_PR_JSON="$(valid_pr_json 'Resolves #123 and resolves #456' '' '[{"number":123,"repository":{"name":"repo","owner":{"login":"owner"}}},{"number":456,"repository":{"name":"repo","owner":{"login":"owner"}}}]')"
-if ! _pcc_target_row "owner/repo" "42" "123" >/dev/null; then
-	print_result "rejects ambiguous closing identities" 0
-else
-	print_result "rejects ambiguous closing identities" 1
-fi
-
-STUB_PR_JSON="$(valid_pr_json 'Resolves other/repo#123' '' '[{"number":123,"repository":{"name":"repo","owner":{"login":"other"}}}]')"
-if ! _pcc_target_row "owner/repo" "42" "123" >/dev/null; then
-	print_result "rejects cross-repository closing identities" 0
-else
-	print_result "rejects cross-repository closing identities" 1
-fi
-
-STUB_PR_JSON="$(valid_pr_json)"
-STUB_PR_JSON="${STUB_PR_JSON/\"isCrossRepository\":false/\"isCrossRepository\":true}"
-if ! _pcc_target_row "owner/repo" "42" "123" >/dev/null; then
-	print_result "rejects cross-repository checkpoint heads" 0
-else
-	print_result "rejects cross-repository checkpoint heads" 1
-fi
-
-STUB_PR_JSON="$(valid_pr_json 'Resolves #123' '[{"name":"origin:worker"},{"name":"needs-maintainer-review"}]')"
-if ! _pcc_target_row "owner/repo" "42" "123" >/dev/null; then
-	print_result "rejects held worker drafts" 0
-else
-	print_result "rejects held worker drafts" 1
-fi
-
-STUB_PR_JSON="$(valid_pr_json)"
-STUB_ISSUE_JSON="$(valid_issue_json '[{"name":"status:in-review"},{"name":"needs-maintainer-review"}]')"
-if ! _pcc_target_row "owner/repo" "42" "123" >/dev/null; then
-	print_result "rejects continuation after linked issue hold" 0
-else
-	print_result "rejects continuation after linked issue hold" 1
-fi
-
-for conflicting_status in status:blocked status:done status:in-progress; do
-	STUB_ISSUE_JSON="$(valid_issue_json "[{\"name\":\"status:in-review\"},{\"name\":\"${conflicting_status}\"}]")"
-	if ! _pcc_target_row "owner/repo" "42" "123" >/dev/null; then
-		print_result "rejects contradictory linked issue lifecycle ${conflicting_status}" 0
-	else
-		print_result "rejects contradictory linked issue lifecycle ${conflicting_status}" 1
-	fi
-done
-
-STUB_ISSUE_JSON="$(valid_issue_json '[{"name":"status:in-review"},{"name":"origin:interactive"}]')"
-STUB_COMMENTS_JSON="$(valid_checkpoint_comments)"
-if _pcc_target_row "owner/repo" "42" "123" "worker-bot" "worker-bot" >/dev/null; then
-	print_result "accepts interactive-provenance issue with current trusted checkpoint release" 0
-else
-	print_result "accepts interactive-provenance issue with current trusted checkpoint release" 1
-fi
-
-STUB_COMMENTS_JSON='[]'
-if ! _pcc_target_row "owner/repo" "42" "123" "worker-bot" "worker-bot" >/dev/null; then
-	print_result "rejects interactive-provenance issue without checkpoint release" 0
-else
-	print_result "rejects interactive-provenance issue without checkpoint release" 1
-fi
-
-STUB_COMMENTS_JSON='[[
-  {"id":10,"created_at":"2026-08-04T22:29:37Z","author_association":"COLLABORATOR","body":"CLAIM_RELEASED reason=worker_draft_checkpoint runner=worker-bot ts=2026-08-04T22:29:36Z"},
-  {"id":11,"created_at":"2026-08-04T22:30:37Z","author_association":"MEMBER","body":"Interactive session claimed this issue"}
-]]'
-if ! _pcc_target_row "owner/repo" "42" "123" "worker-bot" "worker-bot" >/dev/null; then
-	print_result "rejects replayed checkpoint release after a newer human claim" 0
-else
-	print_result "rejects replayed checkpoint release after a newer human claim" 1
-fi
-
-STUB_COMMENTS_JSON="$(valid_checkpoint_comments)"
-STUB_PR_JSON="$(valid_pr_json 'Resolves #123' '' '' 'foreign-runner')"
-if ! _pcc_target_row "owner/repo" "42" "123" "worker-bot" "worker-bot" >/dev/null; then
-	print_result "rejects foreign-authored worker checkpoint" 0
-else
-	print_result "rejects foreign-authored worker checkpoint" 1
-fi
-
-STUB_PR_JSON="$(valid_pr_json)"
-STUB_ISSUE_JSON="$(valid_issue_json)"
-STUB_COMMENTS_JSON='[]'
-
-DISPATCH_ARGS=""
-DISPATCH_RESULT=0
-_prrts_dispatch_guarded() {
-	local repo_slug="$1"
-	local pr_number="$3"
-	local head_ref="${11}"
-	local head_oid="${12}"
-	DISPATCH_ARGS="$*"
-	_prrts_prelaunch_target_fence "$repo_slug" "$pr_number" "$head_ref" "$head_oid" || return 1
-	return "$DISPATCH_RESULT"
-}
-
-STATUS_CALLS=""
-set_issue_status() {
-	local issue_number="$1"
-	local repo_slug="$2"
-	local status="$3"
-	local add_assignee=""
-	local flag=""
-	shift 3
-	STATUS_CALLS="${STATUS_CALLS}${STATUS_CALLS:+$'\n'}${issue_number} ${repo_slug} ${status} $*"
-	while [[ $# -gt 0 ]]; do
-		flag="$1"
-		case "$flag" in
-		--add-assignee)
-			add_assignee="${2:-}"
-			shift 2
-			;;
-		--remove-assignee)
-			shift 2
-			;;
-		*)
-			shift
-			;;
-		esac
-	done
-	[[ -n "$add_assignee" ]] || return 1
-	STUB_ISSUE_JSON="$(valid_issue_json "[{\"name\":\"status:${status}\"}]" "$add_assignee")"
-	export STUB_ISSUE_JSON
-	return 0
-}
-
-STUB_PR_JSON="$(valid_pr_json)"
-output_file="${TEST_ROOT}/dispatch-output"
-if _pcc_dispatch "owner/repo" "${TEST_ROOT}/repo" "42" "123" "worker-bot" >"$output_file"; then
-	output="$(<"$output_file")"
-else
-	output="$(<"$output_file")"
-fi
-if [[ "$output" == *PR_CHECKPOINT_CONTINUATION_DISPATCHED* ]] && \
-	[[ "$DISPATCH_ARGS" == *"draft-checkpoint:1111111111111111111111111111111111111111:contract-3"* ]] && \
-	[[ "$DISPATCH_ARGS" == *"continue-pr worker/issue-123 1111111111111111111111111111111111111111 worker-bot"* ]]; then
-	print_result "dispatch binds continuation to exact PR branch and head" 0
-else
-	print_result "dispatch binds continuation to exact PR branch and head" 1 "output=${output:-missing} args=${DISPATCH_ARGS:-missing}"
-fi
-
-DISPATCH_RESULT="$PRRTS_RC_DISPATCH_DEFERRED"
-if output=$(_pcc_dispatch "owner/repo" "${TEST_ROOT}/repo" "42" "123" "worker-bot") &&
-	[[ "$output" == *PR_CHECKPOINT_CONTINUATION_DEDUPLICATED* ]]; then
-	print_result "active exact-head continuation is deduplicated as handled" 0
-else
-	print_result "active exact-head continuation is deduplicated as handled" 1 "output=${output:-missing}"
-fi
-
-DISPATCH_RESULT="$PRRTS_RC_MAINTAINER_ATTENTION"
-if ! output=$(_pcc_dispatch "owner/repo" "${TEST_ROOT}/repo" "42" "123" "worker-bot") &&
-	[[ "$output" == *PR_CHECKPOINT_CONTINUATION_EXHAUSTED* ]]; then
-	print_result "bounded retry exhaustion is explicit" 0
-else
-	print_result "bounded retry exhaustion is explicit" 1 "output=${output:-missing}"
-fi
-
-STUB_PR_JSON="$(valid_pr_json 'Resolves #123' '' '' 'stale-runner')"
-STUB_ISSUE_JSON="$(valid_issue_json '' 'stale-runner')"
-STATUS_CALLS=""
-DISPATCH_RESULT=0
-if _pcc_dispatch "owner/repo" "${TEST_ROOT}/repo" "42" "123" "stale-runner" "current-runner" >/dev/null &&
-	[[ "$STATUS_CALLS" == '123 owner/repo in-review --add-assignee current-runner --remove-assignee stale-runner' ]] &&
-	[[ "$PCC_ISSUE_ASSIGNEE" == "current-runner" ]] &&
-	[[ "$(_prrts_worker_login 42)" == "current-runner" ]]; then
-	print_result "cross-runner continuation transfers exact issue ownership before launch" 0
-else
-	print_result "cross-runner continuation transfers exact issue ownership before launch" 1 \
-		"calls=${STATUS_CALLS:-missing} assignee=${PCC_ISSUE_ASSIGNEE:-missing}"
-fi
-
-STUB_ISSUE_JSON="$(valid_issue_json '[{"name":"status:queued"}]' 'stale-runner')"
-STATUS_CALLS=""
-DISPATCH_RESULT=1
-if ! _pcc_dispatch "owner/repo" "${TEST_ROOT}/repo" "42" "123" "stale-runner" "current-runner" >/dev/null &&
-	[[ "$STATUS_CALLS" == $'123 owner/repo in-review --add-assignee current-runner --remove-assignee stale-runner\n123 owner/repo queued --add-assignee stale-runner --remove-assignee current-runner' ]] &&
-	[[ "$PCC_ISSUE_ASSIGNEE" == "stale-runner" && "$PCC_OWNERSHIP_TRANSFERRED" -eq 0 ]] &&
-	printf '%s' "$STUB_ISSUE_JSON" | jq -e '
-		.assignees[0].login == "stale-runner" and
-		([.labels[].name] | index("status:queued") != null)
-	' >/dev/null; then
-	print_result "failed cross-runner launch restores prior assignee and lifecycle" 0
-else
-	print_result "failed cross-runner launch restores prior assignee and lifecycle" 1 \
-		"calls=${STATUS_CALLS:-missing} assignee=${PCC_ISSUE_ASSIGNEE:-missing}"
-fi
-DISPATCH_RESULT=0
-
-STUB_PR_JSON="$(valid_pr_json)"
-PCC_LINKED_ISSUE="123"
-PCC_HEAD_REF="worker/issue-123"
-PCC_HEAD_OID="1111111111111111111111111111111111111111"
-PCC_ISSUE_ASSIGNEE="worker-bot"
-PCC_EXPECTED_ASSIGNEE="worker-bot"
-PCC_AUTHENTICATED_LOGIN="worker-bot"
-PCC_CHECKPOINT_ASSIGNEE="worker-bot"
-PCC_ORIGINAL_STATUS="in-review"
-PCC_OWNERSHIP_TRANSFERRED=0
-if [[ "$(_prrts_worker_task_id 42)" == "123" ]] &&
-	[[ "$(_prrts_worker_login 42)" == "worker-bot" ]] &&
-	_prrts_apply_expected_worktree_owner owner/repo 42 "${TEST_ROOT}/repo" \
-		9999 issue-worker batch-1 123 2026-08-01T00:00:00Z process-start-1 "" &&
-	[[ "$PRRTS_WORKTREE_EXPECTED_OWNER_TASK" == "123" &&
-		"$PRRTS_WORKTREE_EXPECTED_OWNER_PROCESS_START" == "process-start-1" ]]; then
-	print_result "continuation preserves the linked issue worktree task identity" 0
-else
-	print_result "continuation preserves the linked issue worktree task identity" 1
-fi
-STUB_ISSUE_JSON="$(valid_issue_json '' 'replacement-owner')"
-if ! _prrts_prelaunch_target_fence "owner/repo" "42" "$PCC_HEAD_REF" "$PCC_HEAD_OID" && \
-	[[ "$PRRTS_WORKTREE_FAILURE_REASON" == "pr_checkpoint_eligibility_changed_before_launch" ]]; then
-	print_result "prelaunch fence rejects one-for-one issue reassignment" 0
-else
-	print_result "prelaunch fence rejects one-for-one issue reassignment" 1
-fi
-STUB_ISSUE_JSON="$(valid_issue_json)"
-prompt_file=$(_prrts_write_prompt_file "owner/repo" "${TEST_ROOT}/repo" "42" "Continue existing work" "0" "fingerprint" "preview")
-if [[ -f "$prompt_file" ]] && \
-	grep -q 'verify-pr-checkpoint-target' "$prompt_file" && \
-	grep -q 'PR_CHECKPOINT_TARGET_VALID' "$prompt_file" && \
-	grep -Fq "\$AIDEVOPS_PR_REPAIR_LINKED_ISSUE" "$prompt_file" && \
-	grep -Fq "\$AIDEVOPS_PR_REPAIR_ISSUE_ASSIGNEE" "$prompt_file" && \
-	grep -Fq '"worker-bot"`' "$prompt_file" && \
-	grep -q "HEAD:\$AIDEVOPS_PR_REPAIR_HEAD_REF" "$prompt_file" && \
-	grep -q 'Do not create another branch' "$prompt_file"; then
-	print_result "continuation prompt preserves exact-target ownership contract" 0
-else
-	print_result "continuation prompt preserves exact-target ownership contract" 1
-fi
+# Test groups live in sibling modules sourced in order (shared fixtures/state).
+# shellcheck source=test-pr-checkpoint-continuation-dispatch.sh
+source "${TEST_SCRIPT_DIR}/test-pr-checkpoint-continuation-dispatch.sh"
+# shellcheck source=test-pr-checkpoint-continuation-selfhold.sh
+source "${TEST_SCRIPT_DIR}/test-pr-checkpoint-continuation-selfhold.sh"
+# shellcheck source=test-pr-checkpoint-continuation-attention.sh
+source "${TEST_SCRIPT_DIR}/test-pr-checkpoint-continuation-attention.sh"
+# shellcheck source=test-pr-checkpoint-continuation-fuse.sh
+source "${TEST_SCRIPT_DIR}/test-pr-checkpoint-continuation-fuse.sh"
 
 if [[ "$TESTS_FAILED" -eq 0 ]]; then
 	printf 'All %d tests passed\n' "$TESTS_RUN"

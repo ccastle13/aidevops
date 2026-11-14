@@ -46,6 +46,9 @@ _initialize_run_result() {
 	_run_runtime_error_type=""
 	_run_classification_source=""
 	_run_classification_pattern=""
+	_HRW_PR_LESS_VERIFIED_CONTEXT=""
+	_HRW_OWN_MERGED_VERIFIED_CONTEXT=""
+	_HRW_OWN_MERGED_RUNTIME_SESSION=""
 	return 0
 }
 
@@ -100,6 +103,145 @@ _run_result_requires_task_complete() {
 	return 1
 }
 
+_run_result_is_issue_worker() {
+	[[ "$role" == "$_RUN_RESULT_ROLE_WORKER" ]] || return 1
+	[[ "$session_key" == issue-* ]] && return 0
+	if [[ "$session_key" =~ ^manual-cli-([1-9][0-9]*)-[0-9]+$ ]]; then
+		[[ "${WORKER_ISSUE_NUMBER:-}" == "${BASH_REMATCH[1]}" ]]
+		return $?
+	fi
+	return 1
+}
+
+# GH#34681: never infer handoff from PR existence alone, or override an
+# explicit (even unsupported) blocker reason. Use the exact-head verifier.
+_run_result_reconcile_unknown_blocker() {
+	local blocker_reason="$1"
+	[[ "$blocker_reason" == unknown && "${AIDEVOPS_TERMINAL_BLOCKER_EXPLICIT_REASON:-}" == false ]] || return 1
+	declare -F _worker_post_pr_handoff_confirmed >/dev/null 2>&1 || return 1
+	_worker_post_pr_handoff_confirmed "$session_key" "$work_dir" || return 1
+	# The checkpoint verifier establishes delivery, not CI health or local edits.
+	# Fail closed on unreadable checks; pending checks are a monitoring handoff.
+	local dirty="" branch="" head="" handoff="" checks_rc=0
+	dirty=$(git -C "$work_dir" status --porcelain 2>/dev/null) || return 1
+	[[ -z "$dirty" ]] || return 1
+	branch=$(git -C "$work_dir" branch --show-current 2>/dev/null) || return 1
+	head=$(git -C "$work_dir" rev-parse HEAD 2>/dev/null) || return 1
+	handoff=$(_pr_handoff_state_for_branch_or_issue "$branch" "${session_key#issue-}" \
+		"${DISPATCH_REPO_SLUG:-}" head-only "$head" 1) || return 1
+	[[ "$handoff" =~ ^ready\|[1-9][0-9]*$ ]] || return 1
+	declare -F gh_pr_checks_observed_json >/dev/null 2>&1 || return 1
+	gh_pr_checks_observed_json "${DISPATCH_REPO_SLUG:-}" "${handoff#*|}" all "$head" >/dev/null 2>&1 || checks_rc=$?
+	[[ "$checks_rc" -eq 0 || "$checks_rc" -eq 8 ]] || return 1
+	_run_result_label="post_pr_handoff"
+	_run_failure_reason=""
+	_run_classification_source="verified_pr_handoff"
+	_run_classification_pattern="unknown_blocker_ready_pr"
+	rm -f "$output_file"
+	return 0
+}
+
+# Legacy prose checkpoints may accompany a merged non-closing PR. Live blocked
+# state takes precedence over PR reconciliation; finish owns the release write.
+_run_result_capture_live_blocker() {
+	local issue_number="${WORKER_ISSUE_NUMBER:-${session_key#issue-}}" live_issue=""
+	[[ "$issue_number" =~ ^[0-9]+$ && -n "${DISPATCH_REPO_SLUG:-}" ]] || return 1
+	live_issue=$(gh api "repos/${DISPATCH_REPO_SLUG}/issues/${issue_number}" 2>/dev/null) || return 1
+	jq -e '.state == "open" and .pull_request == null
+		and ([.labels[]?.name] | index("status:blocked") != null)
+		and ([.labels[]?.name | select(. == "status:in-review" or . == "status:in-progress" or . == "status:queued" or . == "status:claimed")] | length == 0)
+	' <<<"$live_issue" >/dev/null 2>&1 || return 1
+	if declare -F terminal_blocker_capture_output >/dev/null 2>&1; then
+		terminal_blocker_capture_output "$output_file" true || true
+	fi
+	return 0
+}
+
+# GH#36457: infrastructure refusals are runner-local, not a task hold. Never
+# replace an explicit policy/permission/secret dossier with this inference.
+_run_result_classify_lifecycle_refusal() {
+	[[ "${AIDEVOPS_TERMINAL_BLOCKER_EXPLICIT_REASON:-}" == false &&
+		-z "${AIDEVOPS_TERMINAL_BLOCKER_MISSING_SECRETS:-}" &&
+		"$(_terminal_blocker_reason "${AIDEVOPS_TERMINAL_BLOCKER_FINGERPRINT:-}")" == unknown ]] || return 1
+	_hrff_lifecycle_refusal_only "$discovered_session" || return 1
+	AIDEVOPS_TERMINAL_BLOCKER_FINGERPRINT=$(_terminal_blocker_hash 'v2:runner_capability_unmet') || return 1
+	_run_classification_source="lifecycle_admission_evidence"
+	_run_classification_pattern="refusals_without_completed_tools"
+	return 0
+}
+
+# Objective proof complements, rather than broadens, model marker parsing.
+_run_result_terminal_completion_confirmed() {
+	_HRW_PR_LESS_REJECTION=""
+	if [[ "${_run_classification_source:-}" == "pr_less_completion_rejected" ]]; then
+		_run_classification_source=""
+		_run_classification_pattern=""
+	fi
+	if _hrw_own_merged_terminal_complete "$session_key" "${work_dir:-}"; then
+		_run_failure_reason=""
+		_run_classification_source="merged_pr_cleanup_receipt"
+		_run_classification_pattern="verified_own_merged_objective"
+		return 0
+	fi
+	if _hrw_continued_merged_terminal_complete "$session_key" "${work_dir:-}"; then
+		_run_failure_reason=""
+		_run_classification_source="merged_pr_continuation_evidence"
+		_run_classification_pattern="verified_prior_merged_objective"
+		return 0
+	fi
+	if _hrw_pr_less_terminal_complete "$session_key" "${work_dir:-}" \
+		"$(_hrw_issue_number_for_session "$session_key")" "${DISPATCH_REPO_SLUG:-}"; then
+		if [[ -n "${_HRW_SCOPED_DELIVERY_RECEIPT:-}" ]]; then
+			_run_failure_reason=""
+			_run_classification_source="scoped_delivery_receipt"
+			_run_classification_pattern="verified_already_delivered_scope"
+		elif [[ -n "${_HRW_REVIEW_TRIAGE_VERIFIED:-}" ]]; then
+			_run_failure_reason=""
+			_run_classification_source="review_triage_receipt"
+			_run_classification_pattern="verified_no_code_review_triage"
+		fi
+		return 0
+	fi
+	# A triage receipt cannot be replaced by a model's completion token. Keep the
+	# existing implementation marker path for other outcomes and merged receipts.
+	if [[ -z "${_HRW_REVIEW_TRIAGE_CANDIDATE:-}" &&
+		"${_HRW_PR_LESS_REJECTION:-}" != issue_evidence_unavailable ]] && output_has_completion_signal "$output_file"; then
+		return 0
+	fi
+	if [[ -n "${_HRW_PR_LESS_REJECTION:-}" ]]; then
+		_run_classification_source="pr_less_completion_rejected"
+		_run_classification_pattern="$_HRW_PR_LESS_REJECTION"
+	fi
+	return 1
+}
+
+# GH#37926: a checkpoint-continuation session that leaves the draft head
+# unchanged and records no terminal state (mark-complete/blocked/progress) did
+# not succeed. Fails open (returns 1) whenever evidence is unavailable.
+_run_result_continuation_exited_unchanged() {
+	local repair_pr="${AIDEVOPS_PR_REPAIR_NUMBER:-}" start_head="${AIDEVOPS_PR_REPAIR_HEAD_SHA:-}"
+	local repo_slug="${DISPATCH_REPO_SLUG:-}" state_dir="" state_file="" current_head=""
+	[[ "$repair_pr" =~ ^[0-9]+$ && "$start_head" =~ ^[0-9a-fA-F]{40,64}$ && -n "$repo_slug" && -n "${work_dir:-}" ]] || return 1
+	[[ -n "${AIDEVOPS_PR_REPAIR_LINKED_ISSUE:-}" ]] || return 1
+	current_head=$(git -C "$work_dir" rev-parse HEAD 2>/dev/null) || return 1
+	[[ "$current_head" == "$start_head" ]] || return 1
+	state_dir="${AIDEVOPS_PR_REVIEW_THREAD_RESPONSE_STATE_DIR:-${HOME}/.aidevops/.agent-workspace/pr-review-thread-response}"
+	state_file="${state_dir}/$(printf '%s' "$repo_slug" | tr '/:' '--')-${repair_pr}.state"
+	if [[ -f "$state_file" ]] && grep -q '^completed_at=' "$state_file"; then
+		return 1
+	fi
+	return 0
+}
+
+_run_result_flag_unchanged_continuation() {
+	_run_result_label="premature_exit"
+	_run_classification_source="continuation_unchanged_head"
+	_run_classification_pattern="no_terminal_state_unchanged_head"
+	rm -f "$output_file"
+	print_warning "$selected_model checkpoint continuation exited with unchanged head and no terminal state (premature exit — will attempt continuation)"
+	return 0
+}
+
 _handle_run_result_success_output() {
 	if _run_result_requires_task_complete && ! _private_output_has_task_complete "$output_file"; then
 		local incomplete_label="private_incomplete"
@@ -117,18 +259,32 @@ _handle_run_result_success_output() {
 	if [[ "$role" != "$_RUN_RESULT_ROLE_PULSE" && -n "$discovered_session" ]]; then
 		_store_headless_session_if_allowed "$provider" "$session_key" "$discovered_session" "$selected_model" "$role"
 	fi
-	if [[ "$role" == "$_RUN_RESULT_ROLE_WORKER" && "$session_key" == issue-* ]]; then
-		if ! output_has_completion_signal "$output_file"; then
-			_log_empty_result_gaps "$output_file" "$selected_model" "$session_key"
-			_run_result_label="premature_exit"
+	if _run_result_is_issue_worker; then
+		if _run_result_capture_live_blocker; then
+			_run_result_label="$_RUN_RESULT_BLOCKED"
+			_run_failure_reason="$_RUN_RESULT_BLOCKED"
+			_run_classification_source="live_issue_blocked_backstop"
+			_run_result_classify_lifecycle_refusal || true
 			rm -f "$output_file"
-			print_warning "$selected_model worker exited with activity but no completion signal (premature exit — will attempt continuation)"
-			return 77
+			return 83
 		fi
 		if output_has_post_pr_handoff_signal "$output_file"; then
 			_run_result_label="post_pr_handoff"
 			rm -f "$output_file"
 			return 0
+		fi
+		if output_has_blocked_signal "$output_file"; then
+			# shellcheck source=integration-recovery-helper.sh
+			source "${SCRIPT_DIR}/integration-recovery-helper.sh"
+			if integration_recovery_capture "$output_file" "$work_dir" 2>/dev/null; then
+				if [[ "$(jq -r '.action' <<<"$_IR_CAPTURE_RESULT")" == "continue" ]]; then
+					_run_result_label="integration_recovery"
+					_run_failure_reason="adjacent_integration"
+					rm -f "$output_file"
+					return 88
+				fi
+				print_info "Integration recovery is durably owned by Pulse; existing checkpoint and safety gates remain in force"
+			fi
 		fi
 		if output_has_missing_context_blocked_signal "$output_file"; then
 			_run_result_label="brief_recovery"
@@ -154,12 +310,34 @@ _handle_run_result_success_output() {
 			_run_classification_source="$_RUN_RESULT_MODEL_BLOCKED_SIGNAL"
 			_run_classification_pattern="terminal_blocked"
 			if declare -F terminal_blocker_capture_output >/dev/null 2>&1; then
-				terminal_blocker_capture_output "$output_file" || true
+				# Judge the final part with the pattern that classified this exit.
+				terminal_blocker_capture_output "$output_file" false "${_HEADLESS_BLOCKED_LINE_PATTERN:-}" || true
+				_run_result_classify_lifecycle_refusal || true
+				local blocker_reason=""
+				blocker_reason=$(_terminal_blocker_reason "${AIDEVOPS_TERMINAL_BLOCKER_FINGERPRINT:-}")
+				_run_result_reconcile_unknown_blocker "$blocker_reason" && return 0
+				case "$blocker_reason" in
+				push_policy_timeout | network_policy_timeout)
+					_run_failure_reason="$blocker_reason"
+					_run_classification_pattern="$blocker_reason"
+					;;
+				esac
 			fi
 			rm -f "$output_file"
 			print_warning "$selected_model worker reported a terminal BLOCKED state"
 			return 83
 		fi
+		if ! _run_result_terminal_completion_confirmed; then
+			_log_empty_result_gaps "$output_file" "$selected_model" "$session_key"
+			_run_result_label="premature_exit"
+			rm -f "$output_file"
+			print_warning "$selected_model worker exited with activity but no completion signal (premature exit — will attempt continuation)"
+			return 77
+		fi
+	fi
+	if ! _run_result_is_issue_worker && _run_result_continuation_exited_unchanged; then
+		_run_result_flag_unchanged_continuation
+		return 77
 	fi
 	_run_result_label="success"
 	rm -f "$output_file"
@@ -168,7 +346,8 @@ _handle_run_result_success_output() {
 
 # Classify exit 124. Sets failure_reason and optional _run_result_handled_exit.
 _classify_watchdog_run_result() {
-	failure_reason=$(classify_failure_reason "$output_file")
+	classify_failure_reason "$output_file" >/dev/null
+	failure_reason="$_failure_reason"
 	if [[ "$failure_reason" == "$_RUN_RESULT_RATE_LIMIT" ]]; then
 		print_warning "$selected_model watchdog saw provider/rate-limit marker — classifying as rate_limit for rotation"
 		return 0
@@ -214,7 +393,7 @@ _classify_watchdog_run_result() {
 # Classify non-watchdog signal exits before generic provider parsing.
 _classify_signal_run_result() {
 	local local_kill_reason="${_metric_kill_reason:-}"
-	if [[ "$role" == "$_RUN_RESULT_ROLE_WORKER" && "$session_key" == issue-* ]] &&
+	if _run_result_is_issue_worker &&
 		[[ "${exit_code:-}" == "137" || "${exit_code:-}" == "143" ]] &&
 		[[ -n "$local_kill_reason" && "$local_kill_reason" != "natural" && "$local_kill_reason" != "unknown" ]]; then
 		_run_result_label="local_kill"
@@ -247,7 +426,8 @@ _classify_signal_run_result() {
 		_run_result_handled_exit=78
 		return 0
 	fi
-	failure_reason=$(classify_failure_reason "$output_file")
+	classify_failure_reason "$output_file" >/dev/null
+	failure_reason="$_failure_reason"
 	return 0
 }
 
@@ -263,7 +443,7 @@ _copy_run_failure_classification() {
 
 # Route interruptions with durable session evidence to dedicated continuations.
 _handle_transient_run_result() {
-	if [[ "$role" == "$_RUN_RESULT_ROLE_WORKER" && "$session_key" == issue-* ]] &&
+	if _run_result_is_issue_worker &&
 		runtime_signal_terminated_candidate "$output_file" "$exit_code" "$activity_detected"; then
 		if [[ -n "$discovered_session" ]]; then
 			_store_headless_session_if_allowed "$provider" "$session_key" "$discovered_session" "$selected_model" "$role"
@@ -278,7 +458,7 @@ _handle_transient_run_result() {
 		_run_result_handled_exit=78
 		return 0
 	fi
-	if [[ "$role" == "$_RUN_RESULT_ROLE_WORKER" && "$session_key" == issue-* ]] &&
+	if _run_result_is_issue_worker &&
 		service_interruption_continue_candidate \
 			"$failure_reason" "$exit_code" "$activity_detected" "$discovered_session" \
 			"${_failure_provider_error_type:-}"; then

@@ -44,7 +44,7 @@ required_functions = {
     ".agents/scripts/pulse-dep-graph.sh": ["build_dependency_graph_cache"],
     ".agents/scripts/pulse-dispatch-engine.sh": [
         "_should_run_llm_supervisor",
-        "build_ranked_dispatch_candidates_json",
+        "_dispatch_repository_rows",
     ],
     ".agents/scripts/pulse-fix-the-fixer-detector.sh": ["cmd_run"],
     ".agents/scripts/pulse-issue-reconcile-normalize.sh": ["_normalize_label_invariants"],
@@ -78,7 +78,7 @@ required_functions = {
         "_compute_worker_success_rates",
         "_refresh_person_stats_cache",
     ],
-    ".agents/scripts/stats-health-dashboard.sh": ["update_health_issues"],
+    ".agents/scripts/stats-health-dashboard.sh": ["_health_routine_repo_entries"],
     ".agents/scripts/stats-quality-sweep.sh": ["run_daily_quality_sweep"],
     ".agents/scripts/repo-aidevops-health-helper.sh": ["_check_version_bumps"],
 }
@@ -147,6 +147,9 @@ safety_functions = {
         "_normalize_unassign_stampless_interactive"
     ],
     ".agents/scripts/pulse-issue-reconcile-stale.sh": ["_normalize_unassign_stale"],
+    ".agents/scripts/redirect-link-guard-helper.sh": [
+        "redirect_spam_sweep_all_repos"
+    ],
     ".agents/scripts/repo-aidevops-health-helper.sh": [
         "_check_missing_folders",
         "_check_no_init_repos",

@@ -21,8 +21,8 @@ import { mkdirSync, existsSync } from "fs";
 import { join, dirname } from "path";
 import { homedir } from "os";
 import {
-  canonicalizeSqliteDbPath, setDbPath, sqliteAvailable, sqliteExec, sqliteExecSync,
-  shutdownSqlite as _shutdownSqlite, sqlEscape,
+  acquireSqlite, canonicalizeSqliteDbPath, setDbPath, sqliteAvailable, sqliteExec, sqliteExecSync,
+  sqlEscape,
 } from "./observability-sqlite.mjs";
 import {
   createSchema as _createSchema,
@@ -32,6 +32,7 @@ import {
 import {
   calculateCost,
   getPricing,
+  getPricingProvenance,
   PRICING_VERSION,
 } from "./observability-pricing.mjs";
 import { scheduleCostBackfill } from "./observability-cost-backfill.mjs";
@@ -39,6 +40,7 @@ import {
   appendRuntimeEvent,
   initialiseRuntimeEventStore,
 } from "../../scripts/runtime-events.mjs";
+import { createObjectiveEvidenceAdapter } from "./objective-evidence.mjs";
 import {
   enrichActiveSpan,
   runtimeEventOtelAttributes,
@@ -54,10 +56,11 @@ import {
 import {
   consumeRoutingDecision,
   getRoutingFeedback,
-  recordRoutingDecision,
+  recordRoutingDecision as queueRoutingDecision,
   rememberRoutingFeedback,
 } from "./observability-routing.mjs";
 import { normalizeProviderError } from "./provider-error-diagnostics.mjs";
+import { requestProvenance, runtimeProvenance } from "./observability-provenance.mjs";
 
 const HOME = homedir();
 const DEFAULT_OBS_DIR = join(HOME, ".aidevops", ".agent-workspace", "observability");
@@ -71,7 +74,7 @@ const OBS_DIR = dirname(DB_PATH);
 const COST_BACKFILL_MARKER = `${DB_PATH}.cost-backfill-v2.done`;
 
 export { getPricing };
-export { getRoutingFeedback, recordRoutingDecision };
+export { getRoutingFeedback };
 export { buildToolCallInsertSql, classifyToolOutcome, toolCallSucceeded };
 
 /**
@@ -104,7 +107,7 @@ function initDatabase() {
   // 100% of worker startups. Read-only check first — no lock contention,
   // skips the slow path entirely once the DB is ready.
   if (existsSync(DB_PATH) && _isSchemaInitialized(DB_PATH)) {
-    return _runDataMigrations({ toolCallColumnsReady: true, routingColumnsReady: true });
+    return _runDataMigrations({ toolCallColumnsReady: true, routingColumnsReady: true, provenanceColumnsReady: true });
   }
 
   // SLOW PATH (t2900): serialise schema creation across concurrent workers
@@ -115,7 +118,7 @@ function initDatabase() {
     // DOUBLE-CHECKED LOCKING: another worker may have completed init while
     // we waited. If schema is now ready, skip the writer-lock-heavy path.
     if (existsSync(DB_PATH) && _isSchemaInitialized(DB_PATH)) {
-      return _runDataMigrations({ toolCallColumnsReady: true, routingColumnsReady: true });
+      return _runDataMigrations({ toolCallColumnsReady: true, routingColumnsReady: true, provenanceColumnsReady: true });
     }
     if (!_createSchema()) return false;
     return _runDataMigrations();
@@ -129,7 +132,7 @@ function initDatabase() {
  * Historical data backfills are scheduled after startup so large observability
  * databases do not block the OpenCode TUI on table scans or writer locks.
  *
- * @param {{ toolCallColumnsReady?: boolean, routingColumnsReady?: boolean }} [options]
+ * @param {{ toolCallColumnsReady?: boolean, routingColumnsReady?: boolean, provenanceColumnsReady?: boolean }} [options]
  * @returns {boolean} true on success (best-effort — never returns false)
  */
 function _runDataMigrations(options = {}) {
@@ -151,6 +154,16 @@ function _runDataMigrations(options = {}) {
       ["routing_population", "TEXT"],
       ["aidevops_version", "TEXT"],
       ["pricing_version", "TEXT"],
+    ]);
+  }
+  migrateColumns("llm_requests", [["ab_experiment", "TEXT"], ["ab_arm", "TEXT"]]);
+  if (!options.provenanceColumnsReady) {
+    migrateColumns("llm_requests", [
+      ["requested_effort", "TEXT"], ["resolved_effort", "TEXT"], ["observed_effort", "TEXT"],
+      ["effort_source", "TEXT"], ["provider_confirmed_effort", "TEXT"], ["requested_model", "TEXT"],
+      ["observed_model", "TEXT"], ["runtime_name", "TEXT"], ["runtime_version", "TEXT"],
+      ["adapter_version", "TEXT"], ["policy_fingerprint", "TEXT"], ["billing_mode", "TEXT"],
+      ["cost_source", "TEXT"], ["pricing_quality", "TEXT"],
     ]);
   }
   // These indexes must be created after the migration above. On an existing
@@ -209,33 +222,59 @@ const partStreamSummaries = new PartStreamSummaryTracker();
  */
 let dbReady = false;
 let aidevopsVersion = "";
-
-function normalizedAidevopsVersion(value) {
-  const version = String(value || "").trim().replace(/^v/, "");
-  return /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version) ? version : "";
-}
+let runtime = {};
+/** @type {Array<() => void>} */
+const transportReleases = [];
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
+/** Consume captured V2 step metadata into the existing OC1 recording contract. */
+export function consumeV2Completion(event, started, key) {
+  const begin = started.get(key);
+  const data = event?.data;
+  const recordable = [event?.type === "session.step.ended", begin?.data?.model,
+    data?.sessionID, data?.assistantMessageID, data?.tokens,
+    Number.isFinite(begin?.created), Number.isFinite(event?.created)].every(Boolean);
+  if (!recordable) return null;
+  started.delete(key);
+  return { type: "message.updated", properties: { info: {
+    id: data.assistantMessageID, sessionID: data.sessionID, role: "assistant",
+    providerID: begin.data.model.providerID, modelID: begin.data.model.id,
+    agent: begin.data.agent, variant: begin.data.model.variant,
+    tokens: data.tokens, cost: data.cost, finish: data.finish,
+    time: { created: begin.created, completed: event.created },
+  } } };
+}
+
 /**
  * Initialise the observability system.
  * Call once at plugin startup.
- * @param {{ aidevopsVersion?: string }} [options]
+ * @param {{ aidevopsVersion?: string, runtimeVersion?: string, adapterId?: string }} [options]
  * @returns {boolean} Whether initialisation succeeded
  */
 export function initObservability(options = {}) {
-  aidevopsVersion = normalizedAidevopsVersion(
-    options.aidevopsVersion || process.env.AIDEVOPS_VERSION,
-  );
+  runtime = runtimeProvenance(options);
+  aidevopsVersion = runtime.aidevopsVersion;
   dbReady = initDatabase();
   if (dbReady) {
     console.error("[aidevops] Observability: SQLite DB ready at " + DB_PATH);
-    // Shut down the persistent sqlite3 process on exit
-    process.on("exit", _shutdownSqlite);
+    // GH#35702: each successful init holds one shared transport ownership,
+    // paired with disposeObservability(). The transport registry reaps the
+    // sqlite3 child on process exit with a single listener.
+    transportReleases.push(acquireSqlite());
   }
   return dbReady;
+}
+
+/**
+ * Release the transport ownership taken by the matching initObservability().
+ * The last release reaps the sqlite3 child after queued writes drain; other
+ * owners (another V2 location, duplicate module instances) keep it alive.
+ */
+export function disposeObservability() {
+  transportReleases.pop()?.();
 }
 
 /**
@@ -271,6 +310,26 @@ function projectRuntimeEvent(envelope) {
 
 function firstTruthy(values, fallback = null) {
   return values.find(Boolean) || fallback;
+}
+
+const objectiveEvidence = createObjectiveEvidenceAdapter({
+  isReady: () => dbReady,
+  onEvent: projectRuntimeEvent,
+});
+
+export function objectiveContextForSession(sessionID) {
+  return objectiveEvidence.contextForSession(sessionID);
+}
+
+function attachObjectiveMessage(msg) {
+  const objective = objectiveContextForSession(msg.sessionID) || objectiveEvidence.begin(msg.sessionID, msg.id);
+  objectiveEvidence.attach(msg.sessionID, msg.id, objective);
+}
+
+export function recordRoutingDecision(sessionID, decision = {}) {
+  const result = queueRoutingDecision(sessionID, decision);
+  objectiveEvidence.inherit(sessionID, decision.parentSessionID);
+  return result;
 }
 
 function recordOpenCodeRuntimeEvent(event, eventType = event.type, additionalPayload = {}, context = {}) {
@@ -327,6 +386,10 @@ function recordOpenCodeRuntimeEvent(event, eventType = event.type, additionalPay
  */
 function handleMessageUpdated(event, context = {}) {
   const msg = event.properties?.info;
+  if (msg?.role === "user" && msg.sessionID && msg.id) {
+    objectiveEvidence.begin(msg.sessionID, msg.id);
+    return;
+  }
   const isCompletedAssistant = [msg, msg?.role === "assistant", msg?.time?.completed].every(Boolean);
   if (!isCompletedAssistant) return;
 
@@ -343,6 +406,8 @@ function handleMessageUpdated(event, context = {}) {
     routing_reason: routing.reason || null,
     routing_escalated: routing.escalated === 1,
     routing_population: routing.population,
+    ab_experiment: routing.ab_experiment || null,
+    ab_arm: routing.ab_arm || null,
     aidevops_version: aidevopsVersion || null,
     pricing_version: PRICING_VERSION,
   }, context);
@@ -366,7 +431,9 @@ function handleMessageUpdated(event, context = {}) {
   const projectPath = msg.path?.root || msg.path?.cwd || null;
 
   // Calculate cost from tokens — OpenCode does not provide msg.cost
+  const pricing = getPricingProvenance(msg.modelID);
   const cost = calculateCost(msg.tokens, msg.modelID);
+  const provenance = requestProvenance(msg, routing, pricing, runtime);
   rememberRoutingFeedback(msg, routing, cost, errorType, aidevopsVersion, PRICING_VERSION);
 
   const sql = `INSERT INTO llm_requests (
@@ -376,7 +443,10 @@ function handleMessageUpdated(event, context = {}) {
     cost, duration_ms, finish_reason, error_type, error_message,
     tool_call_count, project_path, variant, parent_session_id,
     routing_tier, routing_candidate_index, routing_attempt, routing_reason,
-    routing_escalated, routing_population, aidevops_version, pricing_version
+    routing_escalated, routing_population, aidevops_version, pricing_version, ab_experiment, ab_arm,
+    requested_effort, resolved_effort, observed_effort, effort_source, provider_confirmed_effort,
+    requested_model, observed_model, runtime_name, runtime_version, adapter_version,
+    policy_fingerprint, billing_mode, cost_source, pricing_quality
   ) VALUES (
     ${sqlEscape(msg.sessionID)},
     ${sqlEscape(msg.id)},
@@ -405,10 +475,20 @@ function handleMessageUpdated(event, context = {}) {
     ${routing.escalated === 1 ? 1 : 0},
     ${sqlEscape(routing.population)},
     ${sqlEscape(aidevopsVersion || null)},
-    ${sqlEscape(PRICING_VERSION)}
+    ${sqlEscape(PRICING_VERSION)},
+    ${sqlEscape(routing.ab_experiment || null)},
+    ${sqlEscape(routing.ab_arm || null)},
+    ${sqlEscape(provenance.requested_effort)}, ${sqlEscape(provenance.resolved_effort)},
+    ${sqlEscape(provenance.observed_effort)}, ${sqlEscape(provenance.effort_source)},
+    ${sqlEscape(provenance.provider_confirmed_effort)}, ${sqlEscape(provenance.requested_model)},
+    ${sqlEscape(provenance.observed_model)}, ${sqlEscape(provenance.runtime_name)},
+    ${sqlEscape(provenance.runtime_version)}, ${sqlEscape(provenance.adapter_version)},
+    ${sqlEscape(provenance.policy_fingerprint)}, ${sqlEscape(provenance.billing_mode)},
+    ${sqlEscape(provenance.cost_source)}, ${sqlEscape(provenance.pricing_quality)}
   );`;
 
   sqliteExec(sql);
+  attachObjectiveMessage(msg);
 
   // Update session summary (upsert)
   updateSessionSummary(msg, cost, toolCallCount);
@@ -471,8 +551,9 @@ ON CONFLICT(session_id) DO UPDATE SET
  * @param {object} output - { title, output, metadata }
  * @param {string | undefined} intent - LLM-provided intent string (from agent__intent field)
  * @param {number | null | undefined} [durationMs] - Elapsed milliseconds from tool.execute.before (t2184)
+ * @param {"explicit" | "fallback" | undefined} [intentSource] - Intent provenance
  */
-export function recordToolCall(input, output, intent, durationMs) {
+export function recordToolCall(input, output, intent, durationMs, intentSource) {
   if (!dbReady) return;
 
   const toolName = input.tool || "";
@@ -508,6 +589,7 @@ export function recordToolCall(input, output, intent, durationMs) {
     isSuccess,
     durationMs,
     metadata: output?.metadata,
+    intentSource,
     outcomeCategory,
   });
 
@@ -573,6 +655,7 @@ export function recordSubagentOutcome(evidence = {}) {
     status: "requested",
     success: null,
   }][Number(isDispatch)];
+  objectiveEvidence.inherit(evidence.childSessionID, evidence.parentSessionID);
   const envelope = appendRuntimeEvent({
     eventType: stageDefaults.eventType,
     subjectId: firstTruthy([evidence.childSessionID, evidence.callID], "unknown-child"),
@@ -599,6 +682,16 @@ export function recordSubagentOutcome(evidence = {}) {
   });
   if (envelope) projectRuntimeEvent(envelope);
   return envelope;
+}
+
+/** Persist an explicit parent decision and optional objective outcome receipt. */
+export function recordObjectiveDecision(evidence = {}) {
+  return objectiveEvidence.recordDecision(evidence);
+}
+
+/** Persist an explicit parent acceptance or repair assertion, never host completion. */
+export function recordSubagentAcceptance(evidence = {}) {
+  return objectiveEvidence.recordAcceptance(evidence);
 }
 
 /**

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -654,6 +655,34 @@ class RefreshTests(PoolOpsTestCase):
         self.assertNotIn("secret-refresh", json.dumps(result))
         self.assertNotIn("do not log this", json.dumps(result))
 
+    def test_shared_lock_uses_private_directory_protocol(self) -> None:
+        lock_path = self.tmp / "oauth-pool.json.lock"
+        lock_path.touch()
+        with lock_path.open("w") as lock_file:
+            _common.acquire_lock(lock_file, timeout=1)
+            lock_dir = Path(str(lock_path) + ".d")
+            owner_path = lock_dir / "owner"
+            owner = read_json(owner_path)
+
+            self.assertEqual(owner["schema"], "aidevops.oauth-lock/v1")
+            self.assertEqual(owner["pid"], os.getpid())
+            self.assertTrue(owner["token"])
+            self.assertEqual(stat.S_IMODE(lock_dir.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(owner_path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o600)
+
+            _common.release_lock(lock_file)
+            self.assertFalse(lock_dir.exists())
+
+    def test_atomic_write_enforces_private_parent_and_file_modes(self) -> None:
+        private_dir = self.tmp / "private"
+        target = private_dir / "state.json"
+        _common.atomic_write_json(str(target), {"status": "active"})
+
+        self.assertEqual(read_json(target), {"status": "active"})
+        self.assertEqual(stat.S_IMODE(private_dir.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+
     def test_unauthorized_refresh_error_is_sanitized(self) -> None:
         error = urllib.error.HTTPError(
             url="https://auth.example.invalid/token",
@@ -768,6 +797,49 @@ class RefreshTests(PoolOpsTestCase):
         self.assertFalse(pool_ops_refresh._should_refresh_account(account, "all", now_ms))
         self.assertTrue(pool_ops_refresh._should_refresh_account(account, "all", now_ms + 60_001))
 
+    def test_refresh_revalidates_auth_error_with_unexpired_token(self) -> None:
+        # GH#32927: auto-clear leaves auth-error + cooldownUntil=0; a token far
+        # from expiry must not keep the account permanently unavailable.
+        now_ms = int(time.time() * 1000)
+        week_ms = 7 * 24 * 3_600_000
+        for cleared in (0, None, now_ms - 1):
+            account = {
+                "email": "a@example.com",
+                "access": "old",
+                "refresh": "secret-refresh",
+                "expires": now_ms + week_ms,
+                "status": "auth-error",
+                "cooldownUntil": cleared,
+            }
+            self.assertTrue(pool_ops_refresh._should_refresh_account(account, "all", now_ms))
+
+        account["cooldownUntil"] = now_ms + 60_000
+        self.assertFalse(pool_ops_refresh._should_refresh_account(account, "all", now_ms))
+
+        healthy = dict(account, status="active", cooldownUntil=0)
+        self.assertFalse(pool_ops_refresh._should_refresh_account(healthy, "all", now_ms))
+
+    def test_revalidation_failure_keeps_auth_error_with_new_backoff(self) -> None:
+        now_ms = int(time.time() * 1000)
+        account = {
+            "email": "a@example.com",
+            "access": "old",
+            "refresh": "secret-refresh",
+            "expires": now_ms + 7 * 24 * 3_600_000,
+            "status": "auth-error",
+            "cooldownUntil": 0,
+        }
+        ctx = pool_ops_refresh._RefreshContext("https://auth.example.invalid/token", "client", "ua", "all")
+
+        with mock.patch.object(pool_ops_refresh, "call_token_endpoint", return_value={_common.TOKEN_REFRESH_ERROR_KEY: "http_401"}):
+            refreshed, failed = pool_ops_refresh._refresh_all_eligible([account], ctx, now_ms)
+
+        self.assertEqual(refreshed, [])
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(account["status"], "auth-error")
+        self.assertGreater(account["cooldownUntil"], now_ms)
+        self.assertFalse(pool_ops_refresh._should_refresh_account(account, "all", now_ms + 1))
+
     def test_successful_refresh_clears_retry_backoff_state(self) -> None:
         now_ms = int(time.time() * 1000)
         account = {
@@ -815,6 +887,63 @@ class SimpleCommandsSmokeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Total accounts : 2", result.stdout)
         self.assertIn("anthropic pool", result.stdout)
+
+    def _status_stats(self, accounts: list[dict], now_ms: int = 100_000) -> str:
+        result = run_pool_ops(
+            "status-stats",
+            {"NOW_MS": str(now_ms), "PROV": "anthropic"},
+            stdin=json.dumps({"anthropic": accounts}),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_status_stats_auth_error_never_available(self) -> None:
+        """GH#34377: auth-error is unavailable whatever its cooldown."""
+        auth_error_cooldowns = [
+            {},
+            {"cooldownUntil": None},
+            {"cooldownUntil": 0},
+            {"cooldownUntil": 50_000},
+            {"cooldownUntil": 200_000},
+        ]
+        for extra in auth_error_cooldowns:
+            with self.subTest(extra=extra):
+                out = self._status_stats([{"status": "auth-error", **extra}])
+                self.assertIn("Available now  : 0", out)
+                self.assertIn("Auth errors    : 1", out)
+                self.assertIn("auth-error accounts need re-authentication", out)
+                self.assertNotIn("run reset-cooldowns", out)
+
+    def test_status_stats_keeps_active_and_rate_limit_eligibility(self) -> None:
+        cases = [
+            ({"status": "active"}, 1, 0),
+            ({"status": "idle", "cooldownUntil": None}, 1, 0),
+            ({"status": "rate-limited", "cooldownUntil": 50_000}, 1, 0),
+            ({"status": "rate-limited", "cooldownUntil": 200_000}, 0, 1),
+        ]
+        for account, available, limited in cases:
+            with self.subTest(account=account):
+                out = self._status_stats([account])
+                self.assertIn(f"Available now  : {available}", out)
+                self.assertIn(f"Rate limited   : {limited}", out)
+        out = self._status_stats([{"status": "rate-limited", "cooldownUntil": 200_000}])
+        self.assertIn("run reset-cooldowns or add an account", out)
+
+    def test_status_stats_mixed_pool_totals_are_consistent(self) -> None:
+        out = self._status_stats([
+            {"status": "active"},
+            {"status": "idle", "cooldownUntil": 0},
+            {"status": "rate-limited", "cooldownUntil": 50_000},
+            {"status": "rate-limited", "cooldownUntil": 200_000},
+            {"status": "auth-error", "cooldownUntil": 0},
+            {"status": "auth-error", "cooldownUntil": 200_000},
+        ])
+        self.assertIn("Total accounts : 6", out)
+        self.assertIn("Available now  : 3", out)
+        self.assertIn("Active/idle    : 2", out)
+        self.assertIn("Rate limited   : 1", out)
+        self.assertIn("Auth errors    : 2", out)
+        self.assertNotIn("WARNING", out)
 
     def test_list_accounts(self) -> None:
         pool = {"anthropic": [{"email": "a@example.com", "status": "active", "priority": 3}]}

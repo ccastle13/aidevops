@@ -25,8 +25,59 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit
 source "${SCRIPT_DIR}/shared-constants.sh"
+# shellcheck source=lib/opencode-agent-ownership.sh
+source "${SCRIPT_DIR}/lib/opencode-agent-ownership.sh"
+# Reuse the unified generators collision resolver for deterministic legacy output.
+# shellcheck source=generate-runtime-config-agents.sh
+source "${SCRIPT_DIR}/generate-runtime-config-agents.sh"
 
 set -euo pipefail
+
+show_help() {
+	cat <<'EOF'
+Usage: generate-opencode-agents.sh [help|--help|-h]
+
+Generate the legacy OpenCode agent configuration. With no arguments, the
+generator updates the configured OpenCode files. Help and argument validation
+are observational and complete before any files are changed.
+EOF
+	return 0
+}
+
+parse_arguments() {
+	local argument_count="$#"
+	local first_argument="${1-}"
+	if [[ "$argument_count" -eq 0 ]]; then
+		return 1
+	fi
+	if [[ "$argument_count" -ne 1 ]]; then
+		printf 'Error: unsupported arguments\n' >&2
+		printf 'Run %s --help for usage.\n' "$(basename "$0")" >&2
+		return 2
+	fi
+	case "$first_argument" in
+	help | --help | -h)
+		show_help
+		return 0
+		;;
+	*)
+		printf 'Error: unsupported argument: %s\n' "$first_argument" >&2
+		printf 'Run %s --help for usage.\n' "$(basename "$0")" >&2
+		return 2
+		;;
+	esac
+}
+
+parse_status=0
+parse_arguments "$@" || parse_status=$?
+case "$parse_status" in
+0) exit 0 ;;
+2) exit 2 ;;
+esac
+
+if [[ "$parse_status" -ne 1 ]]; then
+	exit "$parse_status"
+fi
 
 AGENTS_DIR="$HOME/.aidevops/agents"
 OPENCODE_CONFIG_DIR="$HOME/.config/opencode"
@@ -50,7 +101,7 @@ The opencode-aidevops plugin renders session-start framework status (version, en
 
 Do not re-run `aidevops-update-check.sh` or repeat toast content as a greeting — the user has already seen it. Respond directly to the user's message.
 
-**Fallback for agents without a Bash tool** (the plugin only fires toasts when the host runtime exposes the TUI — subagents may not see them): read `~/.aidevops/cache/session-greeting-opencode.txt` if it exists; otherwise read `~/.aidevops/agents/VERSION` for `{version}` and greet with `"Hi!\n\nWe're running https://aidevops.sh v{version}.\n\nWhat would you like to work on?"`.
+**Fallback for agents without a Bash tool** (the plugin only fires toasts when the host runtime exposes the TUI — subagents may not see them): read `~/.aidevops/agents/VERSION` first. Use `~/.aidevops/cache/session-greeting-opencode.txt` for the runtime version only when its aidevops version matches the deployed VERSION; never greet with an outdated cached version.
 
 **Update available prompt**: the raw cached output may begin with `UPDATE_AVAILABLE|<current>|<latest>|<runtime>`. When present, inform the user: "Update available (current → latest). Run `aidevops update` in a terminal session, or type `!aidevops update` below and hit Enter." If the cached output also contains `AUTO_UPDATE_ENABLED`, replace the manual instruction with: "Auto-update is enabled and will apply this within ~10 minutes."
 
@@ -71,13 +122,17 @@ legacy_files=(
 	"plan-plus.md" "aidevops.md" "Browser-Extension-Dev.md" "Mobile-App-Dev.md" "AGENTS.md"
 )
 for f in "${legacy_files[@]}"; do
-	rm -f "$OPENCODE_AGENT_DIR/$f"
+	if _opencode_generated_agent_owned "$OPENCODE_AGENT_DIR/$f"; then
+		rm -f "$OPENCODE_AGENT_DIR/$f"
+	fi
 done
 
 # Remove loop-state files that were incorrectly created as agents
 # These are runtime state files, not agents
-for f in ralph-loop.local.md quality-loop.local.md full-loop.local.md loop-state.md re-anchor.md postflight-loop.md; do
-	rm -f "$OPENCODE_AGENT_DIR/$f"
+for f in quality-loop.local.md full-loop.local.md loop-state.md re-anchor.md postflight-loop.md; do
+	if _opencode_generated_agent_owned "$OPENCODE_AGENT_DIR/$f"; then
+		rm -f "$OPENCODE_AGENT_DIR/$f"
+	fi
 done
 
 # =============================================================================
@@ -105,8 +160,8 @@ echo -e "  ${GREEN}✓${NC} Primary agents configured in opencode.json"
 
 echo -e "${BLUE}Generating subagent markdown files...${NC}"
 
-# Remove existing subagent files (regenerate fresh)
-find "$OPENCODE_AGENT_DIR" -name "*.md" -type f -delete 2>/dev/null || true
+# Remove only aidevops-owned generated files; preserve operator definitions.
+_opencode_clean_generated_agents "$OPENCODE_AGENT_DIR"
 
 # Generate SUBAGENT files from subfolders
 # Some subagents need specific MCP tools enabled
@@ -192,6 +247,9 @@ _get_extra_tools() {
 	chrome-devtools)
 		extra_tools=$'  chrome-devtools_*: true'
 		;;
+	opencode-browse)
+		extra_tools=$'  browse_*: true'
+		;;
 	cloudflare-mcp)
 		extra_tools=$'  cloudflare-api_*: true'
 		;;
@@ -226,10 +284,13 @@ _write_sandboxed_agent() {
 		fm_delim == 2 { exit }
 	' "$f" 2>/dev/null)
 	if [[ -n "$src_bash_false" ]]; then
-		sed \
+		awk '
+			{ print }
+			$0 == "---" { delimiters++; if (delimiters == 2) print "<!-- aidevops:generated-subagent -->" }
+		' "$f" | sed \
 			-e 's/^model: opus$/model: anthropic\/claude-opus-4-6/' \
-			-e 's/^model: sonnet$/model: anthropic\/claude-sonnet-4-6/' \
-			-e 's/^model: haiku$/model: anthropic\/claude-haiku-4-5/' \
+			-e 's/^model: sonnet$/model: anthropic\/claude-sonnet-5-5/' \
+			-e 's/^model: haiku$/model: anthropic\/claude-haiku-5-5/' \
 			"$f" >"$OPENCODE_AGENT_DIR/$name.md"
 		echo 1
 		return 0
@@ -281,6 +342,7 @@ _write_permissive_stub() {
 		[[ -n "$extra_tools" ]] && printf '%s\n' "$extra_tools"
 		printf '%s\n' \
 			"---" \
+			"<!-- aidevops:generated-subagent -->" \
 			"" \
 			"**MANDATORY**: Your first action MUST be to read ~/.aidevops/agents/${rel_path} and follow ALL rules within it."
 	} >"$OPENCODE_AGENT_DIR/$name.md"
@@ -295,6 +357,7 @@ generate_subagent_stub() {
 	local name
 	name=$(basename "$f" .md)
 	[[ "$name" == "AGENTS" || "$name" == "README" ]] && return 0
+	_opencode_agent_output_available "$OPENCODE_AGENT_DIR/$name.md" || return 0
 
 	local rel_path="${f#"$AGENTS_DIR"/}"
 	local src_desc extra_tools
@@ -308,7 +371,7 @@ generate_subagent_stub() {
 	return 0
 }
 
-export -f generate_subagent_stub _get_subagent_description _get_extra_tools _yaml_quote_scalar _write_sandboxed_agent _write_permissive_stub 2>/dev/null || true
+export -f generate_subagent_stub _get_subagent_description _get_extra_tools _yaml_quote_scalar _write_sandboxed_agent _write_permissive_stub _opencode_generated_agent_owned _opencode_agent_output_available 2>/dev/null || true
 export AGENTS_DIR
 export OPENCODE_AGENT_DIR
 
@@ -316,7 +379,7 @@ export OPENCODE_AGENT_DIR
 # tiny sed+cat, so full CPU parallelism is safe and reduces wall-clock time)
 _ncpu=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 _parallel_jobs=$((_ncpu > 4 ? _ncpu : 4))
-subagent_count=$(find "$AGENTS_DIR" -mindepth 2 -name "*.md" -type f -not -path "*/loop-state/*" -not -name "*-skill.md" -print0 |
+subagent_count=$(_resolve_basename_collisions_for_generate |
 	xargs -0 -P "$_parallel_jobs" -I {} bash -c 'generate_subagent_stub "$@"' _ {} |
 	awk '{sum+=$1} END {print sum+0}')
 

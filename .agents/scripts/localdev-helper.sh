@@ -300,9 +300,11 @@ cmd_help() {
 	echo "  branch <app> <branch> [port]  Add branch subdomain route"
 	echo "  branch rm <app> <branch>      Remove branch route"
 	echo "  branch list [app]             List branch routes"
+	echo "  branch prune [app] [--repo <path>] [--dry-run]  Drop branches with no live worktree"
 	echo "  db <command>       Shared Postgres management (start, create, list, drop, url)"
 	echo "  list               Dashboard: all projects, URLs, certs, health, LocalWP"
 	echo "  status             Infrastructure health: dnsmasq, Traefik, certs, ports"
+	echo "  diagnose <name>    Compare macOS .local default and IPv4-only HTTPS lookup"
 	echo "  help               Show this help message"
 	echo ""
 	echo "Run performs (zero-config):"
@@ -394,6 +396,14 @@ main() {
 		;;
 	status)
 		cmd_status
+		;;
+	diagnose)
+		shift
+		if [[ -z "${1:-}" ]]; then
+			print_error "Usage: localdev-helper.sh diagnose <name>"
+			exit 1
+		fi
+		diagnose_local_name_resolution "${1}.local"
 		;;
 	infer-name)
 		# Internal: infer project name for a directory (used by worktree-helper.sh)

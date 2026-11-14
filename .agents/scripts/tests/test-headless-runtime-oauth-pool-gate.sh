@@ -106,11 +106,11 @@ PY
 	return 0
 }
 
-TEST_MODELS=("openai/gpt-5.5" "anthropic/claude-sonnet-4-6")
+TEST_MODELS=("openai/gpt-5.5" "anthropic/claude-sonnet-5-5")
 cooldown="$(future_ms)"
 write_pool "{\"openai\":[{\"email\":\"one@example.test\",\"status\":\"rate-limited\",\"cooldownUntil\":${cooldown}},{\"email\":\"two@example.test\",\"status\":\"auth-error\",\"cooldownUntil\":${cooldown}}],\"anthropic\":[{\"email\":\"ok@example.test\",\"status\":\"active\",\"cooldownUntil\":0}]}"
 actual="$(_choose_model_auto "worker" "standard")"
-assert_equals "anthropic/claude-sonnet-4-6" "$actual" "all cooling OpenAI OAuth pool accounts are skipped" || true
+assert_equals "anthropic/claude-sonnet-5-5" "$actual" "all cooling OpenAI OAuth pool accounts are skipped" || true
 
 cooldown="$(future_ms)"
 write_pool "{\"openai\":[{\"email\":\"one@example.test\",\"status\":\"rate-limited\",\"cooldownUntil\":${cooldown}},{\"email\":\"two@example.test\",\"status\":\"idle\",\"cooldownUntil\":0}]}"
@@ -131,8 +131,24 @@ AIDEVOPS_OPENAI_API_KEY_SOURCE="oauth-pool"
 export OPENAI_API_KEY AIDEVOPS_OPENAI_API_KEY_SOURCE
 write_pool "{\"openai\":[{\"email\":\"one@example.test\",\"status\":\"rate-limited\",\"cooldownUntil\":${cooldown}}],\"anthropic\":[{\"email\":\"ok@example.test\",\"status\":\"active\",\"cooldownUntil\":0}]}"
 actual="$(_choose_model_auto "worker" "standard")"
-assert_equals "anthropic/claude-sonnet-4-6" "$actual" "OAuth-injected OpenAI API key does not bypass OAuth pool cooldown gate" || true
+assert_equals "anthropic/claude-sonnet-5-5" "$actual" "OAuth-injected OpenAI API key does not bypass OAuth pool cooldown gate" || true
 unset OPENAI_API_KEY AIDEVOPS_OPENAI_API_KEY_SOURCE
+
+# GH#36707: an inherited pool-derived Anthropic env token must not pin
+# selection to an exhausted pool; a genuinely independent key still bypasses.
+TEST_MODELS=("anthropic/claude-sonnet-5-5" "openai/gpt-5.5")
+cooldown="$(future_ms)"
+ANTHROPIC_API_KEY="test-inherited-token"
+AIDEVOPS_ANTHROPIC_API_KEY_SOURCE="oauth-pool"
+export ANTHROPIC_API_KEY AIDEVOPS_ANTHROPIC_API_KEY_SOURCE
+write_pool "{\"anthropic\":[{\"email\":\"one@example.test\",\"status\":\"rate-limited\",\"cooldownUntil\":${cooldown}}],\"openai\":[{\"email\":\"ok@example.test\",\"status\":\"active\",\"cooldownUntil\":0}]}"
+actual="$(_choose_model_auto "worker" "standard")"
+assert_equals "openai/gpt-5.5" "$actual" "inherited pool-derived Anthropic key falls back from exhausted pool" || true
+unset AIDEVOPS_ANTHROPIC_API_KEY_SOURCE
+actual="$(_choose_model_auto "worker" "standard")"
+assert_equals "anthropic/claude-sonnet-5-5" "$actual" "independent Anthropic API key bypasses OAuth pool cooldown gate" || true
+unset ANTHROPIC_API_KEY
+TEST_MODELS=("openai/gpt-5.5" "anthropic/claude-sonnet-5-5")
 
 rm -f "$HOME/.aidevops/oauth-pool.json"
 actual="$(_choose_model_auto "worker" "standard")"

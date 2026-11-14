@@ -17,12 +17,12 @@ For prompt-economy reasons these rules live here rather than in always-on AGENTS
 
 ## Task Creation
 
-Issue-first planning uses the implemented atomic publication contract in
-`reference/planning-publication-lifecycle.md`: online local creators add
-`publication:pending` and withhold positive dispatch labels until the exact
-default-branch TODO/ref/brief snapshot is validated. Direct publication or a
-merged planning PR triggers idempotent reconciliation; failed or closed-unmerged
-publication leaves the issue blocked and safe to retry.
+Issues lead; `TODO.md` and briefs are repository backups (GH#34232,
+`reference/planning-publication-lifecycle.md`). A worker-ready issue gets its
+intended dispatch labels at creation and never waits for a planning merge.
+`publication:pending` is an opt-in hold for bodies that are not yet
+self-contained (for example `/new-task --batch` template stubs); companion
+files go on a seed draft PR (`workflows/brief.md` "Seeded Draft PR Decision").
 
 1. Define the task: `/define` (interactive interview) or `/new-task` (quick creation)
 2. Brief file at `todo/tasks/{task_id}-brief.md` is MANDATORY (see `~/.aidevops/agents/templates/brief-template.md`)
@@ -33,7 +33,7 @@ publication leaves the issue blocked and safe to retry.
 7. Never skip verification. Run applicable existing required tests, but do not add tests by default or create test infrastructure without explicit authority; see `reference/ci-gate-policy.md`.
 8. **Performance/optimization issues require evidence** (GH#17832-17835): actual measurements (timing, profiling), verified line references, and data scale assessment. "May cause O(n^2)" without data is not actionable — use the "Performance Optimization" issue template. See "Framework Rules > AI-Generated Issue Quality" above.
 
-Format: `- [ ] t001 Description @owner #tag ~4h started:ISO blocked-by:t002`
+Format: `- [ ] t1 Description @owner #tag ~4h started:ISO blocked-by:t2`
 
 Dependency rule: when a TODO/issue declares ordered work with `blocked-by:*`
 or `blocks:*`, preserve the text marker for human/reconciliation context and
@@ -48,7 +48,28 @@ normal TODO-to-GitHub relationship backfill and status normalization; Pulse
 changes the next leaf to `status:available` after all blockers close. Workers
 complete only their own leaf and do not manually edit successors.
 
+External upstream-release blockers use a body marker instead of prose:
+`<!-- aidevops:upstream-release-gate repo=OWNER/REPO commit=SHA -->` (full SHA,
+own line). Pulse's stale-blocked sweep unblocks the issue once a recent upstream
+tag contains that commit. Details: `workflows/brief.md` "Waiting on an upstream
+release"; implementation: `scripts/upstream-release-gate-lib.sh`.
+
 Task IDs: `/new-task` or `claim-task-id.sh`. NEVER grep TODO.md for next ID.
+
+### Cross-repository child tasks
+
+Declare the brief field `- **Target repository:** owner/repo` when child
+repository ownership is explicit. This is the child's issue and task-ID home;
+`- **Parent:** other-owner/coordination-repo#123` is a relationship, not
+a repository selector. For pre-allocation claims pass the prewritten brief with
+`claim-task-id.sh --brief-file PATH --repo-path PATH`, or pass
+`--target-repo owner/repo` when a brief has not yet been assigned a task ID.
+Both options may be supplied together. The claim compares declarations with
+the selected Git remote before touching the counter; `issue-sync-helper.sh push`
+validates all selected briefs before labels, TODO refs, or issues are
+written. `--repo` and `--project-root` still select the actual publication
+repository. Absent target metadata preserves historical same-repository
+behaviour. Never guess the target from prose or a cross-repo parent.
 
 ## Safety-Stop Recovery
 
@@ -95,7 +116,7 @@ the parent objective.
 
 - **`### Complexity Impact` field (t2803):** Section for tasks modifying shell functions. Author must estimate growth: 80-100 lines projected post-change requires a warning; >100 lines (the `function-complexity` gate) REQUIRES a pre-planned refactor. Prevents the recurring pattern where workers grow a function past the gate threshold and trigger repeated dispatch failures (canonical: 8 workers on GH#20702). Include this section for any `EDIT:` targeting an existing function body; delete it when the task creates only new files or new functions. Full guidance: `reference/large-file-split.md §0`.
 
-- **Worker-ready issue body heuristic (t2417):** Before creating a full brief, `/define`, `/new-task`, and `task-brief-helper.sh` check whether the linked issue body is already worker-ready — i.e., it contains 4+ of the 7 known heading signals (`## Task`, `## Why`, `## How`, `## Acceptance`, `## What`, `## Session Origin`, `## Files to modify`). When the issue body is worker-ready, the brief file is either skipped (headless default) or replaced with a stub that links to the issue as the canonical brief. This prevents brief/issue body duplication and the collision surface it creates (see GH#20015). Helper: `scripts/brief-readiness-helper.sh`. Threshold override: `BRIEF_READINESS_THRESHOLD` env var.
+- **Worker-ready issue body heuristic (t2417):** `scripts/brief-readiness-helper.sh check` detects existing implementation context (historical 4-of-7 headings; schema-v2 requires substantive evidence). Reuse that content rather than authoring a competing brief. The legacy `stub <task-id> <issue> <slug> [repo-path]` command now captures the complete observed body and provenance in `todo/tasks/`, create-only. Existing briefs are preserved, not refreshed or backfilled. Commit the capture before acknowledging durable recovery; comments and later remote events remain uncaptured. See `reference/forge-portability.md` for ownership, lag, conflict and recovery limits. Threshold override: `BRIEF_READINESS_THRESHOLD`.
 
 **Brief composition**: All GitHub-written content (issue bodies, briefs, PR descriptions, comments, escalation reports, worker guidance) follows `workflows/brief.md` — the centralised formatting workflow. Load it before publishing; optional seeded draft PRs are governed there, not in this root guide.
 
@@ -120,17 +141,26 @@ Natural-language task capture must be as explicit as slash commands. When a user
 |-------------|-------|--------------|
 | `/full-loop ...`, issue/task number after `/full-loop`, "do/work/fix/implement this now", "in this session" | Execute `/full-loop` in the primary conversation | Do not ask whether to start or delegate; proceed unless blocked by safety/secret/destructive gates |
 | "background", "worker", "auto-dispatch", "have an agent do this" | Compose with `workflows/brief.md`, create TODO/issue with `#auto-dispatch` when readiness passes, and queue/dispatch | Ask only for missing secrets, destructive approval, unknown repo, or unavailable verification |
-| "save", "log", "for later", `/save-todo`, `/aidevops-save-todo` | Compose with `workflows/brief.md`; save as a local TODO/plan without creating an implementation issue | Do not ask again; explicit later intent is the decision |
+| "save", "log", "for later", `/save-todo`, `/aidevops-save-todo` | Compose with `workflows/brief.md`; saved `tNNN` TODO rows publish through issue-sync as non-dispatched tracking issues without `auto-dispatch`; ID-less plan lines stay local | Do not ask again; explicit later intent is the decision |
 | "create/file/open an issue", or a session identifies a fixable out-of-scope finding | Compose with `workflows/brief.md`; create a worker-ready implementation issue with `#auto-dispatch` | Do not ask for separate dispatch approval; issue creation authorizes implementation |
 | Ambiguous "we need to...", "should add...", "can you note..." | Infer the safest productive route from the established objective: implement in scope now, otherwise create a worker-ready auto-dispatch issue | Ask before publication only when human input is materially irreplaceable under `reference/self-improvement.md` |
 
 Never offer "create an issue" and "create an issue and auto-dispatch" as separate
 choices for implementation work. Decide whether an issue should exist before
-publishing it; once created, automatic implementation is the default. Explicit
-save/later intent stays local and needs no follow-up question. If a brief cannot
+publishing it; once an implementation issue is created, automatic implementation
+is the default. Explicit save/later intent creates non-dispatched tracking issues
+for `tNNN` TODO rows through issue-sync; only ID-less plan lines stay local. Neither
+form needs a follow-up dispatch question. If a brief cannot
 meet auto-dispatch readiness, repair it autonomously when possible; otherwise
 record the concrete blocker and missing irreplaceable input without converting
 routine uncertainty into `#no-auto-dispatch`.
+
+**Release-bound sessions:** when an interactive session holds release intent for a
+repository, or is working that repository's backlog, a fixable same-repo finding
+is still filed as above, but filing is its durable record, not a hand-off. Claim it
+at filing when eligible and solve it before the release through
+`reference/release-scope-sweep.md`; only ineligible issues wait for pulse.
+Headless workers keep the normal auto-dispatch hand-off.
 
 ## Auto-Dispatch and Completion
 
@@ -139,6 +169,17 @@ routine uncertainty into `#no-auto-dispatch`.
   - referenced files or patterns in the `How` section;
   - automatable verification; and
   - 2+ acceptance criteria beyond generic tests/lint.
+
+  Credential-dependent execution on a configured runner is eligible when the
+  issue declares required **names** via `needs-secret:NAME` labels or the body
+  marker `<!-- aidevops:needs-secrets NAME1 NAME2 -->`. The claim-time capability
+  gate uses the union of labels, body markers, `requires-secrets:` lines and
+  dispatch-class declarations; a runtime-added label never drops body requirements. The pulse
+  compares names against `aidevops secret list` locally before claim and again
+  at the claim boundary. Missing names yield without a worker attempt; after
+  `AIDEVOPS_SECRET_STARVATION_SECONDS` (default 86400), a single marked notice
+  names the missing credentials and applies `status:blocked`. Never declare
+  values or assume the body marker hides names in a public issue.
 
   If readiness is missing, improve the brief when practical, but do not suppress useful issue publication or ask the user to perform routine triage. Publish without `#auto-dispatch`, state the missing information, and leave the issue recorded for autonomous enrichment; use `#parent`/blocked only when those semantics are true. Do not add `#no-auto-dispatch` merely because readiness is incomplete—that label is reserved for explicit durable manual intent with its reason recorded on the issue. See `workflows/plans.md` "Auto-Dispatch Tagging".
 - **Exclusions**: Omit `#auto-dispatch` only for:
@@ -154,7 +195,7 @@ routine uncertainty into `#no-auto-dispatch`.
 - **Dispatch-path advisory (t2821, t2832, t2920)**: When a task's `### Files Scope` or `## How` section references a file in `.agents/configs/self-hosting-files.conf`, use `#auto-dispatch` as normal. The t2819 detector auto-elevates these workers to `tier:thinking`; runtime routing chooses the concrete model and reasoning level. Worker isolation, CI gates, watchdog kills, and the t2690 circuit breaker replace the historical `no-auto-dispatch` default. Interactive implementation keeps `#auto-dispatch`; its active claim is the temporary deduplication gate. **Durable opt-out (rare):** use `#no-auto-dispatch` only for explicit manual intent or a recorded unresolved safety/authority decision, never merely because the creating session will not implement the issue itself. Full decision tree: `reference/auto-dispatch.md` "Dispatch-Path Default (t2821 / t2920)".
 - **Quality gate**: Same readiness definition as `#auto-dispatch` above; do not maintain a second criteria list.
 - **Dispatch-label mutual exclusion**: `#auto-dispatch` and `#no-auto-dispatch` must never coexist. Managed issue-create/edit paths normalize conflicts without suppressing publication: an explicit manual hold wins a same-command conflict, and adding either label removes its opposite.
-- **Interactive workflow**: Keep worker-ready issues tagged `#auto-dispatch`; claim with `status:in-review` + assignment while working, then release with unassignment so unfinished work resumes automatically.
+- **Interactive workflow**: Keep worker-ready issues tagged `#auto-dispatch`; claim with `status:claimed` + assignment while working, then release with unassignment so unfinished work resumes automatically. Reserve `status:in-review` for an open non-draft PR that is actually ready for review.
 - **Server-side safety net (t2798)**: `.github/workflows/apply-status-available-default.yml` applies `status:available` to issues that carry `auto-dispatch` but have no `status:*` label — catches bypass-path creations (bare `gh issue create`, web UI) that skip `claim-task-id.sh`.
 
 **Session origin labels are provenance only**: Issues and PRs are automatically tagged with `origin:worker` (headless/pulse dispatch) or `origin:interactive` (user session). Applied by `claim-task-id.sh`, `issue-sync-helper.sh`, and `pulse-wrapper.sh`. In TODO.md, use `#worker` or `#interactive` tags to set origin explicitly; these map to the corresponding labels on push. Do not treat `origin:*` labels as workflow permission: `auto-dispatch` controls worker pickup on issues, and PR merge throughput is controlled by draft/hold state plus explicit merge-throughput preferences.
@@ -165,13 +206,26 @@ routine uncertainty into `#no-auto-dispatch`.
 
 **`origin:interactive` implies maintainer approval, not merge consent**: PRs tagged `origin:interactive` pass the maintainer gate automatically when the PR author is `OWNER` or `MEMBER` — the maintainer was present and directing the work. No separate `sudo aidevops approve` is needed. Contributors (`COLLABORATOR`) with `origin:interactive` still go through the normal gate — the label alone is not sufficient. The pulse also never auto-closes `origin:interactive` PRs via the deterministic merge pass, even if the task ID appears in recent commits (incremental work on the same issue is legitimate).
 
-**Auto-merge timing (t2411/GH#23238):** `origin:interactive` PRs from `OWNER`/`MEMBER` auto-merge only when CI passes, no CHANGES_REQUESTED, not draft, no `hold-for-review`, and merge throughput is explicitly opted in by `allow-auto-merge`, `AIDEVOPS_INTERACTIVE_PR_AUTO_MERGE=1`, global `orchestration.interactive_pr_auto_merge=true`, or per-repo `repos.json` `interactive_pr_auto_merge=true`. Default is manual/draft. `/pr-loop` or an explicit finalise/ready request is the normal signal to make a draft PR ready. Full checklist and user preference precedence: `reference/auto-merge.md`.
+**Auto-merge timing (t2411/GH#23238):** `origin:interactive` PRs from `OWNER`/`MEMBER` auto-merge only when CI passes, no CHANGES_REQUESTED, not draft, no `hold-for-review`, and merge throughput is explicitly opted in by `allow-auto-merge`, `AIDEVOPS_INTERACTIVE_PR_AUTO_MERGE=1`, global `orchestration.interactive_pr_auto_merge=true`, or per-repo `repos.json` `interactive_pr_auto_merge=true`. Pulse merge throughput is off by default. Interactive PRs open as drafts so work survives interruption; after verification, implementation intent in a maintainer repository (`workflows/full-loop.md` Step 4.2), `/pr-loop`, or an explicit finalise/ready request makes the PR ready. Full checklist and user preference precedence: `reference/auto-merge.md`.
 
 **Auto-merge timing (t2449, t3052, t3062) — `origin:worker` (worker-briefed):** `origin:worker` PRs auto-merge when the linked issue was filed by `OWNER`/`MEMBER`, its author has authenticated write authority, its author is in the trusted-issue-author allowlist (`.agents/configs/trusted-issue-authors.conf`, t3062), OR the linked issue has verified cryptographic maintainer approval (`sudo aidevops approve issue N`); no live NMR/hold gate remains; and CI passes. Historical NMR does not force a trusted author to self-approve. Feature flag: `AIDEVOPS_WORKER_BRIEFED_AUTO_MERGE` (default 1=on). Full 9-criterion checklist + security rationale: `reference/auto-merge.md`.
 
 **Admin merge authority:** Interactive sessions run as the repo admin/owner. For maintainer-owned or maintainer-approved work (`OWNER`/`MEMBER` PR author, maintainer-authored linked issue, trusted issue author, or valid crypto approval), `REVIEW_REQUIRED`, stale branch-protection state, or a self-blocking framework gate is not a user-action blocker once non-gate CI is green and no human `CHANGES_REQUESTED` review exists. Use `full-loop-helper.sh merge <N> <slug> --admin --squash` when needed; it records merge and cleanup evidence. Direct `gh pr merge` is blocked because it bypasses exact-head, review, receipt, and cleanup gates. Only keep the merge gated when the issue/PR originates from a non-maintainer and lacks cryptographic maintainer approval.
 
 **`origin:interactive` also skips pulse dispatch (GH#18352)**: When an issue carries `origin:interactive` AND has any human assignee, the pulse's deterministic dedup guard (`dispatch-dedup-helper.sh is-assigned`) treats the assignee as blocking — even if that assignee is the repo owner or maintainer, and regardless of the current `status:*` label. This closes the race where an interactive session claimed a task via `claim-task-id.sh` (applying `status:claimed` + owner assignment) and the pulse dispatched a duplicate worker before the session could open its PR. The full active lifecycle is now recognised: `status:queued`, `status:in-progress`, `status:in-review`, and `status:claimed` all keep owner/maintainer assignees in the blocking set.
+
+### Issue-List State Projection
+
+| Current evidence | Issue label | Reader action |
+|---|---|---|
+| Interactive owner working | `status:claimed` | Preserve the claim; do not dispatch. |
+| Worker actively running | `status:in-progress` | Preserve the claim; do not dispatch. |
+| Exact draft checkpoint stopped on evidence | `status:blocked` | Read the structured blocker reason and next action. |
+| Trusted correction validated for the exact checkpoint | `status:available` | Dispatch the existing exact-head continuation. |
+| Open, non-draft linked PR | `status:in-review` | Review or merge the PR. |
+| Linked PR merged | `status:done` | No implementation action. |
+
+These projections require a fresh authoritative issue/PR read. Unknown or ambiguous reads preserve the prior state; labels and stale prose never authorize continuation, clear a hold, or replace #31265's exact-head evidence contract.
 
 **Implementing a `#auto-dispatch` task interactively (MANDATORY):** Start with `interactive-start-helper.sh --issue N --repo owner/repo --task "description" --auto-dispatch`. Add `--background` only when the user explicitly requested it. All issue-started implementations claim with `--implementing`, export the local-only implementation marker, run the pre-edit loop check, and start full-loop before any code is written. External repositories skip managed issue mutations but still continue local implementation and the normal contribution PR flow.
 
@@ -217,7 +271,7 @@ Use `/routine` to design, dry-run, and schedule these definitions. Reference: `.
 
 **Cross-repo awareness**: The supervisor manages tasks across all repos in `~/.config/aidevops/repos.json` where `pulse: true`. Each repo entry has a `slug` field (`owner/repo`) — ALWAYS use this for `gh` commands, never guess org names. Use `gh issue list --repo <slug>` and `gh pr list --repo <slug>` for each pulse-enabled repo to get the full picture. Repos with `"local_only": true` have no GitHub remote — skip `gh` operations on them. Repo paths may be nested (e.g., `~/Git/cloudron/netbird-app`), not just `~/Git/<name>`.
 
-**Repo registration**: When you create or clone a new repo (via `gh repo create`, `git clone`, `git init`, etc.), add it to `~/.config/aidevops/repos.json` immediately. Every repo the user works with should be registered — unregistered repos are invisible to cross-repo tools (pulse, health dashboard, session time, contributor stats). After registering, run `/setup-git` to apply per-repo platform secrets (currently `SYNC_PAT` for GitHub, with GitLab/Gitea/Bitbucket coming) — see `reference/sync-pat-platforms.md`.
+**Repo registration**: When you create or clone a new repo (via `gh repo create`, `git clone`, `git init`, etc.), add it to `~/.config/aidevops/repos.json` immediately. Every repo the user works with should be registered — unregistered repos are invisible to cross-repo tools (pulse, health dashboard, session time, contributor stats). After registering, run `/setup-git` to apply per-repo platform secrets (currently `SYNC_PAT` for GitHub, with GitLab/Gitea/Bitbucket coming) — see `reference/sync-pat-platforms.md`. Registration alone misses init, labels, workflows and branch protection; complete `reference/repo-onboarding.md`.
 
 **repos.json structure (CRITICAL):** The file is `{"initialized_repos": [...], "git_parent_dirs": [...]}`. New repo entries MUST be appended inside the `initialized_repos` array — NEVER as top-level keys. After ANY write, validate: `jq . ~/.config/aidevops/repos.json > /dev/null`. A malformed file silently breaks the pulse for ALL repos.
 

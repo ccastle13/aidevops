@@ -29,6 +29,11 @@ fi
 # Validate the invocation boundary and classify its trust mode.
 # Uses caller-scoped output_file, exit_code_file, runtime_role, and mode flags.
 _invoke_opencode_validate_context() {
+	if [[ -z "${_invoke_work_dir:-}" ]]; then
+		print_error "Worker launch requires an explicit work directory"
+		printf '%s' "75" >"$exit_code_file"
+		return 1
+	fi
 	if _headless_private_workload_enabled; then
 		private_workload=1
 		if [[ ! -f "$PRIVATE_OUTPUT_FILTER" ]] || ! command -v python3 >/dev/null 2>&1; then
@@ -100,6 +105,16 @@ _invoke_opencode_copy_isolated_auth() {
 			jq -e --arg provider "$_invoke_provider" 'has($provider)' \
 			"${isolated_data_dir}/opencode/auth.json" >/dev/null 2>&1; then
 			public_triage_auth_ready=1
+		fi
+		# aidevops:trust-boundary — pure public triage cannot load the plugin
+		# which implements Anthropic OAuth. Never treat a copied entry as usable
+		# auth or silently fall back to an ambient credential for this entry.
+		if [[ "$public_triage" -eq 1 && "${_invoke_provider:-}" == "anthropic" ]] &&
+			jq -e '.anthropic.type == "oauth"' \
+			"${isolated_data_dir}/opencode/auth.json" >/dev/null 2>&1; then
+			print_error "Public triage provider authentication unavailable: Anthropic OAuth requires the plugin disabled by OPENCODE_PURE (Model not found)"
+			printf '%s' "86" >"$exit_code_file"
+			return 1
 		fi
 	fi
 	return 0
@@ -223,10 +238,13 @@ _invoke_opencode_prepare_child_command() {
 		local -a new_cmd=()
 		local inserted=0
 		local arg=""
+		# OpenCode V1 accepts only uppercase levels; V2 accepts only lowercase.
+		local log_level="WARN"
+		[[ "${AIDEVOPS_OPENCODE_PROFILE:-v1}" != "v2" ]] || log_level="warn"
 		for arg in "${_oc_cmd[@]}"; do
 			new_cmd+=("$arg")
 			if [[ "$arg" == "run" && "$inserted" -eq 0 ]]; then
-				new_cmd+=("--print-logs" "--log-level" "WARN")
+				new_cmd+=("--print-logs" "--log-level" "$log_level")
 				inserted=1
 			fi
 		done
@@ -238,6 +256,10 @@ _invoke_opencode_prepare_child_command() {
 # Execute one sandboxed command while preserving the child's pipeline status.
 _invoke_opencode_run_sandboxed() {
 	local passthrough_csv=""
+	# This launcher-only hint is NOT added to the child's environment allowlist.
+	# Protected workloads remain unobserved, but cannot bypass managed admission.
+	local AIDEVOPS_LIFECYCLE_WORKTREE="${_invoke_work_dir:-}"
+	export AIDEVOPS_LIFECYCLE_WORKTREE
 	if ! prepare_headless_signing_sandbox_env "$runtime_role"; then
 		print_error "Headless signing configuration could not be safely isolated for the sandbox"
 		printf '%s' "87" >"$exit_code_file"
@@ -295,12 +317,43 @@ _invoke_opencode_run_bare() {
 	if [[ "${AIDEVOPS_HEADLESS_SANDBOX_DISABLED:-}" == "1" ]]; then
 		print_info "AIDEVOPS_HEADLESS_SANDBOX_DISABLED=1 — using bare timeout (no privilege isolation) (GH#20146 audit)"
 	fi
+	# Observe only AFTER existing sandbox policy permits bare
+	# execution. Never disable isolation to enable observation. The exec shim
+	# records its own identity, not worker_pid (which belongs to a shell).
+	# An absent worktree must not be interpreted as the current directory.
+	if [[ -n "${_invoke_work_dir:-}" || -n "${AIDEVOPS_LIFECYCLE_GENERATION_ID:-}" || -n "${AIDEVOPS_LIFECYCLE_RUN_ID:-}" ]]; then
+		local lifecycle_entry="${SCRIPT_DIR}/../worker-lifecycle/worker-launch.py"
+		# shellcheck source=worker-lifecycle-state.sh
+		source "${SCRIPT_DIR}/worker-lifecycle-state.sh"
+		local lifecycle_status=0
+		worker_lifecycle_prepare_launch "${_invoke_work_dir:-}" "$lifecycle_entry" "$private_workload" || lifecycle_status=$?
+		if [[ "$lifecycle_status" -ne 0 ]]; then
+			printf '%s' "$lifecycle_status" >"$exit_code_file"
+			return "$lifecycle_status"
+		fi
+		_oc_cmd=(${WORKER_LIFECYCLE_PREFIX[@]+"${WORKER_LIFECYCLE_PREFIX[@]}"} "${_oc_cmd[@]}")
+	fi
 	run_without_opencode_session_env timeout "$HEADLESS_SANDBOX_TIMEOUT_DEFAULT" "${_oc_cmd[@]}" 2>&1 | tee "$output_file"
 	printf '%s' "${PIPESTATUS[0]}" >"$exit_code_file"
 	return 0
 }
 
 # Start the runtime subprocess and publish its PID to the caller scope.
+_invoke_opencode_set_working_directory() {
+	[[ "${AIDEVOPS_OPENCODE_PROFILE:-v1}" == "v2" ]] || return 0
+	if [[ -z "${_invoke_work_dir:-}" || ! -d "$_invoke_work_dir" ]]; then
+		print_error "OpenCode V2 launch directory is unavailable: ${_invoke_work_dir:-<unset>}"
+		printf '%s' "86" >"$exit_code_file"
+		return 86
+	fi
+	if ! cd "$_invoke_work_dir"; then
+		print_error "OpenCode V2 could not enter launch directory: $_invoke_work_dir"
+		printf '%s' "86" >"$exit_code_file"
+		return 86
+	fi
+	return 0
+}
+
 _invoke_opencode_launch_worker() {
 	(
 		set +e
@@ -310,6 +363,8 @@ _invoke_opencode_launch_worker() {
 		local -a sandbox_home_args=()
 		local -a _oc_cmd=()
 		local prepare_status=0
+		_invoke_opencode_set_working_directory || prepare_status=$?
+		[[ "$prepare_status" -eq 0 ]] || exit "$prepare_status"
 		_invoke_opencode_prepare_child_command || prepare_status=$?
 		[[ "$prepare_status" -eq 0 ]] || exit "$prepare_status"
 		if [[ -x "$SANDBOX_EXEC_HELPER" && "${AIDEVOPS_HEADLESS_SANDBOX_DISABLED:-}" != "1" ]]; then
@@ -332,6 +387,11 @@ _invoke_opencode_start_monitors() {
 	[[ "$stall_timeout" =~ ^[0-9]+$ ]] || stall_timeout=600
 	local phase1_timeout="${HEADLESS_PHASE1_TIMEOUT_SECONDS:-180}"
 	[[ "$phase1_timeout" =~ ^[0-9]+$ ]] || phase1_timeout=180
+	# GH#36700: report the effective backstop and where deferral decisions are
+	# recorded, so an external per-attempt timeout can be compared with it.
+	local hard_kill_seconds="${WORKER_STALL_HARD_KILL_SECONDS:-1500}"
+	[[ "$hard_kill_seconds" =~ ^[0-9]+$ ]] || hard_kill_seconds=1500
+	local lifecycle_log="${WORKER_LIFECYCLE_LOG:-${HOME}/.aidevops/logs/pulse-dispatch.log}"
 	if [[ -x "$watchdog_script" ]]; then
 		nohup "$watchdog_script" \
 			--output-file "$output_file" --worker-pid "$worker_pid" \
@@ -340,7 +400,7 @@ _invoke_opencode_start_monitors() {
 			--stall-timeout "$stall_timeout" --phase1-timeout "$phase1_timeout" \
 			</dev/null >/dev/null 2>&1 &
 		watchdog_pid=$!
-		print_info "[lifecycle] activity_watchdog_started pid=$watchdog_pid worker=$worker_pid stall_timeout=${stall_timeout}s"
+		print_info "[lifecycle] activity_watchdog_started pid=$watchdog_pid worker=$worker_pid stall_timeout=${stall_timeout}s phase1=${phase1_timeout}s hard_kill=${hard_kill_seconds}s events=${exit_code_file}.watchdog_events lifecycle_log=${lifecycle_log}"
 	else
 		print_warning "[lifecycle] standalone watchdog not found at $watchdog_script — falling back to inline"
 		_run_activity_watchdog "$output_file" "$worker_pid" "$exit_code_file" "$_invoke_session_key" &
@@ -373,10 +433,26 @@ _invoke_opencode_cleanup_monitors() {
 		wait "$watchdog_pid" 2>/dev/null || true
 	fi
 	print_info "[lifecycle] watchdog_cleaned pid=$watchdog_pid"
+	_invoke_opencode_report_watchdog_events "${exit_code_file:-}"
 	if [[ -n "${_rl_monitor_pid:-}" ]]; then
 		kill "$_rl_monitor_pid" 2>/dev/null || true
 		wait "$_rl_monitor_pid" 2>/dev/null || true
 	fi
+	return 0
+}
+
+# GH#36700: summarise the standalone watchdog's per-attempt decisions in the
+# wrapper log once the watchdog has been reaped. Deferral reasons otherwise
+# exist only in the shared lifecycle log. Reporting only; never changes the
+# worker result.
+_invoke_opencode_report_watchdog_events() {
+	local exit_file="$1"
+	local events_file="${exit_file}.watchdog_events"
+	[[ -n "$exit_file" && -f "$events_file" ]] || return 0
+	local deferrals="0" last_event=""
+	deferrals=$(grep -c 'worker_stall_deferred' "$events_file" 2>/dev/null) || deferrals="0"
+	last_event=$(tail -n 1 "$events_file" 2>/dev/null) || last_event=""
+	print_info "[lifecycle] watchdog_summary deferrals=${deferrals} last_event=${last_event:-none}"
 	return 0
 }
 

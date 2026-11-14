@@ -5,7 +5,7 @@
 # AI DevOps Framework CLI
 # Usage: aidevops <command> [options]
 #
-# Version: 3.32.298
+# Version: 3.39.187
 
 set -euo pipefail
 
@@ -209,6 +209,9 @@ unset _AIDEVOPS_CLI_ROOT _AIDEVOPS_CLI_MODULES_SUBDIR
 # shellcheck source=.agents/scripts/aidevops-cli/aidevops-repos-lib.sh
 # shellcheck disable=SC1091  # module path resolved at runtime via $INSTALL_DIR
 source "${AIDEVOPS_CLI_MODULES_DIR}/aidevops-repos-lib.sh"
+# shellcheck source=.agents/scripts/aidevops-cli/repo-discovery-lib.sh
+# shellcheck disable=SC1091
+source "${AIDEVOPS_CLI_MODULES_DIR}/repo-discovery-lib.sh"
 # shellcheck source=.agents/scripts/aidevops-cli/aidevops-init-lib.sh
 # shellcheck disable=SC1091
 source "${AIDEVOPS_CLI_MODULES_DIR}/aidevops-init-lib.sh"
@@ -276,12 +279,52 @@ _run_update_setup_transaction() {
 	local output_mode="$1"
 	local expected_sha="$2"
 	local setup_exit=0
-	_run_update_setup "$output_mode" || setup_exit=$?
+	local rollback_receipt=""
+	rollback_receipt=$(mktemp) || return 1
+	AIDEVOPS_UPDATE_ROLLBACK_RECEIPT="$rollback_receipt" _run_update_setup "$output_mode" || setup_exit=$?
 	if [[ "$setup_exit" -ne 0 ]]; then
+		rm -f "$rollback_receipt"
 		print_error "Agent deployment failed: setup exited with code $setup_exit"
 		return 1
 	fi
-	_update_verify_deployment_state "$expected_sha" || return 1
+	if ! _update_verify_deployment_state "$expected_sha"; then
+		# Load deployment helpers only in the recovery subprocess, keeping the
+		# CLI's already-sourced runtime and global state unchanged.
+		if [[ -s "$rollback_receipt" ]]; then
+			(
+				if ! declare -F _runtime_bundle_rollback >/dev/null; then
+					# shellcheck source=.agents/scripts/setup/modules/agent-deploy.sh
+					source "$INSTALL_DIR/.agents/scripts/setup/modules/agent-deploy.sh" || exit 1
+				fi
+				if ! declare -F aidevops_runtime_transition_lock_acquire >/dev/null; then
+					# shellcheck source=.agents/scripts/setup/modules/agent-runtime.sh
+					source "$INSTALL_DIR/.agents/scripts/setup/modules/agent-runtime.sh" || exit 1
+				fi
+				{
+					IFS= read -r _AIDEVOPS_ACTIVE_BUNDLE_ROOT &&
+						IFS= read -r _AIDEVOPS_PREVIOUS_BUNDLE_ROOT &&
+						IFS= read -r _AIDEVOPS_PREVIOUS_DEPLOYED_SHA
+				} <"$rollback_receipt" || exit 1
+				_runtime_bundle_rollback "$_AIDEVOPS_REAL_HOME/.aidevops/agents"
+			) || print_error "Failed to roll back the runtime bundle after convergence failure"
+		fi
+		rm -f "$rollback_receipt"
+		return 1
+	fi
+	rm -f "$rollback_receipt"
+	_update_adopt_deployed_version
+	return 0
+}
+
+# GH#34114: VERSION_FILE is pinned at startup to the physical runtime bundle this
+# process loaded from (pwd -P resolves the agents symlink). After a verified
+# deployment flips that symlink, later get_version calls in this process (success
+# line, project sync, Homebrew drift check) must report the deployed version.
+# Only the version pointer moves; already-sourced CLI modules stay coherent.
+_update_adopt_deployed_version() {
+	local deployed_version_file="$_AIDEVOPS_REAL_HOME/.aidevops/agents/VERSION"
+	[[ -f "$deployed_version_file" ]] || return 0
+	VERSION_FILE="$deployed_version_file"
 	return 0
 }
 
@@ -307,7 +350,17 @@ _run_update_source_access_reconciliation() {
 		return 0
 	fi
 
-	print_warning "AIDEVOPS_DEFERRED_ACTION action=source-access-reconcile command='aidevops setup --scope source-access'"
+	if [[ -t 0 && -t 1 ]]; then
+		print_info "Reconciling the protected source-access broker..."
+		if AIDEVOPS_SOURCE_ACCESS_INTERACTIVE=true bash "$INSTALL_DIR/setup.sh" --stage source-access; then
+			print_success "Protected source-access broker reconciled"
+			return 0
+		fi
+		print_warning "Source-access broker maintenance was blocked; it will retry during the next interactive update"
+		return 0
+	fi
+
+	print_warning "Source-access broker maintenance requires an attached terminal for privilege confirmation; the next interactive update will retry automatically"
 	return 0
 }
 
@@ -344,19 +397,10 @@ cmd_update_help() {
 }
 
 cmd_update() {
-	# Update is operational, not compositional. Do not let any reachable Git,
-	# package-manager, migration, or setup subprocess inherit an editor or pager.
-	# Local declarations restore the caller's environment when this function exits.
-	local EDITOR=/usr/bin/false
-	local VISUAL=/usr/bin/false
-	local GIT_EDITOR=/usr/bin/false
-	local GIT_SEQUENCE_EDITOR=/usr/bin/false
-	local GIT_PAGER=cat
-	local PAGER=cat
-	local GIT_TERMINAL_PROMPT=0
+	local EDITOR=/usr/bin/false VISUAL=/usr/bin/false GIT_EDITOR=/usr/bin/false
+	local GIT_SEQUENCE_EDITOR=/usr/bin/false GIT_PAGER="cat" PAGER="cat" GIT_TERMINAL_PROMPT=0
 	export EDITOR VISUAL GIT_EDITOR GIT_SEQUENCE_EDITOR GIT_PAGER PAGER GIT_TERMINAL_PROMPT
 	local skip_project_sync=false
-	local reconcile_repo_verify=false
 	local update_output_mode="${AIDEVOPS_OUTPUT_MODE:-auto}"
 	local arg
 	for arg in "$@"; do
@@ -372,127 +416,134 @@ cmd_update() {
 	current_version=$(get_version)
 	print_info "Current version: $current_version"
 	print_info "Fetching latest version..."
+	_AIDEVOPS_UPDATE_RECONCILE_REPO_VERIFY=false
+	_update_install_framework "$current_version" "$update_output_mode" || return 1
+	_update_finish "$skip_project_sync"
+	return 0
+}
 
+_update_install_framework() {
+	local current_version="$1" update_output_mode="$2"
 	if check_dir "$INSTALL_DIR/.git"; then
-		cd "$INSTALL_DIR" || exit 1
-		if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
-			print_error "Refusing to update: tracked local changes exist in $INSTALL_DIR"
-			git status --short
-			print_info "Commit or stash these changes, then rerun aidevops update."
-			return 1
-		fi
-		local current_branch
-		current_branch=$(git branch --show-current 2>/dev/null || echo "")
-		if [[ "$current_branch" != "main" ]]; then
-			print_info "Switching to main branch..."
-			if ! git checkout main --quiet 2>/dev/null && ! git checkout -b main origin/main --quiet 2>/dev/null; then
-				print_error "Failed to switch to main; refusing to update the active '$current_branch' branch."
-				return 1
-			fi
-		fi
-		local local_hash
-		local_hash=$(git rev-parse HEAD) || return 1
-		if ! _update_fetch_main main; then
-			print_error "Failed to fetch origin/main; no update was applied."
-			return 1
-		fi
-		local remote_hash
-		remote_hash=$(git rev-parse origin/main) || return 1
-		if [[ "$local_hash" != "$remote_hash" ]] && git merge-base --is-ancestor "$remote_hash" "$local_hash" 2>/dev/null; then
-			print_error "Refusing to update: local commits exist on main."
-			print_info "Preserve or reconcile the local history in $INSTALL_DIR, then rerun aidevops update."
-			return 1
-		fi
-		if [[ "$local_hash" == "$remote_hash" ]]; then
-			print_success "Framework already up to date!"
-			local repo_version deployed_version
-			repo_version=$(cat "$INSTALL_DIR/VERSION" 2>/dev/null || echo "unknown")
-			deployed_version=$(cat "$HOME/.aidevops/agents/VERSION" 2>/dev/null || echo "none")
-			if [[ "$repo_version" != "$deployed_version" ]]; then
-				print_warning "Deployed agents ($deployed_version) don't match repo ($repo_version)"
-				print_info "Re-running incremental setup to sync agents..."
-				_run_update_setup_transaction "$update_output_mode" "$local_hash" || return 1
-			else
-				# t2706: VERSION matches but .deployed-sha may lag HEAD when
-				# fixes land between releases. Detect and redeploy on framework
-				# code drift (inline so bootstrap doesn't depend on the deployed
-				# aidevops-update-check.sh already carrying the same check).
-				# Docs-only drift is intentionally skipped — no runtime impact.
-				local stamp_file="$HOME/.aidevops/.deployed-sha"
-				if [[ -f "$stamp_file" ]]; then
-					local deployed_sha has_code_drift=0
-					deployed_sha=$(tr -d '[:space:]' <"$stamp_file" 2>/dev/null) || deployed_sha=""
-					if [[ -n "$deployed_sha" && "$deployed_sha" != "$local_hash" ]]; then
-						if _update_repo_verify_files_changed "$deployed_sha" "$local_hash"; then reconcile_repo_verify=true; fi
-						# Per Gemini code-review on PR #20342: use git's path filter +
-						# `grep -q .` to detect drift across the full set of deploy-affecting
-						# paths (not just .agents/ subdirs — also setup.sh, .agents/scripts/setup/modules/,
-						# and aidevops.sh itself, which are deployed/sourced by setup).
-						if git -C "$INSTALL_DIR" diff --name-only "$deployed_sha" "$local_hash" -- \
-							.agents/scripts/ .agents/agents/ .agents/workflows/ .agents/prompts/ .agents/hooks/ \
-							setup.sh .agents/scripts/setup/modules/ aidevops.sh 2>/dev/null | grep -q .; then
-							has_code_drift=1
-						fi
-						if [[ "$has_code_drift" -eq 1 ]]; then
-							print_warning "Deployed scripts drifted (${deployed_sha:0:7}→${local_hash:0:7})"
-							print_info "Re-running incremental setup to deploy latest scripts..."
-							_run_update_setup_transaction "$update_output_mode" "$local_hash" || return 1
-						fi
-						# GH#21735: workflow templates can change between
-						# releases without triggering has_code_drift (templates
-						# live outside the deploy-affecting paths). Check the
-						# template subset separately and surface drift.
-						_update_check_workflow_drift "$deployed_sha" "$local_hash"
-					fi
-				fi
-			fi
-		else
-			print_info "Applying latest changes..."
-			local old_hash
-			old_hash="$local_hash"
-			if [[ "${_AIDEVOPS_UPDATE_CANONICAL_FAST_FORWARDED:-false}" == "true" ]]; then
-				:
-			elif git merge --ff-only "$remote_hash" --quiet; then
-				:
-			else
-				print_error "Fast-forward update failed; preserving local history."
-				print_info "Review $INSTALL_DIR, resolve the divergence, then rerun aidevops update."
-				return 1
-			fi
-			local new_version new_hash
-			new_version=$(get_version)
-			new_hash=$(git rev-parse HEAD)
-			if [[ "$new_hash" != "$remote_hash" ]]; then
-				print_error "Updated HEAD does not match the fetched origin/main commit; refusing to run setup."
-				return 1
-			fi
-			if [[ "$old_hash" != "$new_hash" ]]; then
-				if _update_repo_verify_files_changed "$old_hash" "$new_hash"; then reconcile_repo_verify=true; fi
-				_update_render_changelog "$old_hash" "$new_hash" "$current_version"
-				# GH#21735: surface workflow template drift so the
-				# operator can resync downstream callers before CI bites.
-				_update_check_workflow_drift "$old_hash" "$new_hash"
-			fi
-			echo ""
-			# Verify supply chain integrity before applying changes
-			_update_verify_signature
-			echo ""
-			print_info "Running incremental setup to apply changes (falls back to full setup if needed)..."
-			_run_update_setup_transaction "$update_output_mode" "$new_hash" || return 1
-			print_success "Updated to version $new_version (agents deployed)"
-		fi
+		_update_existing_install "$current_version" "$update_output_mode" || return 1
 	else
 		_update_fresh_install || return 1
 	fi
+	return 0
+}
+
+_update_existing_install() {
+	local current_version="$1" update_output_mode="$2"
+	cd "$INSTALL_DIR" || exit 1
+	if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+		print_error "Refusing to update: tracked local changes exist in $INSTALL_DIR"
+		git status --short
+		print_info "Commit or stash these changes, then rerun aidevops update."
+		return 1
+	fi
+	local current_branch
+	current_branch=$(git branch --show-current 2>/dev/null || echo "")
+	if [[ "$current_branch" != "main" ]]; then
+		print_info "Switching to main branch..."
+		if ! git checkout main --quiet 2>/dev/null && ! git checkout -b main origin/main --quiet 2>/dev/null; then
+			print_error "Failed to switch to main; refusing to update the active '$current_branch' branch."
+			return 1
+		fi
+	fi
+	local local_hash remote_hash
+	local_hash=$(git rev-parse HEAD) || return 1
+	if ! _update_fetch_main main; then
+		print_error "Failed to fetch origin/main; no update was applied."
+		return 1
+	fi
+	remote_hash=$(git rev-parse origin/main) || return 1
+	if [[ "$local_hash" != "$remote_hash" ]] && git merge-base --is-ancestor "$remote_hash" "$local_hash" 2>/dev/null; then
+		print_error "Refusing to update: local commits exist on main."
+		print_info "Preserve or reconcile the local history in $INSTALL_DIR, then rerun aidevops update."
+		return 1
+	fi
+	if [[ "$local_hash" == "$remote_hash" ]]; then
+		_update_already_current "$local_hash" "$update_output_mode" || return 1
+	else
+		_update_apply_remote "$local_hash" "$remote_hash" "$current_version" "$update_output_mode"
+	fi
+	return 0
+}
+
+_update_already_current() {
+	local local_hash="$1" update_output_mode="$2"
+	print_success "Framework already up to date!"
+	local repo_version deployed_version
+	repo_version=$(cat "$INSTALL_DIR/VERSION" 2>/dev/null || echo "unknown")
+	deployed_version=$(cat "$HOME/.aidevops/agents/VERSION" 2>/dev/null || echo "none")
+	if [[ "$repo_version" != "$deployed_version" ]]; then
+		print_warning "Deployed agents ($deployed_version) don't match repo ($repo_version)"
+		print_info "Re-running incremental setup to sync agents..."
+		_run_update_setup_transaction "$update_output_mode" "$local_hash"
+		return $?
+	fi
+	local stamp_file="$HOME/.aidevops/.deployed-sha" deployed_sha=""
+	[[ -f "$stamp_file" ]] || return 0
+	deployed_sha=$(tr -d '[:space:]' <"$stamp_file" 2>/dev/null) || deployed_sha=""
+	[[ -n "$deployed_sha" && "$deployed_sha" != "$local_hash" ]] || return 0
+	if _update_repo_verify_files_changed "$deployed_sha" "$local_hash"; then _AIDEVOPS_UPDATE_RECONCILE_REPO_VERIFY=true; fi
+	if git -C "$INSTALL_DIR" diff --name-only "$deployed_sha" "$local_hash" -- .agents/scripts/ .agents/agents/ .agents/workflows/ .agents/prompts/ .agents/hooks/ .agents/worker-lifecycle/ setup.sh .agents/scripts/setup/modules/ aidevops.sh 2>/dev/null | grep . >/dev/null; then
+		print_warning "Deployed scripts drifted (${deployed_sha:0:7}→${local_hash:0:7})"
+		print_info "Re-running incremental setup to deploy latest scripts..."
+		_run_update_setup_transaction "$update_output_mode" "$local_hash" || return 1
+	fi
+	_update_check_workflow_drift "$deployed_sha" "$local_hash"
+	return 0
+}
+
+_update_apply_remote() {
+	local old_hash="$1" remote_hash="$2" current_version="$3" update_output_mode="$4"
+	print_info "Applying latest changes..."
+	if [[ "${_AIDEVOPS_UPDATE_CANONICAL_FAST_FORWARDED:-false}" != "true" ]] && ! git merge --ff-only "$remote_hash" --quiet; then
+		print_error "Fast-forward update failed; preserving local history."
+		print_info "Review $INSTALL_DIR, resolve the divergence, then rerun aidevops update."
+		return 1
+	fi
+	local new_version new_hash
+	new_hash=$(git rev-parse HEAD)
+	if [[ "$new_hash" != "$remote_hash" ]]; then
+		print_error "Updated HEAD does not match the fetched origin/main commit; refusing to run setup."
+		return 1
+	fi
+	if [[ "$old_hash" != "$new_hash" ]]; then
+		if _update_repo_verify_files_changed "$old_hash" "$new_hash"; then _AIDEVOPS_UPDATE_RECONCILE_REPO_VERIFY=true; fi
+		_update_render_changelog "$old_hash" "$new_hash" "$current_version"
+		_update_check_workflow_drift "$old_hash" "$new_hash"
+	fi
+	echo ""
+	_update_verify_signature
+	echo ""
+	print_info "Running incremental setup to apply changes (falls back to full setup if needed)..."
+	_run_update_setup_transaction "$update_output_mode" "$new_hash" || return 1
+	new_version=$(get_version)
+	print_success "Updated to version $new_version (agents deployed)"
+	return 0
+}
+
+_update_start_pulse() {
+	[[ "${AIDEVOPS_SKIP_PULSE_RESTART:-0}" != "1" ]] || return 0
+	local pulse_helper="${AGENTS_DIR}/scripts/pulse-lifecycle-helper.sh"
+	[[ -x "$pulse_helper" ]] && "$pulse_helper" start >/dev/null 2>&1 || print_warning "Pulse start failed (non-fatal)"
+	return 0
+}
+
+_update_finish() {
+	local skip_project_sync="$1"
 
 	_run_update_source_access_reconciliation
 	_update_sync_projects "$skip_project_sync" "$(get_version)"
-	if [[ "$skip_project_sync" != "$_AIDEVOPS_UPDATE_TRUE" && "$reconcile_repo_verify" == "$_AIDEVOPS_UPDATE_TRUE" ]]; then
+	if [[ "$skip_project_sync" != "$_AIDEVOPS_UPDATE_TRUE" && "${_AIDEVOPS_UPDATE_RECONCILE_REPO_VERIFY:-false}" == "$_AIDEVOPS_UPDATE_TRUE" ]]; then
 		_update_reconcile_repo_verify
 	fi
 	_update_check_homebrew
 	_update_check_planning
 	_update_check_tools
+	_update_reconcile_tabby_config
 	_update_sweep_opencode_symlinks
 	# t2926: Re-check setsid on every update (runs even when setup.sh is skipped).
 	_update_check_setsid
@@ -529,13 +580,7 @@ cmd_update() {
 	# 'start' subcommand does not check it directly — only 'restart' and
 	# 'restart-if-running' do). Non-fatal: a pulse start failure should
 	# not fail the update.
-	if [[ "${AIDEVOPS_SKIP_PULSE_RESTART:-0}" != "1" ]]; then
-		local _pulse_helper="${AGENTS_DIR}/scripts/pulse-lifecycle-helper.sh"
-		if [[ -x "$_pulse_helper" ]]; then
-			"$_pulse_helper" start >/dev/null 2>&1 || print_warning "Pulse start failed (non-fatal)"
-		fi
-	fi
-
+	_update_start_pulse
 	return 0
 }
 
@@ -655,12 +700,6 @@ cmd_features() {
 	echo "                 - seeds/ for initial/test data"
 	echo "                 - Auto-generate migrations on schema diff"
 	echo ""
-	echo "  beads          Task graph visualization with Beads"
-	echo "                 - Dependency tracking (blocked-by:, blocks:)"
-	echo "                 - Graph visualization with bd CLI"
-	echo "                 - Ready task detection (/ready)"
-	echo "                 - Bi-directional sync with TODO.md/PLANS.md"
-	echo ""
 	echo "  sops           Encrypted config files with SOPS + age"
 	echo "                 - Value-level encryption (keys visible, values encrypted)"
 	echo "                 - .sops.yaml with age backend (simpler than GPG)"
@@ -696,7 +735,6 @@ cmd_features() {
 	echo "  aidevops init planning           # Enable only planning"
 	echo "  aidevops init sops               # Enable SOPS encryption"
 	echo "  aidevops init security           # Enable security posture checks"
-	echo "  aidevops init beads              # Enable beads (includes planning)"
 	echo "  aidevops init database           # Enable only database"
 	echo "  aidevops init deployment-context # Scaffold deployment inventory"
 	echo "  aidevops init wordpress-context  # Scaffold WordPress + deployment context"
@@ -769,25 +807,73 @@ _repos_list() {
 }
 
 _repos_add() {
-	git rev-parse --is-inside-work-tree &>/dev/null || {
+	local bootstrap_slug=""
+	local confirmation=""
+	local repo_path="."
+	local path_given=0
+	local sync_only=""
+	while [[ $# -gt 0 ]]; do
+		local argument="$1"
+		case "$argument" in
+		help | -h | --help)
+			echo "Usage: aidevops repos add [path] [--sync-only] [--slug OWNER/REPO --confirm REGISTER_CANONICAL_REPOSITORY]"
+			echo "  --sync-only  Register for explicit sync/cleanup without Pulse or recurring maintenance"
+			return 0
+			;;
+		--sync-only)
+			sync_only="true"
+			shift
+			;;
+		--slug)
+			bootstrap_slug="${2:-}"
+			shift 2
+			;;
+		--confirm)
+			confirmation="${2:-}"
+			shift 2
+			;;
+		*)
+			if [[ "$argument" == -* || "$path_given" -eq 1 ]]; then
+				print_error "Usage: aidevops repos add [path] [--sync-only] [--slug OWNER/REPO --confirm REGISTER_CANONICAL_REPOSITORY]"
+				return 2
+			fi
+			repo_path="$argument"
+			path_given=1
+			shift
+			;;
+		esac
+	done
+	git -C "$repo_path" rev-parse --is-inside-work-tree &>/dev/null || {
 		print_error "Not in a git repository"
 		return 1
 	}
 	local project_root
-	project_root=$(git rev-parse --show-toplevel)
-	[[ ! -f "$project_root/.aidevops.json" ]] && {
-		print_error "No .aidevops.json found - run 'aidevops init' first"
+	project_root=$(git -C "$repo_path" rev-parse --show-toplevel)
+	if [[ ! -f "$project_root/.aidevops.json" ]]; then
+		if [[ -z "$bootstrap_slug" || "$confirmation" != "REGISTER_CANONICAL_REPOSITORY" ]]; then
+			print_error "No .aidevops.json found - run 'aidevops init' or use the confirmed --slug bootstrap form"
+			return 1
+		fi
+		local recovery_helper="${AGENTS_DIR}/scripts/canonical-recovery-helper.sh"
+		[[ -x "$recovery_helper" ]] || {
+			print_error "Canonical bootstrap verifier is unavailable"
+			return 1
+		}
+		"$recovery_helper" verify-bootstrap-registration --repo "$project_root" \
+			--slug "$bootstrap_slug" --confirm "$confirmation" || return 1
+	elif [[ -n "$bootstrap_slug" || -n "$confirmation" ]]; then
+		print_error "The --slug bootstrap form is only valid when .aidevops.json is absent"
 		return 1
-	}
+	fi
 	local version features
-	if command -v jq &>/dev/null; then
+	if [[ -f "$project_root/.aidevops.json" ]] && command -v jq &>/dev/null; then
 		version=$(jq -r '.version' "$project_root/.aidevops.json" 2>/dev/null || echo "unknown")
 		features=$(jq -r '[.features | to_entries[] | select(.value == true) | .key] | join(",")' "$project_root/.aidevops.json" 2>/dev/null || echo "")
 	else
 		version="unknown"
 		features=""
 	fi
-	register_repo "$project_root" "$version" "$features"
+	register_repo "$project_root" "$version" "$features" "$bootstrap_slug" "$sync_only" || return 1
 	print_success "Registered $(basename "$project_root")"
 	return 0
 }
@@ -806,9 +892,27 @@ _repos_remove() {
 		print_error "jq required for repo management"
 		return 1
 	}
+	local match_count
+	match_count=$(jq --arg path "$repo_path" '[.initialized_repos[]? | select(.path == $path)] | length' "$REPOS_FILE") || return 1
+	if [[ "$match_count" -eq 0 ]]; then
+		print_error "Repository is not registered: $repo_path"
+		return 1
+	fi
 	local temp_file="${REPOS_FILE}.tmp"
-	jq --arg path "$repo_path" '.initialized_repos |= map(select(.path != $path))' "$REPOS_FILE" >"$temp_file" && mv "$temp_file" "$REPOS_FILE"
+	if ! jq --arg path "$repo_path" '.initialized_repos |= map(select(.path != $path))' "$REPOS_FILE" >"$temp_file"; then
+		rm -f "$temp_file"
+		return 1
+	fi
+	mv "$temp_file" "$REPOS_FILE" || return 1
 	print_success "Removed $repo_path from registry"
+	return 0
+}
+
+_repos_remove_usage() {
+	echo "Usage: aidevops repos remove [repo-path]"
+	echo ""
+	echo "Remove the selected repository from the aidevops registry."
+	echo "When repo-path is omitted, use the current Git repository."
 	return 0
 }
 
@@ -865,28 +969,129 @@ _repos_maintenance() {
 	return 0
 }
 
+_repos_pulse() {
+	local state="${1:-}"
+	local selector="${2:-}"
+	if [[ "$state" == "auth" ]]; then
+		shift
+		local auth_helper="${AIDEVOPS_CLI_MODULES_DIR%/aidevops-cli}/pulse_repo_auth.py"
+		[[ -f "$auth_helper" ]] || auth_helper="${AGENTS_DIR}/scripts/pulse_repo_auth.py"
+		AIDEVOPS_REPOS_CONFIG="$REPOS_FILE" python3 "$auth_helper" "$@"
+		return $?
+	fi
+	case "$state" in
+	on | true) state="true" ;;
+	off | false) state="false" ;;
+	*)
+		print_error "Usage: aidevops repos pulse <on|off> [slug-or-path]"
+		return 2
+		;;
+	esac
+	if [[ -z "$selector" ]]; then
+		selector=$(git rev-parse --show-toplevel 2>/dev/null) || {
+			print_error "Specify a repo slug/path or run from within a registered repo"
+			return 1
+		}
+	fi
+	set_repo_pulse "$selector" "$state" || return $?
+	local result maintenance pulse slug path
+	result=$(get_repo_maintenance_state "$selector") || return 1
+	IFS=$'\t' read -r maintenance pulse slug path <<<"$result"
+	print_success "Pulse ${pulse} for ${slug:-$path} (maintenance ${maintenance})"
+	return 0
+}
+
+_repos_actions() {
+	local state="${1:-}" selector="${2:-}" reason="${3:-}"
+	case "$state" in
+	on) state="available" ;;
+	off) state="unavailable" ;;
+	*)
+		print_error "Usage: aidevops repos actions <on|off> [slug-or-path] [reason]"
+		return 1
+		;;
+	esac
+	if [[ -z "$selector" ]]; then
+		selector=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
+	fi
+	set_repo_actions "$selector" "$state" "$reason" || return 1
+	print_success "GitHub Actions capability: $state for $selector"
+	return 0
+}
+
+cmd_github() {
+	local action="${1:-}"
+	if [[ "$action" != "auth" ]]; then
+		print_error "Usage: aidevops github auth <set|status|check|clear|profile|usage|migrate>"
+		return 1
+	fi
+	shift
+	local auth_helper="${AIDEVOPS_CLI_MODULES_DIR%/aidevops-cli}/github_auth_cli.py"
+	[[ -f "$auth_helper" ]] || auth_helper="${AGENTS_DIR}/scripts/github_auth_cli.py"
+	AIDEVOPS_REPOS_CONFIG="$REPOS_FILE" python3 "$auth_helper" "$@"
+	return $?
+}
+
 # Repos management command
 cmd_repos() {
 	local action="${1:-list}"
 	case "$action" in
 	list | ls) _repos_list ;;
-	add) _repos_add ;;
-	remove | rm) _repos_remove "${2:-}" ;;
+	add)
+		shift
+		_repos_add "$@"
+		;;
+	remove | rm)
+		case "${2:-}" in
+		help | -h | --help) _repos_remove_usage ;;
+		*) _repos_remove "${2:-}" ;;
+		esac
+		;;
 	clean) _repos_clean ;;
+	migrate-layout)
+		shift
+		local migrate_helper="${AIDEVOPS_CLI_MODULES_DIR%/aidevops-cli}/repo-layout-migrate-helper.sh"
+		[[ -f "$migrate_helper" ]] || migrate_helper="${AGENTS_DIR}/scripts/repo-layout-migrate-helper.sh"
+		if [[ ! -x "$migrate_helper" ]]; then
+			print_error "Repository layout migration helper is unavailable"
+			return 1
+		fi
+		"$migrate_helper" "$@"
+		;;
 	maintenance | maintain)
 		shift
 		_repos_maintenance "$@"
+		;;
+	pulse)
+		shift
+		_repos_pulse "$@"
+		;;
+	actions)
+		shift
+		_repos_actions "$@"
 		;;
 	*)
 		echo "Usage: aidevops repos <command>"
 		echo ""
 		echo "Commands:"
 		echo "  list     List all registered projects (default)"
-		echo "  add      Register current project"
+		echo "  add [path] [--sync-only]"
+		echo "           Register project; --sync-only disables Pulse and recurring maintenance"
+		echo "           Confirmed --slug bootstraps config-free canonical repos"
 		echo "  remove   Remove project from registry"
 		echo "  clean    Remove entries for non-existent projects"
+		echo "  migrate-layout <plan|apply|rollback|status>"
+		echo "           Guarded owner-layout migration with durable receipts"
 		echo "  maintenance <on|off> [repo]"
 		echo "           Include/exclude a registered repo from recurring automation"
+		echo "  pulse <on|off> [repo]"
+		echo "           Enable/disable Pulse task automation (on requires maintenance)"
+		echo "  pulse auth <set|status|check|clear> owner/repo [options]"
+		echo "           Configure repository GitHub App reads without changing write auth"
+		echo "  pulse auth usage [--since 1h]"
+		echo "           Show recent gh requests by credential and Pulse auth route"
+		echo "  actions <on|off> [repo] [reason]"
+		echo "           Record GitHub Actions availability; off requires exact-head local checks"
 		;;
 	esac
 }
@@ -928,9 +1133,9 @@ cmd_detect() {
 	local to_register=()
 
 	if [[ -d "$HOME/Git" ]]; then
-		while IFS= read -r -d '' aidevops_json; do
-			local repo_dir
-			repo_dir=$(dirname "$aidevops_json")
+		while IFS= read -r -d '' repo_dir; do
+			local aidevops_json="$repo_dir/.aidevops.json"
+			[[ -f "$aidevops_json" ]] || continue
 
 			# Check if already registered
 			init_repos_file
@@ -940,7 +1145,7 @@ cmd_detect() {
 					found=$((found + 1))
 				fi
 			fi
-		done < <(find "$HOME/Git" -maxdepth 3 -name ".aidevops.json" -print0 2>/dev/null)
+		done < <(aidevops_discover_canonical_repos "$HOME/Git")
 	fi
 
 	if [[ $found -eq 0 ]]; then
@@ -1047,6 +1252,8 @@ cmd_setup() {
 _help_commands() {
 	echo "Commands:"
 	echo "  init [features]    Initialize aidevops in current project"
+	echo "  project-config restore <slug> [--backup FILE] [--apply]  Restore missing ignored local config only"
+	echo "  project-config set validator_timeout_seconds <n>  Set an audited, ignored canonical timeout from any worktree"
 	echo "  setup --scope <s>  Run scoped setup/deploy (opencode, agents, source-access, hooks, tabby, pulse, gui-desktop, ai-session, full)"
 	echo "  init-routines      Scaffold private routines repo (--org <name> | --local)"
 	echo "  upgrade-planning   Upgrade TODO.md/PLANS.md to latest templates"
@@ -1070,14 +1277,21 @@ _help_commands() {
 	echo "  repos [cmd]        Manage registered projects (list/add/remove/clean)"
 	echo "  lint [cmd]         Audit/configure native repo lint, format, typecheck, and hooks"
 	echo "  design <cmd>       DESIGN.md detection, scaffolding, and brand guideline exports"
-	echo "  cleanup <cmd>      Cleanup helpers (remote branch audit/delete)"
+	echo "  keywords <cmd>     context/keywords.md search targets: scaffold, brief, sync, track, budget"
+	echo "  cleanup [cmd]      Storage report/reclaim (all --apply) and branch cleanup"
 	echo "  model-accounts-pool OAuth account pool (list/check/diagnose/add/rotate/reset-cooldowns)"
 	echo "  gpt56-context <cmd> Manage the 300K GPT-5.6 OpenCode context cap (enable/disable/status)"
+	echo "  gpt6-context <cmd> Manage the default ~240K GPT-6 Sol/Luna compaction cap (enable/disable/status)"
+	echo "  astra-context <cmd> Manage the default ~240K Astra compaction target (enable/disable/status; disable = 400K)"
 	echo "  client-format      Client request format alignment (extract/check/canary/monitor)"
 	echo "  opencode-db <cmd>  OpenCode SQLite maintenance/session lookup (check/report/sessions/maintain/window/status/install)"
-	echo "  opencode [args]    Launch OpenCode with aidevops per-session DB isolation"
+	echo "  opencode [agent] [args]    Launch OpenCode with Build+ and per-session DB isolation"
+	echo "  codex|claude [agent] [args]  Launch with full permissions (default agent: build-plus)"
+	echo "  <runtime> [agent] [args]     Also cursor, droid, gemini, continue, kilo, kiro, aider, amp, kimi, qwen"
+	echo "                              Use <runtime> --help or --list-agents for launch options"
 	echo "  opencode-desktop   Launch/install OpenCode Desktop with aidevops DB isolation"
 	echo "  opencode-sandbox   Test OpenCode versions in isolation (install/run/check/clean)"
+	echo "  sessions [cmd]     Live OpenCode sessions: list/show/send/ask/inbox/outbox/prune (bare: list)"
 	echo "  approve <cmd>      Cryptographic issue/PR approval (setup/issue/pr/verify/status)"
 	echo "  circuit-breaker    Supervisor circuit breaker (status/reset/check/trip) (alias: cb)"
 	echo "  issue <cmd>        Interactive issue ownership (claim/release/status/scan-stale)"
@@ -1087,16 +1301,18 @@ _help_commands() {
 	echo "  email [cmd]        Email mailbox management (mailbox add/list/test/remove)"
 	echo "  ip-check <cmd>     IP reputation checks (check/batch/report/providers)"
 	echo "  review-gate <cmd>  Configure review_gate merge policies (rate-limit/completion)"
+	echo "  github auth <cmd> Repository auth routes, App profiles, checks and local usage"
 	echo "  github-app-auth    GitHub App auth setup/status and API route decisions"
 	echo "  source-access <cmd> Session-bound, sudo-signed source-read approvals"
-	echo "  secret <cmd>       Manage secrets (set/list/run/init/import/status)"
+	echo "  secret <cmd>       Manage secrets (set/rm/list/run/init/import/status)"
 	echo "  vault <cmd>        Local encrypted Vault broker (init/unlock/lock/status/read/update)"
 	echo "  config <cmd>       Feature toggles (list/get/set/reset/path/help)"
 	echo "  knowledge <cmd>    Knowledge plane management (init/status/provision)"
 	echo "  campaign <cmd>     Campaign plane: init/provision/ls (P1) + asset (P4) + new/list/status/archive (P2) + draft (P5) + launch/promote (P6) + grow (orchestration)"
 	echo "  stats <cmd>        LLM usage analytics (summary/models/projects/costs/trend)"
-	echo "  tabby <cmd>        Manage Tabby terminal profiles (sync/status/zshrc/help)"
+	echo "  tabby <cmd>        Manage Tabby profiles (sync/status) and remote tmux tabs (sessions)"
 	echo "  buzz <cmd>         Manage Buzz Desktop OpenCode ACP compatibility"
+	echo "  opencode-browse [cmd] Drive your own browser via OpenCode browse (status/pair/install/doctor)"
 	echo "  parent-status <N>  Show decomposition state of parent-task issue #N (alias: ps)"
 	echo "  detect             Find and register aidevops projects"
 	echo "  uninstall          Remove aidevops from your system"
@@ -1105,12 +1321,13 @@ _help_commands() {
 	return 0
 }
 
-_help_detailed_sections() {
+_help_security_sections() {
 	echo "Security:"
 	echo "  aidevops security            # Run ALL checks (posture + hygiene + supply chain)"
 	echo "  aidevops security posture    # Interactive security posture setup (gopass, gh, SSH)"
 	echo "  aidevops security status     # Combined posture + hygiene summary"
 	echo "  aidevops security scan       # Secret hygiene & supply chain scan"
+	echo "  aidevops security fix        # Interactive credential hygiene remediation"
 	echo "  aidevops security scan-pth   # Python .pth file audit (supply chain IoC)"
 	echo "  aidevops security scan-secrets # Plaintext credential locations"
 	echo "  aidevops security scan-deps  # Unpinned dependency check"
@@ -1166,34 +1383,21 @@ _help_detailed_sections() {
 	echo "    aidevops client-format extract      # 1. Re-extract constants"
 	echo "    aidevops client-format canary       # 2. Verify against real CLI"
 	echo ""
+	return 0
+}
+
+_help_detailed_sections_content() {
+	_help_security_sections
 	echo "Secrets:"
 	echo "  aidevops secret set NAME     # Store a secret (hidden input)"
+	echo "  aidevops secret rm NAME      # Remove from gopass + plaintext (confirm or --yes)"
 	echo "  aidevops secret list         # List secret names (never values)"
 	echo "  aidevops secret run CMD      # Run with secrets injected + redacted"
 	echo "  aidevops secret init         # Initialize gopass encrypted store"
 	echo "  aidevops secret import       # Import from credentials.sh to gopass"
 	echo "  aidevops secret status       # Show backend status"
 	echo ""
-	echo "Vault:"
-	echo "  aidevops vault init          # Create local encrypted Vault metadata"
-	echo "  aidevops vault status        # Show uninitialized/locked/unlocked/corrupted"
-	echo "  aidevops vault unlock        # Unlock into an in-memory local broker"
-	echo "  aidevops vault lock          # Stop broker and forget in-memory keys"
-	echo "  aidevops vault read NAME     # Read protected data through broker"
-	echo "  aidevops vault update NAME   # Encrypt stdin value through broker"
-	echo ""
-	echo "GitHub App Auth:"
-	echo "  aidevops github-app-auth status --json       # Show active auth mode and budgets"
-	echo "  aidevops github-app-auth route issue-list    # Explain route decision"
-	echo "  aidevops github-app-auth rate-limit --json   # Show cached per-pool budgets"
-	echo ""
-	echo "Feature Toggles:"
-	echo "  aidevops config list         # List all toggles with current values"
-	echo "  aidevops config get <key>    # Get a toggle value"
-	echo "  aidevops config set <k> <v>  # Set a toggle (true/false)"
-	echo "  aidevops config reset [key]  # Reset toggle(s) to defaults"
-	echo "  aidevops config path         # Show config file path"
-	echo ""
+	_help_vault_and_config_sections
 	echo "Knowledge Plane:"
 	echo "  aidevops knowledge init repo           # Provision _knowledge/ in current repo"
 	echo "  aidevops knowledge init personal       # Provision at ~/.aidevops/.agent-workspace/knowledge/"
@@ -1210,6 +1414,13 @@ _help_detailed_sections() {
 	echo "  aidevops design guidelines [path] --pdf # Generate brand guideline HTML/PDF exports"
 	echo "  aidevops design survey [--json]        # Audit owned initialized GUI repos"
 	echo "  aidevops design issues --apply         # File auto-dispatch issues for missing design artifacts"
+	echo ""
+	echo "Search Targets (context/keywords.md):"
+	echo "  aidevops keywords scaffold [path]      # Create strategy + registry, gitignore data for public repos"
+	echo "  aidevops keywords brief --asset image  # Slice targets/entities/rules for one job"
+	echo "  aidevops keywords sync                 # Merge registry with the private team hub"
+	echo "  aidevops keywords track --source github # Record rank observations (budget-gated paid sources)"
+	echo "  aidevops keywords survey | issues --apply # Backfill registered repos"
 	echo ""
 	echo "Campaign Plane:"
 	echo "  aidevops campaign init [<path>]          # Provision _campaigns/ directory contract (P1)"
@@ -1265,6 +1476,11 @@ _help_detailed_sections() {
 	echo "    aidevops circuit-breaker reset"
 	echo ""
 	_help_management_sections
+	return 0
+}
+
+_help_detailed_sections() {
+	_help_detailed_sections_content
 	return 0
 }
 
@@ -1343,6 +1559,7 @@ cmd_help() {
 	echo "  aidevops update              # Update framework + check projects"
 	echo "  aidevops runtime-bundle list # List retained validated runtime bundle IDs"
 	echo "  aidevops gpt56-context       # Manage the 300K GPT-5.6 OpenCode context cap"
+	echo "  aidevops gpt6-context enable # Cap GPT-6 Sol/Luna usable input near 240K"
 	echo "  aidevops repos               # List registered projects"
 	echo "  aidevops launch-worker 22259 marcusquinn/aidevops --dry-run"
 	echo "  aidevops repos add           # Register current project"
@@ -1571,8 +1788,8 @@ _main_check_unregistered() {
 	local unregistered
 	unregistered=$(detect_unregistered_repo 2>/dev/null) || true
 	if [[ -n "$unregistered" && "$command" != "detect" && "$command" != "repos" ]]; then
-		echo -e "${YELLOW}[TIP]${NC} This project uses aidevops but isn't registered. Run: aidevops repos add"
-		echo ""
+		echo -e "${YELLOW}[TIP]${NC} This project uses aidevops but isn't registered. Run: aidevops repos add" >&2
+		echo "" >&2
 	fi
 	return 0
 }
@@ -1583,18 +1800,65 @@ _main_check_version() {
 	cli_version=$(get_version)
 	[[ -f "$AGENTS_DIR/VERSION" ]] && agents_version=$(cat "$AGENTS_DIR/VERSION") || agents_version="not installed"
 	if [[ "$agents_version" == "not installed" ]]; then
-		echo -e "${YELLOW}[WARN]${NC} Agents not installed. Run: aidevops update"
-		echo ""
+		echo -e "${YELLOW}[WARN]${NC} Agents not installed. Run: aidevops update" >&2
+		echo "" >&2
 	elif [[ "$cli_version" != "$agents_version" ]]; then
-		echo -e "${YELLOW}[WARN]${NC} Version mismatch - CLI: $cli_version, Agents: $agents_version"
-		echo -e "       Run: aidevops update"
-		echo ""
+		echo -e "${YELLOW}[WARN]${NC} Version mismatch - CLI: $cli_version, Agents: $agents_version" >&2
+		echo -e "       Run: aidevops update" >&2
+		echo "" >&2
 	fi
+	return 0
+}
+
+# Verify advisory metadata only during an explicit full security assessment.
+_security_check_advisories() {
+	local advisories_dir="$HOME/.aidevops/advisories"
+	local dismissed_file="$advisories_dir/dismissed.txt"
+	local tls_helper="tls-trust-helper.sh"
+	local advisory_file adv_id line check status
+	local -a check_args=()
+	for advisory_file in "$advisories_dir"/*.advisory; do
+		[[ -f "$advisory_file" ]] || continue
+		adv_id="${advisory_file##*/}"
+		adv_id="${adv_id%.advisory}"
+		if [[ -f "$dismissed_file" ]] && grep -qxF -- "$adv_id" "$dismissed_file"; then
+			continue
+		fi
+		check=""
+		while IFS= read -r line || [[ -n "$line" ]]; do
+			if [[ "$line" == '# check: '* ]]; then
+				check="${line#\# check: }"
+				break
+			fi
+		done <"$advisory_file"
+		[[ -n "$check" ]] || continue
+		# Split literal whitespace only: no evaluation, expansion or shell quoting.
+		IFS=$' \t' read -r -a check_args <<<"$check"
+		# Allow only the checking subcommand, never help/probe-script (also exit 0).
+		if [[ "${check_args[0]:-}" != tls-trust || "${check_args[1]:-}" != local ]] ||
+			{ [[ ${#check_args[@]} -ne 2 ]] &&
+				! { [[ ${#check_args[@]} -eq 4 && "${check_args[2]:-}" == --canary && "${check_args[3]:-}" != -* ]]; }; }; then
+			printf 'Keeping %s: unsupported advisory check\n' "$adv_id"
+			continue
+		fi
+		status=0
+		_dispatch_helper "$tls_helper" "$tls_helper" "${check_args[@]:1}" || status=$?
+		if [[ "$status" -eq 0 ]]; then
+			if printf '%s\n' "$adv_id" >>"$dismissed_file"; then
+				printf 'auto-dismissed %s: verified clean\n' "$adv_id"
+			else
+				printf 'Keeping %s: could not record dismissal\n' "$adv_id" >&2
+			fi
+		else
+			printf 'Keeping %s: advisory check exited %s\n' "$adv_id" "$status"
+		fi
+	done
 	return 0
 }
 
 # Route 'aidevops security [subcommand]' to appropriate helpers
 _cmd_security() {
+	local tls_helper="tls-trust-helper.sh"
 	case "${1:-}" in
 	"")
 		# No args: run ALL security checks (posture + hygiene + advisories)
@@ -1607,9 +1871,15 @@ _cmd_security() {
 		_dispatch_helper "secret-hygiene-helper.sh" "secret-hygiene-helper.sh" scan || true
 		echo ""
 		_dispatch_helper "supply-chain-advisory-helper.sh" "supply-chain-advisory-helper.sh" scan || true
+		echo ""
+		_dispatch_helper "$tls_helper" "$tls_helper" local || true
+		_security_check_advisories
 		;;
 	scan | scan-secrets | scan-pth | scan-deps)
 		_dispatch_helper "secret-hygiene-helper.sh" "secret-hygiene-helper.sh" "$@"
+		;;
+	fix)
+		_dispatch_helper "security-fix-helper.sh" "security-fix-helper.sh" || return $?
 		;;
 	dismiss)
 		if [[ "${2:-}" == "tanstack-minishaihulud-2026-05" ]]; then
@@ -1637,6 +1907,16 @@ _cmd_security() {
 	supply-chain)
 		shift || true
 		_dispatch_helper "supply-chain-advisory-helper.sh" "supply-chain-advisory-helper.sh" "${@:-scan}"
+		;;
+	tls-trust)
+		shift || true
+		_dispatch_helper "$tls_helper" "$tls_helper" "${@:-local}"
+		return $?
+		;;
+	cert-watch)
+		shift || true
+		_dispatch_helper "cert-watch-helper.sh" "cert-watch-helper.sh" "${@:-run}"
+		return $?
 		;;
 	*)
 		_dispatch_helper "security-posture-helper.sh" "security-posture-helper.sh" "$@"
@@ -1755,53 +2035,112 @@ _cmd_client_format() {
 }
 
 # Main entry point
+_main_badges() {
+	local subcommand="${1:-}"
+	local sync_helper="badges-sync-helper.sh"
+	case "$subcommand" in
+	render)
+		shift
+		local helper="$HOME/.aidevops/agents/scripts/readme-badges-helper.sh"
+		[[ -f "$helper" ]] || helper="$AGENTS_DIR/scripts/readme-badges-helper.sh"
+		if [[ -f "$helper" ]]; then bash "$helper" render "$@"; else print_error "readme-badges-helper.sh not found. Run: aidevops update"; return 1; fi
+		;;
+	check) shift; _dispatch_helper "badges-check-helper.sh" "badges-check-helper.sh" "$@" ;;
+	sync) shift; _dispatch_helper "$sync_helper" "$sync_helper" "$@" ;;
+	install) shift; _dispatch_helper "$sync_helper" "$sync_helper" --workflow-only "$@" ;;
+	help | --help | -h | "")
+		echo ""
+		echo "aidevops badges — README badge block and repo metrics workflow management (t2975)"
+		echo ""
+		echo "Subcommands:"
+		echo "  render  <slug>                 Print canonical badge block for a repo"
+		echo "  check   [--repo SLUG] [--json]  Detect badge drift across managed repos"
+		echo "  sync    [--repo SLUG] [--apply] Inject badge block + generate metrics + install workflow"
+		echo "  install [--repo SLUG] [--apply] Install repo metrics refresh workflow only"
+		echo ""
+		echo "Options (check/sync/install):"
+		echo "  --repo SLUG    Limit to a single repo"
+		echo "  --apply        Actually perform the sync (default: dry-run)"
+		echo "  --json         Machine-readable output"
+		echo "  --verbose      Show diff summaries (check only)"
+		echo ""
+		echo "Examples:"
+		echo "  aidevops badges check                       # scan all repos for badge drift"
+		echo "  aidevops badges check --json | jq '.[]'    # machine-readable output"
+		echo "  aidevops badges render owner/repo           # print badge block"
+		echo "  aidevops badges sync                        # dry-run sync across all repos"
+		echo "  aidevops badges sync --repo owner/r --apply # apply to a single repo"
+		echo "  aidevops metrics generate [PATH]            # generate local docs/metrics artifacts"
+		echo ""
+		;;
+	*) print_error "Unknown badges subcommand: $subcommand (try render|check|sync|install|help)"; return 1 ;;
+	esac
+	return 0
+}
+
 main() {
 	local command="${1:-help}"
 	local check_workflows_helper="check-workflows-helper.sh"
+	local update_help="help"
 	shift || true
-
-	# Help for inventory commands must bypass repository auto-detection and
-	# version checks. Those startup checks may read the repository registry,
-	# while help must remain bounded and side-effect-free.
-	if [[ "$command" == "check-workflows" || "$command" == "workflows" ]]; then
-		local arg
-		for arg in "$@"; do
-			case "$arg" in
-			-h | --help)
-				_dispatch_helper "$check_workflows_helper" "$check_workflows_helper" "$@"
-				return $?
-				;;
-			esac
-		done
-	fi
-
-	# Update help must return before startup checks or cmd_update(), which can
-	# inspect repositories, fetch remotes, deploy agents, and synchronize projects.
 	if [[ "$command" == "update" || "$command" == "upgrade" || "$command" == "u" ]]; then
 		local arg
 		for arg in "$@"; do
-			case "$arg" in
-			help | -h | --help)
-				cmd_update_help
-				return $?
-				;;
-			esac
+			if [[ "$arg" == "$update_help" || "$arg" == "-h" || "$arg" == "--help" ]]; then cmd_update_help; return $?; fi
 		done
+		_main_check_unregistered "$command"
+		cmd_update "$@"
+		return $?
 	fi
-
-	# Auto-detect unregistered repo on any command (silent check)
+	_main_early_help "$command" "$check_workflows_helper" "$@" && return 0
 	_main_check_unregistered "$command"
+	_main_check_version
+	_main_dispatch "$command" "$check_workflows_helper" "$@"
+}
 
-	# Check if agents need updating (skip for update command itself)
-	if [[ "$command" != "update" && "$command" != "upgrade" && "$command" != "u" ]]; then
-		_main_check_version
-	fi
+_main_early_help() {
+	local command="$1" check_workflows_helper="$2" arg
+	shift 2
+	for arg in "$@"; do
+		if [[ "$command" == "check-workflows" || "$command" == "workflows" ]] && [[ "$arg" == "-h" || "$arg" == "--help" ]]; then _dispatch_helper "$check_workflows_helper" "$check_workflows_helper" "$@"; return $?; fi
+	done
+	return 1
+}
 
+# Fleet sync commands: managed caller workflows and the Dependabot exclusion
+# for aidevops reusable-workflow pins (GH#36723).
+_main_dispatch_sync() {
+	local command="$1"
+	shift
+	local helper="sync-workflows-helper.sh"
+	[[ "$command" == "sync-dependabot" ]] && helper="dependabot-aidevops-exclusion-helper.sh"
+	_dispatch_helper "$helper" "$helper" "$@"
+	return $?
+}
+
+# OpenCode database, desktop, sandbox and session-bus commands.
+_main_dispatch_opencode_tools() {
+	local command="$1"
+	shift
+	case "$command" in
+	opencode-db | oc-db) _dispatch_helper "opencode-db-maintenance-helper.sh" "opencode-db-maintenance-helper.sh" "$@" ;;
+	opencode-desktop | oc-desktop) _dispatch_helper "opencode-launcher-helper.sh" "opencode-launcher-helper.sh" desktop "$@" ;;
+	opencode-sandbox | oc-sandbox) _dispatch_helper "opencode-sandbox-helper.sh" "opencode-sandbox-helper.sh" "$@" ;;
+	sessions | session-bus) _dispatch_helper "session-bus-helper.sh" "session-bus-helper.sh" "$@" ;;
+	*) return 1 ;;
+	esac
+	return $?
+}
+
+_main_dispatch() {
+	local command="$1" check_workflows_helper="$2"
+	shift 2
 	case "$command" in
 	init | i) cmd_init "$@" ;;
+	project-config) _dispatch_helper "project-config-restore-helper.sh" "project-config-restore-helper.sh" "$@" ;;
 	setup) cmd_setup "$@" ;;
 	features | f) cmd_features ;;
-	status | s) cmd_status ;;
+	status | s) cmd_status "$@" ;;
 	update | upgrade | u) cmd_update "$@" ;;
 	runtime-bundle | runtime_bundle) AIDEVOPS_INSTALL_DIR="$INSTALL_DIR" _dispatch_helper "runtime-bundle-rollback-helper.sh" "runtime-bundle-rollback-helper.sh" "$@" ;;
 	release) _dispatch_helper "full-loop-release-helper.sh" "full-loop-release-helper.sh" "$@" ;;
@@ -1811,7 +2150,9 @@ main() {
 	lint) _dispatch_helper "lint-helper.sh" "lint-helper.sh" "$@" ;;
 	upgrade-planning | up) cmd_upgrade_planning "$@" ;;
 	repos | projects) cmd_repos "$@" ;;
+	github) cmd_github "$@" ;;
 	design) _dispatch_helper "design-guidelines-helper.sh" "design-guidelines-helper.sh" "$@" ;;
+	keywords | kw) _dispatch_helper "keywords-helper.sh" "keywords-helper.sh" "$@" ;;
 	skill) cmd_skill "$@" ;;
 	skills) cmd_skills "$@" ;;
 	sources | agent-sources) _dispatch_helper "agent-sources-helper.sh" "agent-sources-helper.sh" "$@" ;;
@@ -1820,116 +2161,23 @@ main() {
 	schedule) _dispatch_helper "deferred-job-helper.sh" "deferred-job-helper.sh" "$@" ;;
 	launch-worker | launch_worker) cmd_launch_worker "$@" ;;
 	check-workflows | workflows) _dispatch_helper "$check_workflows_helper" "$check_workflows_helper" "$@" ;;
-	sync-workflows) _dispatch_helper "sync-workflows-helper.sh" "sync-workflows-helper.sh" "$@" ;;
+	sync-workflows | sync-dependabot) _main_dispatch_sync "$command" "$@" ;;
 	metrics) _dispatch_helper "repo-metrics-helper.sh" "repo-metrics-helper.sh" "$@" ;;
-	badges)
-		# Badge management: render | check | sync | install (t2975)
-		# Bare 'aidevops badges' with no subcommand shows a usage summary.
-		# Subcommands:
-		#   render <slug>               — render canonical badge block for a repo
-		#   check  [--repo SLUG] [--json] [--verbose]  — cross-repo drift check
-		#   sync   [--repo SLUG] [--apply]              — inject badge block + generate metrics + install workflow
-		#   install [--repo SLUG] [--apply]             — install repo metrics refresh workflow only
-		local _badges_sub="${1:-help}"
-		local _badges_check_h="badges-check-helper.sh"
-		local _badges_sync_h="badges-sync-helper.sh"
-		case "$_badges_sub" in
-		render)
-			shift
-			local _render_helper
-			_render_helper=$(bash -c '
-				d="$HOME/.aidevops/agents/scripts/readme-badges-helper.sh"
-				l="'"$AGENTS_DIR"'/scripts/readme-badges-helper.sh"
-				[[ -f "$d" ]] && echo "$d" || echo "$l"
-			')
-			if [[ -f "$_render_helper" ]]; then
-				bash "$_render_helper" render "$@"
-			else
-				print_error "readme-badges-helper.sh not found. Run: aidevops update"
-				exit 1
-			fi
-			;;
-		check)
-			shift
-			_dispatch_helper "$_badges_check_h" "$_badges_check_h" "$@"
-			;;
-		sync)
-			shift
-			_dispatch_helper "$_badges_sync_h" "$_badges_sync_h" "$@"
-			;;
-		install)
-			shift
-			_dispatch_helper "$_badges_sync_h" "$_badges_sync_h" --workflow-only "$@"
-			;;
-		help | --help | -h | "")
-			echo ""
-			echo "aidevops badges — README badge block and repo metrics workflow management (t2975)"
-			echo ""
-			echo "Subcommands:"
-			echo "  render  <slug>                 Print canonical badge block for a repo"
-			echo "  check   [--repo SLUG] [--json]  Detect badge drift across managed repos"
-			echo "  sync    [--repo SLUG] [--apply] Inject badge block + generate metrics + install workflow"
-			echo "  install [--repo SLUG] [--apply] Install repo metrics refresh workflow only"
-			echo ""
-			echo "Options (check/sync/install):"
-			echo "  --repo SLUG    Limit to a single repo"
-			echo "  --apply        Actually perform the sync (default: dry-run)"
-			echo "  --json         Machine-readable output"
-			echo "  --verbose      Show diff summaries (check only)"
-			echo ""
-			echo "Examples:"
-			echo "  aidevops badges check                       # scan all repos for badge drift"
-			echo "  aidevops badges check --json | jq '.[]'    # machine-readable output"
-			echo "  aidevops badges render owner/repo           # print badge block"
-			echo "  aidevops badges sync                        # dry-run sync across all repos"
-			echo "  aidevops badges sync --repo owner/r --apply # apply to a single repo"
-			echo "  aidevops metrics generate [PATH]            # generate local docs/metrics artifacts"
-			echo ""
-			;;
-		*)
-			print_error "Unknown badges subcommand: $_badges_sub (try render|check|sync|install|help)"
-			exit 1
-			;;
-		esac
-		;;
+	badges) _main_badges "$@" ;;
 	security) _cmd_security "$@" ;;
 	doctor | doc) _dispatch_helper "doctor-helper.sh" "doctor-helper.sh" "$@" ;;
 	detect | scan) cmd_detect ;;
 	ip-check | ip_check) _dispatch_helper "ip-reputation-helper.sh" "ip-reputation-helper.sh" "$@" ;;
 	model-accounts-pool | map) _dispatch_helper "oauth-pool-helper.sh" "oauth-pool-helper.sh" "$@" ;;
 	gpt56-context | gpt56_context) _dispatch_helper "gpt56-context-helper.sh" "gpt56-context-helper.sh" "$@" ;;
-	cleanup)
-		local _cleanup_sub="${1:-help}"
-		case "$_cleanup_sub" in
-		branches | remote-branches)
-			shift || true
-			_dispatch_helper "remote-branch-cleanup-helper.sh" "remote-branch-cleanup-helper.sh" "$_cleanup_sub" "$@"
-			;;
-		help | --help | -h | "")
-			echo "Usage: aidevops cleanup <branches|remote-branches> [options]"
-			echo ""
-			echo "Cleanup commands:"
-			echo "  branches          Audit stale remote branches (dry-run default)"
-			echo "  remote-branches   Alias for branches"
-			echo ""
-			echo "Options:"
-			echo "  --repo PATH       Repository path (default: current directory)"
-			echo "  --remote NAME     Remote to audit (default: origin)"
-			echo "  --apply           Delete safe candidates"
-			echo ""
-			;;
-		*)
-			print_error "Unknown cleanup subcommand: $_cleanup_sub (try branches|remote-branches|help)"
-			exit 1
-			;;
-		esac
-		;;
+	gpt6-context | gpt6_context) _dispatch_helper "gpt6-context-helper.sh" "gpt6-context-helper.sh" "$@" ;;
+	astra-context | astra_context) _dispatch_helper "astra-context-helper.sh" "astra-context-helper.sh" "$@" ;;
+	cleanup) _main_dispatch_cleanup "$@" ;;
 	client-format) _cmd_client_format "$@" ;;
 	github-app-auth | github-app | gh-auth) _dispatch_helper "github-app-auth-helper.sh" "github-app-auth-helper.sh" "$@" ;;
-	opencode-db | oc-db) _dispatch_helper "opencode-db-maintenance-helper.sh" "opencode-db-maintenance-helper.sh" "$@" ;;
-	opencode | oc) _dispatch_helper "opencode-launcher-helper.sh" "opencode-launcher-helper.sh" "$@" ;;
-	opencode-desktop | oc-desktop) _dispatch_helper "opencode-launcher-helper.sh" "opencode-launcher-helper.sh" desktop "$@" ;;
-	opencode-sandbox | oc-sandbox) _dispatch_helper "opencode-sandbox-helper.sh" "opencode-sandbox-helper.sh" "$@" ;;
+	opencode-db | oc-db | opencode-desktop | oc-desktop | opencode-sandbox | oc-sandbox | sessions | session-bus) _main_dispatch_opencode_tools "$command" "$@" ;;
+	opencode | oc | codex | claude | claude-code | cursor | cursor-agent | droid | gemini | gemini-cli | continue | cn | kilo | kiro | kiro-cli | aider | amp | kimi | qwen | windsurf)
+		_dispatch_helper "runtime-launcher-helper.sh" "runtime-launcher-helper.sh" "$command" "$@" ;;
 	review-gate | review_gate) _dispatch_helper "review-gate-config-helper.sh" "review-gate-config-helper.sh" "$@" ;;
 	source-access | source_access) _dispatch_helper "source-access-helper.sh" "source-access-helper.sh" "$@" ;;
 	secret | secrets) _dispatch_helper "secret-helper.sh" "secret-helper.sh" "$@" ;;
@@ -1944,17 +2192,9 @@ main() {
 	worktree | wt) _dispatch_helper "worktree-helper.sh" "worktree-helper.sh" "$@" ;;
 	issue) _dispatch_helper "interactive-session-helper.sh" "interactive-session-helper.sh" "$@" ;;
 	signing) _dispatch_helper "signing-setup.sh" "signing-setup.sh" "$@" ;;
-	contributions | contrib)
-		# Bare `aidevops contributions` defaults to status (most common use).
-		# Other subcommands (seed, scan, stop, restart, install, uninstall) forward verbatim.
-		[[ $# -eq 0 ]] && set -- status
-		_dispatch_helper "contribution-watch-helper.sh" "contribution-watch-helper.sh" "$@"
-		;;
-	inbox)
-		# Bare `aidevops inbox` defaults to status (most common use).
-		[[ $# -eq 0 ]] && set -- status
-		_dispatch_helper "inbox-helper.sh" "inbox-helper.sh" "$@"
-		;;
+	contributions | contrib) _main_dispatch_contributions "$@" ;;
+	# Bare `aidevops inbox` / `aidevops opencode-browse` default to status.
+	inbox) _dispatch_helper "inbox-helper.sh" "inbox-helper.sh" "${@:-status}" ;;
 	case | cases)
 		# Bare `aidevops case` defaults to list (most common use).
 		[[ $# -eq 0 ]] && set -- list
@@ -1969,48 +2209,12 @@ main() {
 	email) _cmd_email "$@" ;;
 	stats | observability) _dispatch_helper "observability-helper.sh" "observability-helper.sh" "$@" ;;
 	tabby) _dispatch_helper "tabby-helper.sh" "tabby-helper.sh" "$@" ;;
+	opencode-browse) _dispatch_helper "opencode-browse-helper.sh" "opencode-browse-helper.sh" "${@:-status}" ;;
 	buzz) _dispatch_helper "buzz-desktop-helper.sh" "buzz-desktop-helper.sh" "$@" ;;
 	init-routines) _dispatch_helper "init-routines-helper.sh" "init-routines-helper.sh" "$@" ;;
 	parent-status | ps) _dispatch_helper "parent-status-helper.sh" "parent-status-helper.sh" "$@" ;;
 	knowledge) _dispatch_helper "knowledge-helper.sh" "knowledge-helper.sh" "$@" ;;
-	campaign | campaigns)
-		# P1 provisioning: init/provision/status/ls → campaigns-provision-helper.sh
-		# P4 asset binary: asset → campaign-asset-helper.sh
-		# P2+P6: all other subcommands → campaign-helper.sh
-		local _camp_cmd="${1:-help}"
-		local _camp_helper="campaign-helper.sh"
-		local _camp_provision_helper="campaigns-provision-helper.sh"
-		case "$_camp_cmd" in
-		init | provision | ls)
-			_dispatch_helper "$_camp_provision_helper" "$_camp_provision_helper" "$@"
-			;;
-		status)
-			if [[ $# -le 1 || -d "${2:-}" || "${2:-}" == .* || "${2:-}" == /* || "${2:-}" == ~* ]]; then
-				_dispatch_helper "$_camp_provision_helper" "$_camp_provision_helper" "$@"
-			else
-				_dispatch_helper "$_camp_helper" "$_camp_helper" "$@"
-			fi
-			;;
-		asset | assets)
-			shift
-			_dispatch_helper "campaign-asset-helper.sh" "campaign-asset-helper.sh" "$@"
-			;;
-		grow | growth)
-			shift
-			local _growth_helper="${AIDEVOPS_CLI_MODULES_DIR%/aidevops-cli}/campaign-growth-helper.py"
-			[[ ! -f "$_growth_helper" ]] && _growth_helper="$AGENTS_DIR/scripts/campaign-growth-helper.py"
-			if [[ -f "$_growth_helper" ]]; then
-				python3 "$_growth_helper" "$@"
-			else
-				print_error "campaign-growth-helper.py not found. Run: aidevops update"
-				return 1
-			fi
-			;;
-		*)
-			_dispatch_helper "$_camp_helper" "$_camp_helper" "$@"
-			;;
-		esac
-		;;
+	campaign | campaigns) _main_dispatch_campaign "$@" ;;
 	performance) _dispatch_helper "performance-helper.sh" "performance-helper.sh" "$@" ;;
 	reach) _dispatch_helper "reach-helper.sh" "reach-helper.sh" "$@" ;;
 	config | configure) _dispatch_config "$@" ;;
@@ -2024,6 +2228,106 @@ main() {
 		exit 1
 		;;
 	esac
+}
+
+_main_dispatch_cleanup() {
+	local cleanup_subcommand="${1:-report}"
+	local storage_helper="storage-cleanup-helper.sh"
+	case "$cleanup_subcommand" in
+	branches | remote-branches)
+		shift || true
+		_dispatch_helper "remote-branch-cleanup-helper.sh" "remote-branch-cleanup-helper.sh" "$cleanup_subcommand" "$@"
+		;;
+	local-branches)
+		shift || true
+		_dispatch_helper "local-branch-cleanup-helper.sh" "local-branch-cleanup-helper.sh" "$@"
+		;;
+	report | status | all | tmp | worktrees | artefacts | opencode | observability | maintenance)
+		# GH#35245: storage stores route to their existing owning cleaners.
+		_dispatch_helper "$storage_helper" "$storage_helper" "$@"
+		return $?
+		;;
+	help | --help | -h)
+		echo "Usage: aidevops cleanup [report|all|<store>|<branch-cmd>] [options]"
+		echo ""
+		echo "Storage (dry-run unless --apply):"
+		echo "  (no args), report Sizes of aidevops-owned stores and their cleaners"
+		echo "  all [--apply]     Preview or clean every store"
+		echo "  tmp|worktrees|artefacts|opencode|observability [--apply]  One store"
+		echo "  Daily automatic run: routine r922 Storage hygiene (installed by setup)"
+		echo "  maintenance plan --repo PATH  Plan legacy worktrees (read-only)"
+		echo "  maintenance check|apply --plan FILE --confirm TOKEN  Explicit user-space maintenance"
+		echo ""
+		echo "Branches (dry-run unless --apply):"
+		echo "  branches          Audit stale remote branches"
+		echo "  remote-branches   Alias for branches"
+		echo "  local-branches    Audit merged local branches"
+		echo ""
+		echo "Branch options:"
+		echo "  --repo PATH       Repository path (default: current directory)"
+		echo "  --remote NAME     Remote to audit (default: origin)"
+		echo "  --branch NAME     Single local branch (local-branches only)"
+		echo "  --apply           Delete safe candidates"
+		echo ""
+		;;
+	*) print_error "Unknown cleanup subcommand: $cleanup_subcommand (try report|all|tmp|worktrees|artefacts|opencode|observability|branches|local-branches|help)"; return 1 ;;
+	esac
+	return 0
+}
+
+_help_vault_and_config_sections() {
+	echo "Vault:"
+	echo "  aidevops vault init          # Create local encrypted Vault metadata"
+	echo "  aidevops vault status        # Show uninitialized/locked/unlocked/corrupted"
+	echo "  aidevops vault unlock        # Unlock into an in-memory local broker"
+	echo "  aidevops vault lock          # Stop broker and forget in-memory keys"
+	echo "  aidevops vault read NAME     # Read protected data through broker"
+	echo "  aidevops vault update NAME   # Encrypt stdin value through broker"
+	echo ""
+	echo "GitHub App Auth:"
+	echo "  aidevops github-app-auth status --json       # Show active auth mode and budgets"
+	echo "  aidevops github-app-auth route issue-list    # Explain route decision"
+	echo "  aidevops github-app-auth rate-limit --json   # Show cached per-pool budgets"
+	echo ""
+	echo "Feature Toggles:"
+	echo "  aidevops config list         # List all toggles with current values"
+	echo "  aidevops config get <key>    # Get a toggle value"
+	echo "  aidevops config set <k> <v>  # Set a toggle (true/false)"
+	echo "  aidevops config reset [key]  # Reset toggle(s) to defaults"
+	echo "  aidevops config path         # Show config file path"
+	echo ""
+	return 0
+}
+
+_main_dispatch_contributions() {
+	[[ $# -eq 0 ]] && set -- status
+	_dispatch_helper "contribution-watch-helper.sh" "contribution-watch-helper.sh" "$@"
+	return $?
+}
+
+_main_dispatch_campaign() {
+	local campaign_command="${1:-help}" campaign_helper="campaign-helper.sh"
+	local provision_helper="campaigns-provision-helper.sh"
+	case "$campaign_command" in
+	init | provision | ls) _dispatch_helper "$provision_helper" "$provision_helper" "$@" ;;
+	status)
+		if [[ $# -le 1 || -d "${2:-}" || "${2:-}" == .* || "${2:-}" == /* || "${2:-}" == ~* ]]; then
+			_dispatch_helper "$provision_helper" "$provision_helper" "$@"
+		else
+			_dispatch_helper "$campaign_helper" "$campaign_helper" "$@"
+		fi
+		;;
+	asset | assets) shift; _dispatch_helper "campaign-asset-helper.sh" "campaign-asset-helper.sh" "$@" ;;
+	grow | growth)
+		shift
+		local growth_helper="${AIDEVOPS_CLI_MODULES_DIR%/aidevops-cli}/campaign-growth-helper.py"
+		[[ ! -f "$growth_helper" ]] && growth_helper="$AGENTS_DIR/scripts/campaign-growth-helper.py"
+		[[ -f "$growth_helper" ]] || { print_error "campaign-growth-helper.py not found. Run: aidevops update"; return 1; }
+		python3 "$growth_helper" "$@"
+		;;
+	*) _dispatch_helper "$campaign_helper" "$campaign_helper" "$@" ;;
+	esac
+	return 0
 }
 
 main "$@"

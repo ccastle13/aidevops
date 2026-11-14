@@ -247,8 +247,10 @@ assert_file_eq "review_scan section survives as last field" \
 	"${SECTIONS_DIR}/review_scan" "$FIXTURE_REVIEW_SCAN"
 
 # 6. tool_count and qlty metadata survive too (sanity check on numeric fields).
-assert_file_eq "tool_count is captured (5 tools succeeded + coderabbit always-on)" \
-	"${SECTIONS_DIR}/tool_count" "6"
+# t18508: only non-empty sections count, so the empty CodeRabbit fixture is
+# excluded from coverage.
+assert_file_eq "tool_count is captured (5 non-empty tool sections; empty CodeRabbit is not counted)" \
+	"${SECTIONS_DIR}/tool_count" "5"
 assert_file_eq "qlty_smell_count read independently of qlty_section" \
 	"${SECTIONS_DIR}/qlty_smell_count" "42"
 # t2066: grade is derived from the smell count via _compute_qlty_grade_from_count.
@@ -287,12 +289,10 @@ test_grade_mapping "151 smells → F (lower bound)" 151 F
 test_grade_mapping "500 smells → F" 500 F
 test_grade_mapping "non-numeric → UNKNOWN" "not-a-number" UNKNOWN
 
-# 7. _quality_sweep_for_repo end-to-end smoke test: stub _ensure_quality_issue
-#    and gh so it doesn't hit the network, then verify the full pipeline reads
-#    every section back into a local variable. The gh wrapper writes the
-#    captured --body to a file because the real call site uses
-#    `comment_stderr=$(gh ... --body "$comment_body" ...)` which runs in a
-#    subshell — variable assignments inside it would not propagate back.
+# 7. _quality_sweep_for_repo end-to-end smoke test: stub the issue/comment
+#    helpers so it doesn't hit the network, then verify the full pipeline reads
+#    every section back into a local variable. The stub writes the captured body
+#    to a file because the real call site runs in a subshell.
 export CAPTURED_COMMENT_FILE="${TMP_HOME}/captured-comment"
 : >"$CAPTURED_COMMENT_FILE"
 
@@ -303,7 +303,7 @@ _ensure_quality_issue() {
 _update_quality_issue_body() {
 	return 0
 }
-gh() {
+gh_issue_comment() {
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 		--body)

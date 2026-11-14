@@ -227,12 +227,29 @@ _calendar_shift_month() {
 }
 
 #######################################
+# Undo Markdown-formatter rewrites inside cron(...) expressions.
+# Prettier escapes a lone '*' as '\*' and rewrites '*' pairs that can form
+# emphasis ('*/15 *') as '_'. Neither '\' nor '_' is valid in any schedule.
+#######################################
+_unescape_markdown_cron() {
+	local expr="$1"
+	if [[ "$expr" =~ ^cron\(.*\)$ ]]; then
+		expr="${expr//\\\*/*}"
+		expr="${expr//_/*}"
+	fi
+	printf '%s' "$expr"
+	return 0
+}
+
+#######################################
 # Parse a schedule expression into normalised fields
 #
 # Returns: type hour minute [day_of_week|day_of_month] or cron fields
 #######################################
 _parse_expression() {
-	local expr="$1"
+	local raw_expr="$1"
+	local expr
+	expr=$(_unescape_markdown_cron "$raw_expr")
 
 	# Phase C defensive guard (t2423): detect regex metacharacters that indicate
 	# a caller has passed a pattern string instead of a schedule expression.
@@ -295,16 +312,6 @@ _parse_expression() {
 			printf '%s: %s\n' "$SCHEDULE_ERROR_PREFIX" "cron expression must have 5 fields, got $field_count" >&2
 			return 1
 		fi
-		# Warn about escaped asterisks (\*) that won't match as wildcards.
-		# In TODO.md, authors sometimes write cron(\* \* \*) for Markdown rendering,
-		# but the backslash is literal in bash and _cron_field_matches sees "\*" not "*".
-		local _field
-		for _field in "${_cron_fields[@]}"; do
-			if [[ "$_field" == '\*' ]]; then
-				printf '%s\n' "WARNING: cron field '\\*' (escaped asterisk) does not match as wildcard — use '*' in repeat: expressions (t2423)" >&2
-				break
-			fi
-		done
 		printf 'cron %s' "$cron_expr"
 		return 0
 	fi
@@ -777,6 +784,28 @@ cmd_is_due() {
 }
 
 #######################################
+# latest-slot: Print the most recent calendar boundary as an epoch, using the
+# same timezone/DST calculations as is-due. Persistent services have no slot.
+#######################################
+cmd_latest_slot() {
+	local expression="$1"
+	local parsed="" now_epoch=""
+	parsed=$(_parse_expression "$expression") || return 2
+	now_epoch=$(_now_epoch) || return 2
+	case "$parsed" in
+	daily\ * | weekly\ * | monthly\ *)
+		_calendar_boundary_epoch "$parsed" "$SCHEDULE_BOUNDARY_LATEST" "$now_epoch"
+		return $?
+		;;
+	cron\ *)
+		_cron_latest_boundary "${parsed#cron }" 0 "$now_epoch"
+		return $?
+		;;
+	*) return 1 ;;
+	esac
+}
+
+#######################################
 # next-run: Calculate the next run time for a schedule expression
 #
 # Arguments:
@@ -892,12 +921,17 @@ main() {
 		cmd_is_due "$1" "$2"
 		return $?
 		;;
-	next-run)
+	latest-slot | next-run)
 		if [[ $# -lt 1 ]]; then
-			printf '%s\n' "Usage: routine-schedule-helper.sh next-run <expression>" >&2
+			printf 'Usage: routine-schedule-helper.sh %s <expression>\n' "$command" >&2
 			return 2
 		fi
-		cmd_next_run "$1"
+		local expression="$1"
+		if [[ "$command" == "latest-slot" ]]; then
+			cmd_latest_slot "$expression"
+		else
+			cmd_next_run "$expression"
+		fi
 		return $?
 		;;
 	parse)
@@ -917,11 +951,12 @@ main() {
 		return $?
 		;;
 	*)
-		printf '%s\n' "Usage: routine-schedule-helper.sh {is-due|next-run|parse|systemd-calendar} <args>" >&2
+		printf '%s\n' "Usage: routine-schedule-helper.sh {is-due|latest-slot|next-run|parse|systemd-calendar} <args>" >&2
 		printf '%s\n' "" >&2
 		printf '%s\n' "Commands:" >&2
 		printf '%s\n' "  is-due <expression> <last-run-epoch>  Check if routine is due (exit 0=due, 1=not due)" >&2
 		printf '%s\n' "  next-run <expression>                 Print next run ISO timestamp" >&2
+		printf '%s\n' "  latest-slot <expression>              Print latest calendar slot epoch" >&2
 		printf '%s\n' "  parse <expression>                    Output normalised fields" >&2
 		printf '%s\n' "  systemd-calendar <expression>         Print systemd OnCalendar value" >&2
 		printf '%s\n' "" >&2

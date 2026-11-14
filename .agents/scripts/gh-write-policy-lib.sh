@@ -14,6 +14,9 @@ _GH_WRITE_POLICY_LIB_LOADED=1
 _SHIM_ORIGIN_INTERACTIVE_LABEL="origin:interactive"
 _SHIM_ISSUE_FIRST_SCOPE_EXTERNAL="external"
 _SHIM_MANAGED_LABEL_SET=""
+_SHIM_REPO_WRITE_CACHE_SLUG=""
+_SHIM_REPO_WRITE_CACHE_RESULT=""
+_SHIM_PR_CREATE_PARTIAL_RC=78
 
 if [[ -z "${_SHIM_DIR:-}" ]]; then
 	_gh_write_policy_path="${BASH_SOURCE[0]%/*}"
@@ -21,6 +24,19 @@ if [[ -z "${_SHIM_DIR:-}" ]]; then
 	_SHIM_DIR="$(cd "$_gh_write_policy_path" && pwd)"
 	unset _gh_write_policy_path
 fi
+# shellcheck source=./gh-closing-reference-lib.sh
+source "${_SHIM_DIR}/gh-closing-reference-lib.sh"
+
+_shim_validate_pr_closing_keywords() {
+	case "${_modified_args[0]:-}:${_modified_args[1]:-}" in
+	pr:create | pr:edit | pr:merge)
+		_gh_validate_pr_closing_keywords "${_modified_args[@]:2}"
+		return $?
+		;;
+	esac
+	return 0
+}
+
 _shim_is_headless_automation() {
 	case ":${HEADLESS:-}:${FULL_LOOP_HEADLESS:-}:${AIDEVOPS_HEADLESS:-}:${OPENCODE_HEADLESS:-}:${GITHUB_ACTIONS:-}:${AIDEVOPS_SESSION_ORIGIN:-}:" in
 	*:1:* | *:true:* | *:worker:* | *:pulse:* | *:routine:* | *:headless:*) return 0 ;;
@@ -651,13 +667,20 @@ _shim_normalize_dispatch_labels() {
 		if [[ $has_manual -eq 1 ]]; then
 			_shim_filter_cli_label_action "--add-label" "$_SHIM_DISPATCH_AUTO_LABEL"
 			_shim_filter_cli_label_action "--remove-label" "$_SHIM_DISPATCH_MANUAL_LABEL"
-			_shim_cli_label_action_has "--remove-label" "$_SHIM_DISPATCH_AUTO_LABEL" ||
-				_modified_args+=(--remove-label "$_SHIM_DISPATCH_AUTO_LABEL")
+			if _shim_dispatch_label_exists "$_SHIM_DISPATCH_AUTO_LABEL"; then
+				_shim_cli_label_action_has "--remove-label" "$_SHIM_DISPATCH_AUTO_LABEL" ||
+					_modified_args+=(--remove-label "$_SHIM_DISPATCH_AUTO_LABEL")
+			fi
 			[[ $has_auto -eq 0 ]] || _shim_warn_dispatch_label_conflict
 		elif [[ $has_auto -eq 1 ]]; then
 			_shim_filter_cli_label_action "--remove-label" "$_SHIM_DISPATCH_AUTO_LABEL"
-			_shim_cli_label_action_has "--remove-label" "$_SHIM_DISPATCH_MANUAL_LABEL" ||
-				_modified_args+=(--remove-label "$_SHIM_DISPATCH_MANUAL_LABEL")
+			# Only inject the opposite removal when it exists. `gh issue edit`
+			# fails the whole update when asked to remove a nonexistent label.
+			# Lookup failures are fail-open: preserve the user's requested edit.
+			if _shim_dispatch_label_exists "$_SHIM_DISPATCH_MANUAL_LABEL"; then
+				_shim_cli_label_action_has "--remove-label" "$_SHIM_DISPATCH_MANUAL_LABEL" ||
+					_modified_args+=(--remove-label "$_SHIM_DISPATCH_MANUAL_LABEL")
+			fi
 		fi
 		return 0
 		;;
@@ -680,6 +703,20 @@ _shim_normalize_dispatch_labels() {
 		_shim_warn_dispatch_label_conflict
 	fi
 	return 0
+}
+
+_shim_dispatch_label_exists() {
+	local label="$1"
+	local repo=""
+	local labels_json=""
+	local label_delimiter=$'\n'
+	repo=$(_shim_target_repo_slug "${_modified_args[@]}" 2>/dev/null || true)
+	[[ -n "$repo" ]] || return 1
+	labels_json=$(AIDEVOPS_GH_ROUTE_DECISION="dispatch-label-presence" \
+		_shim_run_transport "$REAL_GH" rest gh_dispatch_label_presence 0 \
+		api "/repos/${repo}/labels?per_page=100" --paginate --jq '.[].name' 2>/dev/null) || return 1
+	[[ "${label_delimiter}${labels_json}${label_delimiter}" == *"${label_delimiter}${label}${label_delimiter}"* ]]
+	return $?
 }
 
 _shim_managed_label_inventory_runner() {
@@ -743,7 +780,11 @@ _shim_normalize_interactive_tracking_issue_create() {
 	_SHIM_MANAGED_LABEL_SET="tracking"
 
 	_shim_issue_create_has_label_prefix "origin:" || _modified_args+=(--label "$_SHIM_ORIGIN_INTERACTIVE_LABEL")
-	_shim_issue_create_has_label_prefix "status:" || _modified_args+=(--label "status:in-review")
+	# GH#32703: publication:pending issues intentionally carry no status until
+	# planning-publication-reconcile.sh projects one; an injected active status
+	# would permanently block dispatch of auto-dispatch tasks.
+	_shim_issue_create_has_label_prefix "status:" || _shim_issue_create_has_label "publication:pending" ||
+		_modified_args+=(--label "status:in-review")
 	_shim_issue_create_has_type_label || _modified_args+=(--label "bug")
 	return 0
 }
@@ -764,9 +805,118 @@ _shim_normalize_pr_create_origin() {
 	if _shim_is_headless_automation; then
 		origin_label="origin:worker"
 	fi
+	local repo_slug=""
+	repo_slug=$(_shim_target_repo_slug "${_modified_args[@]}" 2>/dev/null || true)
+	if [[ -z "$repo_slug" ]] || ! _shim_authenticated_actor_has_repo_write "$repo_slug"; then
+		printf '[aidevops][gh-shim][INFO] Upstream write authority is unavailable; deferring automatic %s provenance to repository triage.\n' \
+			"$origin_label" >&2
+		return 0
+	fi
 	_SHIM_MANAGED_LABEL_SET="origin"
 	_modified_args+=(--label "$origin_label")
 	return 0
+}
+
+_shim_pr_create_get_head() {
+	local args=("$@")
+	local idx=0
+	local arg=""
+	while [[ $idx -lt ${#args[@]} ]]; do
+		arg="${args[$idx]}"
+		case "$arg" in
+		--head)
+			printf '%s\n' "${args[idx + 1]:-}"
+			return 0
+			;;
+		--head=*)
+			printf '%s\n' "${arg#--head=}"
+			return 0
+			;;
+		esac
+		idx=$((idx + 1))
+	done
+	return 1
+}
+
+_shim_pr_create_validate_url() {
+	local url="$1"
+	local repo_slug="$2"
+	if [[ "$url" =~ ^https://[^/]+/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([0-9]+)$ ]] &&
+		[[ "${BASH_REMATCH[1]}" == "$repo_slug" ]]; then
+		printf '%s\n' "$url"
+		return 0
+	fi
+	return 1
+}
+
+_shim_pr_create_url_from_output() {
+	local output_file="$1"
+	local repo_slug="$2"
+	local line=""
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		if _shim_pr_create_validate_url "$line" "$repo_slug"; then
+			return 0
+		fi
+	done <"$output_file"
+	return 1
+}
+
+_shim_pr_create_recover_exact_url() {
+	local repo_slug="$1"
+	shift
+	local head_ref=""
+	local response=""
+	local recovered_url=""
+	head_ref=$(_shim_pr_create_get_head "$@" 2>/dev/null || true)
+	[[ "$head_ref" =~ ^[A-Za-z0-9_.-]+:[A-Za-z0-9._/-]+$ ]] || return 1
+	response=$(_shim_run_transport "$REAL_GH" rest gh_pr_create_recovery 0 \
+		api "/repos/${repo_slug}/pulls" --method GET -f state=open \
+		-f "head=${head_ref}" -f per_page=5 2>/dev/null) || return 1
+	recovered_url=$(printf '%s\n' "$response" | jq -r --arg repo "$repo_slug" --arg head "$head_ref" \
+		'[.[] | select(.state == "open" and .head.label == $head and .base.repo.full_name == $repo)] | if length == 1 then .[0].html_url // empty else empty end' \
+		2>/dev/null || true)
+	_shim_pr_create_validate_url "$recovered_url" "$repo_slug"
+	return $?
+}
+
+_shim_run_pr_create_transport() {
+	local binary="$1"
+	local path="$2"
+	local caller="$3"
+	local retry="$4"
+	shift 4
+	local repo_slug=""
+	local stdout_file=""
+	local stderr_file=""
+	local rc=0
+	local durable_url=""
+	local output_has_url=0
+	repo_slug=$(_shim_target_repo_slug "$@" 2>/dev/null || true)
+	stdout_file=$(mktemp -t aidevops-gh-pr-create-out.XXXXXX 2>/dev/null || true)
+	stderr_file=$(mktemp -t aidevops-gh-pr-create-err.XXXXXX 2>/dev/null || true)
+	if [[ -z "$repo_slug" || -z "$stdout_file" || -z "$stderr_file" ]]; then
+		[[ -z "$stdout_file" ]] || rm -f "$stdout_file"
+		[[ -z "$stderr_file" ]] || rm -f "$stderr_file"
+		_shim_run_transport "$binary" "$path" "$caller" "$retry" "$@"
+		return $?
+	fi
+	_shim_run_transport "$binary" "$path" "$caller" "$retry" "$@" \
+		>"$stdout_file" 2>"$stderr_file" || rc=$?
+	durable_url=$(_shim_pr_create_url_from_output "$stdout_file" "$repo_slug" 2>/dev/null || true)
+	[[ -z "$durable_url" ]] || output_has_url=1
+	cat "$stdout_file"
+	cat "$stderr_file" >&2
+	if [[ $rc -ne 0 && -z "$durable_url" ]]; then
+		durable_url=$(_shim_pr_create_recover_exact_url "$repo_slug" "$@" 2>/dev/null || true)
+	fi
+	rm -f "$stdout_file" "$stderr_file"
+	if [[ $rc -ne 0 && -n "$durable_url" ]]; then
+		[[ $output_has_url -eq 1 ]] || printf '%s\n' "$durable_url"
+		printf '[aidevops][gh-shim][PARTIAL] Durable PR %s exists after a create-time mutation failure; not retrying creation.\n' \
+			"$durable_url" >&2
+		return "$_SHIM_PR_CREATE_PARTIAL_RC"
+	fi
+	return "$rc"
 }
 
 _shim_pr_create_get_title() {
@@ -874,6 +1024,7 @@ _shim_target_matches_local_checkout() {
 _shim_file_issue_first_scope() {
 	local file_path="$1"
 	local content="${2:-}"
+	local include_reason="${3:-0}"
 	local marker_lines=""
 	local marker_count=0
 	local scope=""
@@ -901,7 +1052,13 @@ _shim_file_issue_first_scope() {
 	# attempting to infer exemptions from human language.
 	if [[ "$marker_count" -gt 1 ]] ||
 		grep -Eqi 'aidevops:issue-first-pr:(start|scope=)|issue-first|linked issue|every human-authored pr' <<<"$content"; then
-		printf 'universal\n'
+		if [[ "$include_reason" == 1 ]] &&
+			grep -qF 'aidevops:issue-first-pr:start' <<<"$content" &&
+			! grep -qF 'aidevops:issue-first-pr:scope=' <<<"$content"; then
+			printf 'universal:legacy-managed\n'
+		else
+			printf 'universal\n'
+		fi
 		return 0
 	fi
 	return 1
@@ -940,6 +1097,7 @@ _shim_file_declared_issue_first_scope() {
 }
 
 _shim_local_issue_first_scope() {
+	local include_reason="${1:-0}"
 	local root=""
 	local tmpl=""
 	local scope=""
@@ -975,10 +1133,10 @@ _shim_local_issue_first_scope() {
 	# remains universal until a managed scope declaration is added.
 	for tmpl in "${policy_files[@]}"; do
 		[[ -f "$tmpl" ]] || continue
-		scope=$(_shim_file_issue_first_scope "$tmpl" 2>/dev/null || true)
+		scope=$(_shim_file_issue_first_scope "$tmpl" "" "$include_reason" 2>/dev/null || true)
 		[[ -n "$scope" ]] || continue
-		if [[ "$scope" == "universal" ]]; then
-			printf 'universal\n'
+		if [[ "${scope%%:*}" == "universal" ]]; then
+			printf '%s\n' "$scope"
 			return 0
 		fi
 		selected_scope="$scope"
@@ -990,9 +1148,10 @@ _shim_local_issue_first_scope() {
 
 _shim_repo_issue_first_scope() {
 	local repo_slug="$1"
+	local include_reason="${2:-0}"
 	local scope=""
 	if _shim_target_matches_local_checkout "$repo_slug"; then
-		scope=$(_shim_local_issue_first_scope 2>/dev/null || true)
+		scope=$(_shim_local_issue_first_scope "$include_reason" 2>/dev/null || true)
 		if [[ -n "$scope" ]]; then
 			printf '%s\n' "$scope"
 			return 0
@@ -1012,16 +1171,29 @@ _shim_authenticated_actor_has_repo_write() {
 	local current_user=""
 	local permission=""
 	[[ -n "$repo_slug" && "$repo_slug" == */* ]] || return 1
+	if [[ "$_SHIM_REPO_WRITE_CACHE_SLUG" == "$repo_slug" ]]; then
+		[[ "$_SHIM_REPO_WRITE_CACHE_RESULT" == "write" ]]
+		return $?
+	fi
 	#aidevops:trust-boundary -- exemption requires live GitHub identity and permission.
 	current_user=$(_shim_run_transport "$REAL_GH" rest gh_api_user 0 \
 		api user --jq '.login // empty' 2>/dev/null) || current_user=""
-	[[ -n "$current_user" && "$current_user" =~ ^[A-Za-z0-9-]+$ ]] || return 1
+	if [[ -z "$current_user" || ! "$current_user" =~ ^[A-Za-z0-9-]+$ ]]; then
+		_SHIM_REPO_WRITE_CACHE_SLUG="$repo_slug"
+		_SHIM_REPO_WRITE_CACHE_RESULT="unavailable"
+		return 1
+	fi
 	permission=$(_shim_run_transport "$REAL_GH" rest gh_api_collaborator_permission 0 \
 		api "/repos/${repo_slug}/collaborators/${current_user}/permission" \
 		--jq '.permission // .role_name // empty' 2>/dev/null) || permission=""
+	_SHIM_REPO_WRITE_CACHE_SLUG="$repo_slug"
 	case "$permission" in
-	admin | maintain | write) return 0 ;;
+	admin | maintain | write)
+		_SHIM_REPO_WRITE_CACHE_RESULT="write"
+		return 0
+		;;
 	esac
+	_SHIM_REPO_WRITE_CACHE_RESULT="unavailable"
 	return 1
 }
 
@@ -1030,12 +1202,16 @@ _shim_block_pr_create_without_linked_issue_if_needed() {
 
 	local repo_slug=""
 	local policy_scope=""
+	local policy_reason=""
 	local title=""
 	local body=""
 	repo_slug=$(_shim_target_repo_slug "${_modified_args[@]}" 2>/dev/null || true)
 	[[ -n "$repo_slug" ]] || return 0
-	policy_scope=$(_shim_repo_issue_first_scope "$repo_slug" 2>/dev/null || true)
+	# Opt into reason metadata; ordinary scope callers retain their exact output.
+	policy_scope=$(_shim_repo_issue_first_scope "$repo_slug" 1 2>/dev/null || true)
 	[[ -n "$policy_scope" ]] || return 0
+	[[ "$policy_scope" == *:* ]] && policy_reason="${policy_scope#*:}"
+	policy_scope="${policy_scope%%:*}"
 
 	title=$(_shim_pr_create_get_title 2>/dev/null || true)
 	body=$(_shim_pr_create_get_body 2>/dev/null || true)
@@ -1053,6 +1229,9 @@ _shim_block_pr_create_without_linked_issue_if_needed() {
 		printf '  GitHub could not verify admin, maintain, or write permission for the authenticated actor; the exemption fails closed.\n' >&2
 	fi
 	printf '  Task-prefixed titles such as GH#NNN: or tNNN: are also accepted when they map to the project task system.\n' >&2
+	if [[ "$policy_reason" == "legacy-managed" ]]; then
+		printf '  The managed issue-first block predates the scope marker; if repository policy is external-only, refresh it with: aidevops sync-workflows --workflow linked-issue-check --apply --repo %s --issue <N>\n' "$repo_slug" >&2
+	fi
 	return 1
 }
 # shellcheck disable=SC2154  # body indexes are initialized by the shim before use

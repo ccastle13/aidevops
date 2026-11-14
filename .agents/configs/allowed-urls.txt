@@ -69,6 +69,7 @@ api.infraforge.ai
 api.instantly.ai
 api.leadsforge.ai
 api.linkedin.com
+api.linkup.so
 api.linode.com
 api.machines.dev
 api.manyreach.com
@@ -81,7 +82,9 @@ api.partner.com
 api.perplexity.ai
 api-beta.quickfile.co.uk
 api.quickfile.co.uk
+api.render.com
 api.replicate.com
+api.runpod.ai
 api.sandbox.namecheap.com
 api.securitytrails.com
 api.semrush.com
@@ -98,6 +101,7 @@ api.stripe.com
 api.telegram.org
 api.together.ai
 api.together.xyz
+api.typesafe.ai
 api.twilio.com
 api.vultr.com
 api.warmforge.ai
@@ -109,7 +113,6 @@ apireq.enhancor.ai
 apiv2.ahrefs.com
 app.ahrefs.com
 app.au.snyk.io
-app.closte.com
 app.codacy.com
 app.coderabbit.ai
 app.contentkingapp.com
@@ -121,6 +124,7 @@ app.factory.ai
 app.heygen.com
 app.langwatch.ai
 app.leadsforge.ai
+app.linkup.so
 app.neuronwriter.com
 app.outscraper.com
 app.revenuecat.com
@@ -180,6 +184,7 @@ cdn.jsdelivr.net
 challenges.cloudflare.com
 chat.googleapis.com
 chat.whatsapp.com
+chatgpt.com
 checklistdesign.com
 chrome.google.com
 chromedevtools.github.io
@@ -193,7 +198,6 @@ cli.coderabbit.ai
 cli.github.com
 client-mainwp.yourdomain.com
 clifford.io
-closte.com
 cloud-api.near.ai
 cloud.browser-use.com
 cloud.digitalocean.com
@@ -228,6 +232,7 @@ console.aws.amazon.com
 console.cloud.google.com
 console.groq.com
 console.hetzner.cloud
+console.runpod.io
 console.twilio.com
 context7.com
 context7.io
@@ -300,7 +305,6 @@ docs.aws.amazon.com
 docs.bluebubbles.app
 docs.browser-use.com
 docs.capsolver.com
-docs.closte.com
 docs.cloudron.io
 docs.codacy.com
 docs.codefactor.io
@@ -313,10 +317,12 @@ docs.crawl4ai.com
 docs.crewai.com
 docs.dataforseo.com
 docs.daytona.io
+docs.dev.runwayml.com
 docs.digitalocean.com
 docs.docker.com
-docs.dspyground.com
+docs.exa.ai
 docs.factory.ai
+docs.firecrawl.dev
 docs.fireworks.ai
 docs.gitea.io
 docs.github.com
@@ -328,6 +334,7 @@ docs.higgsfield.ai
 docs.jj-vcs.dev
 docs.langflow.org
 docs.langwatch.ai
+docs.linkup.so
 docs.litellm.ai
 docs.maestro.dev
 docs.manyreach.com
@@ -342,6 +349,7 @@ docs.orbstack.dev
 docs.perplexity.ai
 docs.pipecat.ai
 docs.pydantic.dev
+docs.runpod.io
 docs.sentry.io
 docs.skyvern.com
 docs.snyk.io
@@ -349,6 +357,7 @@ docs.socket.dev
 docs.sonarcloud.io
 docs.sonarqube.org
 docs.stagehand.dev
+docs.tavily.com
 docs.together.ai
 docs.unstract.com
 docs.urbit.org
@@ -365,9 +374,6 @@ download.pytorch.org
 downloads.snyk.io
 downloads.wordpress.org
 dribbble.com
-dspy-docs.vercel.app
-dspy.ai
-dspyground.com
 electric-sql.com
 elevenlabs.io
 emaillove.com
@@ -435,6 +441,7 @@ grith.ai
 growth.design
 gumroad.com
 gw.dataimpulse.com
+help.seoutils.app
 herbertograca.com
 heygen.com
 higgsfield.ai
@@ -506,6 +513,7 @@ mcp.cloudflare.com
 mcp.context7.com
 mcp.grep.app
 mcp.linear.app
+mcp.linkup.so
 mcp.provider.com
 mcp.sentry.dev
 mcp.socket.dev
@@ -599,7 +607,6 @@ platform.higgsfield.ai
 platform.openai.com
 play.google.com
 playbooks.com
-playground.dspyground.com
 playwright.dev
 podcasts.apple.com
 poolors.com
@@ -612,6 +619,7 @@ previsible.io
 privatebin.info
 privatebin.net
 project.pages.dev
+prompt.linkup.so
 provenance-ping.marcusquinn.workers.dev
 proxycheck.io
 pttrns.com
@@ -623,7 +631,6 @@ qlty.sh
 qwen35-122b.completions.near.ai
 rankmath.com
 rapha.cc
-rapidfuzz.github.io
 raw.githubusercontent.com
 react-spectrum.adobe.com
 reactjs.org
@@ -643,7 +650,6 @@ relay.tools
 remotion.dev
 remotion.media
 repo.wp-composer.com
-repomix.com
 rest-api.fluentcrm.com
 roadmap.neuronwriter.com
 route53.amazonaws.com
@@ -668,7 +674,9 @@ secretlint.github.io
 semver.org
 sendersupport.olc.protection.outlook.com
 sentry.io
+seoutils.app
 seranking.com
+serpapi.com
 serper.dev
 server.smartlead.ai
 service.com
@@ -773,6 +781,7 @@ vault.yourdomain.com
 vercel.com
 verify.twilio.com
 via.placeholder.com
+videorouter.sh
 warmupinbox.com
 warp.dev
 wave.webaim.org

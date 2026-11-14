@@ -5,6 +5,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit
+# Re-exec under modern Bash before creating a PID-named control worktree:
+# exec preserves $$ but does not run the EXIT cleanup trap.
+# shellcheck source=./shared-constants.sh
+source "${SCRIPT_DIR}/shared-constants.sh"
+# shellcheck source=./full-loop-release-worktree-lib.sh
+source "${SCRIPT_DIR}/full-loop-release-worktree-lib.sh"
 
 _full_loop_release_valid_repo_root() {
 	local candidate_root="$1"
@@ -38,16 +44,50 @@ REPO_ROOT=$(_full_loop_release_resolve_repo_root) || {
 }
 _FULL_LOOP_RELEASE_PATH=""
 _FULL_LOOP_RELEASE_CONTROL_PATH=""
+_FULL_LOOP_RELEASE_PREPARATION_PATH=""
 
+# Release-owned removals use _full_loop_release_remove_worktree (audited fence,
+# full-loop-release-worktree-lib.sh, GH#35024).
 cleanup_release_worktree() {
+	local exit_status="$?"
 	local release_path="${_FULL_LOOP_RELEASE_PATH:-}"
 	local control_path="${_FULL_LOOP_RELEASE_CONTROL_PATH:-}"
 	if [[ -n "$release_path" && "$release_path" != "$control_path" && -d "$release_path" ]]; then
-		git -C "$REPO_ROOT" worktree remove "$release_path" >/dev/null 2>&1 || true
+		if [[ "$exit_status" -eq 0 || "$release_path" != "${_FULL_LOOP_RELEASE_PREPARATION_PATH:-}" ]]; then
+			_full_loop_release_remove_worktree "$release_path" release-exit || true
+		else
+			printf 'Release preparation retained for guarded recovery (exit %s).\n' "$exit_status" >&2
+		fi
 	fi
 	if [[ -n "$control_path" && -d "$control_path" ]]; then
-		git -C "$control_path" worktree remove "$control_path" >/dev/null 2>&1 || true
+		_full_loop_release_remove_worktree "$control_path" release-control-exit || true
 	fi
+	return 0
+}
+
+# GH#32528: control worktrees are disposable detached snapshots named by the
+# creating PID. An invocation killed by SIGKILL (tool timeouts, process-group
+# teardown) never runs its EXIT trap, which leaked dozens of full checkouts per
+# hour. Reclaim those whose creating process is gone and that have been idle
+# for 30+ minutes before adding a new one. Failures never block the release.
+# GH#37424: idleness comes from top-level entries, not the root mtime, which
+# the Spotlight-marker backfill bumps in every existing tree.
+_full_loop_release_reap_stale_control_worktrees() {
+	local repository_root="$1"
+	local worktree_base="$2"
+	local stale_path=""
+	local stale_pid=""
+
+	for stale_path in "$worktree_base"/aidevops-release-control-*; do
+		[[ -d "$stale_path" && ! -L "$stale_path" && -f "$stale_path/.git" ]] || continue
+		stale_pid="${stale_path##*-}"
+		[[ "$stale_pid" =~ ^[0-9]+$ && "$stale_pid" != "$$" ]] || continue
+		kill -0 "$stale_pid" 2>/dev/null && continue
+		_full_loop_release_tree_recently_active "$stale_path" 1 && continue
+		# Non-force via the audited fence: a dirty or busy snapshot is preserved.
+		: "$repository_root"
+		_full_loop_release_remove_worktree "$stale_path" release-control-stale || true
+	done
 	return 0
 }
 
@@ -59,12 +99,13 @@ _full_loop_release_prepare_control_worktree() {
 	local checkout_commit=""
 
 	[[ -d "$repository_root/.git" && -d "$worktree_base" ]] || return 1
+	_full_loop_release_reap_stale_control_worktrees "$repository_root" "$worktree_base"
 	source_commit=$(git -C "$repository_root" rev-parse HEAD 2>/dev/null) || return 1
 	[[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
-	git -C "$repository_root" worktree add --detach "$control_path" "$source_commit" >/dev/null || return 1
+	worktree_create_registered "$repository_root" "$control_path" "$source_commit" --detach >/dev/null || return 1
 	checkout_commit=$(git -C "$control_path" rev-parse HEAD 2>/dev/null || true)
 	if [[ ! -f "$control_path/.git" || "$checkout_commit" != "$source_commit" ]]; then
-		git -C "$control_path" worktree remove "$control_path" >/dev/null 2>&1 || true
+		_full_loop_release_remove_worktree "$control_path" release-control-unverified || true
 		return 1
 	fi
 	_FULL_LOOP_RELEASE_CONTROL_PATH="$control_path"
@@ -73,7 +114,10 @@ _full_loop_release_prepare_control_worktree() {
 	return 0
 }
 
-if [[ -d "$REPO_ROOT/.git" ]] && ! _full_loop_release_prepare_control_worktree "$REPO_ROOT"; then
+# Every release-owned tree below is created in this process (GH#37365).
+_full_loop_release_declare_lifecycle_owner
+
+if [[ "${1:-}" != "sources" && "${1:-}" != "reap-stale" && -d "$REPO_ROOT/.git" ]] && ! _full_loop_release_prepare_control_worktree "$REPO_ROOT"; then
 	printf 'Cannot prepare a linked release control worktree.\n' >&2
 	exit 1
 fi
@@ -94,8 +138,14 @@ source "${SCRIPT_DIR}/full-loop-helper-state.sh"
 source "${SCRIPT_DIR}/release-lane-helper.sh"
 # shellcheck source=./full-loop-release-reconcile.sh
 source "${SCRIPT_DIR}/full-loop-release-reconcile.sh"
+# shellcheck source=./full-loop-release-adopt.sh
+source "${SCRIPT_DIR}/full-loop-release-adopt.sh"
 # shellcheck source=./full-loop-release-aggregate-recovery.sh
 source "${SCRIPT_DIR}/full-loop-release-aggregate-recovery.sh"
+# shellcheck source=./full-loop-release-snapshot-migration.sh
+source "${SCRIPT_DIR}/full-loop-release-snapshot-migration.sh"
+# shellcheck source=./release-signing-helper.sh
+source "${SCRIPT_DIR}/release-signing-helper.sh"
 
 _FULL_LOOP_RESOLVED_SOURCE_JSON=""
 _FULL_LOOP_RESOLVED_SOURCE_PR=""
@@ -112,12 +162,48 @@ _full_loop_capture_release_authorization() {
 	local resolver="$4"
 	local expected_sources="${5:-}"
 	local authorization_json=""
-	local resolver_args=(resolve-authorization --source-pr "$source_pr" --repo "$repo" --branch main)
+	local expected_intent=""
+	local attempt=0
+	local resolver_rc=0
+	local resolver_args=(resolve-authorization --snapshot --source-pr "$source_pr" --repo "$repo" --branch main)
 	[[ -n "$expected_sources" ]] && resolver_args+=(--expected-sources "$expected_sources")
-	authorization_json=$(cd "$release_path" && bash "$resolver" "${resolver_args[@]}") || return 1
+	# gh can fail inside the resolver with an empty JSON read, or a successful
+	# resolver can emit an empty/truncated document. Neither proves authorization.
+	for attempt in 1 2 3; do
+		resolver_rc=0
+		authorization_json=$(cd "$release_path" && bash "$resolver" "${resolver_args[@]}" 2>&1) || resolver_rc=$?
+		if [[ "$resolver_rc" -eq 0 ]] && jq -e 'type == "object" and (.expected_sources | type == "array")' \
+			<<<"$authorization_json" >/dev/null 2>&1; then
+			break
+		fi
+		if [[ "$resolver_rc" -ne 0 && "$authorization_json" != *'unexpected end of JSON input'* ]]; then
+			printf '%s\n' "$authorization_json" >&2
+			return 1
+		fi
+	done
+	if [[ "$attempt" -eq 3 && "$resolver_rc" -ne 0 ]] ||
+		! jq -e 'type == "object" and (.expected_sources | type == "array")' \
+			<<<"$authorization_json" >/dev/null 2>&1; then
+		printf 'Release authorization read is indeterminate; pinned lane remains fenced.\n' >&2
+		return 8
+	fi
+	if [[ -n "$expected_sources" ]]; then
+		expected_intent=$(release_authorization_intent_json "$expected_sources") || return 1
+		#aidevops:trust-boundary
+		jq -e --argjson intent "$expected_intent" '
+			.expected_sources as $sources
+			| ($intent | map(.pr) | sort) == ($sources | map(.pr) | sort)
+			and all($intent[]; . as $entry | any($sources[];
+				.pr == $entry.pr and ($entry.merge == null or .merge == $entry.merge)))
+		' <<<"$authorization_json" >/dev/null || return 1
+	fi
 	_FULL_LOOP_RESOLVED_EXPECTED_SOURCES=$(jq -er '
 		.expected_sources | sort_by(.pr) | map("\(.pr)@\(.merge)") | join(",")
 	' <<<"$authorization_json") || return 1
+	if [[ "$(jq -r '.mode // ""' <<<"$authorization_json")" == "snapshot" ]]; then
+		_full_loop_bind_snapshot_authorization "$repo" "$source_pr" "$authorization_json" \
+			"$_FULL_LOOP_RESOLVED_EXPECTED_SOURCES" || return 1
+	fi
 	_full_loop_persist_release_authorization "$repo" "$source_pr" "$_FULL_LOOP_RESOLVED_EXPECTED_SOURCES"
 	return $?
 }
@@ -128,11 +214,25 @@ _full_loop_resolve_requested_release_source() {
 	local release_path="$3"
 	local resolver="$4"
 	local expected_sources="${5:-}"
+	local resolution_mode="${6:-snapshot}"
+	local pinned_aggregate="${7:-}"
 	local blocked_pr_json=""
 	local blocked_merge=""
 	local blocked_head=""
 	[[ -x "$resolver" ]] || return 1
 	local resolver_args=(resolve-source --source-pr "$source_pr" --repo "$repo" --branch main)
+	case "$resolution_mode" in
+	snapshot)
+		[[ -z "$pinned_aggregate" ]] || return 1
+		resolver_args+=(--snapshot)
+		;;
+	aggregate)
+		# Signed-tag recovery requires the trailer resolver: exact tip by default,
+		# or an explicitly pinned reviewed aggregate ancestor (GH#34710).
+		[[ -z "$pinned_aggregate" ]] || resolver_args+=(--pinned-aggregate "$pinned_aggregate")
+		;;
+	*) return 1 ;;
+	esac
 	[[ -n "$expected_sources" ]] && resolver_args+=(--expected-sources "$expected_sources")
 	if ! _FULL_LOOP_RESOLVED_SOURCE_JSON=$(cd "$release_path" && bash "$resolver" "${resolver_args[@]}"); then
 		blocked_pr_json=$(gh pr view "$source_pr" --repo "$repo" --json state,mergedAt,mergeCommit,baseRefName 2>/dev/null || true)
@@ -190,7 +290,7 @@ _full_loop_release_validate_existing_tag_authorization() {
 _full_loop_release_guard_existing() {
 	local repo="$1"
 	local source_pr="$2"
-	local expected_sources="${3:-$source_pr}"
+	local expected_sources="${3:-}"
 	local receipt_path=""
 	local release_status=""
 	local existing_tag_rc=0
@@ -232,7 +332,7 @@ _full_loop_release_guard_existing() {
 		_full_loop_release_validate_existing_tag_authorization "$repo" "$source_pr" "$expected_sources" || return 1
 		printf 'Existing signed release tag found for PR #%s; reconciling without another version bump\n' "$source_pr"
 		_full_loop_release_timing_finish release-existing-guard "$guard_started" existing-tag
-		_full_loop_release_existing_command reconcile "$source_pr"
+		_full_loop_release_existing_with_lane reconcile "$source_pr"
 		return $?
 		;;
 	1)
@@ -255,18 +355,79 @@ _full_loop_release_usage() {
 Usage:
   aidevops release [patch|minor|major] SOURCE_PR [incremental|full] [--expected-sources PR[,PR...]]
   aidevops release status SOURCE_PR
+  aidevops release sources SOURCE_PR
+  aidevops release reap-stale [--limit N]
+  aidevops release hold OWNER/REPO --pr N [--version vX.Y.Z] [--ttl-minutes M]
+  aidevops release unhold OWNER/REPO
+  aidevops release hold-status OWNER/REPO
+  aidevops release owner OWNER/REPO TAG --session ID
+  aidevops release owner-notify OWNER/REPO TAG [--result TEXT]
+  aidevops release duplicate-check OWNER/REPO vX.Y.Z
   aidevops release reconcile SOURCE_PR
+  aidevops release adopt-published SOURCE_PR --tag TAG
+  aidevops release recover-reservation SOURCE_PR
   aidevops release refresh-aggregate STALE_AGGREGATION_PR
-  aidevops release recover-aggregate SOURCE_PR --tag TAG --expected-sources PR[,PR...]
+  aidevops release recover-aggregate SOURCE_PR --tag TAG --expected-sources PR[,PR...] [--aggregate-commit SHA]
   aidevops release authorization-gap SOURCE_PR --tag TAG --expected-sources PR@SHA[,PR@SHA...] --reason TEXT
 
-Release publication is provenance-bound and normally unattended. `status` is
-read-only. `reconcile` verifies the newest matching signed tag, queues an
-idempotent recovery workflow when needed, and finalizes local release receipts
+Release publication is provenance-bound and normally unattended. `status` and
+`sources` are read-only. `sources` prints the verified source manifest as JSON
+for the locally fetched origin/main snapshot, without reserving a lane. Fetch
+main and tags beforehand for a current preview; later merges can change the set.
+Use expected_sources[].pr as the --expected-sources list, or include merge SHAs
+to pin it. Preview is not publication authorization. `reconcile` verifies the
+newest matching signed tag, queues an idempotent recovery workflow when needed,
+and finalizes local release receipts
 only after GitHub, npm, and Homebrew all converge. A published stale tag can be
 settled only by verified post-publication supersession; it is never redispatched.
+`recover-aggregate --aggregate-commit` pins the merge commit of a reviewed
+aggregation PR that later ordinary merges have passed; it must remain in main
+history and its immutable manifest must authorize the expected sources.
 EOF
 	return 0
+}
+
+# GH#33069 (t18554): the disposable release control worktree can inherit a
+# shallow object store from the canonical repo (older deployed copies,
+# --depth clones, or other tools). `git describe --tags` then fails inside
+# _full_loop_release_prepare_new AFTER the lane has been reserved, stranding
+# it for the five-minute recovery window. Self-heal in the control worktree —
+# never the canonical checkout — before any lane write. Modeled on
+# _check_and_handle_shallow_clone in full-loop-helper-commit.sh.
+#
+# Behaviour:
+#   AIDEVOPS_SHALLOW_UNSHALLOW=0  → print RELEASE_SHALLOW_STORE action=disabled, return 1
+#   otherwise                     → attempt `git fetch --unshallow --tags origin`
+#
+# Returns: 0 if REPO_ROOT is full-depth or was successfully unshallowed
+#          1 if shallow and auto-unshallow is disabled or failed
+_full_loop_release_ensure_full_history() {
+	local is_shallow=""
+	is_shallow=$(git -C "$REPO_ROOT" rev-parse --is-shallow-repository 2>/dev/null || echo "false")
+	if [[ "$is_shallow" != "true" ]]; then
+		return 0
+	fi
+
+	local opt="${AIDEVOPS_SHALLOW_UNSHALLOW:-1}"
+	if [[ "$opt" == "0" ]]; then
+		printf 'RELEASE_SHALLOW_STORE action=disabled\n' >&2
+		printf 'Run: git fetch --unshallow --tags origin\n' >&2
+		printf 'See .agents/reference/git-hygiene.md for recovery steps.\n' >&2
+		return 1
+	fi
+
+	if timeout_sec "${AIDEVOPS_RELEASE_UNSHALLOW_TIMEOUT_S:-600}" \
+		git -C "$REPO_ROOT" fetch --unshallow --tags origin >/dev/null 2>&1; then
+		is_shallow=$(git -C "$REPO_ROOT" rev-parse --is-shallow-repository 2>/dev/null || echo "false")
+		if [[ "$is_shallow" != "true" ]]; then
+			printf 'RELEASE_SHALLOW_STORE action=healed\n' >&2
+			return 0
+		fi
+	fi
+	printf 'RELEASE_SHALLOW_STORE action=failed\n' >&2
+	printf 'Run: git fetch --unshallow --tags origin\n' >&2
+	printf 'See .agents/reference/git-hygiene.md for recovery steps.\n' >&2
+	return 1
 }
 
 _full_loop_release_prepare_new() {
@@ -276,6 +437,11 @@ _full_loop_release_prepare_new() {
 	local resolver="$4"
 	local expected_sources="$5"
 	local phase_started=""
+	local snapshot=""
+	local base=""
+	local base_tag=""
+	local base_object=""
+	local shallow_state=""
 
 	phase_started=$(_full_loop_release_timing_start release-run-fetch-main)
 	if ! git -C "$REPO_ROOT" fetch origin main >/dev/null; then
@@ -283,19 +449,47 @@ _full_loop_release_prepare_new() {
 		return 1
 	fi
 	_full_loop_release_timing_finish release-run-fetch-main "$phase_started" ok
+	snapshot=$(jq -r '.snapshot_sha // ""' <<<"${_AIDEVOPS_RELEASE_LANE_JSON:-null}") || return 1
+	if [[ -z "$snapshot" ]]; then
+		snapshot=$(git -C "$REPO_ROOT" rev-parse 'origin/main^{commit}') || return 1
+		if ! base_tag=$(git -C "$REPO_ROOT" describe --tags --match 'v[0-9]*' --abbrev=0 "$snapshot" 2>/dev/null); then
+			shallow_state=$(git -C "$REPO_ROOT" rev-parse --is-shallow-repository 2>/dev/null || echo "unknown")
+			printf 'RELEASE_BASE_TAG_UNRESOLVED snapshot=%s shallow=%s\n' "$snapshot" "$shallow_state" >&2
+			printf 'Run: git fetch --unshallow --tags origin\n' >&2
+			return 1
+		fi
+		base=$(git -C "$REPO_ROOT" rev-parse "refs/tags/${base_tag}^{commit}") || return 1
+		base_object=$(git -C "$REPO_ROOT" rev-parse "refs/tags/${base_tag}") || return 1
+	else
+		base=$(jq -er '.snapshot_base' <<<"$_AIDEVOPS_RELEASE_LANE_JSON") || return 1
+		base_tag=$(jq -er '.snapshot_base_tag' <<<"$_AIDEVOPS_RELEASE_LANE_JSON") || return 1
+		base_object=$(jq -er '.snapshot_base_object' <<<"$_AIDEVOPS_RELEASE_LANE_JSON") || return 1
+	fi
+	[[ "$snapshot" =~ ^[0-9a-f]{40}$ ]] || return 1
+	git -C "$REPO_ROOT" merge-base --is-ancestor "$snapshot" origin/main || return 1
+	release_lane_pin_snapshot "$repo" "$source_pr" "$snapshot" "$base" "$base_tag" "$base_object" || return 1
+	AIDEVOPS_RELEASE_SNAPSHOT_SHA="$snapshot"
+	AIDEVOPS_RELEASE_SNAPSHOT_BASE="$base"
+	AIDEVOPS_RELEASE_SNAPSHOT_BASE_TAG="$base_tag"
+	AIDEVOPS_RELEASE_SNAPSHOT_BASE_OBJECT="$base_object"
+	export AIDEVOPS_RELEASE_SNAPSHOT_SHA AIDEVOPS_RELEASE_SNAPSHOT_BASE
+	export AIDEVOPS_RELEASE_SNAPSHOT_BASE_TAG AIDEVOPS_RELEASE_SNAPSHOT_BASE_OBJECT
 	phase_started=$(_full_loop_release_timing_start release-run-worktree-add)
-	if ! git -C "$REPO_ROOT" worktree add --detach "$release_path" origin/main >/dev/null; then
+	if ! worktree_create_registered "$REPO_ROOT" "$release_path" "$snapshot" --detach >/dev/null; then
 		_full_loop_release_timing_finish release-run-worktree-add "$phase_started" failed
 		return 1
 	fi
 	_full_loop_release_timing_finish release-run-worktree-add "$phase_started" ok
 	_FULL_LOOP_RELEASE_PATH="$release_path"
+	_FULL_LOOP_RELEASE_PREPARATION_PATH="$release_path"
 	trap 'cleanup_release_worktree' EXIT
 
 	phase_started=$(_full_loop_release_timing_start release-run-capture-authorization)
-	if ! _full_loop_capture_release_authorization "$repo" "$source_pr" "$release_path" "$resolver" "$expected_sources"; then
+	local authorization_rc=0
+	_full_loop_capture_release_authorization "$repo" "$source_pr" "$release_path" "$resolver" "$expected_sources" || authorization_rc=$?
+	if [[ "$authorization_rc" -ne 0 ]]; then
 		_full_loop_release_timing_finish release-run-capture-authorization "$phase_started" failed
-		return 1
+		return "$authorization_rc"
 	fi
 	_full_loop_release_timing_finish release-run-capture-authorization "$phase_started" ok
 	phase_started=$(_full_loop_release_timing_start release-run-resolve-source)
@@ -334,15 +528,28 @@ _full_loop_release_run_new() {
 	local evidence_release_type=""
 	local run_started=""
 	local phase_started=""
+	local preparation_rc=0
+	local resume_command=""
 	run_started=$(_full_loop_release_timing_start release-run-new)
 	if [[ ! -d "$worktree_base" ]]; then
 		_full_loop_release_timing_finish release-run-new "$run_started" failed
 		return 1
 	fi
 	resolver="${AIDEVOPS_FULL_LOOP_SOURCE_RESOLVER:-$release_path/.agents/scripts/release-provenance-helper.sh}"
-	if ! _full_loop_release_prepare_new "$repo" "$source_pr" "$release_path" "$resolver" "$expected_sources"; then
+	_full_loop_release_prepare_new "$repo" "$source_pr" "$release_path" "$resolver" "$expected_sources" || preparation_rc=$?
+	if [[ "$preparation_rc" -ne 0 ]]; then
 		_full_loop_release_timing_finish release-run-new "$run_started" failed
-		return 1
+		if release_lane_abandon_owned_reservation "$repo" "$source_pr"; then
+			# No publication mutation occurred; normal EXIT cleanup can remove the scratch copy.
+			_FULL_LOOP_RELEASE_PREPARATION_PATH=""
+			printf 'Untouched reservation released; refresh reviewed sources and retry the authorized release command without waiting.\n' >&2
+		elif [[ "$preparation_rc" -eq 8 ]]; then
+			resume_command="aidevops release $release_type $source_pr $deployment_scope"
+			[[ -z "$expected_sources" ]] || resume_command+=" --expected-sources $expected_sources"
+			printf 'After the guarded dead-executor window, resume with:\n  aidevops release recover-reservation %s\n  %s\n' \
+				"$source_pr" "$resume_command" >&2
+		fi
+		return "$preparation_rc"
 	fi
 
 	version_manager="${AIDEVOPS_FULL_LOOP_VERSION_MANAGER:-$release_path/.agents/scripts/version-manager.sh}"
@@ -356,6 +563,7 @@ _full_loop_release_run_new() {
 		trap - EXIT
 		cd "$release_path" || exit 1
 		AIDEVOPS_RELEASE_INTENT_TRUSTED=1 \
+			AIDEVOPS_RELEASE_SNAPSHOT_SHA="$_FULL_LOOP_RESOLVED_SOURCE_MERGE" \
 			AIDEVOPS_TRUSTED_ISSUE_PRIORITY="${AIDEVOPS_TRUSTED_ISSUE_PRIORITY:-}" \
 			AIDEVOPS_RELEASE_DEPLOY_SCOPE="$deployment_scope" \
 			bash "$version_manager" release "$release_type" --source-pr "$source_pr" \
@@ -413,10 +621,15 @@ _full_loop_release_existing_with_lane() {
 	local lane_owned=false
 	local lane_phase=""
 	existing_repo=$(_full_loop_resolve_repo "${AIDEVOPS_FULL_LOOP_REPO:-}") || return 1
+	if [[ "$release_type" == "recover-reservation" ]]; then
+		release_lane_recover_reservation "$existing_repo" "$source_pr"
+		return $?
+	fi
 	release_lane_read "$existing_repo" || lane_read_rc=$?
 	case "$lane_read_rc" in
 	0)
 		printf 'RELEASE_LANE=%s\n' "$(jq -c '{active,source_pr,phase,tag,updated_at,terminal_receipt}' <<<"$_AIDEVOPS_RELEASE_LANE_JSON")"
+		release_lane_liveness_report "$_AIDEVOPS_RELEASE_LANE_JSON"
 		if jq -e --argjson source_pr "$source_pr" '.active == true and .source_pr == $source_pr' \
 			<<<"$_AIDEVOPS_RELEASE_LANE_JSON" >/dev/null; then
 			lane_owned=true
@@ -427,13 +640,15 @@ _full_loop_release_existing_with_lane() {
 			! jq -e --argjson source_pr "$source_pr" '.active != true or .source_pr == $source_pr' \
 				<<<"$_AIDEVOPS_RELEASE_LANE_JSON" >/dev/null; then
 			printf 'A different source owns the active release lane\n' >&2
+			release_lane_owner_session_hint "$_AIDEVOPS_RELEASE_LANE_JSON" >&2
 			return 75
 		fi
 		;;
 	2) ;;
+	76) return 76 ;; # Quota diagnostic is already emitted by release_lane_read.
 	*)
 		printf 'Cannot verify repository release lane\n' >&2
-		return 1
+		return "$lane_read_rc"
 		;;
 	esac
 	if [[ "$release_type" == "$_FULL_LOOP_RELEASE_ACTION_RECONCILE" &&
@@ -463,11 +678,41 @@ _full_loop_release_existing_with_lane() {
 			"$_FULL_LOOP_AGGREGATE_RECOVERY_PHASE" | "$_AIDEVOPS_RELEASE_LANE_PHASE_AGGREGATION_REFRESH" | "$_FULL_LOOP_AGGREGATE_COMMIT_PHASE")
 				printf 'Aggregate recovery transaction remains fenced in phase %s\n' "$lane_phase"
 				;;
-			*) release_lane_update "$existing_repo" "$source_pr" "remote-publication" || return 1 ;;
+			*) release_lane_update "$existing_repo" "$source_pr" "remote-publication" "${_FULL_LOOP_RELEASE_FOUND_TAG:-}" || return 1 ;;
 			esac
 		fi
 	fi
 	return "$existing_rc"
+}
+
+#aidevops:trust-boundary
+# A competing start may complete an already-published lane, but only the
+# persisted source authorization and CAS-protected reconcile may finalize it.
+_full_loop_release_finalize_published_competing_lane() {
+	local repo="$1"
+	local state_json="$2"
+	local lane_pr=""
+	local lane_tag=""
+	local observation=""
+	jq -e '.active == true and (.source_pr | type == "number") and .source_pr > 0
+		and (.tag | type == "string" and length > 0)
+		and .terminal_receipt == null
+		and (.phase == "remote-publication" or .phase == "exact-tag-deployment")' \
+		<<<"$state_json" >/dev/null || return 1
+	observation=$(_release_lane_executor_observe "$state_json") || return 1
+	[[ "$(jq -r '.state // "unknown"' <<<"$observation")" == "dead" ]] || return 1
+	lane_pr=$(jq -r '.source_pr' <<<"$state_json") || return 1
+	lane_tag=$(jq -r '.tag' <<<"$state_json") || return 1
+	_full_loop_release_inspect_remote "$repo" "$lane_tag" || return 1
+	# Reconcile revalidates the lane's persisted authorization and tag provenance.
+	_full_loop_release_existing_with_lane reconcile "$lane_pr" || return 1
+	release_lane_read "$repo" || return 1
+	jq -e --argjson pr "$lane_pr" --arg tag "$lane_tag" '.active == false and .source_pr == $pr and .tag == $tag
+		and (.terminal_receipt == "published" or .terminal_receipt == "superseded")' \
+		<<<"$_AIDEVOPS_RELEASE_LANE_JSON" >/dev/null || return 1
+	printf 'RELEASE_LANE_FINALIZED source_pr=%s tag=%s receipt=%s\n' \
+		"$lane_pr" "$lane_tag" "$(jq -r '.terminal_receipt' <<<"$_AIDEVOPS_RELEASE_LANE_JSON")"
+	return 0
 }
 
 _full_loop_release_guard_competing_lane() {
@@ -478,15 +723,25 @@ _full_loop_release_guard_competing_lane() {
 	case "$lane_read_rc" in
 	2) return 0 ;;
 	0) ;;
-	*) return 1 ;;
+	*) return "$lane_read_rc" ;;
 	esac
 	if jq -e --argjson source_pr "$source_pr" '.active == true and .source_pr != $source_pr' \
 		<<<"$_AIDEVOPS_RELEASE_LANE_JSON" >/dev/null; then
+		if _release_lane_abandoned_reservation "$_AIDEVOPS_RELEASE_LANE_JSON"; then
+			release_lane_recover_reservation "$repo" "$(jq -r '.source_pr' <<<"$_AIDEVOPS_RELEASE_LANE_JSON")" "$_AIDEVOPS_RELEASE_LANE_HEAD"
+			return $?
+		fi
+		if _full_loop_release_finalize_published_competing_lane "$repo" "$_AIDEVOPS_RELEASE_LANE_JSON"; then
+			return 0
+		fi
+		# A failed or deferred reconcile may have changed the lane. Report the
+		# latest state when possible, but never allow this start to reserve it.
+		release_lane_read "$repo" || true
 		printf 'ACTIVE_RELEASE_LANE source_pr=%s phase=%s tag=%s\n' \
 			"$(jq -r '.source_pr' <<<"$_AIDEVOPS_RELEASE_LANE_JSON")" \
 			"$(jq -r '.phase' <<<"$_AIDEVOPS_RELEASE_LANE_JSON")" \
 			"$(jq -r '.tag // "pending"' <<<"$_AIDEVOPS_RELEASE_LANE_JSON")"
-		printf 'Resume with: aidevops release reconcile %s\n' "$(jq -r '.source_pr' <<<"$_AIDEVOPS_RELEASE_LANE_JSON")"
+		release_lane_liveness_report "$_AIDEVOPS_RELEASE_LANE_JSON"
 		return 75
 	fi
 	return 0
@@ -501,6 +756,7 @@ _full_loop_release_resolve_persisted_intent() {
 	local requested_sources="$3"
 	local persisted_sources="$4"
 	local release_type="${5:-patch}"
+	local retry_assertion="$requested_sources"
 	local persisted_prs=""
 	local requested_prs=""
 	local transaction_rc=0
@@ -514,6 +770,9 @@ _full_loop_release_resolve_persisted_intent() {
 	requested_prs=$(release_authorization_intent_json "$requested_sources" | jq -c 'map(.pr)') || return 1
 	persisted_prs=$(release_authorization_intent_json "$persisted_sources" | jq -c 'map(.pr)') || return 1
 	if [[ "$requested_prs" == "$persisted_prs" ]]; then
+		requested_sources=$(_full_loop_recovery_resolve_lane_authorization \
+			"$requested_sources" "$persisted_sources") || return 1
+		_FULL_LOOP_RESERVED_RECOVERY_EXPECTED="$requested_sources"
 		_full_loop_recovery_lane_requires_prepublication_transaction "$repo" "$source_pr" \
 			"$persisted_sources" || transaction_rc=$?
 		case "$transaction_rc" in
@@ -523,9 +782,29 @@ _full_loop_release_resolve_persisted_intent() {
 		esac
 	fi
 	_full_loop_recovery_expand_reserved_authorization "$repo" "$source_pr" "$requested_sources" \
-		"$release_type" || return $?
+		"$release_type" "$retry_assertion" || return $?
 	_FULL_LOOP_RESERVED_RECOVERY_EXPECTED="$_FULL_LOOP_AGGREGATE_RECOVERY_EXPECTED"
 	_FULL_LOOP_RESERVED_RECOVERY_COMPLETED=true
+	return 0
+}
+
+# Print executor-host guidance when an adopted lane is tagless and its
+# authorization file is absent on this host (the failed-pre-publication recovery
+# only runs where that file exists). Advisory only; never changes the exit code.
+_full_loop_release_print_foreign_host_hint() {
+	local repo="$1"
+	local source_pr="$2"
+	local release_type="$3"
+	local lane_host=""
+	local lane_tag=""
+	release_lane_read "$repo" >/dev/null 2>&1 || return 0
+	lane_tag=$(jq -r '.tag // ""' <<<"$_AIDEVOPS_RELEASE_LANE_JSON" 2>/dev/null) || return 0
+	[[ -z "$lane_tag" ]] || return 0
+	_full_loop_read_release_authorization "$repo" "$source_pr" >/dev/null 2>&1 && return 0
+	lane_host=$(jq -r '.executor.host_id // ""' <<<"$_AIDEVOPS_RELEASE_LANE_JSON" 2>/dev/null) || return 0
+	printf 'Lane has no tag and no release authorization exists on this host (executor host_id: %s).\n' "${lane_host:-unknown}"
+	printf 'Recovery of a failed pre-publication lane only works on the executor host; run there: aidevops release %s %s incremental\n' \
+		"${release_type:-patch}" "$source_pr"
 	return 0
 }
 
@@ -537,19 +816,43 @@ _full_loop_release_start_new() {
 	local expected_sources="$5"
 	local existing_state_rc=0
 	local persisted_expected=""
+	local preparing_recovery_rc=0
+	# GH#37339: reclaim leaked release checkouts before taking a new lane.
+	_full_loop_release_reap_with_lane "$repo" "${AIDEVOPS_RELEASE_REAP_LIMIT:-10}" || true
+	# Before history recovery or any lane write, prove this host can produce a
+	# GitHub-verifiable signature. Existing-tag reconciliation does not use this path.
+	release_signing_preflight "$REPO_ROOT" || return 1
 	_FULL_LOOP_RESERVED_RECOVERY_COMPLETED=false
 	_FULL_LOOP_RESERVED_RECOVERY_FAILED_PREPUBLICATION=false
+	_full_loop_release_ensure_full_history || return 1
 	_full_loop_release_guard_competing_lane "$repo" "$source_pr" || return $?
+	# A snapshot retry must not turn an implicit legacy subset into a new exact
+	# CLI assertion. The verified capture migrates compatible prior evidence.
 	if persisted_expected=$(_full_loop_read_release_authorization "$repo" "$source_pr"); then
-		_full_loop_release_resolve_persisted_intent "$repo" "$source_pr" "$expected_sources" \
-			"$persisted_expected" "$release_type" || return $?
-		expected_sources="$_FULL_LOOP_RESERVED_RECOVERY_EXPECTED"
+		if _full_loop_snapshot_retry_eligible "$repo" "$source_pr"; then
+			# Reuse, but never replace, the reviewed snapshot when the retry omitted
+			# its optional assertion. Explicit assertions remain independently checked.
+			expected_sources="${expected_sources:-$persisted_expected}"
+		else
+			_full_loop_release_resolve_persisted_intent "$repo" "$source_pr" "$expected_sources" \
+				"$persisted_expected" "$release_type" || return $?
+			expected_sources="$_FULL_LOOP_RESERVED_RECOVERY_EXPECTED"
+		fi
 	fi
-	_full_loop_release_guard_existing "$repo" "$source_pr" "${expected_sources:-$source_pr}" || existing_state_rc=$?
+	_full_loop_release_guard_existing "$repo" "$source_pr" "$expected_sources" || existing_state_rc=$?
 	case "$existing_state_rc" in
 	0) return 0 ;;
 	2) ;;
 	*) return "$existing_state_rc" ;;
+	esac
+	_full_loop_recovery_dead_preparing "$repo" "$source_pr" "$expected_sources" "$release_type" || preparing_recovery_rc=$?
+	case "$preparing_recovery_rc" in
+	0)
+		_full_loop_release_run_new "$repo" "$source_pr" "$release_type" "$deployment_scope" "$expected_sources"
+		return $?
+		;;
+	2) ;;
+	*) return "$preparing_recovery_rc" ;;
 	esac
 	if [[ "$_FULL_LOOP_RESERVED_RECOVERY_COMPLETED" == "$_FULL_LOOP_RELEASE_BOOL_TRUE" ]]; then
 		_full_loop_release_run_new "$repo" "$source_pr" "$release_type" "$deployment_scope" "$expected_sources"
@@ -558,20 +861,123 @@ _full_loop_release_start_new() {
 	release_lane_acquire "$repo" "$source_pr" "${expected_sources:-$source_pr}" || return $?
 	if [[ "$_AIDEVOPS_RELEASE_LANE_RESULT" == "adopted" ]]; then
 		printf 'Release lane already belongs to PR #%s; reconcile instead of creating another version bump\n' "$source_pr"
+		_full_loop_release_print_foreign_host_hint "$repo" "$source_pr" "$release_type"
 		return 8
 	fi
 	_full_loop_release_run_new "$repo" "$source_pr" "$release_type" "$deployment_scope" \
-		"${expected_sources:-$source_pr}"
+		"$expected_sources"
+	return $?
+}
+
+_full_loop_release_preview_sources() {
+	local source_pr="$1"
+	local tag_name="$2"
+	local gap_reason="$3"
+	local expected_sources="$4"
+	[[ "$source_pr" =~ ^[0-9]+$ && -z "$tag_name" && -z "$gap_reason" && -z "$expected_sources" ]] || return 1
+	_full_loop_release_bind_repo_context || return 1
+	(
+		cd "$REPO_ROOT" || exit 1
+		bash "${SCRIPT_DIR}/release-provenance-helper.sh" preview-sources \
+			--source-pr "$source_pr" --repo "$AIDEVOPS_FULL_LOOP_REPO" --branch main
+	)
+	return $?
+}
+
+_full_loop_release_cmd_recover_aggregate() {
+	local source_pr="$1"
+	local tag_name="$2"
+	local expected_sources="$3"
+	local aggregate_commit="$4"
+	local recovery_repo=""
+	[[ "$source_pr" =~ ^[0-9]+$ && "$tag_name" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && -n "$expected_sources" ]] || {
+		_full_loop_release_usage >&2
+		return 1
+	}
+	_full_loop_release_bind_repo_context || return 1
+	recovery_repo=$(_full_loop_resolve_repo "${AIDEVOPS_FULL_LOOP_REPO:-}") || return 1
+	_FULL_LOOP_AGGREGATE_RECOVERY_PIN="$aggregate_commit"
+	_full_loop_release_recover_aggregate "$recovery_repo" "$source_pr" "$tag_name" "$expected_sources"
+	return $?
+}
+
+_full_loop_release_cmd_authorization_gap() {
+	local source_pr="$1"
+	local tag_name="$2"
+	local expected_sources="$3"
+	local gap_reason="$4"
+	local gap_repo=""
+	[[ "$source_pr" =~ ^[0-9]+$ && -n "$tag_name" && -n "$expected_sources" && -n "$gap_reason" ]] || {
+		_full_loop_release_usage >&2
+		return 1
+	}
+	_full_loop_release_bind_repo_context || return 1
+	gap_repo=$(_full_loop_resolve_repo "${AIDEVOPS_FULL_LOOP_REPO:-}") || return 1
+	_full_loop_release_record_authorization_gap "$gap_repo" "$source_pr" "$tag_name" "$expected_sources" "$gap_reason"
+	return $?
+}
+
+_full_loop_release_cmd_reap_stale() {
+	local limit="50"
+	local reap_repo=""
+	local -a reap_args=("${@:2}")
+	local idx=0
+	while [[ "$idx" -lt "${#reap_args[@]}" ]]; do
+		case "${reap_args[$idx]}" in
+		--limit)
+			limit="${reap_args[$((idx + 1))]:-}"
+			idx=$((idx + 2))
+			;;
+		*)
+			_full_loop_release_usage >&2
+			return 1
+			;;
+		esac
+	done
+	[[ "$limit" =~ ^[0-9]+$ ]] || {
+		_full_loop_release_usage >&2
+		return 1
+	}
+	_full_loop_release_bind_repo_context || return 1
+	reap_repo=$(_full_loop_resolve_repo "${AIDEVOPS_FULL_LOOP_REPO:-}") || return 1
+	_full_loop_release_reap_with_lane "$reap_repo" "$limit"
+	return $?
+}
+
+_full_loop_release_is_manual_hold_command() {
+	local command_name="${1:-}"
+	case "$command_name" in
+	hold | unhold | hold-status | owner | owner-notify | duplicate-check) return 0 ;;
+	esac
+	return 1
+}
+
+_full_loop_release_cmd_refresh_aggregate() {
+	local source_pr="$1"
+	local successor_repo=""
+	[[ "$source_pr" =~ ^[0-9]+$ ]] || { _full_loop_release_usage >&2; return 1; }
+	_full_loop_release_bind_repo_context || return 1
+	successor_repo=$(_full_loop_resolve_repo "${AIDEVOPS_FULL_LOOP_REPO:-}") || return 1
+	_full_loop_release_refresh_aggregate "$successor_repo" "$source_pr"
 	return $?
 }
 
 main() {
+	if _full_loop_release_is_manual_hold_command "${1:-}"; then
+		"${SCRIPT_DIR}/manual-release-hold-helper.sh" "$@"
+		return $?
+	fi
+	if [[ "${1:-}" == "reap-stale" ]]; then
+		_full_loop_release_cmd_reap_stale "$@"
+		return $?
+	fi
 	local release_type="${1:-patch}"
 	local source_pr="${2:-}"
 	local deployment_scope="incremental"
 	local expected_sources="${AIDEVOPS_RELEASE_EXPECTED_SOURCES:-}"
 	local tag_name=""
 	local gap_reason=""
+	local aggregate_commit=""
 	if [[ $# -ge 2 ]]; then
 		shift 2
 	else
@@ -598,54 +1004,49 @@ main() {
 			[[ -n "$gap_reason" ]] || return 1
 			shift 2
 			;;
+		--aggregate-commit)
+			aggregate_commit="${2:-}"
+			[[ "$aggregate_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
+			shift 2
+			;;
 		*) return 1 ;;
 		esac
 	done
+	[[ -z "$aggregate_commit" || "$release_type" == "recover-aggregate" ]] || return 1
 	case "$release_type" in
 	help | --help | -h)
 		_full_loop_release_usage
 		return 0
 		;;
-	status | reconcile)
+	sources)
+		_full_loop_release_preview_sources "$source_pr" "$tag_name" "$gap_reason" "$expected_sources"
+		return $?
+		;;
+	status | reconcile | recover-reservation)
 		[[ "$source_pr" =~ ^[0-9]+$ ]] || {
 			_full_loop_release_usage >&2
 			return 1
 		}
+		[[ "$release_type" != "recover-reservation" || (-z "$tag_name" && -z "$gap_reason" && -z "$expected_sources") ]] || return 1
 		_full_loop_release_bind_repo_context || return 1
 		_full_loop_release_existing_with_lane "$release_type" "$source_pr"
 		return $?
 		;;
 	refresh-aggregate)
-		[[ "$source_pr" =~ ^[0-9]+$ ]] || {
-			_full_loop_release_usage >&2
-			return 1
-		}
-		_full_loop_release_bind_repo_context || return 1
-		local successor_repo=""
-		successor_repo=$(_full_loop_resolve_repo "${AIDEVOPS_FULL_LOOP_REPO:-}") || return 1
-		_full_loop_release_refresh_aggregate "$successor_repo" "$source_pr"
+		_full_loop_release_cmd_refresh_aggregate "$source_pr"
 		return $?
 		;;
 	recover-aggregate)
-		[[ "$source_pr" =~ ^[0-9]+$ && "$tag_name" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && -n "$expected_sources" ]] || {
-			_full_loop_release_usage >&2
-			return 1
-		}
-		_full_loop_release_bind_repo_context || return 1
-		local recovery_repo=""
-		recovery_repo=$(_full_loop_resolve_repo "${AIDEVOPS_FULL_LOOP_REPO:-}") || return 1
-		_full_loop_release_recover_aggregate "$recovery_repo" "$source_pr" "$tag_name" "$expected_sources"
+		_full_loop_release_cmd_recover_aggregate "$source_pr" "$tag_name" "$expected_sources" "$aggregate_commit"
+		return $?
+		;;
+	adopt-published)
+		[[ -z "$expected_sources" && -z "$gap_reason" ]] || return 1
+		_full_loop_release_cmd_adopt_published "$source_pr" "$tag_name"
 		return $?
 		;;
 	authorization-gap)
-		[[ "$source_pr" =~ ^[0-9]+$ && -n "$tag_name" && -n "$expected_sources" && -n "$gap_reason" ]] || {
-			_full_loop_release_usage >&2
-			return 1
-		}
-		_full_loop_release_bind_repo_context || return 1
-		local gap_repo=""
-		gap_repo=$(_full_loop_resolve_repo "${AIDEVOPS_FULL_LOOP_REPO:-}") || return 1
-		_full_loop_release_record_authorization_gap "$gap_repo" "$source_pr" "$tag_name" "$expected_sources" "$gap_reason"
+		_full_loop_release_cmd_authorization_gap "$source_pr" "$tag_name" "$expected_sources" "$gap_reason"
 		return $?
 		;;
 	esac

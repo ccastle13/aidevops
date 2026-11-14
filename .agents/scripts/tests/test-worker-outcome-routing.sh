@@ -111,6 +111,126 @@ if [[ "$(_enrichment_parse_fast_fail_key 501:owner/repo)" != $'501\towner/repo' 
 	fail "quality-debt enrichment lost legacy fast-fail key compatibility"
 fi
 
+# Exercise the real enrichment launcher and unchanged runtime env validator,
+# without contacting a model or writing a GitHub issue.
+(
+	FIXTURE_SCRIPTS="${TEST_ROOT}/fixture-scripts"
+	FIXTURE_REPO="${TEST_ROOT}/source-repo"
+	mkdir -p "$FIXTURE_SCRIPTS"
+	git clone --quiet --shared --no-checkout "${SCRIPTS_DIR}/../.." "$FIXTURE_REPO"
+	git -C "$FIXTURE_REPO" remote set-url origin https://github.com/owner/repo.git
+	export ENRICHMENT_TEST_ROOT="$TEST_ROOT" ENRICHMENT_SCRIPTS_DIR="$SCRIPTS_DIR"
+	cat >"${FIXTURE_SCRIPTS}/worktree-helper.sh" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+add)
+	[[ "${ENRICHMENT_PREPARE_FAIL:-0}" != 1 ]] || exit 1
+	git worktree add -b "$2" "${ENRICHMENT_TEST_ROOT}/${2#feature/}" HEAD
+	;;
+remove) git worktree remove "$2" ;;
+*) exit 1 ;;
+esac
+HELPER
+	cat >"${FIXTURE_SCRIPTS}/runtime.sh" <<'RUNTIME'
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$ENRICHMENT_SCRIPTS_DIR"
+source "${SCRIPT_DIR}/headless-runtime-launch.sh"
+work_dir="" session_key="" title=""
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--dir) work_dir="$2"; shift 2 ;;
+	--session-key) session_key="$2"; shift 2 ;;
+	--title) title="$2"; shift 2 ;;
+	*) shift ;;
+	esac
+done
+_validate_issue_worker_env_contract worker "$session_key" "$work_dir" "$title" 'issue #502'
+[[ "$WORKER_ISSUE_NUMBER" == 502 && "$WORKER_REPO_SLUG" == owner/repo ]]
+[[ -f "$work_dir/.git" ]]
+printf '%s\n' "$work_dir" >"${ENRICHMENT_TEST_ROOT}/launched-worktree"
+printf 'model-selection-reached\n'
+if [[ "${ENRICHMENT_RUNTIME_FAIL:-0}" == 1 ]]; then
+	printf 'discard-before-tail\n'
+	for ((i=1; i<=25; i++)); do printf 'runtime-failure-%s\n' "$i"; done
+	exit 7
+fi
+touch "${ENRICHMENT_TEST_ROOT}/guidance-added"
+RUNTIME
+	chmod +x "${FIXTURE_SCRIPTS}/worktree-helper.sh" "${FIXTURE_SCRIPTS}/runtime.sh"
+	SCRIPT_DIR="$FIXTURE_SCRIPTS"
+	HEADLESS_RUNTIME_HELPER="${FIXTURE_SCRIPTS}/runtime.sh"
+	# Exercise the non-systemd producer contract with the existing fixture.
+	uname() {
+		printf 'Darwin\n'
+		return 0
+	}
+	git() {
+		command git "$@" || return $?
+		if [[ "$*" == "-C ${FIXTURE_REPO} worktree list --porcelain" ]]; then
+			# More than a pipe buffer after the match: early awk exit used to
+			# discard the correct path when the producer received SIGPIPE.
+			local i=0
+			for ((i=0; i<4000; i++)); do
+				printf 'worktree /fixture/other-%s\nbranch refs/heads/other-%s\n\n' "$i" "$i"
+			done
+		fi
+		return 0
+	}
+	gh() {
+		printf 'brief\n'
+		[[ ! -f "${TEST_ROOT}/guidance-added" ]] || printf '## Worker Guidance\n'
+		return 0
+	}
+	prompt_file=$(mktemp)
+	_enrichment_run_worker "$prompt_file" 502 owner/repo "$FIXTURE_REPO" test/model || fail "enrichment did not pass the real env contract"
+	launched_worktree=$(<"${TEST_ROOT}/launched-worktree")
+	[[ ! -e "$prompt_file" && ! -d "$launched_worktree" ]] || fail "successful enrichment did not clean up"
+	[[ -z "$(check_worktree_owner "$launched_worktree")" ]] || fail "enrichment left registry ownership"
+	rm -f "${TEST_ROOT}/guidance-added"
+	export ENRICHMENT_RUNTIME_FAIL=1
+	prompt_file=$(mktemp)
+	enrichment_status=0
+	_enrichment_run_worker "$prompt_file" 502 owner/repo "$FIXTURE_REPO" test/model || enrichment_status=$?
+	[[ "$enrichment_status" == 1 ]] || fail "runtime failure was not reported"
+	grep -q 'runtime-failure-25' "$LOGFILE" || fail "runtime output was discarded"
+	if grep -q 'discard-before-tail\|runtime-failure-5$' "$LOGFILE"; then fail "runtime output tail was not bounded"; fi
+	launched_worktree=$(<"${TEST_ROOT}/launched-worktree")
+	[[ ! -e "$prompt_file" && ! -d "$launched_worktree" ]] || fail "failed enrichment did not clean up"
+	export ENRICHMENT_PREPARE_FAIL=1
+	prompt_file=$(mktemp)
+	enrichment_status=0
+	_enrichment_run_worker "$prompt_file" 502 owner/repo "$FIXTURE_REPO" test/model || enrichment_status=$?
+	[[ "$enrichment_status" == 2 && ! -e "$prompt_file" ]] || fail "preparation failure lost retry status or prompt cleanup"
+)
+
+# Real persistent reservation: crashes and preparation failures retain backoff
+# and consume the finite budget, even across separate dispatch calls.
+for attempt in 1 2 3; do
+	_ff_with_lock _ff_reserve_enrichment_attempt 502 owner/repo || fail "reservation failed"
+	if _ff_with_lock _ff_reserve_enrichment_attempt 502 owner/repo; then
+		fail "reservation ignored backoff or exhaustion"
+	fi
+	state=$(_ff_load)
+	jq -e --argjson attempt "$attempt" '."owner/repo/502".enrichment_attempts == $attempt' \
+		<<<"$state" >/dev/null || fail "attempt not persisted"
+	_ff_save "$(jq '."owner/repo/502".enrichment_retry_after = 0' <<<"$state")"
+done
+if _ff_with_lock _ff_reserve_enrichment_attempt 502 owner/repo; then
+	fail "fourth preparation attempt allowed"
+fi
+
+# Completion must retire either stored key form without creating missing entries.
+for stored_key in owner/repo/505 505:owner/repo; do
+	_ff_save "$(jq -nc --arg key "$stored_key" '{($key): {enrichment_needed: true}, unrelated: {enrichment_needed: true}}')"
+	_ff_with_lock _ff_mark_enrichment_done 505 owner/repo
+	_ff_load | jq -e --arg key "$stored_key" '
+		length == 2 and .[$key].enrichment_needed == false and
+		.[$key].enrichment_done == true and .unrelated.enrichment_needed == true
+	' >/dev/null || fail "enrichment completion did not retire stored key ${stored_key}"
+done
+
 ENRICHMENT_MAX_PER_CYCLE=5
 STOP_FLAG="${TEST_ROOT}/stop"
 ENRICHMENT_MODEL_CALLS="${TEST_ROOT}/enrichment-model-calls"
@@ -134,7 +254,7 @@ _enrichment_resolve_repo_path() {
 	return 0
 }
 _enrichment_fetch_issue_data() {
-	printf '%s\n' '{"title":"test","body":"brief","prior_attempt":{"effective_outcome":"failed"}}'
+	printf '%s\n' '{"title":"test","body":"brief","state":"OPEN","prior_attempt":{"effective_outcome":"failed"}}'
 	return 0
 }
 _enrichment_build_prompt() {
@@ -155,8 +275,17 @@ fi
 if [[ "$(<"$ENRICHMENT_RUN_CALLS")" != "502" ]]; then
 	fail "quality-debt enrichment routed the wrong effective outcome"
 fi
-if [[ "$(wc -l <"$ENRICHMENT_MARK_CALLS" | tr -d ' ')" != "2" ]]; then
-	fail "quality-debt enrichment did not finalize both suppressed and processed entries"
+if [[ "$(wc -l <"$ENRICHMENT_MARK_CALLS" | tr -d ' ')" != "3" ]]; then
+	fail "quality-debt enrichment did not reserve and finalize the processed entry"
 fi
+
+_enrichment_run_worker() {
+	return 2
+}
+rm -f "$ENRICHMENT_MARK_CALLS"
+remaining_slots=$(dispatch_enrichment_workers 2)
+[[ "$remaining_slots" == 1 ]] || fail "preparation failure bypassed the attempt budget"
+[[ "$(wc -l <"$ENRICHMENT_MARK_CALLS" | tr -d ' ')" == 2 ]] || fail "preparation failure reservation missing"
+if grep -q '_ff_mark_enrichment_done 502' "$ENRICHMENT_MARK_CALLS"; then fail "preparation failure was marked done"; fi
 
 printf 'PASS worker outcome routing consults reconciled dispositions\n'

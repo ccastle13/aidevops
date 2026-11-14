@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2025-2026 Marcus Quinn
 # Using /bin/bash directly (not #!/usr/bin/env bash) for compatibility with
@@ -78,6 +78,7 @@ map_tags_to_labels() {
 		local label="$tag"
 		case "$tag" in
 		bugfix | bug) label="bug" ;;
+		ops) label="chore" ;;
 		feat | feature) label="enhancement" ;;
 		hardening) label="quality" ;;
 		sync) label="git" ;;
@@ -123,13 +124,13 @@ _parent_body_has_phase_markers() {
 	# observed in the aidevops backlog (## Children most common). Accepts
 	# both `## Phases` (singular-sub-list style) and `## Phase N[: ...]`
 	# (per-phase subsection style).
-	if printf '%s' "$body" | grep -qE '^##[[:space:]]+(Children|Child [Ii]ssues|Sub-?[Tt]asks|Phases?([[:space:]]+.*)?)[[:space:]]*$' 2>/dev/null; then
+	if printf '%s' "$body" | grep -E '^##[[:space:]]+(Children|Child [Ii]ssues|Sub-?[Tt]asks|Phases?([[:space:]]+.*)?)[[:space:]]*$' >/dev/null 2>&1; then
 		return 0
 	fi
 
 	# Prose patterns — must match _extract_children_from_prose's contract
 	# byte-for-byte so this check and the reconciler agree on what counts.
-	if printf '%s' "$body" | grep -qE '(^|[^a-zA-Z0-9_])([Pp]hase[[:space:]]+[0-9]+[^#]*#[0-9]+|[Ff]iled[[:space:]]+as[[:space:]]*#[0-9]+|[Tt]racks[[:space:]]+#[0-9]+|[Bb]locked[[:space:]]-?[[:space:]]*by[[:space:]]*:?[[:space:]]*#[0-9]+)'; then
+	if printf '%s' "$body" | grep -E '(^|[^a-zA-Z0-9_])([Pp]hase[[:space:]]+[0-9]+[^#]*#[0-9]+|[Ff]iled[[:space:]]+as[[:space:]]*#[0-9]+|[Tt]racks[[:space:]]+#[0-9]+|[Bb]locked[[:space:]]-?[[:space:]]*by[[:space:]]*:?[[:space:]]*#[0-9]+)' >/dev/null; then
 		return 0
 	fi
 
@@ -401,14 +402,14 @@ _resolve_plan_context() {
 		plan_section=$(extract_plan_section "$plan_link" "$project_root")
 		if [[ -n "$plan_section" ]]; then
 			detected_plan_id=$(echo "$plan_section" | awk '
-				/^<!--TOON:plan\{/ { getline data; if (match(data, /^p[0-9]+,/)) { print substr(data, RSTART, RLENGTH-1); exit } }
+				!found && /^<!--TOON:plan\{/ { getline data; if (match(data, /^p[0-9]+,/)) { print substr(data, RSTART, RLENGTH-1); found=1 } }
 			' || true)
 		fi
 	else
 		local auto_detected
 		auto_detected=$(find_plan_by_task_id "$task_id" "$project_root")
 		if [[ -n "$auto_detected" ]]; then
-			detected_plan_id=$(echo "$auto_detected" | head -1)
+			detected_plan_id=$(echo "$auto_detected" | sed -n '1p')
 			plan_section=$(echo "$auto_detected" | tail -n +2)
 		fi
 	fi
@@ -546,8 +547,8 @@ _compose_issue_sections() {
 	fi
 
 	body=$(_compose_issue_related_files "$body" "$task_id" "$project_root") || return 1
-	body=$(_compose_issue_worker_guidance "$body" "$project_root/todo/tasks/${task_id}-brief.md")
-	body=$(_compose_issue_brief "$body" "$project_root/todo/tasks/${task_id}-brief.md")
+	body=$(_compose_issue_worker_guidance "$body" "$project_root/todo/tasks/${task_id}-brief.md") || return 1
+	body=$(_compose_issue_brief "$body" "$project_root/todo/tasks/${task_id}-brief.md") || return 1
 	body=$(_compose_issue_brief_workflow_reference "$body")
 
 	echo "$body"
@@ -595,6 +596,7 @@ _compose_issue_worker_guidance() {
 		local readiness_helper="$SCRIPT_DIR/brief-readiness-helper.sh"
 		local brief_body=""
 		brief_body=$(<"$brief_file")
+		brief_body=$(bash "$readiness_helper" scope-normalize "$brief_body") || return 1
 		if [[ -f "$readiness_helper" ]] && bash "$readiness_helper" check --body "$brief_body" >/dev/null 2>&1; then
 			promote=1
 		fi
@@ -604,7 +606,7 @@ _compose_issue_worker_guidance() {
 
 	if [[ "$promote" -eq 1 ]]; then
 		local done_when=""
-		if ! printf '%s\n' "$body" | grep -qiE '^## (Done when|Acceptance Criteria)[[:space:]]*$'; then
+		if ! printf '%s\n' "$body" | grep -iE '^## (Done when|Acceptance Criteria)[[:space:]]*$' >/dev/null; then
 			done_when=$(awk '
 				/^## Acceptance [Cc]riteria[[:space:]]*$/ { capture=1; next }
 				/^## / && capture { exit }
@@ -654,6 +656,12 @@ _compose_issue_brief() {
 		body="$body"$'\n\n'"$ISSUE_SYNC_DETAILS_OPEN"$'\n'"<summary>Full task brief and audit context</summary>"$'\n\n'"## Task Brief"$'\n\n'"$brief_content"$'\n\n'"$ISSUE_SYNC_DETAILS_CLOSE"
 	fi
 
+	# Keep composition pure: the author persists the same transformation with
+	# prepare-scope before publication. Never rewrite a mirror during body sync.
+	if printf '%s\n' "$body" | grep -iE '^#{2,3} Files (to Modify|Scope)[[:space:]]*$' >/dev/null; then
+		body=$(bash "$SCRIPT_DIR/brief-readiness-helper.sh" scope-normalize "$body") || return 1
+	fi
+
 	echo "$body"
 	return 0
 }
@@ -682,7 +690,7 @@ compose_issue_body() {
 
 	# Parse the main task line
 	local first_line
-	first_line=$(echo "$block" | head -1)
+	first_line=$(echo "$block" | sed -n '1p')
 	local parsed
 	parsed=$(parse_task_line "$first_line")
 
@@ -711,7 +719,7 @@ compose_issue_body() {
 	# _resolve_plan_context outputs: line 1 = plan ID, remaining lines = plan section.
 	local plan_context detected_plan_id plan_section
 	plan_context=$(_resolve_plan_context "$plan_link" "$task_id" "$project_root")
-	detected_plan_id=$(echo "$plan_context" | head -1)
+	detected_plan_id=$(echo "$plan_context" | sed -n '1p')
 	plan_section=$(echo "$plan_context" | tail -n +2)
 
 	# Build metadata header

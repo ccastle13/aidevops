@@ -7,11 +7,14 @@
 
 - `.agents/content/media-generation-providers.md` — Canonical hosted/local provider routing
 - `.agents/content/video-kie.md` — Kie.ai image/video/audio Market API
+- `.agents/content/video-videorouter.md` — VideoRouter cheapest-host media routing (H3, Wan, Seedance, Kling, Veo)
+- `.agents/content/video-runpod.md` — Runpod Public Endpoints and bring-your-own-model GPUs
+- `.agents/scripts/media-gen-cost-helper.sh` — API vs GPU-rental batch cost and break-even
 - `.agents/tools/video/video-prompt-design.md` — Veo 3 Meta Framework (7-component prompting)
 - `.agents/content/video-higgsfield.md` — Higgsfield API integration
 - `.agents/content/heygen-skill.md` — HeyGen Avatar API (talking-head generation)
 - `.agents/content/video-muapi.md` — MuAPI (VEED lipsync, face swap, VFX)
-- `.agents/tools/video/remotion.md` — Programmatic video editing
+- `.agents/tools/video/remotion/remotion.md` — Programmatic video editing
 - `.agents/tools/voice/voice-models.md` — TTS model comparison (ElevenLabs, MiniMax, Qwen3-TTS)
 - `.agents/tools/voice/qwen3-tts.md` — Qwen3-TTS setup and voice cloning
 - `.agents/content/production-image.md` — Image generation (Nanobanana Pro, Midjourney, Freepik)

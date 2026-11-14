@@ -10,6 +10,12 @@
       "description": "JSON Schema reference for editor autocomplete and validation."
     },
 
+    "recovery_policy": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*\\.md#[^#\\r\\n]+$",
+      "description": "Repo .aidevops.json only (GH#35129): optional repo-relative Markdown path#Exact heading declaring enabled queue recovery actions. See reference/recovery-policy.md. Loaded only from the remote default branch with maintainer access; never grants permissions."
+    },
+
     "updates": {
       "type": "object",
       "description": "Auto-update behaviour for aidevops, skills, tools, and OpenClaw.",
@@ -140,15 +146,30 @@
         },
         "max_workers_cap": {
           "type": "integer",
-          "default": 8,
-          "minimum": 1,
-          "description": "Hard ceiling for pulse worker pool size after RAM-based calculation. Env: AIDEVOPS_MAX_WORKERS_CAP"
+          "default": 0,
+          "minimum": 0,
+          "description": "Hard ceiling for pulse worker pool size after RAM-based calculation. 0 = auto ((total RAM - reserve) / per-worker RAM, min 2, max 64). Worker admission is RAM-only: CPU load and core counts never limit it (GH#35537). Env: AIDEVOPS_MAX_WORKERS_CAP"
+        },
+        "max_load_per_core": {
+          "type": "number",
+          "default": 4.0,
+          "exclusiveMinimum": 0,
+          "deprecated": true,
+          "description": "DEPRECATED (GH#35537): CPU load never gates worker admission. This field is ignored. Remove from config."
+        },
+        "cpu_idle_admit_percent": {
+          "type": "integer",
+          "default": 25,
+          "minimum": 0,
+          "maximum": 100,
+          "deprecated": true,
+          "description": "DEPRECATED (GH#35537): CPU idle never gates worker admission. This field is ignored. Remove from config."
         },
         "min_worker_concurrency": {
           "type": "integer",
           "default": 6,
           "minimum": 0,
-          "description": "Minimum active implementation-worker floor while provider/account health and host load permit. Set to 0 to disable. Env: AIDEVOPS_MIN_WORKER_CONCURRENCY"
+          "description": "Minimum active implementation-worker floor while provider/account health and RAM headroom permit. Never exceeds RAM headroom. Set to 0 to disable. Env: AIDEVOPS_MIN_WORKER_CONCURRENCY"
         },
         "quality_debt_cap_pct": {
           "type": "integer",
@@ -161,7 +182,7 @@
           "type": "integer",
           "default": 24,
           "minimum": 1,
-          "description": "Worker slots allowed per available provider OAuth account. Default 24 lets one healthy account reach the configured max worker cap unless RAM, load, provider health, rate limits, auth errors, or explicit overrides reduce capacity. Env: PULSE_PROVIDER_ACCOUNT_SLOT_MULTIPLIER"
+          "description": "Worker slots allowed per available provider OAuth account. Default 24 lets one healthy account reach the configured max worker cap unless RAM, provider health, rate limits, auth errors, or explicit overrides reduce capacity. Env: PULSE_PROVIDER_ACCOUNT_SLOT_MULTIPLIER"
         },
         "pulse_model": {
           "type": "string",
@@ -254,6 +275,36 @@
           "default": 2,
           "minimum": 1,
           "description": "Maximum simultaneous FOSS contribution workers. Env: AIDEVOPS_FOSS_MAX_CONCURRENT"
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "keywords": {
+      "type": "object",
+      "description": "Search-targets registry (context/keywords.md) hub and paid-provider budget settings.",
+      "properties": {
+        "monthly_budget_usd": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0,
+          "description": "Default paid-provider spend cap per property per month (USD). Env: AIDEVOPS_KEYWORDS_MONTHLY_BUDGET_USD"
+        },
+        "hub_slug": {
+          "type": "string",
+          "default": "",
+          "description": "Private team hub repository (owner/repo); local only. Env: AIDEVOPS_KEYWORDS_HUB_SLUG"
+        },
+        "hub_path": {
+          "type": "string",
+          "default": "",
+          "description": "Optional explicit hub checkout path. Env: AIDEVOPS_KEYWORDS_HUB_PATH"
+        },
+        "dataforseo_estimate_usd": {
+          "type": "number",
+          "default": 0.05,
+          "minimum": 0,
+          "description": "Pre-call estimate for one DataForSEO ranked-keywords call. Env: AIDEVOPS_KEYWORDS_DATAFORSEO_ESTIMATE_USD"
         }
       },
       "additionalProperties": false
@@ -481,6 +532,44 @@
               }
             }
           }
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "storage": {
+      "type": "object",
+      "description": "Worktree archive candidacy and compact-archive retention. Thresholds are hours of confirmed idle; they never bypass owner, open-PR, process, lock, marker or archive-verification guards.",
+      "properties": {
+        "worktree_archive_retention_mode": {
+          "type": "string",
+          "enum": ["off", "dry-run", "apply"],
+          "default": "dry-run",
+          "description": "Compact-archive expiry mode. dry-run reports only; apply deletes expired archives. Env: AIDEVOPS_WORKTREE_ARCHIVE_RETENTION_MODE"
+        },
+        "opencode_session_retention_days": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Permanently delete OpenCode sessions last updated more than N days ago from the active and archive DBs (default and isolated), then VACUUM. 0 (default) keeps everything; invalid values are treated as 0. Env: AIDEVOPS_OPENCODE_SESSION_RETENTION_DAYS"
+        },
+        "worktree_local_commit_archive_hours": {
+          "type": "integer",
+          "minimum": 24,
+          "default": 168,
+          "description": "Confirmed-idle hours before an abandoned worktree with local commits may be archived. Env (seconds): ORPHAN_LOCAL_COMMIT_ARCHIVE_SECS"
+        },
+        "worktree_generated_dirty_archive_hours": {
+          "type": "integer",
+          "minimum": 24,
+          "default": 168,
+          "description": "Confirmed-idle hours before a dirty generated auto/review worktree may be archived. Env (seconds): ORPHAN_GENERATED_DIRTY_ARCHIVE_SECS"
+        },
+        "worktree_unattributed_archive_hours": {
+          "type": "integer",
+          "minimum": 24,
+          "default": 336,
+          "description": "Confirmed-idle hours before an unattributed worktree with no open head PR may be archived. Env (days): WORKTREE_UNATTRIBUTED_RETENTION_DAYS"
         }
       },
       "additionalProperties": false

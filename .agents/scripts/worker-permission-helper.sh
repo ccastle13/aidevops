@@ -13,6 +13,23 @@ readonly PERMISSION_REQUEST_SCHEMA="aidevops-permission-request/v1"
 readonly PERMISSION_BLOCKER_STATUS="blocked"
 readonly PERMISSION_BLOCKER_TRUE="true"
 readonly PERMISSION_PERSISTENCE_FAILED_EVENT="permission_request_persistence_failed"
+# GH#35128: exit status of `request` when the capture is an owned temp-dir recovery.
+readonly PERMISSION_OWNED_RECOVERY_RC=3
+readonly PERMISSION_EXTERNAL_DIRECTORY="external_directory"
+
+permission_persistence_attempts() {
+	local attempts="${AIDEVOPS_PERMISSION_PERSISTENCE_ATTEMPTS:-3}"
+	[[ "$attempts" =~ ^[1-9][0-9]*$ ]] || attempts=3
+	printf '%s\n' "$attempts"
+	return 0
+}
+
+permission_persistence_retry_delay() {
+	local delay="${AIDEVOPS_PERMISSION_PERSISTENCE_RETRY_DELAY:-1}"
+	[[ "$delay" =~ ^[0-9]+$ ]] || delay=1
+	printf '%s\n' "$delay"
+	return 0
+}
 
 permission_record_blocker() {
 	local event="$1"
@@ -100,7 +117,7 @@ permission_validate_capture() {
 # metadata. Counts retain multiplicity while scalar fields stay schema-safe.
 permission_blocker_capability_json() {
 	local capture_file="$1"
-	jq -c '
+	jq -c --slurpfile policy "${SCRIPT_DIR}/../configs/worker-permission-policy.json" '
 		def counted:
 			map(strings | select(length > 0))
 			| sort
@@ -115,9 +132,41 @@ permission_blocker_capability_json() {
 			risk_level: (["critical", "high", "medium", "low"]
 				| map(. as $level | select(any($requests[]; .risk.level == $level)))
 				| .[0]),
-			grantable: all($requests[]; .risk.grantable == true)
+			grantable: all($requests[];
+				.risk.grantable == true
+				and (.permission as $permission | $policy[0].pattern_capable_permissions | index($permission) != null))
 		}
 	' "$capture_file"
+	return $?
+}
+
+# GH#35128: True when every captured request is an external_directory access to
+# a scratch/temp path (not a repo, credential, or secret location). Such requests
+# are redirected to AIDEVOPS_TEMP_DIR instead of a maintainer hold.
+# GH#35676: bash and read on tmp/temp paths are included. Such paths are
+# ephemeral and a grant binds to one expired session/worktree, so a hold could
+# never be usefully approved; owned recovery grants nothing and redispatches.
+# Caches are excluded for bash/read: they hold real dependency content and keep
+# the node_modules provisioning route and maintainer hold.
+permission_capture_is_temp_write_recovery() {
+	local capture_file="$1"
+	jq -e --arg perm "$PERMISSION_EXTERNAL_DIRECTORY" '
+		def unsafe:
+			test("(^|/)([.]ssh|[.]gnupg|[.]aws|[.]git|[.]env[^/]*|credentials[^/]*|secrets?)(/|$)|[.][.]");
+		def scratch:
+			test("(^|/)(tmp|temp|[.]cache)(/|$)") and (unsafe | not);
+		def ephemeral:
+			test("(^|/)(tmp|temp)(/|$)") and (test("/node_modules(/|$)") | not) and (unsafe | not);
+		(.requests | length > 0)
+		and all(.requests[];
+			.permission == $perm
+			and (.patterns | length > 0)
+			and (
+				((.tool // "" | test("^(write|edit)$")) and all(.patterns[]; scratch))
+				or ((.tool // "" | test("^(bash|read)$")) and all(.patterns[]; ephemeral))
+			)
+		)
+	' "$capture_file" >/dev/null 2>&1
 	return $?
 }
 
@@ -208,12 +257,24 @@ permission_request_already_posted() {
 	return $?
 }
 
+permission_issue_has_block() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local issue_json=""
+	issue_json=$(gh_issue_view "$issue_number" --repo "$repo_slug" --json labels 2>/dev/null) || return 1
+	jq -e '
+		([.labels[]?.name] | index("needs-maintainer-permissions") != null)
+		and ([.labels[]?.name] | index("status:blocked") != null)
+	' <<<"$issue_json" >/dev/null 2>&1
+	return $?
+}
+
 permission_render_capabilities() {
 	local envelope_file="$1"
-	jq -r '.capabilities[] |
+	jq -r --arg perm "$PERMISSION_EXTERNAL_DIRECTORY" '.capabilities[] |
 		def safe: gsub("<"; "&lt;") | gsub(">"; "&gt;");
 		def avoidable_tool_bin_read:
-			.permission == "external_directory"
+			.permission == $perm
 			and .tool == "read"
 			and any(.patterns[]?; test("/[.](bun|qlty)/bin/[*][*]?$|/[.]local/bin/[*][*]?$"));
 		"- **" + .permission + "** via `" + .tool + "` — "
@@ -221,9 +282,71 @@ permission_render_capabilities() {
 		+ "\n  - Reason: " + (if .intent == "" then "No additional model rationale was available." else (.intent | safe) end)
 		+ "\n  - Risk: **" + .risk.level + "** — " + (.risk.reason | safe)
 		+ (if avoidable_tool_bin_read then "\n  - Recovery: Routine tool discovery should use `command -v TOOL`, `TOOL --version`, or a repository wrapper instead of reading the install directory." else "" end)
+		+ (if .permission == $perm and .tool == "read"
+			and (.patterns | length > 0) and all(.patterns[]; contains("/node_modules/"))
+			then "\n  - Owned recovery: The AI controller should evaluate bounded in-worktree dependency provisioning (`reference/dispatch-blockers.md`). This is a candidate, not permission to read or copy the requested external path. Preserve this request, branch, PR and session; prove the original process terminal or transfer ownership before provisioning. The current signed permission-history contract has no unsigned supersession path: retain the hold and route this exact checkpoint to the existing AI brief owner/coordinator. Never retry the denied tool, clear the hold, or launch a replacement worker under an implied grant."
+			else "" end)
 		+ (if .risk.grantable then "" else "\n  - **Not grantable:** sensitive scope requires an alternative approach." end)' \
 		"$envelope_file"
 	return $?
+}
+
+#######################################
+# GH#34040: Render commit durability from runtime evidence. Preservation is
+# claimed only for a pushed branch or a verified recovery bundle.
+# Args: $1=durability token from the headless runtime (may be empty)
+#######################################
+permission_durability_text() {
+	local durability="$1"
+	local value="${durability#*:}"
+	local home_label='~'
+	value="${value//\`/}"
+	value="${value//$'\n'/ }"
+	if [[ -n "${HOME:-}" && "$value" == "${HOME}/"* ]]; then
+		value="${home_label}${value#"${HOME}"}"
+	fi
+	case "$durability" in
+	none)
+		printf '%s\n' "**Commit durability:** no unpushed commits were present."
+		;;
+	pushed:?*)
+		printf '%s\n' "**Commit durability:** committed work is pushed to \`origin/${value}\`."
+		;;
+	bundle:?*)
+		printf '%s\n' "**Commit durability:** the branch push failed; unpushed commits are in a verified recovery bundle at \`${value}\`."
+		;;
+	work_lost)
+		printf '%s\n' "**Commit durability: work_lost** — unpushed commits could not be pushed or bundled and are not durably preserved."
+		;;
+	*)
+		printf '%s\n' "**Commit durability:** not verified by the runtime; do not assume unpushed commits survive worktree cleanup."
+		;;
+	esac
+	return 0
+}
+
+permission_approval_text() {
+	local capture_file="$1"
+	local issue_number="$2"
+	local repo_slug="$3"
+	if [[ "$(permission_blocker_capability_json "$capture_file" | jq -r '.grantable')" == "$PERMISSION_BLOCKER_TRUE" ]]; then
+		printf '%s\n' "Review the exact scope above, then run:
+
+    sudo aidevops approve permissions issue ${issue_number} ${repo_slug} --request REQUEST_ID
+
+This signs only the listed capabilities for this issue. It does not approve the issue scope, clear needs-maintainer-review, or authorize merge/release.
+
+To decline instead (for example, the requesting session has ended), sign a withdrawal that grants nothing and lets dispatch resume without this capability:
+
+    sudo aidevops approve permissions issue ${issue_number} ${repo_slug} --request REQUEST_ID --withdraw"
+	else
+		printf '%s\n' "permission_non_grantable: this request cannot be represented as a scoped maintainer grant. For task denials, the owning agent's static subagent allowlist/routing must be corrected; signing a permission grant cannot override it. Other non-grantable capabilities require an authorized alternative, not a signature.
+
+If this request holds dispatch, release it with a signed withdrawal that grants nothing:
+
+    sudo aidevops approve permissions issue ${issue_number} ${repo_slug} --request REQUEST_ID --withdraw"
+	fi
+	return 0
 }
 
 permission_post_request() {
@@ -232,12 +355,18 @@ permission_post_request() {
 	local repo_slug="$3"
 	local session_key="$4"
 	local work_dir="$5"
+	local durability="${6:-}"
 	local envelope_file comment_file request_id capability_text changed_text branch resume_json target worker_session
+	local durability_text="" approval_text heading="Maintainer permission required"
+	approval_text=$(permission_approval_text "$capture_file" "$issue_number" "$repo_slug") || return 1
+	[[ "$approval_text" != permission_non_grantable:* ]] || heading="Non-grantable permission blocker"
+	durability_text=$(permission_durability_text "$durability")
 	envelope_file=$(mktemp)
 	comment_file=$(mktemp)
 	resume_json=$(permission_issue_resume_json "$issue_number" "$repo_slug")
 	permission_build_envelope "$capture_file" "$issue_number" "$repo_slug" "$session_key" "$work_dir" "$resume_json" >"$envelope_file"
 	request_id=$(jq -r '.request_id' "$envelope_file")
+	approval_text="${approval_text//REQUEST_ID/$request_id}"
 	if permission_request_already_posted "$issue_number" "$repo_slug" "$request_id"; then
 		rm -f "$envelope_file" "$comment_file"
 		printf '%s\n' "$request_id"
@@ -257,7 +386,7 @@ permission_post_request() {
 	worker_session=$(jq -r '.worker.session // "not available"' "$envelope_file")
 	cat >"$comment_file" <<EOF
 ${PERMISSION_REQUEST_MARKER}
-## Maintainer permission required
+## ${heading}
 
 Background work paused instead of waiting indefinitely for an unavailable interactive permission response.
 
@@ -279,24 +408,34 @@ ${capability_text}
 
 ${changed_text}
 
-The worktree and OpenCode session are preserved for continuation. Paths are home/worktree-normalized, credential-like values are redacted, and raw tool metadata is intentionally omitted.
+${durability_text}
+
+Paths are home/worktree-normalized, credential-like values are redacted, and raw tool metadata is intentionally omitted.
 
 ### Approval
 
-Review the exact scope above, then run:
-
-    sudo aidevops approve permissions issue ${issue_number} ${repo_slug} --request ${request_id}
-
-This signs only the listed capabilities for this issue. It does not approve the issue scope, clear needs-maintainer-review, or authorize merge/release.
+${approval_text}
 
 ~~~json
 $(jq . "$envelope_file")
 ~~~
 EOF
-	if ! gh_issue_comment "$issue_number" --repo "$repo_slug" --body-file "$comment_file" >/dev/null; then
-		rm -f "$envelope_file" "$comment_file"
-		return 1
-	fi
+	local attempt=1 attempts delay
+	attempts=$(permission_persistence_attempts)
+	delay=$(permission_persistence_retry_delay)
+	while ! gh_issue_comment "$issue_number" --repo "$repo_slug" --body-file "$comment_file" >/dev/null; do
+		# A timed-out write may still have reached GitHub. Verify before retrying so
+		# request-specific evidence remains exactly-once.
+		if permission_request_already_posted "$issue_number" "$repo_slug" "$request_id"; then
+			break
+		fi
+		if [[ "$attempt" -ge "$attempts" ]]; then
+			rm -f "$envelope_file" "$comment_file"
+			return 1
+		fi
+		attempt=$((attempt + 1))
+		[[ "$delay" -eq 0 ]] || sleep "$delay"
+	done
 	rm -f "$envelope_file" "$comment_file"
 	printf '%s\n' "$request_id"
 	return 0
@@ -305,17 +444,79 @@ EOF
 permission_apply_block() {
 	local issue_number="$1"
 	local repo_slug="$2"
-	gh_issue_edit_safe "$issue_number" --repo "$repo_slug" \
-		--add-label "needs-maintainer-permissions" \
-		--remove-label "status:queued" \
-		--remove-label "status:claimed" \
-		--remove-label "status:in-progress" \
-		--remove-label "status:in-review" >/dev/null
+	local attempt=1 attempts delay
+	attempts=$(permission_persistence_attempts)
+	delay=$(permission_persistence_retry_delay)
+	permission_issue_has_block "$issue_number" "$repo_slug" && return 0
+	while true; do
+		if gh_issue_edit_safe "$issue_number" --repo "$repo_slug" \
+			--add-label "needs-maintainer-permissions" \
+			--add-label "status:blocked" \
+			--remove-label "status:queued" \
+			--remove-label "status:claimed" \
+			--remove-label "status:in-progress" \
+			--remove-label "status:in-review" >/dev/null; then
+			return 0
+		fi
+		# Re-read after an ambiguous failure. A successful first write must not be
+		# repeated merely because the response was lost.
+		permission_issue_has_block "$issue_number" "$repo_slug" && return 0
+		[[ "$attempt" -lt "$attempts" ]] || return 1
+		attempt=$((attempt + 1))
+		[[ "$delay" -eq 0 ]] || sleep "$delay"
+	done
+}
+
+readonly PERMISSION_CANONICAL_REDIRECT_RC=3
+readonly PERMISSION_CANONICAL_REDIRECT_TEXT="Canonical checkouts are not grantable to workers. Read the same tracked path in your own worktree; install dependencies worktree-locally."
+
+# Succeeds when every captured pattern targets a registered canonical checkout
+# path from repos.json (GH#35139). Patterns are home-sanitized (~/...) in the
+# capture, so both sides are normalized to ~-relative form before comparing.
+permission_targets_canonical_checkout() {
+	local capture_file="$1"
+	local repos_file="${AIDEVOPS_REPOS_FILE:-${REPOS_JSON:-${HOME}/.config/aidevops/repos.json}}"
+	[[ -f "$repos_file" ]] || return 1
+	jq -e -n --arg home "$HOME" --slurpfile repos "$repos_file" --slurpfile capture "$capture_file" '
+		def norm: sub("^" + $home; "~") | sub("/(\\*+)?$"; "") | sub("/\\*+$"; "");
+		def canon: [($repos[0].initialized_repos // [])[] | .path | strings | norm | select(length > 1)];
+		canon as $roots
+		| [$capture[0].requests[].patterns[]?] as $patterns
+		| ($patterns | length) > 0
+		and all($patterns[]; . as $p | ($p | norm) as $n
+			| ($n | contains("/../") | not)
+			and any($roots[]; . as $r | $n == $r or ($n | startswith($r + "/"))))
+	' >/dev/null 2>&1
 	return $?
 }
 
+permission_write_pending_marker() {
+	local work_dir="$1"
+	local issue_number="$2"
+	local repo_slug="$3"
+	local session_key="$4"
+	local request_id="$5"
+	[[ -n "$work_dir" && -d "$work_dir" ]] || return 0
+	local git_dir="" pending_file=""
+	if ! git_dir=$(git -C "$work_dir" rev-parse --absolute-git-dir 2>/dev/null); then
+		permission_record_blocker "$PERMISSION_PERSISTENCE_FAILED_EVENT" "$PERMISSION_BLOCKER_STATUS" \
+			"git_directory_lookup_failed" "$PERMISSION_BLOCKER_TRUE" "$issue_number" "$repo_slug" "$session_key" "$request_id" \
+			"Permission pending marker location could not be resolved"
+		return 1
+	fi
+	pending_file="${git_dir}/aidevops-permission-pending"
+	if ! jq -cn --arg request "$request_id" --arg issue "$issue_number" --arg session "$session_key" \
+		'{request_id: $request, issue: ($issue | tonumber), session: $session}' >"$pending_file"; then
+		permission_record_blocker "$PERMISSION_PERSISTENCE_FAILED_EVENT" "$PERMISSION_BLOCKER_STATUS" \
+			"pending_marker_write_failed" "$PERMISSION_BLOCKER_TRUE" "$issue_number" "$repo_slug" "$session_key" "$request_id" \
+			"Permission pending marker could not be persisted"
+		return 1
+	fi
+	return 0
+}
+
 cmd_request() {
-	local capture_file="" issue_number="" repo_slug="" session_key="" work_dir=""
+	local capture_file="" issue_number="" repo_slug="" session_key="" work_dir="" durability=""
 	local request_id="" capability_json="" permission="" tool="" risk_level="" grantable=""
 	while [[ $# -gt 0 ]]; do
 		local arg="$1"
@@ -340,6 +541,10 @@ cmd_request() {
 			work_dir="${2:-}"
 			shift 2
 			;;
+		--durability)
+			durability="${2:-}"
+			shift 2
+			;;
 		*)
 			printf 'Unknown option: %s\n' "$arg" >&2
 			return 1
@@ -353,12 +558,37 @@ cmd_request() {
 			"Captured permission request failed validation"
 		return 1
 	fi
+	if permission_targets_canonical_checkout "$capture_file"; then
+		permission_record_blocker "permission_request_redirected" "redirected" \
+			"canonical_checkout_redirect" "false" "$issue_number" "$repo_slug" "$session_key" "" \
+			"$PERMISSION_CANONICAL_REDIRECT_TEXT"
+		printf '%s\n' "$PERMISSION_CANONICAL_REDIRECT_TEXT"
+		return "$PERMISSION_CANONICAL_REDIRECT_RC"
+	fi
 	capability_json="$(permission_blocker_capability_json "$capture_file")" || return 1
+	if permission_capture_is_temp_write_recovery "$capture_file"; then
+		permission_record_blocker "permission_temp_dir_recovery" "recovering" \
+			"use_aidevops_temp_dir" "false" "$issue_number" "$repo_slug" "$session_key" "" \
+			"Temp/scratch access redirected to AIDEVOPS_TEMP_DIR; no maintainer approval requested" \
+			"$PERMISSION_EXTERNAL_DIRECTORY" "$(jq -r '.tool' <<<"$capability_json")" \
+			"$(jq -r '.risk_level' <<<"$capability_json")" "false"
+		# shellcheck disable=SC2016 # Markdown backticks are intentional literals.
+		printf '%s\n' 'Recovery: use `AIDEVOPS_TEMP_DIR` (default `$HOME/.aidevops/.agent-workspace/tmp`) for temp artifacts. The requested path is not granted; no needs-maintainer-permissions hold applied.'
+		return "$PERMISSION_OWNED_RECOVERY_RC"
+	fi
 	permission="$(jq -r '.permission' <<<"$capability_json")"
 	tool="$(jq -r '.tool' <<<"$capability_json")"
 	risk_level="$(jq -r '.risk_level' <<<"$capability_json")"
 	grantable="$(jq -r '.grantable' <<<"$capability_json")"
-	if ! request_id=$(permission_post_request "$capture_file" "$issue_number" "$repo_slug" "$session_key" "$work_dir"); then
+	if [[ "$grantable" != "true" ]]; then
+		permission_post_request "$capture_file" "$issue_number" "$repo_slug" "$session_key" "$work_dir" "$durability" >/dev/null || return 1
+		permission_record_blocker "permission_request_non_grantable" "$PERMISSION_BLOCKER_STATUS" \
+			"permission_non_grantable" "$PERMISSION_BLOCKER_TRUE" "$issue_number" "$repo_slug" "$session_key" "" \
+			"Permission request is not grantable; task denials require owning agent allowlist/routing correction" \
+			"$permission" "$tool" "$risk_level" "$grantable"
+		return 1
+	fi
+	if ! request_id=$(permission_post_request "$capture_file" "$issue_number" "$repo_slug" "$session_key" "$work_dir" "$durability"); then
 		permission_record_blocker "$PERMISSION_PERSISTENCE_FAILED_EVENT" "$PERMISSION_BLOCKER_STATUS" \
 			"github_request_comment_failed" "$PERMISSION_BLOCKER_TRUE" "$issue_number" "$repo_slug" "$session_key" "" \
 			"Maintainer permission request comment could not be persisted"
@@ -370,23 +600,7 @@ cmd_request() {
 			"Maintainer permission blocker label could not be persisted"
 		return 1
 	fi
-	if [[ -n "$work_dir" && -d "$work_dir" ]]; then
-		local git_dir="" pending_file=""
-		if ! git_dir=$(git -C "$work_dir" rev-parse --absolute-git-dir 2>/dev/null); then
-			permission_record_blocker "$PERMISSION_PERSISTENCE_FAILED_EVENT" "$PERMISSION_BLOCKER_STATUS" \
-				"git_directory_lookup_failed" "$PERMISSION_BLOCKER_TRUE" "$issue_number" "$repo_slug" "$session_key" "$request_id" \
-				"Permission pending marker location could not be resolved"
-			return 1
-		fi
-		pending_file="${git_dir}/aidevops-permission-pending"
-		if ! jq -cn --arg request "$request_id" --arg issue "$issue_number" --arg session "$session_key" \
-			'{request_id: $request, issue: ($issue | tonumber), session: $session}' >"$pending_file"; then
-			permission_record_blocker "$PERMISSION_PERSISTENCE_FAILED_EVENT" "$PERMISSION_BLOCKER_STATUS" \
-				"pending_marker_write_failed" "$PERMISSION_BLOCKER_TRUE" "$issue_number" "$repo_slug" "$session_key" "$request_id" \
-				"Permission pending marker could not be persisted"
-			return 1
-		fi
-	fi
+	permission_write_pending_marker "$work_dir" "$issue_number" "$repo_slug" "$session_key" "$request_id" || return 1
 	permission_record_blocker "permission_awaiting_approval" "$PERMISSION_BLOCKER_STATUS" \
 		"needs_maintainer_permissions" "$PERMISSION_BLOCKER_TRUE" "$issue_number" "$repo_slug" "$session_key" "$request_id" \
 		"Worker paused until the exact scoped permission request is approved" \
@@ -394,13 +608,40 @@ cmd_request() {
 	return 0
 }
 
+cmd_block() {
+	local issue_number="" repo_slug=""
+	while [[ $# -gt 0 ]]; do
+		local arg="$1"
+		case "$arg" in
+		--issue)
+			issue_number="${2:-}"
+			shift 2
+			;;
+		--repo)
+			repo_slug="${2:-}"
+			shift 2
+			;;
+		*)
+			printf 'Unknown option: %s\n' "$arg" >&2
+			return 1
+			;;
+		esac
+	done
+	[[ "$issue_number" =~ ^[0-9]+$ && "$repo_slug" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+	permission_apply_block "$issue_number" "$repo_slug"
+	return $?
+}
+
 main() {
 	local command="${1:-help}"
 	shift 2>/dev/null || true
 	case "$command" in
 	request) cmd_request "$@" ;;
+	block) cmd_block "$@" ;;
 	*)
-		printf 'Usage: worker-permission-helper.sh request --file FILE --issue N --repo OWNER/REPO --session KEY --work-dir PATH\n' >&2
+		printf '%s\n' \
+			'Usage: worker-permission-helper.sh request --file FILE --issue N --repo OWNER/REPO --session KEY --work-dir PATH [--durability TOKEN]' \
+			'       worker-permission-helper.sh block --issue N --repo OWNER/REPO' >&2
 		return 1
 		;;
 	esac

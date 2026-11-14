@@ -11,10 +11,20 @@ subagents:
   - production-video
   - production-audio
   - production-characters
+  - blender
+  - affinity
+  - freecad
+  - ableton
+  - davinci-resolve
   - media-generation-providers
+  - gemini-image
+  - gemini-video
+  - gemini-music
   - video-higgsfield
   - video-kie
   - video-runway
+  - video-videorouter
+  - video-runpod
   - video-wavespeed
   - video-enhancor
   - video-real-video-enhancer
@@ -60,6 +70,8 @@ Content agent. Domain: blog, video, social, newsletters, podcasts, short-form, A
 - **Architecture**: Research -> Story -> multi-media production -> channel adaptation; final textual product copy -> batched Humanise, while non-text assets bypass it
 - **Multiplier**: One researched story -> 10+ outputs across media types and channels
 - **PR handoff**: `pr.md` owns earned-media judgment, journalist lists, and pitch critique. Content turns approved PR angles into owned-channel assets after PR validates newsworthiness and standing.
+- **Focused creative work**: `3d-modelling.md`, `video.md`, and `audio.md` own editable production work. Use their shared app specialists and `workflows/creative-production.md`; do not copy this whole distribution pipeline into modelling/editing tasks.
+- **Evidence handoff**: `/marketing-decisions` turns imported evidence into bounded content-disposition or creative proposals. It complements this pipeline rather than duplicating strategy, and never publishes or activates a provider.
 
 ```text
                     Research
@@ -146,6 +158,8 @@ For an end-to-end cross-owner campaign lifecycle, use
 owner's reviewed evidence to the growth checkpoint. The campaign growth workflow
 coordinates state and recovery; it does not bypass creative or publishing approval.
 
+For evidence-backed disposition or creative review, pass the bounded proposal through `workflows/marketing-decisions.md`, then return accepted work to this production pipeline. Reports and dry-run action plans are handoffs, not publication or approval.
+
 ```bash
 content-fanout-helper.sh template default   # Brief template
 content-fanout-helper.sh plan ~/brief.md    # Generate fan-out plan
@@ -159,7 +173,7 @@ content-fanout-helper.sh run <plan-file>    # Execute (also: channels, status, e
 | Domain | References |
 |--------|-----------|
 | Research | `tools/context/context7.md`, `tools/browser/crawl4ai.md`, `seo/google-search-console.md`, `seo/dataforseo.md` |
-| Video | `content/media-generation-providers.md`, `content/video-kie.md`, `content/video-higgsfield.md`, `tools/video/video-prompt-design.md` |
+| Video | `content/media-generation-providers.md`, `content/gemini-video.md`, `content/video-kie.md`, `content/video-videorouter.md`, `content/video-runpod.md`, `content/video-higgsfield.md`, `tools/video/video-prompt-design.md`, `media-gen-cost-helper.sh` |
 | Voice | `tools/voice/speech-to-speech.md`, `voice-helper.sh` |
 | SEO/Blog | `seo/`, `content/seo-writer.md`, `content/editor.md`, `content/meta-creator.md`, `content/internal-linker.md` |
 | Social | `content/social-algorithms.md` (recommendation guidance), `content/social-xurl.md` (X), `content/social-linkedin.md`, `content/social-reddit.md` |

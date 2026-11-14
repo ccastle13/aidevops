@@ -114,12 +114,52 @@ if [[ "$(grep -c 'deterministic_merge_pass timing: repo=' "$LOGFILE")" -ne 2 ]];
 fi
 
 for repo in owner/alpha owner/beta; do
-  if ! grep -qE "deterministic_merge_pass timing: repo=${repo} .*list_s=[0-9]+ .*mergeability_s=[0-9]+ .*ruleset_s=[0-9]+ .*branch_protection_s=[0-9]+ .*stuck_detector_s=[0-9]+" "$LOGFILE"; then
+	if ! grep -qE "deterministic_merge_pass timing: repo=${repo} .*list_s=[0-9]+ list_state=complete .*mergeability_s=[0-9]+ .*ruleset_s=[0-9]+ .*branch_protection_s=[0-9]+ .*stuck_detector_s=[0-9]+" "$LOGFILE"; then
     printf 'FAIL: missing structured timing summary for %s\n' "$repo"
     cat "$LOGFILE"
     exit 1
   fi
 done
+
+LIST_TIMEOUT_FILE="${TEST_ROOT}/list-timeout"
+pulse_pr_list_get() {
+	printf '%s' "${AIDEVOPS_GH_READ_TIMEOUT:-unset}" >"$LIST_TIMEOUT_FILE"
+	printf '%s' 'request timed out' >&2
+	return 124
+}
+failed_merged=0 failed_closed=0 failed_count=0 failed_pr_count=0
+failed_list_s=0 failed_list_state="complete"
+_merge_ready_prs_for_repo "owner/failure" failed_merged failed_closed failed_count failed_pr_count "failed_"
+if [[ "$(<"$LIST_TIMEOUT_FILE")" != "45" ]]; then
+	printf 'FAIL: merge PR list did not receive its list-specific 45s timeout\n'
+	exit 1
+fi
+if [[ "$failed_list_state" != "incomplete" || "$failed_pr_count" -ne 0 ]]; then
+	printf 'FAIL: failed PR list was not recorded as incomplete with zero observed PRs\n'
+	exit 1
+fi
+_pmp_log_repo_timing_summary "owner/failure" 0 "$failed_list_s" 0 0 0 0 0 0 0 "$failed_pr_count" "$failed_list_state"
+if ! grep -q 'deterministic_merge_pass timing: repo=owner/failure .*list_state=incomplete' "$LOGFILE"; then
+	printf 'FAIL: missing explicit incomplete PR-list timing telemetry\n'
+	exit 1
+fi
+
+_pmp_now_epoch() { printf '100'; }
+_pmp_now_epoch_into() { printf -v "$1" '%s' "$(_pmp_now_epoch)"; return 0; }
+_PMP_MERGE_PASS_DEADLINE_EPOCH=110
+if [[ "$(_pmp_merge_pr_list_timeout_seconds)" != "10" ]]; then
+	printf 'FAIL: PR-list timeout was not clamped to the remaining pass deadline\n'
+	exit 1
+fi
+rm -f "$LIST_TIMEOUT_FILE"
+_PMP_MERGE_PASS_DEADLINE_EPOCH=100
+expired_rc=0
+_merge_ready_prs_for_repo "owner/expired" failed_merged failed_closed failed_count failed_pr_count "failed_" || expired_rc=$?
+if [[ "$expired_rc" -ne 5 || -f "$LIST_TIMEOUT_FILE" || "$failed_list_state" != "incomplete" ]]; then
+	printf 'FAIL: expired deadline did not pause before the PR-list provider call\n'
+	exit 1
+fi
+_PMP_MERGE_PASS_DEADLINE_EPOCH=0
 
 if ! grep -q 'deterministic_merge_pass timing: total_s=' "$LOGFILE"; then
   printf 'FAIL: missing overall deterministic_merge_pass timing summary\n'
@@ -136,6 +176,61 @@ unset_accumulator_regression() {
 
 if ! unset_accumulator_regression; then
   printf 'FAIL: declared-but-unset timing accumulator was not initialized safely\n'
+  exit 1
+fi
+
+# Exercise the shared final gate, so every call site inherits cumulative timing
+# without relying on a caller-specific timer or wall-clock sleeps.
+final_gate_timing_regression() {
+  local timing_prefix="gate_" gate_trust_gate_s=0 fake_epoch=100
+  local failure="" rc=0
+  local pr_number=7 repo_slug="owner/repo" pr_head_ref_oid="sha-reviewed"
+  local linked_issue=101 pr_labels="origin:worker" pr_updated_at=""
+  local route_calls=0 routed_evidence=""
+  local fresh_evidence='[{"name":"current-check","bucket":"fail"}]'
+  _pmp_now_epoch() { printf '%s' "$fake_epoch"; return 0; }
+  _pmp_now_epoch_into() { printf -v "$1" '%s' "$fake_epoch"; return 0; }
+  _pulse_merge_admin_safety_check() { fake_epoch=$((fake_epoch + 1)); [[ "$failure" != authority ]]; return $?; }
+  _pulse_merge_refresh_review_gate_evidence() { fake_epoch=$((fake_epoch + 1)); [[ "$failure" != review ]]; return $?; }
+  worker_briefed_trust_verdict() { fake_epoch=$((fake_epoch + 1)); [[ "$failure" != worker ]]; return $?; }
+  _pulse_merge_preflight_snapshot_gate() {
+    fake_epoch=$((fake_epoch + 1))
+    if [[ "$failure" == snapshot ]]; then
+      _PULSE_MERGE_PREFLIGHT_BLOCKING_CHECKS_JSON="$fresh_evidence"
+      return 1
+    fi
+    return 0
+  }
+  _pulse_merge_maybe_dispatch_preflight_remediation() { return 0; }
+  _route_pr_to_fix_worker() { local checks_json="${9:-}"; route_calls=$((route_calls + 1)); routed_evidence="$checks_json"; return 0; }
+  for failure in authority review worker snapshot; do
+    _PULSE_MERGE_PREFLIGHT_BLOCKING_CHECKS_JSON='[{"name":"previous-pr-check","bucket":"fail"}]'
+    rc=0
+    _pmp_admin_final_gate_or_route || rc=$?
+    [[ "$rc" -eq 1 ]] || return 1
+    if [[ "$failure" != snapshot ]]; then
+      [[ "$_PULSE_MERGE_PREFLIGHT_BLOCKING_CHECKS_JSON" == "[]" && "$route_calls" -eq 0 ]] || return 1
+    else
+      [[ "$route_calls" -eq 1 && "$routed_evidence" == "$fresh_evidence" ]] || return 1
+    fi
+  done
+  [[ "$gate_trust_gate_s" -eq 10 ]] || return 1
+  failure=""
+  _pulse_merge_final_trust_gate 7 owner/repo sha-reviewed || return 1
+  [[ "$gate_trust_gate_s" -eq 14 ]] || return 1
+  # A real native-auto enable uses the same shared timer.
+  _PULSE_FINAL_REQUIRES_SYNCHRONOUS_MERGE=0
+  _enable_native_auto_merge_for_head 7 owner/repo sha-reviewed 1 || return 1
+  [[ "$gate_trust_gate_s" -eq 18 ]] || return 1
+  # Disabling telemetry must not change authorization or add elapsed time.
+  timing_prefix=""
+  _pulse_merge_final_trust_gate 7 owner/repo sha-reviewed || return 1
+  [[ "$gate_trust_gate_s" -eq 18 ]] || return 1
+  return 0
+}
+
+if ! (final_gate_timing_regression); then
+  printf 'FAIL: final-gate cumulative timing or stale-evidence isolation regressed\n'
   exit 1
 fi
 

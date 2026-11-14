@@ -7,6 +7,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { PRICING_VERSION } from "../observability-pricing.mjs";
 import {
   consumeRoutingDecision,
   recordRoutingDecision as queueRoutingDecision,
@@ -49,17 +50,29 @@ test("routing populations remain disjoint across execution contexts", () => {
 
 test("completed child responses join queued routing decisions to parent feedback", async () => {
   const root = mkdtempSync(join(tmpdir(), "aidevops-routing-join-"));
+  const previousHeadless = process.env.AIDEVOPS_HEADLESS;
+  const previousTier = process.env.AIDEVOPS_DISPATCH_TIER;
+  delete process.env.AIDEVOPS_HEADLESS;
+  delete process.env.AIDEVOPS_DISPATCH_TIER;
   process.env.AIDEVOPS_OBS_DB_OVERRIDE = join(root, "llm-requests.db");
   const observability = await import(`../observability.mjs?routing-join=${Date.now()}`);
   const sqlite = await import("../../../scripts/sqlite-process.mjs");
 
   try {
     assert.equal(observability.initObservability({ aidevopsVersion: "3.32.240" }), true);
+    observability.handleEvent({
+      event: {
+        type: "message.updated",
+        properties: { info: { id: "root-request", sessionID: "root-session", role: "user" } },
+      },
+    });
     observability.recordRoutingDecision("child-session", {
       parentSessionID: "root-session",
       tier: "simple",
       model: "openai/gpt-5.6-luna",
       variant: "max",
+      requestedVariant: "xhigh",
+      resolvedVariant: "max",
       candidateIndex: 0,
       attempt: 1,
       reason: "subagent_profile",
@@ -92,7 +105,7 @@ test("completed child responses join queued routing decisions to parent feedback
     assert.equal(summary.tokensTotal, 17);
     assert.equal(summary.models[0], "openai/gpt-5.6-luna");
     assert.deepEqual(summary.aidevopsVersions, ["3.32.240"]);
-    assert.deepEqual(summary.pricingVersions, ["2026-08-21.1"]);
+    assert.deepEqual(summary.pricingVersions, [PRICING_VERSION]);
     assert.deepEqual(summary.populationsUsed, ["interactive_child"]);
 
     observability.recordSubagentOutcome({
@@ -112,13 +125,37 @@ test("completed child responses join queued routing decisions to parent feedback
       status: "completed",
       success: true,
     });
+    observability.recordSubagentAcceptance({
+      contributionID: "contribution:child",
+      interventionCount: 1,
+      objectiveID: "objective:1",
+      outcome: "accepted_repaired",
+      parentSessionID: "root-session",
+      policyVersion: "v1",
+      runID: "run:1",
+    });
+    const objective = observability.objectiveContextForSession("root-session");
+    const decision = observability.recordObjectiveDecision({
+      parentSessionID: "root-session",
+      contributionID: "opencode-child:child-session",
+      outcome: "accepted_repaired",
+      repairContributionID: "opencode-parent:repair-1",
+      interventionCount: 1,
+      objectiveOutcome: "accepted_unverified",
+      policyVersion: "v1",
+    });
+    assert.equal(decision.recorded, true);
+    assert.equal(decision.objectiveID, objective.objectiveID);
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     const persisted = sqlite.sqliteExecSync(`
-SELECT routing_population || '|' || aidevops_version || '|' || pricing_version
+      SELECT routing_population || '|' || aidevops_version || '|' || pricing_version || '|'
+        || requested_effort || '|' || resolved_effort || '|' || observed_effort || '|'
+        || effort_source || '|' || coalesce(provider_confirmed_effort, '') || '|' || cost_source || '|'
+        || pricing_quality
 FROM llm_requests WHERE message_id = 'message-1';
     `);
-    assert.equal(persisted, "interactive_child|3.32.240|2026-08-21.1");
+    assert.equal(persisted, `interactive_child|3.32.240|${PRICING_VERSION}|xhigh|max|max|host_observed||local_estimate|exact_model`);
 
     const outcomePayload = JSON.parse(sqlite.sqliteExecSync(`
 SELECT payload_json FROM runtime_events WHERE event_type = 'subagent.host.outcome' LIMIT 1;
@@ -133,9 +170,27 @@ SELECT payload_json FROM runtime_events WHERE event_type = 'subagent.host.outcom
       terminal_evidence: "stop",
       verification: "unknown",
     });
+    const acceptancePayload = JSON.parse(sqlite.sqliteExecSync(`
+SELECT payload_json FROM runtime_events WHERE event_type = 'subagent.acceptance' LIMIT 1;
+    `));
+    assert.equal(acceptancePayload.contribution_outcome, "accepted_repaired");
+    assert.equal(acceptancePayload.intervention_count, 1);
+    const attachmentPayload = JSON.parse(sqlite.sqliteExecSync(`
+SELECT payload_json FROM runtime_events WHERE event_type = 'objective.session.attached' LIMIT 1;
+    `));
+    assert.match(attachmentPayload.request_ids[0], /^opencode-message:[a-f0-9]{24}$/);
+    assert.equal(attachmentPayload.objective_id, objective.objectiveID);
+    const decisionOutcome = JSON.parse(sqlite.sqliteExecSync(`
+SELECT payload_json FROM runtime_events WHERE event_type = 'objective.outcome' LIMIT 1;
+    `));
+    assert.equal(decisionOutcome.outcome, "accepted_unverified");
   } finally {
     sqlite.shutdownSqlite();
     delete process.env.AIDEVOPS_OBS_DB_OVERRIDE;
+    if (previousHeadless === undefined) delete process.env.AIDEVOPS_HEADLESS;
+    else process.env.AIDEVOPS_HEADLESS = previousHeadless;
+    if (previousTier === undefined) delete process.env.AIDEVOPS_DISPATCH_TIER;
+    else process.env.AIDEVOPS_DISPATCH_TIER = previousTier;
     rmSync(root, { recursive: true, force: true });
   }
 });

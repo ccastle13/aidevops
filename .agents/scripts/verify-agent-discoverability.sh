@@ -40,6 +40,7 @@ PROMPT_HOOK_REGISTRY="configs/prompt-hook-candidates.conf"
 readonly FRAMEWORK_RULES_FILE="AGENTS.md"
 readonly AGENT_ROUTING_FILE="reference/agent-routing.md"
 readonly BUILD_PLUS_FILE="build-plus.md"
+readonly SUBAGENT_INDEX_FILE="subagent-index.toon"
 PASS=0
 FAIL=0
 WARNINGS=0
@@ -147,6 +148,48 @@ check_frontmatter_description_quoting() {
 	return 0
 }
 
+check_domain_index_view() {
+	local domain_index="${AGENTS_DIR}/reference/domain-index.md"
+	local duplicates
+	local path
+	local checked_paths=0
+
+	duplicates=$(awk -F'|' -v domain_column=2 '
+		/^\|/ && $domain_column !~ /^[[:space:]]*(Domain|-+)/ {
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", $domain_column)
+			if (++seen[$domain_column] == 2) print $domain_column
+		}' "$domain_index")
+	if [[ -n "$duplicates" ]]; then
+		log_fail "Domain index: duplicate domain rows: ${duplicates//$'\n'/, }"
+	else
+		log_ok "Domain index: domain rows are unique"
+	fi
+
+	while IFS= read -r path; do
+		[[ "$path" == *"*"* ]] && continue
+		[[ "$path" != */* && "$path" != *.* ]] && continue
+		checked_paths=$((checked_paths + 1))
+		if [[ -f "${AGENTS_DIR}/${path}" ]]; then
+			log_ok "Domain index: entry point exists: ${path}"
+		else
+			log_fail "Domain index: stale entry point: ${path}"
+		fi
+	done < <(awk -F'`' '/^\|/ { for (field = 2; field <= NF; field += 2) print $field }' "$domain_index")
+	if [[ "$checked_paths" -eq 0 ]]; then
+		log_fail "Domain index: no declared entry points found"
+	fi
+	return 0
+}
+
+check_declared_view_contract() {
+	if python3 "${AGENTS_DIR}/scripts/capability-readiness-helper.py" check >/dev/null; then
+		log_ok "Capability registry: declared views have unique existing paths"
+	else
+		log_fail "Capability registry: stale or duplicate declared view"
+	fi
+	return 0
+}
+
 # ─── Test 1: Extracted reference files exist and are non-empty ───────────────
 echo ""
 echo "=== 1. Extracted Reference Files ==="
@@ -211,6 +254,8 @@ else
 	fi
 	check_file_nonempty "reference/domain-index.md" 2000 "Domain index: substantial content"
 	check_string_in_file "reference/domain-index.md" "Trigger words" "Domain index: trigger-word column present"
+	check_domain_index_view
+	check_declared_view_contract
 fi
 
 # ─── Test 4b: Node server admin specialist is routed and indexed ─────────────
@@ -221,7 +266,17 @@ check_string_in_file "tools/runtime/node-server-admin.md" "mode: subagent" "Node
 check_regex_in_file "$BUILD_PLUS_FILE" '^[[:space:]]*-[[:space:]]*node-server-admin[[:space:]]*$' "Build+: node-server-admin allowlist"
 check_string_in_file "$BUILD_PLUS_FILE" "tools/runtime/node-server-admin.md" "Build+: Node runtime domain route"
 check_string_in_file "reference/domain-index.md" "tools/runtime/node-server-admin.md" "Domain index: Node server admin route"
-check_string_in_file "subagent-index.toon" "node-server-admin" "Subagent index: node-server-admin entry"
+check_string_in_file "$SUBAGENT_INDEX_FILE" "node-server-admin" "Subagent index: node-server-admin entry"
+
+# ─── Test 4c: PHP server admin specialist is routed and indexed ───────────────
+echo ""
+echo "=== 4c. PHP Server Admin Discoverability ==="
+check_file_nonempty "tools/runtime/php-server-admin.md" 2000 "PHP server admin agent"
+check_string_in_file "tools/runtime/php-server-admin.md" "mode: subagent" "PHP server admin: subagent mode"
+check_regex_in_file "$BUILD_PLUS_FILE" '^[[:space:]]*-[[:space:]]*php-server-admin[[:space:]]*$' "Build+: php-server-admin allowlist"
+check_string_in_file "$BUILD_PLUS_FILE" "tools/runtime/php-server-admin.md" "Build+: PHP runtime domain route"
+check_string_in_file "reference/domain-index.md" "tools/runtime/php-server-admin.md" "Domain index: PHP server admin route"
+check_string_in_file "$SUBAGENT_INDEX_FILE" "php-server-admin" "Subagent index: php-server-admin entry"
 
 # ─── Test 5: Primary agent @mention files ─────────────────────────────────────
 echo ""
@@ -244,7 +299,7 @@ AGENT_FILES=(
 for af in "${AGENT_FILES[@]}"; do
 	check_file_nonempty "$af" 100 "Primary agent file"
 done
-check_string_in_file "subagent-index.toon" "PR,pr.md" "subagent-index: PR display name is uppercase"
+check_string_in_file "$SUBAGENT_INDEX_FILE" "PR,pr.md" "subagent-index: PR display name is uppercase"
 check_frontmatter_description_quoting "services/communications/privacy-comparison.md" "OpenCode subagent YAML safety"
 
 # ─── Test 6: Capabilities section retains key entries ─────────────────────────
@@ -324,7 +379,7 @@ else
 		log_fail "subagent-index.toon: could not parse subagents block count"
 	fi
 
-	check_string_in_file "subagent-index.toon" "triggers" "subagent-index.toon: primary agent triggers documented"
+	check_string_in_file "$SUBAGENT_INDEX_FILE" "triggers" "subagent-index.toon: primary agent triggers documented"
 fi
 
 # ─── Test 10: Critical scripts for self-improvement workflow ──────────────────

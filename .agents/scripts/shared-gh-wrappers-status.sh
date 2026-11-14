@@ -464,20 +464,44 @@ _status_label_contract() {
 	printf '%s\t%s\t%s\n' \
 		"status:available" "0e8a16" "Task is available for claiming" \
 		"status:queued" "fbca04" "Worker dispatched, not yet started" \
-		"status:claimed" "f9d0c4" "Interactive session claimed this task" \
+		"status:claimed" "f9d0c4" "Interactive implementation is actively claimed" \
 		"status:in-progress" "1d76db" "Worker actively running" \
-		"status:in-review" "5319e7" "PR open, awaiting review/merge" \
+		"status:in-review" "5319e7" "Non-draft PR ready for review/merge" \
 		"status:done" "6f42c1" "Task is complete" \
-		"status:blocked" "d93f0b" "Waiting on blocker task"
+		"status:blocked" "d93f0b" "Partial work blocked; inspect reason and next action"
 	return 0
 }
 
-# Fetch every repository label once so steady-state verification is read-only.
+# Fetch only exact contract labels in one request, independent of repo label count.
+# Aliases avoid both repository-wide pagination and truncated label search results.
 _status_labels_snapshot() {
 	local repo="$1"
-	AIDEVOPS_GH_ROUTE_DECISION="status-label-contract-list-rest" \
-		_gh_with_timeout read gh api "/repos/${repo}/labels?per_page=100" --paginate \
-		--jq '.[] | [.name, ((.color // "") | ascii_downcase), (.description // "")] | @tsv'
+	local fields=""
+	local response=""
+	local name=""
+	local index=0
+	while IFS=$'\t' read -r name _; do
+		fields="${fields} label${index}: label(name: \"${name}\") { name color description }"
+		index=$((index + 1))
+	done < <(_status_label_contract)
+	AIDEVOPS_GH_ROUTE_DECISION="status-label-contract-exact-graphql" \
+		response=$(_gh_with_timeout read gh api graphql \
+		-f query="query(\$owner: String!, \$name: String!) { repository(owner: \$owner, name: \$name) { ${fields} } }" \
+		-f owner="${repo%%/*}" -f name="${repo#*/}") || return 1
+	# Null labels mean confirmed absence. Errors, null repositories and malformed
+	# partial responses are unknown state and must never trigger label mutations.
+	printf '%s' "$response" | jq -er --argjson count "$index" '
+		def is_string: type == "string";
+		if ((.errors // []) | length) == 0
+			and (.data.repository | type) == "object"
+			and (.data.repository | length) == $count
+			and all(.data.repository[]; . == null or
+				(type == "object" and (.name | is_string)
+				and (.color | is_string)
+				and (.description == null or (.description | is_string))))
+		then [.data.repository[] | select(. != null) |
+			[.name, (.color | ascii_downcase), (.description // "")] | @tsv] | join("\n")
+		else error("unable to verify exact status-label snapshot") end'
 	return $?
 }
 
@@ -537,7 +561,7 @@ _status_label_create_or_reconcile() {
 }
 
 # Ensure all core status:* labels exist on a repo (idempotent, cached per-process).
-# A converged repository costs one paginated read and zero writes. Missing or
+# A converged repository costs one exact-label read and zero writes. Missing or
 # drifted definitions are reconciled, then the complete contract is re-verified
 # before the process-local cache is populated.
 #
@@ -993,9 +1017,11 @@ gh_issue_view() {
 #######################################
 gh_pr_list() {
 	local _rest_capable=0
+	local _prefer_native_filter=0
 	local _uses_search=0
 	local _pool="rest-core"
 	_rest_pr_list_can_preserve_args "$@" && _rest_capable=1
+	_rest_pr_list_prefers_native_filter "$@" && _prefer_native_filter=1
 	if _rest_pr_list_requires_search "$@"; then
 		_uses_search=1
 		_pool="rest-search"
@@ -1007,7 +1033,7 @@ gh_pr_list() {
 		return 0
 	fi
 	local _out="" _rc=0
-	if [[ $_rest_capable -eq 1 ]] && _rest_read_first_enabled; then
+	if [[ $_rest_capable -eq 1 && $_prefer_native_filter -eq 0 ]] && _rest_read_first_enabled; then
 		if [[ $_uses_search -eq 1 ]]; then
 			print_info "[INFO] gh-wrapper: REST-first read mode, routing search-filtered pr list to /search/issues"
 		else
@@ -1021,7 +1047,7 @@ gh_pr_list() {
 		fi
 		return $_rc
 	fi
-	if [[ $_rest_capable -eq 1 ]] && { { command -v github_app_should_route_rest >/dev/null 2>&1 && github_app_should_route_rest "$_pool" gh_pr_list; } || _rest_should_fallback; }; then
+	if [[ $_rest_capable -eq 1 ]] && { { [[ $_prefer_native_filter -eq 0 ]] && command -v github_app_should_route_rest >/dev/null 2>&1 && github_app_should_route_rest "$_pool" gh_pr_list; } || _rest_should_fallback; }; then
 		if [[ $_uses_search -eq 1 ]]; then
 			print_info "[INFO] gh-wrapper: GraphQL budget low, routing search-filtered pr list to /search/issues"
 		else

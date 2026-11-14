@@ -103,6 +103,10 @@ STALL_CPU_THRESHOLD="${WORKER_STALL_CPU_THRESHOLD:-2}"
 # t3056: Lifecycle log for structured kill-reason telemetry. Aggregatable
 # across all workers. Default: pulse-dispatch.log (same file the pulse reads).
 LIFECYCLE_LOG="${WORKER_LIFECYCLE_LOG:-${HOME}/.aidevops/logs/pulse-dispatch.log}"
+# GH#36700: per-attempt copy of this watchdog's decisions, next to the exit-code
+# file, so the worker wrapper can report why a quiet worker was (not) killed.
+# Never the monitored OUTPUT_FILE: writes there would count as output growth.
+WATCHDOG_EVENTS_FILE=""
 
 #######################################
 # Parse arguments
@@ -186,7 +190,36 @@ _parse_args() {
 		echo "Error: --worker-pid must be numeric" >&2
 		return 1
 	}
+	WATCHDOG_EVENTS_FILE="${EXIT_CODE_FILE}.watchdog_events"
 
+	return 0
+}
+
+#######################################
+# Append a watchdog event line to the per-attempt events file (GH#36700).
+# Best-effort: a write failure must never stop monitoring under set -e.
+#
+# Arguments:
+#   $1 - complete event line
+#######################################
+_watchdog_record_attempt_event() {
+	local event_line="$1"
+	[[ -n "$WATCHDOG_EVENTS_FILE" ]] || return 0
+	printf '%s\n' "$event_line" >>"$WATCHDOG_EVENTS_FILE" 2>/dev/null || true
+	return 0
+}
+
+#######################################
+# Record a lifecycle event in the shared lifecycle log (pulse telemetry) and
+# in the per-attempt events file read by the worker wrapper (GH#36700).
+#
+# Arguments:
+#   $1 - complete event line
+#######################################
+_watchdog_record_event() {
+	local event_line="$1"
+	printf '%s\n' "$event_line" >>"$LIFECYCLE_LOG" 2>/dev/null || true
+	_watchdog_record_attempt_event "$event_line"
 	return 0
 }
 
@@ -333,7 +366,7 @@ _watchdog_lsof_network_active() {
 	lsof_output=$(lsof -nP -a -p "$pid_csv" -iTCP -sTCP:ESTABLISHED 2>/dev/null || true)
 	[[ -n "$lsof_output" ]] || return 1
 
-	if printf '%s\n' "$lsof_output" | grep -Eq -- '->[^[:space:]]+:(443|8443)([[:space:]]|$)'; then
+	if grep -Eq -- '->[^[:space:]]+:(443|8443)([[:space:]]|$)' <<<"$lsof_output"; then
 		return 0
 	fi
 	return 1
@@ -361,7 +394,7 @@ _watchdog_ss_network_active() {
 	local pid=""
 	for pid in "${pid_list[@]}"; do
 		[[ "$pid" =~ ^[0-9]+$ ]] || continue
-		if printf '%s\n' "$ss_output" | grep -Eq -- "[[:space:]][^[:space:]]+:(443|8443)([[:space:]]|$).*pid=${pid},"; then
+		if grep -Eq -- "[[:space:]][^[:space:]]+:(443|8443)([[:space:]]|$).*pid=${pid}," <<<"$ss_output"; then
 			return 0
 		fi
 	done
@@ -417,12 +450,14 @@ _get_output_size() {
 }
 
 #######################################
-# Return whether the output file contains a known rate-limit/provider-failure marker.
-# Returns: 0 if a marker is present, 1 otherwise.
+# Return whether the latest output records a trusted provider failure.
+# GH#34067: delegates to the trusted classifier so tool output, docs or
+# source text mentioning "rate limit" cannot trigger a provider kill.
+# Returns: 0 if a trusted provider failure is present, 1 otherwise.
 #######################################
 _output_has_provider_rate_limit() {
-	[[ -f "$OUTPUT_FILE" ]] || return 1
-	grep -Eqi 'rate[ -]?limit|too many requests|http[[:space:]]*429|status[=: ][[:space:]]*429|quota exceeded|overloaded_error|provider.*(failed|unavailable)' "$OUTPUT_FILE" 2>/dev/null
+	_worker_output_has_fresh_provider_failure "$OUTPUT_FILE"
+	return $?
 }
 
 #######################################
@@ -502,27 +537,30 @@ _kill_worker() {
 	local kill_kind="${2:-}"
 
 	# t3056 / GH#21781: Classify the kill reason for structured telemetry.
-	# Maps the human-readable reason string to a machine-readable class.
-	local reason_class="unknown"
-	case "$reason" in
-	phase1:*) reason_class="phase1_zero_output" ;;
-	hard_kill:*) reason_class="hard_kill_stall" ;;
-	provider_rate_limit:*) reason_class="provider_rate_limit" ;;
-	stall:*) reason_class="no_output_stall" ;;
-	*) reason_class="other" ;;
-	esac
+	# GH#34067: the same class is persisted below, so telemetry and the
+	# .kill_reason sentinel cannot disagree.
+	local reason_class=""
+	reason_class=$(_worker_kill_reason_class "$reason")
 
 	# t3056: Emit structured lifecycle line for kill-reason telemetry.
 	# Format matches the t3056 spec so aggregation scripts can classify kills.
 	local _trigger_age=0
 	local lifecycle_event=""
 	_trigger_age=$(( $(date +%s) - _WATCHDOG_START_EPOCH ))
-	printf -v lifecycle_event '[lifecycle] worker_killed pid=%s reason=%s trigger_age=%ss session=%s ts=%s' \
-		"$WORKER_PID" "$reason_class" "$_trigger_age" "${SESSION_KEY:-none}" \
+	# GH#34068: record the most recent liveness deferral so cap kills can be
+	# told apart from proven inactivity in aggregated telemetry.
+	local _deferral_detail=""
+	if [[ "${_MONITOR_LAST_DEFER_EPOCH:-0}" -gt 0 ]]; then
+		_deferral_detail=" last_deferral_reason=${_MONITOR_LAST_DEFER_REASON:-unknown} last_deferral_age=$(( $(date +%s) - _MONITOR_LAST_DEFER_EPOCH ))s"
+	fi
+	if [[ -n "${_MONITOR_CAP_LIVENESS:-}" ]]; then
+		_deferral_detail+=" cap_liveness=${_MONITOR_CAP_LIVENESS}"
+	fi
+	printf -v lifecycle_event '[lifecycle] worker_killed pid=%s reason=%s trigger_age=%ss%s session=%s ts=%s' \
+		"$WORKER_PID" "$reason_class" "$_trigger_age" "$_deferral_detail" "${SESSION_KEY:-none}" \
 		"$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 	worker_attempt_observability_enrich lifecycle_event "$lifecycle_event"
-	printf '%s\n' "$lifecycle_event" \
-		>>"$LIFECYCLE_LOG" 2>/dev/null || true
+	_watchdog_record_event "$lifecycle_event"
 
 	# t2923: Push WIP commits before killing so the work is reachable on origin.
 	# Must happen before SIGTERM so git operations complete cleanly.
@@ -532,7 +570,7 @@ _kill_worker() {
 	# subshell may overwrite exit_code_file with its own exit code
 	# (race condition). The sentinel is authoritative.
 	touch "${EXIT_CODE_FILE}.watchdog_killed"
-	printf '%s\n' "no_output_stall" >"${EXIT_CODE_FILE}.kill_reason" 2>/dev/null || true
+	printf '%s\n' "$reason_class" >"${EXIT_CODE_FILE}.kill_reason" 2>/dev/null || true
 
 	# t2956 / Issue #21231: Hard-kill sentinel — distinguishes proactive
 	# elapsed-time kills from passive no-output stall kills. The helper
@@ -541,9 +579,10 @@ _kill_worker() {
 	# (watchdog_stall_continue), short-circuiting the per-attempt
 	# continuation loop and freeing the slot for re-dispatch. Without this
 	# sentinel, exit 78 still fires (legacy continuation behaviour).
+	# GH#34068: the sentinel and exit routing are unchanged; .kill_reason keeps
+	# the computed class (hard_kill_stall or hard_kill_cap_active).
 	if [[ "$kill_kind" == "stall_killed" ]]; then
 		touch "${EXIT_CODE_FILE}.watchdog_stall_killed"
-		printf '%s\n' "hard_kill_stall" >"${EXIT_CODE_FILE}.kill_reason" 2>/dev/null || true
 	fi
 
 	# Kill child processes first (pipeline members: opencode, tee),
@@ -639,6 +678,9 @@ _monitor_init_state() {
 	_MONITOR_LAST_SIZE=0
 	_MONITOR_STALL_SECONDS=0
 	_MONITOR_DEFERRED_STALL_SECONDS=0
+	_MONITOR_LAST_DEFER_EPOCH=0
+	_MONITOR_LAST_DEFER_REASON=""
+	_MONITOR_CAP_LIVENESS=""
 	_MONITOR_START_EPOCH=$(date +%s)
 	_WATCHDOG_START_EPOCH="$_MONITOR_START_EPOCH"
 	return 0
@@ -708,12 +750,15 @@ _monitor_defer_stall() {
 	# deferred_stall_seconds=$((deferred_stall_seconds + stall_seconds))
 	# Expected labels: reason=ci_wait reason=network_active reason=cpu_active.
 	_MONITOR_DEFERRED_STALL_SECONDS=$((_MONITOR_DEFERRED_STALL_SECONDS + _MONITOR_STALL_SECONDS))
-	printf -v lifecycle_event '[lifecycle] worker_stall_deferred pid=%s reason=%s %sstall_seconds=%ss deferred_total=%ss ts=%s' \
+	_MONITOR_LAST_DEFER_EPOCH=$(date +%s)
+	_MONITOR_LAST_DEFER_REASON="$reason"
+	# GH#36700: elapsed and the effective cap show when the backstop kill lands.
+	printf -v lifecycle_event '[lifecycle] worker_stall_deferred pid=%s reason=%s %sstall_seconds=%ss deferred_total=%ss elapsed=%ss hard_kill=%ss ts=%s' \
 		"$WORKER_PID" "$reason" "$detail" "$_MONITOR_STALL_SECONDS" \
-		"$_MONITOR_DEFERRED_STALL_SECONDS" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+		"$_MONITOR_DEFERRED_STALL_SECONDS" "$((_MONITOR_LAST_DEFER_EPOCH - _MONITOR_START_EPOCH))" \
+		"$HARD_KILL_SECONDS" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 	worker_attempt_observability_enrich lifecycle_event "$lifecycle_event"
-	printf '%s\n' "$lifecycle_event" \
-		>>"$LIFECYCLE_LOG" 2>/dev/null || true
+	_watchdog_record_event "$lifecycle_event"
 	_MONITOR_STALL_SECONDS=0
 	sleep "$POLL_INTERVAL"
 	return 0
@@ -738,8 +783,39 @@ _monitor_enforce_hard_kill() {
 		return 0
 	fi
 
+	# GH#34068: cap timing is unchanged. When a liveness deferral (CI wait,
+	# network, CPU) happened within one stall window, the kill is a policy
+	# cap on active work rather than proven inactivity — classify it so.
+	# A deferral resets the stall counter, so the next confirmed stall lands
+	# ceil(STALL_TIMEOUT/POLL_INTERVAL) polls later plus loop overhead; two
+	# poll intervals of margin cover that without reaching an older cycle.
+	local reason_prefix="hard_kill"
+	local deferral_window=$((STALL_TIMEOUT + 2 * POLL_INTERVAL))
+	# GH#35287: the cap runs BEFORE the normal live-work probes. The first
+	# silent window may cross the cap with no previous deferral at all.
+	# Sample now for classification only; never defer or remove the cap kill.
+	local tree_cpu stall_cpu_threshold="$STALL_CPU_THRESHOLD"
+	[[ "$stall_cpu_threshold" =~ ^[0-9]+$ ]] || stall_cpu_threshold=2
+	_MONITOR_CAP_LIVENESS="none_observed"
+	if _output_has_ci_wait; then
+		_MONITOR_CAP_LIVENESS="ci_wait"
+	elif _watchdog_tree_network_active "$WORKER_PID"; then
+		_MONITOR_CAP_LIVENESS="network_active"
+	else
+		tree_cpu=$(_watchdog_tree_cpu "$WORKER_PID")
+		if [[ "$tree_cpu" -ge "$stall_cpu_threshold" ]]; then
+			_MONITOR_CAP_LIVENESS="cpu_active"
+		fi
+	fi
+	if [[ "${_MONITOR_LAST_DEFER_EPOCH:-0}" -gt 0 ]] &&
+		(( now_epoch - _MONITOR_LAST_DEFER_EPOCH <= deferral_window )); then
+		reason_prefix="hard_kill_cap_active"
+	elif [[ "$_MONITOR_CAP_LIVENESS" != "none_observed" ]]; then
+		reason_prefix="hard_kill_cap_active"
+	fi
+
 	_kill_worker \
-		"hard_kill: total elapsed ${elapsed_total}s ≥ hard-kill threshold ${HARD_KILL_SECONDS}s (current output ${current_size}b, stall=${_MONITOR_STALL_SECONDS}s, deferred=${_MONITOR_DEFERRED_STALL_SECONDS}s) — slot freed for re-dispatch" \
+		"${reason_prefix}: total elapsed ${elapsed_total}s ≥ hard-kill threshold ${HARD_KILL_SECONDS}s (current output ${current_size}b, stall=${_MONITOR_STALL_SECONDS}s, deferred=${_MONITOR_DEFERRED_STALL_SECONDS}s) — slot freed for re-dispatch" \
 		"stall_killed"
 	return 1
 }
@@ -837,6 +913,12 @@ main() {
 	# Set here (not in _monitor) so _kill_worker can reference it
 	# from any context.
 	_WATCHDOG_START_EPOCH=$(date +%s)
+
+	# GH#36700: per-attempt proof that the watchdog is running and which
+	# thresholds are in effect. Not sent to the shared lifecycle log.
+	_watchdog_record_attempt_event "$(printf '[lifecycle] watchdog_monitoring pid=%s worker=%s stall_timeout=%ss phase1=%ss poll=%ss hard_kill=%ss cpu_threshold=%s%% ts=%s' \
+		"$$" "$WORKER_PID" "$STALL_TIMEOUT" "$PHASE1_TIMEOUT" "$POLL_INTERVAL" \
+		"$HARD_KILL_SECONDS" "$STALL_CPU_THRESHOLD" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
 
 	_monitor
 	return 0

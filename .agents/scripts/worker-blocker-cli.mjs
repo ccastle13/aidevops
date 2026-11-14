@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2025-2026 Marcus Quinn
 
-import { appendWorkerBlockerEvent } from "./worker-blocker-log.mjs";
+import { appendWorkerBlockerEvent, isWorkerBlockerEntrypoint } from "./worker-blocker-log.mjs";
 import {
   listActiveWorkerBlockerIssues,
+  resolveStaleSupervisorWorkerBlockers,
   resolveWorkerBlockersForIssue,
   resolveWorkerBlockersForSession,
 } from "./worker-blocker-reconcile.mjs";
@@ -51,6 +52,7 @@ const COMMAND_HANDLERS = new Map([
   ["append", (event, options) => (appendWorkerBlockerEvent(event, options) ? 0 : 1)],
   ["resolve-issue", (event, options) => runResolution(resolveWorkerBlockersForIssue, event, options)],
   ["resolve-session", (event, options) => runResolution(resolveWorkerBlockersForSession, event, options)],
+  ["resolve-stale-supervisor-session", (event, options) => runResolution(resolveStaleSupervisorWorkerBlockers, event, options)],
   ["list-active-issues", runIssueList],
 ]);
 
@@ -60,4 +62,8 @@ export function runWorkerBlockerCli(argv = process.argv.slice(2)) {
   if (!handler) return 2;
   const { event, options } = parseCliArguments(args);
   return handler(event, options);
+}
+
+if (isWorkerBlockerEntrypoint(import.meta.url)) {
+  process.exitCode = runWorkerBlockerCli();
 }

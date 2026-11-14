@@ -19,6 +19,9 @@
 #                           Used by setup.sh and aidevops update.
 #   reconcile-managed       Serialize with runtime activation, stop stale Pulse
 #                           instances, and start only when its supervisor is enabled.
+#                           A launchd-managed cycle from an earlier bundle is left
+#                           to finish instead (GH#34452); launchd starts the
+#                           activated bundle when it exits.
 #
 # Env:
 #   AIDEVOPS_SKIP_PULSE_RESTART=1     Skip restart operations (for debug).
@@ -37,6 +40,30 @@
 #   AIDEVOPS_ACTIVE_AGENTS_LINK=<path>
 #                                     activation link to resolve under the
 #                                     shared runtime transition lock.
+#   AIDEVOPS_PULSE_RECONCILE_DRAIN=1  reconcile-managed lets an in-flight
+#                                     earlier-bundle cycle finish; 0 restores
+#                                     immediate replacement.
+#   AIDEVOPS_PULSE_RECONCILE_DRAIN_MAX_AGE_S=3600
+#                                     cycles at or above this age are replaced
+#                                     immediately (treated as stuck) unless the
+#                                     lock owner's heartbeat lease is fresh
+#                                     (GH#37907). The async post-dispatch
+#                                     housekeeping run is not a cycle and is
+#                                     not counted as an instance.
+#   AIDEVOPS_PULSE_RECONCILE_DRAIN_HARD_CAP_S=<4x lock max age>
+#                                     replace even a fresh-lease cycle at or
+#                                     above this age (default 7200).
+#   AIDEVOPS_PULSE_RECONCILE_DRAIN_REQUEST=1
+#                                     ask a deferred lock owner to stop at its
+#                                     next candidate (LOCKDIR/drain_requested);
+#                                     0 lets it run to its natural end.
+#   AIDEVOPS_PULSE_LOCK_DIR=<path>    instance lock directory (tests).
+#   AIDEVOPS_PULSE_LOCK_MAX_AGE_S=1800
+#                                     heartbeat lease freshness window, shared
+#                                     with pulse-wrapper-config.sh.
+#   AIDEVOPS_PULSE_HOUSEKEEPING_LOCK_DIR=<path>
+#                                     test override for the async housekeeping
+#                                     lock that identifies that run.
 #   AIDEVOPS_PULSE_MERGE_PROCESS_PATTERN=<regex>
 #                                     test override for stale merge routines.
 #
@@ -84,12 +111,36 @@ unset _PULSE_BOOTSTRAP_SCRIPT_DIR _PULSE_RUNTIME_PIN_HELPER _PULSE_PINNED_ROOT _
 _PULSE_SCRIPT="${_PULSE_AGENTS_DIR}/scripts/pulse-wrapper.sh"
 _PULSE_LOG="${HOME}/.aidevops/logs/pulse-wrapper.log"
 
-# Process-match pattern for pgrep. The production default matches any
-# pulse-wrapper.sh script regardless of path. Tests may override this to
-# isolate mock pulses from the live user pulse (the mock's path is embedded
-# in the pattern). See tests/test-pulse-lifecycle-helper.sh.
-_PULSE_PATTERN="${AIDEVOPS_PULSE_PROCESS_PATTERN:-(^|/)pulse-wrapper\\.sh( |\$)}"
-_PULSE_MERGE_PATTERN="${AIDEVOPS_PULSE_MERGE_PROCESS_PATTERN:-(^|/)pulse-merge-routine\\.sh( |\$)}"
+# Process-match pattern for pgrep. Scope the production default to this user's
+# deployed or immutable runtime paths so another local user's Pulse cannot
+# satisfy lifecycle checks on a shared host. Tests may still provide an exact
+# override to isolate mock processes.
+_pulse_escape_ere() {
+	local _value="$1"
+	local _escaped=""
+	local _character=""
+	local _index=0
+	while [[ "$_index" -lt "${#_value}" ]]; do
+		_character="${_value:$_index:1}"
+		case "$_character" in
+		"\\" | "." | "[" | "]" | "^" | '$' | "*" | "+" | "?" | "{" | "}" | "|" | "(" | ")")
+			_escaped="${_escaped}\\${_character}"
+			;;
+		*) _escaped="${_escaped}${_character}" ;;
+		esac
+		_index=$((_index + 1))
+	done
+	printf '%s' "$_escaped"
+	return 0
+}
+# Setup supplies the stable link separately from its physical bundle root.
+_PULSE_DEPLOYED_ROOT=$(_pulse_escape_ere "$_PULSE_ACTIVE_AGENTS_LINK")
+_PULSE_ACTIVE_ROOT=$(_pulse_escape_ere "$_PULSE_AGENTS_DIR")
+_PULSE_BUNDLES_ROOT=$(_pulse_escape_ere "${AIDEVOPS_RUNTIME_BUNDLES_DIR:-${HOME}/.aidevops/runtime-bundles}")
+_PULSE_DEFAULT_PATTERN="(${_PULSE_DEPLOYED_ROOT}|${_PULSE_ACTIVE_ROOT}|${_PULSE_BUNDLES_ROOT}/[^/]+/agents)/scripts/pulse-wrapper\\.sh( |\$)"
+_PULSE_DEFAULT_MERGE_PATTERN="(${_PULSE_DEPLOYED_ROOT}|${_PULSE_ACTIVE_ROOT}|${_PULSE_BUNDLES_ROOT}/[^/]+/agents)/scripts/pulse-merge-routine\\.sh( |\$)"
+_PULSE_PATTERN="${AIDEVOPS_PULSE_PROCESS_PATTERN:-$_PULSE_DEFAULT_PATTERN}"
+_PULSE_MERGE_PATTERN="${AIDEVOPS_PULSE_MERGE_PROCESS_PATTERN:-$_PULSE_DEFAULT_MERGE_PATTERN}"
 
 # Timing
 _PULSE_RESTART_WAIT="${AIDEVOPS_PULSE_RESTART_WAIT:-3}"
@@ -97,6 +148,28 @@ _PULSE_SIGTERM_WAIT="${AIDEVOPS_PULSE_SIGTERM_WAIT:-2}"
 # launchd may accept kickstart before scheduler load permits the process to run.
 # Keep this proof window bounded while tolerating starts beyond the former 5s.
 _PULSE_LAUNCHD_START_WAIT=15
+# GH#34452: setup reconciliation lets a launchd-managed cycle from an earlier
+# bundle finish rather than killing it. Healthy cycles on a loaded runner took
+# up to ~2,450s (2026-10-10/11), so the default ceiling is about 1.5x that; an
+# older cycle is treated as stuck and replaced immediately, as before.
+_PULSE_RECONCILE_DRAIN="${AIDEVOPS_PULSE_RECONCILE_DRAIN:-1}"
+_PULSE_RECONCILE_DRAIN_MAX_AGE="${AIDEVOPS_PULSE_RECONCILE_DRAIN_MAX_AGE_S:-3600}"
+[[ "$_PULSE_RECONCILE_DRAIN_MAX_AGE" =~ ^[0-9]+$ ]] || _PULSE_RECONCILE_DRAIN_MAX_AGE=3600
+_PULSE_RECONCILE_DRAIN_MAX_AGE=$((10#$_PULSE_RECONCILE_DRAIN_MAX_AGE))
+# GH#37907: elastic dispatch (GH#37874) lets a healthy lock owner run past the
+# age ceiling while it refreshes its owner-bound supervisor heartbeat. Such a
+# cycle keeps draining while that lease is fresh (the pulse-watchdog.sh
+# _pulse_dispatch_lease_active test, PULSE_LOCK_MAX_AGE_S) until a hard cap,
+# default 4x the lock max age; it is also asked to stop at its next candidate.
+_PULSE_LOCK_DIR="${AIDEVOPS_PULSE_LOCK_DIR:-${HOME}/.aidevops/logs/pulse-wrapper.lockdir}"
+_PULSE_LOCK_MAX_AGE="${AIDEVOPS_PULSE_LOCK_MAX_AGE_S:-1800}"
+[[ "$_PULSE_LOCK_MAX_AGE" =~ ^[0-9]+$ ]] || _PULSE_LOCK_MAX_AGE=1800
+_PULSE_LOCK_MAX_AGE=$((10#$_PULSE_LOCK_MAX_AGE))
+[[ "$_PULSE_LOCK_MAX_AGE" -ge 1 ]] || _PULSE_LOCK_MAX_AGE=1800
+_PULSE_RECONCILE_DRAIN_HARD_CAP="${AIDEVOPS_PULSE_RECONCILE_DRAIN_HARD_CAP_S:-$((_PULSE_LOCK_MAX_AGE * 4))}"
+[[ "$_PULSE_RECONCILE_DRAIN_HARD_CAP" =~ ^[0-9]+$ ]] || _PULSE_RECONCILE_DRAIN_HARD_CAP=$((_PULSE_LOCK_MAX_AGE * 4))
+_PULSE_RECONCILE_DRAIN_HARD_CAP=$((10#$_PULSE_RECONCILE_DRAIN_HARD_CAP))
+_PULSE_RECONCILE_DRAIN_REQUEST="${AIDEVOPS_PULSE_RECONCILE_DRAIN_REQUEST:-1}"
 
 # Expected-max coexistence threshold (GH#21903).
 #
@@ -141,6 +214,14 @@ _PULSE_EXPECTED_MAX_INSTANCES=$((10#$_PULSE_EXPECTED_MAX_INSTANCES))
 # legitimate t2774 overlap window. _pulse_pids filters them out; status
 # reports them informationally on a separate line.
 _PULSE_SIDECAR_FLAGS_RE='(--merge-only|--self-check|--dry-run|--canary)'
+
+# Async post-dispatch housekeeping lock (pulse-dispatch-engine.sh
+# _pulse_post_dispatch_housekeeping_lockdir). The async run is a disowned
+# subshell of a cycle with its own process group (GH#33256), so it outlives
+# the cycle, is reparented to PID 1 and keeps the bare wrapper argv. The
+# async-pid file it writes is the only marker that tells it apart from a main
+# cycle; a synchronous run is the cycle itself and writes only pid.
+_PULSE_HOUSEKEEPING_LOCK_DIR="${AIDEVOPS_PULSE_HOUSEKEEPING_LOCK_DIR:-${HOME}/.aidevops/logs/pulse-post-dispatch-housekeeping.lock}"
 
 # ANSI colors (guarded — don't collide with shared-constants)
 [[ -z "${_PL_GREEN+x}" ]] && _PL_GREEN='\033[0;32m'
@@ -208,9 +289,12 @@ _pulse_launchd_supervisor_disabled() {
 	command -v launchctl >/dev/null 2>&1 || return 1
 	disabled_state=$(launchctl print-disabled "gui/$(id -u)" 2>/dev/null) || return 1
 	while IFS= read -r disabled_line; do
-		if [[ "$disabled_line" == *"$pulse_label"* && "$disabled_line" == *"=> true"* ]]; then
-			return 0
-		fi
+		# launchctl uses boolean or named states depending on macOS version.
+		# Match the complete label, not a watchdog/sidecar sharing its prefix.
+		disabled_line="${disabled_line//[[:space:]]/}"
+		case "$disabled_line" in
+		"\"${pulse_label}\"=>true" | "\"${pulse_label}\"=>disabled" | "${pulse_label}=>true" | "${pulse_label}=>disabled") return 0 ;;
+		esac
 	done <<<"$disabled_state"
 	return 1
 }
@@ -224,6 +308,33 @@ _pulse_launchd_supervisor_present() {
 	command -v launchctl >/dev/null 2>&1 || return 1
 	[[ -f "$pulse_plist" ]] && return 0
 	launchctl print "gui/$(id -u)/${pulse_label}" >/dev/null 2>&1 || return 1
+	return 0
+}
+
+# A deferred reconciliation relies on launchd starting the stable activation
+# link again after the in-flight cycle exits (StartInterval/KeepAlive), so the
+# job must be loaded, not merely installed as a plist.
+_pulse_launchd_supervisor_loaded() {
+	local os_name="${AIDEVOPS_PULSE_OS_NAME:-}"
+	local pulse_label="${AIDEVOPS_PULSE_LAUNCHD_LABEL:-com.aidevops.aidevops-supervisor-pulse}"
+	[[ -n "$os_name" ]] || os_name=$(uname -s 2>/dev/null || printf 'unknown')
+	[[ "$os_name" == "Darwin" ]] || return 1
+	command -v launchctl >/dev/null 2>&1 || return 1
+	launchctl print "gui/$(id -u)/${pulse_label}" >/dev/null 2>&1 || return 1
+	return 0
+}
+
+# A loaded service alone cannot guarantee another cycle after draining. Require
+# its active timer as well, and never treat a broken user bus as a scheduler.
+_pulse_systemd_supervisor_loaded() {
+	local os_name="${AIDEVOPS_PULSE_OS_NAME:-}"
+	local load_state=""
+	[[ -n "$os_name" ]] || os_name=$(uname -s 2>/dev/null || printf 'unknown')
+	[[ "$os_name" == "Linux" ]] || return 1
+	command -v systemctl >/dev/null 2>&1 || return 1
+	load_state=$(systemctl --user show aidevops-supervisor-pulse.service --property=LoadState --value 2>/dev/null) || return 1
+	[[ "$load_state" == "loaded" ]] || return 1
+	systemctl --user is-active --quiet aidevops-supervisor-pulse.timer || return 1
 	return 0
 }
 
@@ -247,6 +358,18 @@ _pulse_start_managed() {
 	local launchd_target=""
 	local baseline_pids=""
 	local active_pid=""
+	if _pulse_systemd_supervisor_loaded; then
+		baseline_pids=$(_pulse_pids)
+		# A oneshot stays activating for the entire cycle. Waiting for start
+		# completion would hold the activation lock for minutes.
+		systemctl --user start --no-block aidevops-supervisor-pulse.service || return 1
+		if active_pid=$(_pulse_wait_for_launchd_runtime "$baseline_pids"); then
+			_pl_ok "Pulse started by systemd from the activated bundle (PID ${active_pid})"
+			return 0
+		fi
+		_pl_err "systemd accepted the Pulse start but no new activated-bundle process appeared"
+		return 1
+	fi
 	launchd_target="gui/$(id -u)/${pulse_label}"
 	if _pulse_launchd_supervisor_present; then
 		_pl_info "Requesting Pulse restart from launchd supervisor ${pulse_label}"
@@ -265,13 +388,8 @@ _pulse_start_managed() {
 		_pl_err "launchd accepted the Pulse restart but no new activated-bundle process appeared"
 		return 1
 	fi
-	_start || return $?
-	if active_pid=$(_pulse_find_active_runtime_pid_since ""); then
-		_pl_ok "Pulse is running from the activated bundle (PID ${active_pid})"
-		return 0
-	fi
-	_pl_err "Pulse started but its activated runtime bundle could not be verified"
-	return 1
+	_start_activated_runtime
+	return $?
 }
 
 # _pulse_pids_raw: print ALL matching pulse PIDs including subshells of the
@@ -300,25 +418,51 @@ _pulse_pid_list_contains() {
 	return 1
 }
 
+# True when an ancestor of PID (parent upwards, stopping before PID 1) is in the
+# newline-separated list.
+_pulse_pid_descends_from() {
+	local _pid="$1"
+	local _ancestors="$2"
+	local _depth=0
+	[[ "$_pid" =~ ^[0-9]+$ && -n "$_ancestors" ]] || return 1
+	while [[ "$_depth" -lt 64 ]]; do
+		_pid=$(ps -p "$_pid" -o ppid= 2>/dev/null | tr -d ' ')
+		[[ "$_pid" =~ ^[0-9]+$ && "$_pid" -gt 1 ]] || return 1
+		_pulse_pid_list_contains "$_ancestors" "$_pid" && return 0
+		_depth=$((_depth + 1))
+	done
+	return 1
+}
+
 # Snapshot every runtime process whose sourced code must be replaced. The
 # snapshot is deliberate: a launchd KeepAlive replacement created after this
 # point belongs to the activated bundle and is not a failed-stop residual.
+# Scope "standalone-merge" (GH#34452) selects only merge routines outside every
+# Pulse wrapper process tree. launchd starts those from the stable link rather
+# than a leased bundle, so they are retired even while a cycle drains; merge
+# routines a draining cycle spawned run from its bundle and finish with it.
 _pulse_reconciliation_pids_raw() {
+	local _scope="${1:-all}"
 	local _wrapper_pids=""
 	local _merge_pids=""
 	local _emitted=""
 	local _pid=""
 	_wrapper_pids=$(_pulse_pids_raw)
 	_merge_pids=$(_pulse_merge_pids_raw)
+	if [[ "$_scope" != "standalone-merge" ]]; then
+		while IFS= read -r _pid; do
+			[[ "$_pid" =~ ^[0-9]+$ ]] || continue
+			if ! _pulse_pid_list_contains "$_emitted" "$_pid"; then
+				printf '%s\n' "$_pid"
+				_emitted="${_emitted}${_emitted:+$'\n'}${_pid}"
+			fi
+		done <<<"$_wrapper_pids"
+	fi
 	while IFS= read -r _pid; do
 		[[ "$_pid" =~ ^[0-9]+$ ]] || continue
-		if ! _pulse_pid_list_contains "$_emitted" "$_pid"; then
-			printf '%s\n' "$_pid"
-			_emitted="${_emitted}${_emitted:+$'\n'}${_pid}"
+		if [[ "$_scope" == "standalone-merge" ]] && _pulse_pid_descends_from "$_pid" "$_wrapper_pids"; then
+			continue
 		fi
-	done <<<"$_wrapper_pids"
-	while IFS= read -r _pid; do
-		[[ "$_pid" =~ ^[0-9]+$ ]] || continue
 		if ! _pulse_pid_list_contains "$_emitted" "$_pid"; then
 			printf '%s\n' "$_pid"
 			_emitted="${_emitted}${_emitted:+$'\n'}${_pid}"
@@ -348,14 +492,44 @@ _pulse_process_start_token() {
 	return 0
 }
 
+# Elapsed seconds for a PID from `ps -o etime=` ([[dd-]hh:]mm:ss). macOS ps has
+# no etimes keyword. Returns 1 when the process is gone or the value is unusable.
+_pulse_process_age_seconds() {
+	local _pid="$1"
+	local _elapsed=""
+	local _days=0
+	local _hours=0
+	local _minutes=0
+	local _seconds=0
+	local _colons=""
+	[[ "$_pid" =~ ^[0-9]+$ ]] || return 1
+	_elapsed=$(ps -p "$_pid" -o etime= 2>/dev/null | tr -d ' ') || return 1
+	[[ -n "$_elapsed" ]] || return 1
+	if [[ "$_elapsed" == *-* ]]; then
+		_days="${_elapsed%%-*}"
+		_elapsed="${_elapsed#*-}"
+	fi
+	_colons="${_elapsed//[!:]/}"
+	case "${#_colons}" in
+	2) IFS=':' read -r _hours _minutes _seconds <<<"$_elapsed" ;;
+	1) IFS=':' read -r _minutes _seconds <<<"$_elapsed" ;;
+	*) _seconds="$_elapsed" ;;
+	esac
+	[[ "$_days" =~ ^[0-9]+$ && "$_hours" =~ ^[0-9]+$ ]] || return 1
+	[[ "$_minutes" =~ ^[0-9]+$ && "$_seconds" =~ ^[0-9]+$ ]] || return 1
+	printf '%s\n' "$((10#$_days * 86400 + 10#$_hours * 3600 + 10#$_minutes * 60 + 10#$_seconds))"
+	return 0
+}
+
 # Capture PID plus process start time before signalling. A numeric PID alone is
 # not a stable identity: a fast exit followed by PID reuse could otherwise let
 # reconciliation signal an unrelated process during the TERM/KILL windows.
 _pulse_reconciliation_identities() {
+	local _scope="${1:-all}"
 	local _pids=""
 	local _pid=""
 	local _start_token=""
-	_pids=$(_pulse_reconciliation_pids_raw)
+	_pids=$(_pulse_reconciliation_pids_raw "$_scope")
 	while IFS= read -r _pid; do
 		[[ "$_pid" =~ ^[0-9]+$ ]] || continue
 		if ! _start_token=$(_pulse_process_start_token "$_pid"); then
@@ -531,8 +705,11 @@ _pulse_find_active_runtime_pid_since() {
 # Watchdog/status callers may pipe PID lists into consumers that intentionally
 # exit after the first match. Bash's printf reports EPIPE as noisy "Broken pipe"
 # stderr output unless stderr is suppressed at the emit site. Callers ignore
-# SIGPIPE for the full emit loop and restore the prior trap afterwards; return 1
-# to tell the caller to stop emitting without treating the closed pipe as
+# SIGPIPE for the emit loop and restore the prior trap only when the loop
+# completes. After a closed consumer they leave SIGPIPE ignored: bash 3.2
+# printf keeps the failed write in its stdio buffer and flushes it at exit, so
+# the default disposition would kill the producer with status 141. Return 1 to
+# tell the caller to stop emitting without treating the closed pipe as
 # discovery failure.
 _pulse_emit_pid() {
 	local _pid="$1" _rc=0
@@ -568,7 +745,8 @@ _pulse_restore_pipe_trap() {
 #     (launchd on macOS, systemd/init on Linux).
 #   Layer 2 (subshell guard, fallback): for manually-started instances
 #     (PPID != 1), skip PIDs whose parent command itself contains
-#     pulse-wrapper.sh — the process is a subshell of a running pulse.
+#     pulse-wrapper.sh, unless it is a shell -c launcher (cron/bash -lc).
+#     A launcher mentions the script but is not itself a running wrapper.
 #   Layer 3 (sidecar guard, GH#21903): skip PIDs whose argv contains any
 #     sidecar role flag. Sidecars are categorically different from main
 #     pulse cycles and reported separately by _pulse_pids_sidecar.
@@ -576,36 +754,97 @@ _pulse_restore_pipe_trap() {
 # Empty output = no main pulse running.
 # _stop_all uses _pulse_pids_raw (not this function) so it still SIGTERMs
 # all pulse processes including subshells AND sidecars on `stop`.
+_pulse_command_is_launcher() {
+	local _command="$1"
+	[[ "$_command" =~ ^[^[:space:]]*([[:space:]]+--?[[:alnum:]-]+)*[[:space:]]+-[[:alnum:]]*c[[:alnum:]]*([[:space:]]|$) ]] || return 1
+	return 0
+}
+
+_pulse_parent_is_wrapper() {
+	local _parent_cmd="$1"
+	[[ "$_parent_cmd" =~ pulse-wrapper\.sh ]] || return 1
+	# Shell -c/-lc/-cl or separate -l -c options can mention the child's path.
+	# Actual Bash wrapper subshells retain the script argv, not a -c string.
+	_pulse_command_is_launcher "$_parent_cmd" && return 1
+	return 0
+}
+
+# True when PID is the async post-dispatch housekeeping run recorded in its
+# lock. Its stages run up to PREFLIGHT_GROUP_TIMEOUT each, so a healthy run
+# often lasts over an hour; counted as a cycle it reached the reconcile drain
+# ceiling and made setup replace a young in-flight cycle. A process that
+# started after the marker was written is a reused PID, not that run.
+_pulse_pid_is_async_housekeeping() {
+	local _pid="$1"
+	local _pid_file="${_PULSE_HOUSEKEEPING_LOCK_DIR}/async-pid"
+	local _lock_pid=""
+	local _written=""
+	local _age=""
+	local _now=""
+	[[ "$_pid" =~ ^[0-9]+$ && -f "$_pid_file" ]] || return 1
+	IFS= read -r _lock_pid <"$_pid_file" 2>/dev/null || true
+	[[ "$_lock_pid" =~ ^[0-9]+$ && "$_lock_pid" == "$_pid" ]] || return 1
+	if ! declare -F _file_mtime_epoch >/dev/null 2>&1; then
+		# shellcheck source=./portable-stat.sh
+		source "${BASH_SOURCE[0]%/*}/portable-stat.sh" || return 1
+	fi
+	_written=$(_file_mtime_epoch "$_pid_file") || return 1
+	_age=$(_pulse_process_age_seconds "$_pid") || return 1
+	_now=$(date +%s 2>/dev/null) || return 1
+	[[ "$_written" =~ ^[0-9]+$ && "$_now" =~ ^[0-9]+$ ]] || return 1
+	# Whole-second ps/mtime granularity: allow 2s between fork and the write.
+	[[ $((_now - _age)) -le $((_written + 2)) ]] || return 1
+	return 0
+}
+
+# Print the live async housekeeping PID, if any.
+_pulse_async_housekeeping_pid() {
+	local _pid=""
+	local _cmd=""
+	[[ -f "${_PULSE_HOUSEKEEPING_LOCK_DIR}/async-pid" ]] || return 1
+	IFS= read -r _pid <"${_PULSE_HOUSEKEEPING_LOCK_DIR}/async-pid" 2>/dev/null || true
+	[[ "$_pid" =~ ^[0-9]+$ ]] || return 1
+	_cmd=$(ps -p "$_pid" -o command= 2>/dev/null) || return 1
+	[[ "$_cmd" =~ $_PULSE_PATTERN ]] || return 1
+	_pulse_pid_is_async_housekeeping "$_pid" || return 1
+	printf '%s\n' "$_pid"
+	return 0
+}
+
 _pulse_pids() {
-	local _pids="" _pid="" _ppid="" _ppid_cmd="" _cmd="" _pipe_trap=""
+	local _pids="" _pid="" _ppid="" _ppid_cmd="" _cmd="" _pipe_trap="" _consumer_closed=0
 	_pids=$(_pulse_pids_raw)
 	[[ -z "$_pids" ]] && return 0
 	_pipe_trap=$(trap -p PIPE || true)
 	trap '' PIPE
 	while read -r _pid; do
+		_cmd=$(ps -p "$_pid" -o command= 2>/dev/null)
+		# pgrep can also match the launcher itself; it is not a pulse cycle.
+		_pulse_command_is_launcher "$_cmd" && continue
 		_ppid=$(ps -p "$_pid" -o ppid= 2>/dev/null | tr -d ' ')
 		[[ -z "$_ppid" || "$_ppid" == "0" ]] && continue
+		# Async housekeeping guard: the one subshell that outlives its cycle
+		# and is reparented to init/launchd (or a subreaper) is not a cycle.
+		_pulse_pid_is_async_housekeeping "$_pid" && continue
 		# Layer 1 (fast path): process started by init/launchd (PPID=1) is the
 		# canonical top-level instance. Subshells of pulse always have PPID = the
 		# pulse PID itself (> 1), never 1.
 		if [[ "$_ppid" == "1" ]]; then
 			# Layer 3 (sidecar guard): skip if argv contains a sidecar flag.
-			_cmd=$(ps -p "$_pid" -o command= 2>/dev/null)
 			[[ "$_cmd" =~ $_PULSE_SIDECAR_FLAGS_RE ]] && continue
-			_pulse_emit_pid "$_pid" || break
+			_pulse_emit_pid "$_pid" || { _consumer_closed=1; break; }
 			continue
 		fi
 		# Layer 2 (fallback for manually-started instances): skip PIDs whose
 		# parent command contains pulse-wrapper.sh (= direct subshell of pulse).
 		_ppid_cmd=$(ps -p "$_ppid" -o command= 2>/dev/null)
-		[[ "$_ppid_cmd" =~ pulse-wrapper\.sh ]] && continue
+		_pulse_parent_is_wrapper "$_ppid_cmd" && continue
 		# Layer 3 (sidecar guard): also skip non-launchd-started sidecars
 		# (manual --merge-only invocations during testing or debugging).
-		_cmd=$(ps -p "$_pid" -o command= 2>/dev/null)
 		[[ "$_cmd" =~ $_PULSE_SIDECAR_FLAGS_RE ]] && continue
-		_pulse_emit_pid "$_pid" || break
+		_pulse_emit_pid "$_pid" || { _consumer_closed=1; break; }
 	done <<<"$_pids"
-	_pulse_restore_pipe_trap "$_pipe_trap"
+	[[ "$_consumer_closed" -eq 1 ]] || _pulse_restore_pipe_trap "$_pipe_trap"
 	return 0
 }
 
@@ -616,24 +855,25 @@ _pulse_pids() {
 # Subshell guards (Layers 1 and 2) still apply — sidecars run as top-level
 # launchd-spawned processes (PPID=1), never as subshells of a main pulse.
 _pulse_pids_sidecar() {
-	local _pids="" _pid="" _ppid="" _ppid_cmd="" _cmd="" _pipe_trap=""
+	local _pids="" _pid="" _ppid="" _ppid_cmd="" _cmd="" _pipe_trap="" _consumer_closed=0
 	_pids=$(_pulse_pids_raw)
 	[[ -z "$_pids" ]] && return 0
 	_pipe_trap=$(trap -p PIPE || true)
 	trap '' PIPE
 	while read -r _pid; do
+		_cmd=$(ps -p "$_pid" -o command= 2>/dev/null)
+		_pulse_command_is_launcher "$_cmd" && continue
 		_ppid=$(ps -p "$_pid" -o ppid= 2>/dev/null | tr -d ' ')
 		[[ -z "$_ppid" || "$_ppid" == "0" ]] && continue
 		if [[ "$_ppid" != "1" ]]; then
 			_ppid_cmd=$(ps -p "$_ppid" -o command= 2>/dev/null)
-			[[ "$_ppid_cmd" =~ pulse-wrapper\.sh ]] && continue
+			_pulse_parent_is_wrapper "$_ppid_cmd" && continue
 		fi
-		_cmd=$(ps -p "$_pid" -o command= 2>/dev/null)
 		if [[ "$_cmd" =~ $_PULSE_SIDECAR_FLAGS_RE ]]; then
-			_pulse_emit_pid "$_pid" || break
+			_pulse_emit_pid "$_pid" || { _consumer_closed=1; break; }
 		fi
 	done <<<"$_pids"
-	_pulse_restore_pipe_trap "$_pipe_trap"
+	[[ "$_consumer_closed" -eq 1 ]] || _pulse_restore_pipe_trap "$_pipe_trap"
 	return 0
 }
 
@@ -683,18 +923,24 @@ _stop_all() {
 # Stop only the processes present at the beginning of setup reconciliation.
 # Unlike _stop_all, the final check intentionally ignores later PIDs: launchd
 # KeepAlive may immediately create the intended active-bundle replacement.
+# Optional scope: see _pulse_reconciliation_pids_raw.
 _stop_reconciliation_processes() {
+	local _scope="${1:-all}"
 	local _identities=""
 	local _survivors=""
 	local _residual=""
 	local _display_pids=""
-	if ! _identities=$(_pulse_reconciliation_identities); then
+	if ! _identities=$(_pulse_reconciliation_identities "$_scope"); then
 		return 1
 	fi
 	[[ -n "$_identities" ]] || return 0
 
 	_display_pids=$(_pulse_identity_pids "$_identities" | tr '\n' ' ')
-	_pl_info "Stopping pre-reconciliation Pulse process(es): ${_display_pids}"
+	if [[ "$_scope" == "standalone-merge" ]]; then
+		_pl_info "Retiring pre-activation standalone merge routine(s): ${_display_pids}"
+	else
+		_pl_info "Stopping pre-reconciliation Pulse process(es): ${_display_pids}"
+	fi
 	_survivors=$(_pulse_snapshot_survivors "$_identities")
 	_pulse_signal_snapshot TERM "$_survivors"
 	sleep "$_PULSE_SIGTERM_WAIT"
@@ -715,18 +961,135 @@ _stop_reconciliation_processes() {
 	return 0
 }
 
-# _start: launch pulse in background via nohup. No-op if already running.
-_start() {
-	if _is_running; then
-		_pl_info "Pulse already running (PIDs: $(_pulse_pids | tr '\n' ' '))"
+# GH#37907: print the heartbeat age when PID owns the instance lock and its
+# supervisor heartbeat is fresh. This is the elastic dispatch lease test in
+# pulse-watchdog.sh _pulse_dispatch_lease_active, bound to the evaluated PID.
+# A missing, foreign, malformed, future-dated or stale lease returns 1.
+_pulse_owner_lease_fresh_age() {
+	local _pid="$1"
+	local _owner=""
+	local _heartbeat=""
+	local _now=""
+	[[ "$_pid" =~ ^[0-9]+$ ]] || return 1
+	read -r _owner 2>/dev/null <"${_PULSE_LOCK_DIR}/pid" || return 1
+	[[ "$_owner" == "$_pid" ]] || return 1
+	read -r _heartbeat 2>/dev/null <"${_PULSE_LOCK_DIR}/supervisor_heartbeat_epoch" || return 1
+	[[ "$_heartbeat" =~ ^[1-9][0-9]*$ ]] || return 1
+	_now=$(date +%s 2>/dev/null) || return 1
+	[[ "$_now" =~ ^[0-9]+$ ]] || return 1
+	[[ "$_heartbeat" -le "$_now" && $((_now - _heartbeat)) -le "$_PULSE_LOCK_MAX_AGE" ]] || return 1
+	printf '%s\n' "$((_now - _heartbeat))"
+	return 0
+}
+
+# GH#37907: ask the deferred lock owner to stop at its next candidate boundary
+# (pulse-dispatch-lib.sh _pulse_drain_requested_bundle). The marker lives in
+# the owner's lock directory, so releasing the lock removes it, and it names
+# the owner PID so a later lock holder never honours it. Best effort: a lock
+# released meanwhile leaves the cycle to finish on its own.
+_pulse_request_cycle_drain() {
+	local _pid="$1"
+	local _bundle="$2"
+	local _temporary=""
+	[[ "$_pid" =~ ^[0-9]+$ && -d "$_PULSE_LOCK_DIR" ]] || return 1
+	_temporary=$(mktemp "${_PULSE_LOCK_DIR}/drain_requested.XXXXXX" 2>/dev/null) || return 1
+	if printf 'owner=%s\nbundle=%s\n' "$_pid" "$_bundle" >"$_temporary" 2>/dev/null &&
+		mv -f "$_temporary" "${_PULSE_LOCK_DIR}/drain_requested" 2>/dev/null; then
 		return 0
 	fi
+	rm -f "$_temporary" 2>/dev/null || true
+	return 1
+}
 
-	if [[ ! -x "$_PULSE_SCRIPT" ]]; then
-		_pl_err "pulse-wrapper.sh not found or not executable: $_PULSE_SCRIPT"
-		return 2
+# GH#34452: decide whether setup reconciliation leaves running Pulse processes
+# alone. A main Pulse executes one immutable bundle (physical script directory
+# plus runtime lease), so a cycle started before activation can finish safely;
+# killing it on every setup run discarded up to ~26 minutes of cycle work and
+# the dispatch it was about to make. Defer only when a loaded scheduler starts the
+# stable activation link after the cycle exits and every earlier-bundle main
+# PID is younger than the drain ceiling. The caller still retires standalone
+# merge routines, which run from the stable link rather than a leased bundle.
+# The async housekeeping run is not a cycle and never sets the ceiling for one
+# (_pulse_pids excludes it); it only decides the case where no cycle runs.
+# GH#37907: an elastic cycle legitimately outlives the ceiling, so a PID at or
+# past it still drains while it owns the instance lock with a fresh heartbeat
+# lease, up to the hard cap. A deferred lock owner is asked to stop at its next
+# candidate boundary so the activated bundle starts within about one candidate.
+# Returns 0 to leave the Pulse process trees running, 1 to continue with
+# immediate replacement.
+_pulse_reconcile_defers_to_cycle_boundary() {
+	local _main_pids=""
+	local _pid=""
+	local _age=""
+	local _lease_age=""
+	local _lock_owner=""
+	local _drain_owner=""
+	local _draining=""
+	local _current=""
+	[[ "$_PULSE_RECONCILE_DRAIN" != "0" ]] || return 1
+	if ! _pulse_launchd_supervisor_loaded && ! _pulse_systemd_supervisor_loaded; then
+		return 1
 	fi
+	_main_pids=$(_pulse_pids)
+	if [[ -z "$_main_pids" ]]; then
+		# No cycle runs. A young housekeeping run finishes on its own bundle
+		# and the scheduler starts the activated bundle at its next interval; one
+		# at or above the ceiling is replaced with everything else, as before.
+		_pid=$(_pulse_async_housekeeping_pid) || return 1
+		_age=$(_pulse_process_age_seconds "$_pid") || return 1
+		if [[ "$_age" -ge "$_PULSE_RECONCILE_DRAIN_MAX_AGE" ]]; then
+			_pl_info "Async housekeeping PID ${_pid} has run ${_age}s (drain ceiling ${_PULSE_RECONCILE_DRAIN_MAX_AGE}s) with no cycle running; replacing it now"
+			return 1
+		fi
+		_pl_info "Deferring Pulse start to the scheduler interval: no cycle is running; async housekeeping PID ${_pid} (${_age}s) finishes on its own bundle"
+		return 0
+	fi
+	while IFS= read -r _pid; do
+		[[ "$_pid" =~ ^[0-9]+$ ]] || continue
+		if _pulse_pid_uses_active_runtime "$_pid"; then
+			_current="${_current}${_current:+ }${_pid}"
+			continue
+		fi
+		if ! _age=$(_pulse_process_age_seconds "$_pid"); then
+			_pl_info "Pulse PID ${_pid} age is unavailable; using immediate replacement"
+			return 1
+		fi
+		if [[ "$_age" -ge "$_PULSE_RECONCILE_DRAIN_MAX_AGE" ]]; then
+			if ! _lease_age=$(_pulse_owner_lease_fresh_age "$_pid"); then
+				_pl_info "Pulse PID ${_pid} has run ${_age}s (drain ceiling ${_PULSE_RECONCILE_DRAIN_MAX_AGE}s) without a fresh owner heartbeat lease; replacing it now"
+				return 1
+			fi
+			if [[ "$_age" -ge "$_PULSE_RECONCILE_DRAIN_HARD_CAP" ]]; then
+				_pl_info "Pulse PID ${_pid} has run ${_age}s (drain hard cap ${_PULSE_RECONCILE_DRAIN_HARD_CAP}s, heartbeat ${_lease_age}s); replacing it now"
+				return 1
+			fi
+			_pl_info "Pulse PID ${_pid} deferring: elastic owner lease fresh (age ${_age}s, heartbeat ${_lease_age}s)"
+		fi
+		if [[ -z "$_lock_owner" ]]; then
+			read -r _lock_owner 2>/dev/null <"${_PULSE_LOCK_DIR}/pid" || _lock_owner="none"
+		fi
+		[[ "$_lock_owner" != "$_pid" ]] || _drain_owner="$_pid"
+		_draining="${_draining}${_draining:+ }${_pid} (${_age}s)"
+	done <<<"$_main_pids"
+	if [[ -n "$_draining" ]]; then
+		_pl_info "Deferring Pulse replacement to the cycle boundary: earlier-bundle cycle ${_draining} keeps running; scheduler starts bundle $(_pulse_runtime_bundle_id) when it exits"
+		if [[ -n "$_drain_owner" && "$_PULSE_RECONCILE_DRAIN_REQUEST" != "0" ]]; then
+			if _pulse_request_cycle_drain "$_drain_owner" "$(_pulse_runtime_bundle_id)"; then
+				_pl_info "Requested cooperative drain: lock owner PID ${_drain_owner} stops at its next candidate boundary"
+			else
+				_pl_info "Cooperative drain request for PID ${_drain_owner} was not recorded; the cycle finishes at its natural end"
+			fi
+		fi
+	elif [[ -n "$_current" ]]; then
+		_pl_info "Pulse already running from the activated bundle (PID ${_current})"
+	else
+		return 1
+	fi
+	return 0
+}
 
+# _pulse_launch_unmanaged: launch pulse in background via nohup.
+_pulse_launch_unmanaged() {
 	mkdir -p "${_PULSE_LOG%/*}"
 
 	# t2994: cache priming moved into pulse-wrapper.sh::main() with a
@@ -744,12 +1107,49 @@ _start() {
 
 	# Give nohup a moment to fork and let pulse-wrapper emit its startup banner.
 	sleep 1
+	return 0
+}
+
+_pulse_require_script() {
+	if [[ ! -x "$_PULSE_SCRIPT" ]]; then
+		_pl_err "pulse-wrapper.sh not found or not executable: $_PULSE_SCRIPT"
+		return 2
+	fi
+	return 0
+}
+
+# _start: launch pulse in background via nohup. No-op if already running.
+_start() {
+	if _is_running; then
+		_pl_info "Pulse already running (PIDs: $(_pulse_pids | tr '\n' ' '))"
+		return 0
+	fi
+
+	_pulse_require_script || return $?
+	_pulse_launch_unmanaged
 
 	if _is_running; then
-		_pl_ok "Pulse started (PID: $(_pulse_pids | head -1))"
+		_pl_ok "Pulse started (PID: $(_pulse_pids | sed -n '1p'))"
 		return 0
 	fi
 	_pl_err "Pulse failed to start — check $_PULSE_LOG"
+	return 1
+}
+
+_start_activated_runtime() {
+	local active_pid=""
+	if active_pid=$(_pulse_find_active_runtime_pid_since ""); then
+		_pl_info "Pulse already running from the activated bundle (PID ${active_pid})"
+		return 0
+	fi
+	_pulse_require_script || return $?
+	_pulse_launch_unmanaged
+	# The unmanaged runtime may publish its lease after the first probe.
+	if active_pid=$(_pulse_wait_for_launchd_runtime ""); then
+		_pl_ok "Pulse is running from the activated bundle (PID ${active_pid})"
+		return 0
+	fi
+	_pl_err "Pulse started but its activated runtime bundle could not be verified"
 	return 1
 }
 
@@ -807,7 +1207,7 @@ _reconcile_managed() {
 		return 1
 	fi
 
-	if [[ "${AIDEVOPS_PULSE_MANAGED_ENABLED:-false}" != "true" ]]; then
+	if [[ "${AIDEVOPS_PULSE_MANAGED_ENABLED:-false}" != "true" || -f "$HOME/.aidevops/logs/pulse-session.stop" ]]; then
 		supervisor_disabled=true
 	elif _pulse_launchd_supervisor_disabled; then
 		supervisor_disabled=true
@@ -824,6 +1224,9 @@ _reconcile_managed() {
 			reconcile_rc=1
 		fi
 		[[ "$reconcile_rc" -eq 0 ]] && _pl_info "Pulse remains stopped because its supervisor is disabled"
+	elif _pulse_reconcile_defers_to_cycle_boundary; then
+		# The owning scheduler starts the activated bundle after the cycle exits.
+		_stop_reconciliation_processes standalone-merge || reconcile_rc=$?
 	else
 		_stop_reconciliation_processes || reconcile_rc=$?
 		if [[ "$reconcile_rc" -eq 0 ]]; then
@@ -857,10 +1260,11 @@ _reconcile_managed() {
 #   it. GH#21903 reframes it as PILE-UP detection: warn only when the count
 #   exceeds the threshold (genuine respawn-outpacing-cycle-completion pattern).
 _status() {
-	local _pids="" _sidecar_pids=""
+	local _pids="" _sidecar_pids="" _housekeeping_pid=""
 	_pids=$(_pulse_pids)
 	_sidecar_pids=$(_pulse_pids_sidecar)
-	if [[ -z "$_pids" && -z "$_sidecar_pids" ]]; then
+	_housekeeping_pid=$(_pulse_async_housekeeping_pid) || _housekeeping_pid=""
+	if [[ -z "$_pids" && -z "$_sidecar_pids" && -z "$_housekeeping_pid" ]]; then
 		printf 'Pulse: not running\n'
 		return 0
 	fi
@@ -873,7 +1277,9 @@ _status() {
 		[[ "$_pid_count" =~ ^[0-9]+$ ]] || _pid_count=0
 	fi
 
-	if [[ "$_pid_count" -eq 0 ]]; then
+	if [[ "$_pid_count" -eq 0 && -z "$_sidecar_pids" ]]; then
+		printf 'Pulse: not running (async housekeeping only)\n'
+	elif [[ "$_pid_count" -eq 0 ]]; then
 		printf 'Pulse: not running (sidecar(s) only)\n'
 	else
 		printf 'Pulse: running (%s instance%s)\n' "$_pid_count" "$([[ $_pid_count -eq 1 ]] || printf 's')"
@@ -882,7 +1288,7 @@ _status() {
 	# Read lock-holder PID for cross-reference (GH#21433 acceptance criterion).
 	# AIDEVOPS_PULSE_LOCK_DIR overrides the default path — useful for tests
 	# that must isolate from the real user lockdir (GH#21581).
-	local _lockdir="${AIDEVOPS_PULSE_LOCK_DIR:-${HOME}/.aidevops/logs/pulse-wrapper.lockdir}"
+	local _lockdir="$_PULSE_LOCK_DIR"
 	local _lock_pid=""
 	if [[ -f "${_lockdir}/pid" ]]; then
 		_lock_pid=$(cat "${_lockdir}/pid" 2>/dev/null || echo "")
@@ -923,9 +1329,17 @@ _status() {
 			_setime=$(ps -p "$_pid" -o etime= 2>/dev/null | tr -d ' ')
 			_scmd=$(ps -p "$_pid" -o command= 2>/dev/null)
 			# Extract role flag from argv for the display label.
-			_srole=$(printf '%s' "$_scmd" | grep -oE "$_PULSE_SIDECAR_FLAGS_RE" | head -1)
+			_srole=$(printf '%s' "$_scmd" | grep -oE "$_PULSE_SIDECAR_FLAGS_RE" | sed -n '1p')
 			printf '    PID %s [%s] (uptime %s)\n' "$_pid" "${_srole:-sidecar}" "${_setime:-unknown}"
 		done <<<"$_sidecar_pids"
+	fi
+
+	# Async housekeeping (informational only — not a cycle, not counted).
+	if [[ -n "$_housekeeping_pid" ]]; then
+		local _hetime=""
+		_hetime=$(ps -p "$_housekeeping_pid" -o etime= 2>/dev/null | tr -d ' ')
+		printf '  Async housekeeping: PID %s (uptime %s; not a cycle, excluded from the instance count)\n' \
+			"$_housekeeping_pid" "${_hetime:-unknown}"
 	fi
 
 	# PILE-UP check applies to MAIN count only — sidecars are categorically
@@ -964,6 +1378,18 @@ Env:
   AIDEVOPS_AGENTS_DIR=<path>               Override ~/.aidevops/agents.
   AIDEVOPS_ACTIVE_AGENTS_LINK=<path>        Active runtime link for reconciliation.
   AIDEVOPS_PULSE_MANAGED_ENABLED=true       Allow reconcile-managed to start Pulse.
+  AIDEVOPS_PULSE_RECONCILE_DRAIN=0          Replace an in-flight launchd cycle
+                                            immediately (default 1 lets it finish).
+  AIDEVOPS_PULSE_RECONCILE_DRAIN_MAX_AGE_S=3600
+                                            Replace cycles at least this old now,
+                                            unless the lock owner's heartbeat
+                                            lease is fresh (GH#37907).
+  AIDEVOPS_PULSE_RECONCILE_DRAIN_HARD_CAP_S=7200
+                                            Replace even fresh-lease cycles at
+                                            this age (default 4x lock max age).
+  AIDEVOPS_PULSE_RECONCILE_DRAIN_REQUEST=0  Do not ask a deferred cycle to stop
+                                            at its next candidate boundary.
+  AIDEVOPS_PULSE_HOUSEKEEPING_LOCK_DIR=...  Override the async housekeeping lock (tests).
   AIDEVOPS_PULSE_MERGE_PROCESS_PATTERN=...  Override merge-routine match (tests).
 
 Exit codes:

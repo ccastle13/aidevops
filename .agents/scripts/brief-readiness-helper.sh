@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Marcus Quinn
 #
 # brief-readiness-helper.sh — Detect worker-ready issue bodies and generate
-# stub briefs linking to the canonical issue (t2417, GH#20015).
+# repo-native captures of worker-ready issues (t18404; legacy `stub` interface).
 #
 # Historical issue bodies retain heading-based readiness. Bodies carrying the
 # brief schema-v2 marker must also contain substantive write-surface, hazard,
@@ -12,8 +12,8 @@
 # This helper provides:
 #   1. A readiness detector (`check`) that scores an issue body against
 #      known heading sets and returns a pass/fail verdict.
-#   2. A stub-brief writer (`stub`) that creates a minimal brief linking
-#      to the canonical issue instead of duplicating its content.
+#   2. A capture writer (`stub`, retained for compatibility) that preserves
+#      the complete observed issue body without overwriting local knowledge.
 #   3. A similarity check (`similarity`) that compares an existing brief
 #      file against an issue body and reports overlap percentage.
 #
@@ -40,6 +40,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)" || exit 1
 if [[ -f "$SCRIPT_DIR/shared-constants.sh" ]]; then
 	source "$SCRIPT_DIR/shared-constants.sh"
 fi
+# shellcheck source=./task-identity-lib.sh
+source "$SCRIPT_DIR/task-identity-lib.sh"
 
 # ---------------------------------------------------------------------------
 # Logging (inline fallbacks if shared-constants not sourced)
@@ -97,7 +99,7 @@ _score_body() {
 
 	local heading
 	for heading in "${PRIMARY_HEADINGS[@]}" "${ALTERNATE_HEADINGS[@]}"; do
-		if printf '%s\n' "$body" | grep -qiF "$heading"; then
+		if grep -qiF "$heading" <<<"$body"; then
 			score=$((score + 1))
 		fi
 	done
@@ -112,7 +114,7 @@ _is_schema_v2_brief() {
 	local unfenced=""
 
 	unfenced=$(_unfenced_brief_text "$body")
-	if printf '%s\n' "$unfenced" | grep -qF "$BRIEF_SCHEMA_V2_MARKER"; then
+	if grep -qF "$BRIEF_SCHEMA_V2_MARKER" <<<"$unfenced"; then
 		return 0
 	fi
 	return 1
@@ -162,7 +164,27 @@ _field_line() {
 	local section="${_args[0]}"
 	local field="${_args[1]}"
 
-	printf '%s\n' "$section" | grep -iF -m 1 "**${field}:**" || true
+	printf '%s\n' "$section" | awk -v field="$field" '
+		BEGIN { label = tolower("**" field ":**") }
+		!found {
+			if (index(tolower($0), label)) {
+				found = 1
+				base = match($0, /[^ \t]/) - 1
+				value = $0
+			}
+			next
+		}
+		{
+			if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/ || match($0, /[^ \t]/) - 1 <= base) {
+				exit
+			}
+			continuation = $0
+			sub(/^[ \t]+/, "", continuation)
+			sub(/[ \t]+$/, "", continuation)
+			value = value " " continuation
+		}
+		END { if (found) print value }
+	'
 	return 0
 }
 
@@ -174,7 +196,7 @@ _field_is_substantive() {
 
 	line=$(_field_line "$section" "$field")
 	[[ -n "$line" ]] || return 1
-	if printf '%s\n' "$line" | grep -qiE ':\*\*[[:space:]]*($|TBD$|TODO$|N/?A[[:space:]]*$|unknown[[:space:]]*$|\{|<)'; then
+	if grep -qiE ':\*\*[[:space:]]*($|TBD$|TODO$|N/?A[[:space:]]*$|unknown[[:space:]]*$|\{|<)' <<<"$line"; then
 		return 1
 	fi
 	# The field wrapper contributes eight characters. Require at least four
@@ -191,22 +213,33 @@ _write_surface_field_is_valid() {
 
 	_field_is_substantive "$section" "$field" || return 1
 	line=$(_field_line "$section" "$field")
-	if printf '%s\n' "$line" | grep -qE "\`[^\`]+\`|(^|[[:space:]])(EDIT|NEW):"; then
+	if grep -qE "\`[^\`]+\`|(^|[[:space:]])(EDIT|NEW):" <<<"$line"; then
 		return 0
 	fi
-	if printf '%s\n' "$line" | grep -qiE '(N/?A|not applicable|not yet knowable|unknown).*(because|evidence|searched|documentation-only|new-file-only|until|no existing)'; then
+	if grep -qiE '(N/?A|not applicable|not yet knowable|unknown).*(because|evidence|searched|documentation-only|new-file-only|until|no existing)' <<<"$line"; then
 		return 0
 	fi
 	return 1
 }
 
-_has_unfilled_placeholder() {
+_first_unfilled_placeholder() {
 	local -a _args=("$@")
 	local body="${_args[0]}"
 	local prose=""
+	local match=""
 
 	prose=$(_brief_prose_text "$body")
-	if printf '%s\n' "$prose" | grep -qiE '<[[:alpha:]][^>]*>|\{[^{}]*(command|path|purpose|criterion|rationale|summary|deliverable|problem|evidence|task|title)[^{}]*\}'; then
+	match=$(printf '%s\n' "$prose" | grep -oiE '<[[:alpha:]][^>]*>|\{[^{}]*(command|path|purpose|criterion|rationale|summary|deliverable|problem|evidence|task|title)[^{}]*\}' | head -n 1 || true)
+	[[ -n "$match" ]] || return 1
+	printf '%.80s\n' "$match"
+	return 0
+}
+
+_has_unfilled_placeholder() {
+	local -a _args=("$@")
+	local body="${_args[0]}"
+
+	if _first_unfilled_placeholder "$body" >/dev/null; then
 		return 0
 	fi
 	return 1
@@ -216,7 +249,7 @@ _has_file_target() {
 	local -a _args=("$@")
 	local section="${_args[0]}"
 
-	if printf '%s\n' "$section" | grep -qE "^[[:space:]]*-[[:space:]]+[\`]?(EDIT|NEW):[[:space:]]+[\`]?[^ \`{<]+"; then
+	if grep -qE "^[[:space:]]*-[[:space:]]+[\`]?(EDIT|NEW):[[:space:]]+[\`]?[^ \`{<]+" <<<"$section"; then
 		return 0
 	fi
 	return 1
@@ -226,7 +259,7 @@ _has_implementation_step() {
 	local -a _args=("$@")
 	local section="${_args[0]}"
 
-	if printf '%s\n' "$section" | grep -qE '^[[:space:]]*[0-9]+\.[[:space:]]+[^<{][^{}]{8,}'; then
+	if grep -qE '^[[:space:]]*[0-9]+\.[[:space:]]+[^<{][^{}]{8,}' <<<"$section"; then
 		return 0
 	fi
 	return 1
@@ -236,10 +269,60 @@ _has_executable_verification() {
 	local -a _args=("$@")
 	local section="${_args[0]}"
 
-	if printf '%s\n' "$section" | grep -qE '^[[:space:]]*(\$[[:space:]]*)?(bash |shellcheck |pytest( |$)|python[0-9]* |node |npm |pnpm |yarn |bun |go test( |$)|cargo test( |$)|make |bundle exec |composer |git diff( |$)|\./|[.][[:alnum:]_/-]+\.sh([[:space:]]|$))'; then
+	if grep -qE '^[[:space:]]*(\$[[:space:]]*)?(bash |shellcheck |pytest( |$)|python[0-9]* |node |npm |pnpm |yarn |bun |go test( |$)|cargo test( |$)|make |bundle exec |composer |git diff( |$)|\./|[.][[:alnum:]_/-]+\.sh([[:space:]]|$))' <<<"$section"; then
 		return 0
 	fi
 	return 1
+}
+
+# Pure producer transformation: consume only structurally visible declarations.
+# Existing scope is never rewritten, including when it needs author-side repair.
+cmd_scope() {
+	local action="$1"
+	local body="$2"
+	local visible=""
+	visible=$(_unfenced_brief_text "$(_visible_brief_text "$body")")
+	printf '%s\n' "$visible" | python3 "$SCRIPT_DIR/brief_scope.py" \
+		"$action" "$body" "$(_unfenced_brief_text "$body")"
+	return $?
+}
+
+# Explicit authoring operation, never called by read-only composition/sync.
+# Require an existing regular task brief inside a linked authoring worktree.
+cmd_prepare_scope() {
+	local brief="$1"
+	local root="" body="" prepared=""
+	root=$(git -C "$(dirname "$brief")" rev-parse --show-toplevel) || return 1
+	[[ -f "$root/.git" ]] || { log_error "Scope preparation requires a linked worktree"; return 1; }
+	body=$(<"$brief")
+	prepared=$(cmd_scope normalize "$body") || return 1
+	python3 -c '
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+
+root, name, before, after = sys.argv[1:]
+path = Path(os.path.abspath(name))
+expected = Path(root) / "todo" / "tasks"
+if path.parent != expected or path.resolve() != path or not path.name.endswith("-brief.md"):
+    sys.exit("Scope preparation requires a non-symlink local task brief")
+if not path.is_file() or path.read_text().rstrip("\n") != before:
+    sys.exit("Brief changed during preparation; retry from current author-owned content")
+if before == after:
+    sys.exit(0)
+fd, temporary = tempfile.mkstemp(prefix=".scope-", dir=expected)
+try:
+    with os.fdopen(fd, "w") as output:
+        os.fchmod(output.fileno(), stat.S_IMODE(path.stat().st_mode))
+        output.write(after + "\n")
+    os.replace(temporary, path)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+' "$root" "$brief" "$body" "$prepared"
+	return $?
 }
 
 _validate_v2_body() {
@@ -254,6 +337,7 @@ _validate_v2_body() {
 	local acceptance=""
 	local errors=""
 	local field=""
+	local placeholder_match=""
 	local checkbox_count=0
 	local checkbox_pattern='^[[:space:]]*-[[:space:]]+\[[ xX]\]'
 	local negative_pattern='regression|never|must not|does not|do not|without|rejects?|preserves?|no [[:alnum:]]'
@@ -266,12 +350,18 @@ _validate_v2_body() {
 	verification=$(_extract_markdown_section "$visible" "### Verification Before Dispatch" "$BRIEF_BOOL_TRUE")
 	acceptance=$(_extract_markdown_section "$visible" "## Acceptance Criteria")
 
+	cmd_scope check "$body" >/dev/null 2>&1 || errors="${errors}files-scope:canonical;"
 	_has_file_target "$files_to_modify" || errors="${errors}files-to-modify:target;"
 	_has_implementation_step "$implementation_steps" || errors="${errors}implementation-steps:substantive;"
 
-	for field in "Callers/readers" "Writers/mutation paths" "Tests/fixtures" "Schemas/config" "Generated/deployed mirrors" "Migrations/backfills" "Cleanup/rollback paths"; do
+	for field in "Callers/readers" "Writers/mutation paths" "Schemas/config" "Generated/deployed mirrors" "Migrations/backfills" "Cleanup/rollback paths"; do
 		_write_surface_field_is_valid "$write_surface" "$field" || errors="${errors}write-surface:${field};"
 	done
+	# Accept the current template label and the legacy label in existing briefs.
+	if ! _write_surface_field_is_valid "$write_surface" "Existing verification/tests" &&
+		! _write_surface_field_is_valid "$write_surface" "Tests/fixtures"; then
+		errors="${errors}write-surface:Existing verification/tests;"
+	fi
 
 	for field in "Concurrency/atomicity" "Migration/rollback" "Mixed-version/backward compatibility" "Idempotency/retry" "Partial failure/recovery"; do
 		_field_is_substantive "$hazards" "$field" || errors="${errors}hazard:${field};"
@@ -282,11 +372,19 @@ _validate_v2_body() {
 
 	checkbox_count=$(printf '%s\n' "$acceptance" | grep -cE "$checkbox_pattern" || true)
 	[[ "$checkbox_count" -ge 2 ]] || errors="${errors}acceptance:multiple-observable-criteria;"
-	printf '%s\n' "$acceptance" | grep -E "$checkbox_pattern" | grep -qiE "$negative_pattern" || errors="${errors}acceptance:negative-regression;"
-	printf '%s\n' "$acceptance" | grep -E "$checkbox_pattern" | grep -viE "$negative_pattern" | grep -q . || errors="${errors}acceptance:positive;"
-	_has_unfilled_placeholder "$visible" && errors="${errors}placeholder:unfilled;"
+	# Materialise intermediate results instead of piping into early-exit
+	# readers: under pipefail a writer's SIGPIPE turns a match into a miss
+	# (GH#33882).
+	local checkbox_lines="" positive_lines=""
+	checkbox_lines=$(grep -E "$checkbox_pattern" <<<"$acceptance" || true)
+	grep -qiE "$negative_pattern" <<<"$checkbox_lines" || errors="${errors}acceptance:negative-regression;"
+	positive_lines=$(grep -viE "$negative_pattern" <<<"$checkbox_lines" || true)
+	grep -q . <<<"$positive_lines" || errors="${errors}acceptance:positive;"
+	placeholder_match=$(_first_unfilled_placeholder "$visible" || true)
+	[[ -n "$placeholder_match" ]] && errors="${errors}placeholder:unfilled;"
 
 	if [[ -n "$errors" ]]; then
+		[[ -n "$placeholder_match" ]] && printf 'PLACEHOLDER_MATCH=%s\n' "$placeholder_match"
 		printf 'VALIDATION_ERRORS=%s\n' "$errors"
 		return 1
 	fi
@@ -426,10 +524,10 @@ cmd_check() {
 }
 
 # ---------------------------------------------------------------------------
-# cmd_stub: write a minimal stub brief that links to the canonical issue.
+# cmd_stub: capture the observed issue body, retaining the legacy command name.
 #
 # Args: <task-id> <issue-number> <slug> [repo-path]
-# Creates: todo/tasks/{task_id}-brief.md (stub form)
+# Creates: todo/tasks/{task_id}-brief.md (full body plus provenance)
 # Exit: 0 on success
 # ---------------------------------------------------------------------------
 cmd_stub() {
@@ -439,54 +537,55 @@ cmd_stub() {
 	local slug="${_stub_args[2]:-}"
 	local repo_path="${_stub_args[3]:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 
-	if [[ -z "$task_id" || -z "$issue_number" || -z "$slug" ]]; then
+	if ! task_identity_validate "$task_id" || [[ ! "$issue_number" =~ ^[1-9][0-9]*$ ||
+		! "$slug" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ || ! -d "$repo_path" ]]; then
 		log_error "Usage: brief-readiness-helper.sh stub <task-id> <issue-number> <slug> [repo-path]"
 		return 2
 	fi
 
 	local brief_dir="$repo_path/todo/tasks"
 	local brief_path="$brief_dir/${task_id}-brief.md"
-	local today
-	today=$(date +%Y-%m-%d)
+	mkdir -p "$brief_dir" || return 1
 
-	mkdir -p "$brief_dir"
-
-	if [[ -f "$brief_path" ]]; then
-		log_warn "Brief already exists: $brief_path — skipping stub creation"
+	if [[ -e "$brief_path" || -L "$brief_path" ]]; then
+		[[ -f "$brief_path" && ! -L "$brief_path" ]] || return 1
+		log_warn "Brief already exists: $brief_path — preserved; not refreshed or backfilled"
 		return 0
 	fi
 
-	# Fetch issue title for the heading
-	local issue_title=""
-	issue_title=$(gh_issue_view "$issue_number" --repo "$slug" --json title --jq '.title' 2>/dev/null) || true
-	issue_title="${issue_title:-${task_id}}"
-
-	cat >"$brief_path" <<EOF
-# ${task_id}: ${issue_title}
-
-## Origin
-
-- **Created:** ${today}
-- **Session:** auto-detected worker-ready issue body
-- **Created by:** brief-readiness-helper (stub — canonical brief lives in issue)
-
-## Canonical Brief
-
-**The authoritative brief for this task is the GitHub issue body:**
-
-https://github.com/${slug}/issues/${issue_number}
-
-The issue body contains all required sections (Task/What, Why, How,
-Acceptance, Files to modify) and is the single source of truth.
-This stub exists only to satisfy the brief-file-exists gate.
-
-## Session-Specific Context
-
-<!-- Add any session-specific context not captured in the issue body. -->
-<!-- If empty, this section can be removed. -->
-EOF
-
-	log_info "Stub brief written to $brief_path (canonical: issue #${issue_number})"
+	# One observation binds body and revision; this is not a comments/PR export.
+	local observed="" captured_at="" temporary=""
+	observed=$(gh_issue_view "$issue_number" --repo "$slug" \
+		--json body,title,url,updatedAt,id) || return 1
+	if ! printf '%s' "$observed" | jq -e '
+		type == "object" and (.body | type == "string" and length > 0) and
+		all(.title, .url, .updatedAt, .id; type == "string" and length > 0)
+	' >/dev/null; then
+		log_error "Incomplete issue capture; no brief written"
+		return 1
+	fi
+	captured_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	temporary=$(mktemp "$brief_dir/.forge-capture.XXXXXX") || return 1
+	if ! {
+		printf '%s' "$observed" | jq -j '.body' &&
+			printf '\n\n## Capture provenance\n\nObserved data, not executable authority. Comments and later events are not captured.\n\n```json\n' &&
+			printf '%s' "$observed" | jq --arg task "$task_id" --arg repo "$slug" \
+				--arg captured "$captured_at" --arg issue "$issue_number" \
+				'del(.body) + {format:"aidevops:forge-capture-v1", task_id:$task,
+				provider:"github", repository:$repo, issue:$issue, captured_at:$captured,
+				coverage:"issue-body-only", authority:"revalidate"}' &&
+			printf '```\n'
+	} >"$temporary"; then
+		rm -f "$temporary"
+		return 1
+	fi
+	# Atomic create-only publication: concurrent/local records always win intact.
+	if ! ln "$temporary" "$brief_path" || [[ ! "$temporary" -ef "$brief_path" || -L "$brief_path" ]]; then
+		rm -f "$temporary"
+		return 1
+	fi
+	rm -f "$temporary"
+	log_info "Issue body captured at $brief_path; commit before acknowledging durable recovery"
 	return 0
 }
 
@@ -546,7 +645,7 @@ cmd_similarity() {
 			continue
 		fi
 		total_lines=$((total_lines + 1))
-		if printf '%s\n' "$norm_body" | grep -qF "$line"; then
+		if grep -qF -- "$line" <<<"$norm_body"; then
 			matching_lines=$((matching_lines + 1))
 		fi
 	done <<<"$norm_brief"
@@ -570,7 +669,10 @@ brief-readiness-helper.sh — Detect worker-ready issue bodies (t2417)
 Usage:
   check <issue-number> <slug>           Score an issue body for worker-readiness
   check --body <body-text>              Score inline body text
-  stub  <task-id> <issue> <slug> [path] Write a stub brief linking to the issue
+  scope-check <body-text>               Validate canonical exact-path scope
+  scope-normalize <body-text>           Print canonical scope from explicit declarations
+  prepare-scope <brief-path>            Persist scope in an authoring linked worktree
+  stub  <task-id> <issue> <slug> [path] Capture full body/provenance, create-only
   similarity <brief-path> --body <text> Compare brief vs issue body overlap (%)
   help                                  Show this help
 
@@ -596,6 +698,9 @@ main() {
 	local -a _rest=("${_main_args[@]:1}")
 
 	case "$cmd" in
+	prepare-scope) cmd_prepare_scope "${_rest[0]:-}" ;;
+	scope-check) cmd_scope check "${_rest[0]:-}" ;;
+	scope-normalize) cmd_scope normalize "${_rest[0]:-}" ;;
 	check)      cmd_check "${_rest[@]}" ;;
 	stub)       cmd_stub "${_rest[@]}" ;;
 	similarity) cmd_similarity "${_rest[@]}" ;;

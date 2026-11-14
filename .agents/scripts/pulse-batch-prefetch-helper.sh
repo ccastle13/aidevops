@@ -115,6 +115,12 @@ REPOS_JSON="${REPOS_JSON:-${HOME}/.config/aidevops/repos.json}"
 BATCH_CACHE_DIR="${PULSE_BATCH_PREFETCH_CACHE_DIR:-${HOME}/.aidevops/logs/batch-prefetch}"
 PULSE_BATCH_PREFETCH_ENABLED="${PULSE_BATCH_PREFETCH_ENABLED:-1}"
 PULSE_PREFETCH_FULL_SWEEP_INTERVAL="${PULSE_PREFETCH_FULL_SWEEP_INTERVAL:-14400}"
+# GH#33074: an events-ETag 304 may keep an owner's snapshots unrefreshed only
+# while they are younger than this. Org event feeds omit private-repo activity,
+# so an unbounded skip froze private-org snapshots for weeks. 900s matches the
+# dispatch negative-cache PR fingerprint bound in pulse-dispatch-lib.sh.
+PULSE_EVENTS_TICKLE_MAX_CACHE_AGE="${PULSE_EVENTS_TICKLE_MAX_CACHE_AGE:-900}"
+[[ "$PULSE_EVENTS_TICKLE_MAX_CACHE_AGE" =~ ^[0-9]+$ ]] || PULSE_EVENTS_TICKLE_MAX_CACHE_AGE=900
 BATCH_SEARCH_LIMIT="${PULSE_BATCH_SEARCH_LIMIT:-200}"
 LOGFILE="${LOGFILE:-${HOME}/.aidevops/logs/pulse-wrapper.log}"
 PULSE_BATCH_CONDITIONAL_REST_ENABLED="${PULSE_BATCH_CONDITIONAL_REST_ENABLED:-1}"
@@ -686,6 +692,12 @@ _conditional_rest_refresh_slug_leader() {
 	else
 		_prefetch_gh_read gh api -i -H "Accept: application/vnd.github+json" "$endpoint" >"$response_file" 2>"$err_file" || rc=$?
 	fi
+	# gh 2.102 emits only stderr for 304, exiting 1 with empty stdout.
+	# Adapt only a conditional request; preserve all other failure paths.
+	if [[ "$rc" -ne 0 && -n "$etag" && ! -s "$response_file" ]] &&
+		grep -qE '^gh: HTTP 304([[:space:]]|$)' "$err_file"; then
+		printf 'HTTP/2 304\r\netag: %s\r\n\r\n' "$etag" >"$response_file"
+	fi
 	local status=""
 	if [[ -n "$request_key" && -n "$generation" ]] && ! gh_request_state_singleflight_is_owner "$request_key" "$generation"; then
 		rm -f "$response_file" "$err_file"
@@ -780,13 +792,17 @@ _conditional_rest_refresh_slug() {
 _conditional_rest_per_slug() {
 	local kind="$1"
 	local slugs="${2:-}"
+	# Bash 3.2 output parameter, scoped by each owner/collection caller.
+	_CONDITIONAL_REST_FAILED_SLUGS=""
 	[[ -n "$slugs" ]] || return 1
-	local slug="" failures=0
+	local slug=""
 	while IFS= read -r slug; do
 		[[ -n "$slug" ]] || continue
-		_conditional_rest_refresh_slug "$kind" "$slug" || failures=$((failures + 1))
+		if ! _conditional_rest_refresh_slug "$kind" "$slug"; then
+			_CONDITIONAL_REST_FAILED_SLUGS="${_CONDITIONAL_REST_FAILED_SLUGS:+${_CONDITIONAL_REST_FAILED_SLUGS},}${slug}"
+		fi
 	done < <(tr ',' '\n' <<< "$slugs")
-	[[ "$failures" -eq 0 ]] || return 1
+	[[ -z "$_CONDITIONAL_REST_FAILED_SLUGS" ]] || return 1
 	return 0
 }
 
@@ -887,10 +903,12 @@ _refresh_owner_issues() {
 	local owner="$1"
 	local slugs="${2:-}"
 	local graphql_remaining="${3:-}"
+	local _CONDITIONAL_REST_FAILED_SLUGS=""
 	if _conditional_rest_per_slug issues "$slugs"; then
 		_log "conditional REST issues complete for owner=${owner} — skipped search"
 		return 0
 	fi
+	slugs="$_CONDITIONAL_REST_FAILED_SLUGS"
 	if _search_should_route_to_rest "$graphql_remaining"; then
 		_route_owner_search_to_rest issues "$owner" "$slugs"
 		return 0
@@ -910,7 +928,7 @@ _refresh_owner_issues() {
 	local issue_err
 	issue_err=$(mktemp)
 	local issue_json=""
-	issue_json=$(_prefetch_gh_read gh search issues --owner "$owner" --state open \
+	issue_json=$(_prefetch_gh_read gh search issues --repo "$slugs" --state open \
 		--limit "$BATCH_SEARCH_LIMIT" \
 		--json number,title,state,labels,updatedAt,assignees,body,authorAssociation,author,repository 2>"$issue_err") || issue_json=""
 	_OWNER_SEARCH_CALLS=$((_OWNER_SEARCH_CALLS + 1))
@@ -954,10 +972,12 @@ _refresh_owner_prs() {
 	local owner="$1"
 	local slugs="${2:-}"
 	local graphql_remaining="${3:-}"
+	local _CONDITIONAL_REST_FAILED_SLUGS=""
 	if _conditional_rest_per_slug prs "$slugs"; then
 		_log "conditional REST prs complete for owner=${owner} — skipped search"
 		return 0
 	fi
+	slugs="$_CONDITIONAL_REST_FAILED_SLUGS"
 	if _search_should_route_to_rest "$graphql_remaining"; then
 		_route_owner_search_to_rest prs "$owner" "$slugs"
 		return 0
@@ -974,7 +994,7 @@ _refresh_owner_prs() {
 	local pr_err
 	pr_err=$(mktemp)
 	local pr_json=""
-	pr_json=$(_prefetch_gh_read gh search prs --owner "$owner" --state open \
+	pr_json=$(_prefetch_gh_read gh search prs --repo "$slugs" --state open \
 		--limit "$BATCH_SEARCH_LIMIT" \
 		--json number,title,labels,updatedAt,assignees,repository,createdAt,author 2>"$pr_err") || pr_json=""
 	_OWNER_SEARCH_CALLS=$((_OWNER_SEARCH_CALLS + 1))
@@ -1026,9 +1046,73 @@ _record_events_tickle_stats() {
 	return 0
 }
 
+# Return 0 when every slug's issues and PR snapshots are fresh within
+# PULSE_EVENTS_TICKLE_MAX_CACHE_AGE. Arguments: $1=comma-separated slugs.
+_owner_snapshots_recent() {
+	local slugs="$1"
+	local slug="" kind=""
+	local -a slug_list=()
+	IFS=',' read -r -a slug_list <<<"$slugs"
+	[[ "${#slug_list[@]}" -gt 0 ]] || return 1
+	for slug in "${slug_list[@]}"; do
+		[[ -n "$slug" ]] || return 1
+		for kind in "$_KIND_ISSUES" "$_KIND_PRS"; do
+			_resolve_cache_snapshot "$kind" "$slug" "$PULSE_EVENTS_TICKLE_MAX_CACHE_AGE" || return 1
+		done
+	done
+	return 0
+}
+
+# Decide whether an events_tickle 0 may skip this owner's refresh (GH#33074).
+# Cooldown skips always hold: fanout must not run while rate-limited. ETag
+# skips hold only while snapshots are recent, because org event feeds list
+# public events only and cannot prove private-repo issues/PRs are unchanged.
+# Arguments: $1=comma-separated slugs.
+_events_tickle_skip_is_safe() {
+	local slugs="$1"
+	[[ "${_PULSE_EVENTS_TICKLE_LAST_REASON:-}" == "cooldown" ]] && return 0
+	_owner_snapshots_recent "$slugs"
+	return $?
+}
+
 # =============================================================================
 # Subcommand: refresh
 # =============================================================================
+_refresh_awake_owner() {
+	local owner="$1" slugs="$2" graphql_remaining="$3"
+	# Filter only enabled slugs selected by _group_repos_by_owner. Never use
+	# this scheduling state for PR merge/repair/checkpoint recovery stages.
+	local awake_slugs="" slug="" force_refresh=0 repo_slugs=()
+	# shellcheck source=./pulse-repo-dormancy.sh
+	source "${SCRIPT_DIR}/pulse-repo-dormancy.sh"
+	IFS=',' read -r -a repo_slugs <<<"$slugs"
+	for slug in "${repo_slugs[@]}"; do
+		pulse_repo_scan_allowed "$slug" || continue
+		awake_slugs="${awake_slugs:+$awake_slugs,}$slug"
+		if pulse_repo_wake_pending "$slug"; then
+			force_refresh=1
+		fi
+	done
+	slugs="$awake_slugs"
+	[[ -n "$slugs" ]] || return 0
+
+	# Owner tickle can suppress a refresh only when no per-repo wake is pending.
+	local tickle_rc=0
+	events_tickle "$owner" || tickle_rc=$?
+	if [[ "$tickle_rc" -eq 0 && "$force_refresh" == 0 ]]; then
+		if _events_tickle_skip_is_safe "$slugs"; then
+			_log "events tickle fresh for owner=${owner} — skipping search calls"
+			return 0
+		fi
+		_PULSE_EVENTS_TICKLE_FRESH=$((_PULSE_EVENTS_TICKLE_FRESH - 1))
+		_PULSE_EVENTS_TICKLE_STALE=$((_PULSE_EVENTS_TICKLE_STALE + 1))
+		_log "events tickle fresh for owner=${owner} but snapshots older than ${PULSE_EVENTS_TICKLE_MAX_CACHE_AGE}s — refreshing"
+	fi
+	_refresh_owner_issues "$owner" "$slugs" "$graphql_remaining" || true
+	_refresh_owner_prs "$owner" "$slugs" "$graphql_remaining" || true
+	return 0
+}
+
 _cmd_refresh() {
 	_check_enabled || {
 		_log "batch prefetch disabled (PULSE_BATCH_PREFETCH_ENABLED=0)"
@@ -1084,30 +1168,14 @@ _cmd_refresh() {
 	local owner="" slugs=""
 	while IFS='|' read -r owner slugs; do
 		[[ -n "$owner" ]] || continue
-
-		# L1 events ETag tickle (t2830, GH#20868): cheap conditional GET
-		# via REST core bucket. On 304 (ETag unchanged), skip the 2 Search
-		# API calls for this owner entirely. On error (exit 2), fail-open
-		# and let the normal batch search proceed.
-		local _tickle_rc=0
-		events_tickle "$owner" || _tickle_rc=$?
-		if [[ "$_tickle_rc" -eq 0 ]]; then
-			_log "events tickle fresh for owner=${owner} — skipping search calls"
-			continue
-		fi
-
-		_refresh_owner_issues "$owner" "$slugs" "$_graphql_remaining" || true
-		_refresh_owner_prs "$owner" "$slugs" "$_graphql_remaining" || true
+		_refresh_awake_owner "$owner" "$slugs" "$_graphql_remaining"
 	done <<<"$owner_groups"
 
 	_log "refresh complete: search_calls=${_OWNER_SEARCH_CALLS} cache_writes=${_OWNER_CACHE_WRITES} errors=${_OWNER_ERRORS} tickle_fresh=${_PULSE_EVENTS_TICKLE_FRESH} tickle_stale=${_PULSE_EVENTS_TICKLE_STALE} conditional_304=${_OWNER_CONDITIONAL_304} conditional_refreshes=${_OWNER_CONDITIONAL_REFRESHES} conditional_misses=${_OWNER_CONDITIONAL_MISSES}"
 
-	# t2902: aggregate gh API call records to JSON report at the end of each
-	# refresh cycle. Fail-open: if gh-api-instrument.sh isn't sourced, the
-	# 2>/dev/null || true silences the unbound function and the host script
-	# keeps working. trim keeps the append-only log under MAX_LINES.
-	gh_aggregate_calls 2>/dev/null || true
-	gh_trim_log 2>/dev/null || true
+	# The completed Pulse cycle owns report/sidecar publication and retention.
+	# A partial prefetch must not overwrite its bounded coverage with a later
+	# cutoff. Standalone diagnostics use gh-api-instrument.sh report instead.
 
 	# Record tickle counters to pulse-stats.json (one timestamp entry per
 	# fresh/stale owner). Fail-open: pulse_stats_increment is sourced from
@@ -1130,9 +1198,11 @@ _cmd_refresh() {
 
 # Resolve a cache snapshot to one canonical state without printing payload data.
 # Sets _CACHE_SNAPSHOT_STATE and _CACHE_SNAPSHOT_PATH for Bash 3.2 callers.
+# Optional $3 overrides the maximum fresh age in seconds.
 _resolve_cache_snapshot() {
 	local kind="$1"
 	local slug="$2"
+	local max_age="${3:-$PULSE_PREFETCH_FULL_SWEEP_INTERVAL}"
 	local cache_file=""
 	local cache_ts=""
 	local cache_epoch=0
@@ -1190,7 +1260,7 @@ _resolve_cache_snapshot() {
 		_CACHE_SNAPSHOT_STATE="$_CACHE_STATE_MALFORMED"
 		return 1
 	fi
-	if [[ "$age" -ge "$PULSE_PREFETCH_FULL_SWEEP_INTERVAL" ]]; then
+	if [[ "$age" -ge "$max_age" ]]; then
 		_CACHE_SNAPSHOT_STATE="stale"
 		return 1
 	fi

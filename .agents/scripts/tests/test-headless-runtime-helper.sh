@@ -51,6 +51,9 @@ setup_test_env() {
 	# shellcheck source=/dev/null
 	source "$HELPER_SCRIPT" >/dev/null 2>&1
 	set -e
+	# Finish-path fixtures model a run whose runtime launched (GH#37669);
+	# not-launched cases set _WORKER_RUNTIME_LAUNCH_STARTED=0 explicitly.
+	_WORKER_RUNTIME_LAUNCH_STARTED=1
 	return 0
 }
 
@@ -99,6 +102,7 @@ source "${SCRIPT_DIR}/test-headless-runtime-checkpoint-tests.sh"
 
 run_worker_db_persistence_tests() {
 	test_seed_worker_db_session_context_copies_only_selected_session
+	test_seed_worker_db_session_context_restores_archived_session
 	test_seed_worker_db_session_context_rebinds_replacement_worktree
 	test_seed_worker_db_session_context_copies_migration_metadata
 	test_seed_worker_db_session_context_uses_schema_only_fresh_db
@@ -113,6 +117,10 @@ run_worker_db_persistence_tests() {
 	test_merge_worker_db_rejects_missing_required_destination_column
 	test_merge_worker_db_failure_preserves_recovery_db_without_auth
 	test_replay_preserved_worker_db_verifies_before_deletion
+	test_replay_corrupt_worker_db_quarantines_evidence_and_finalizes_healthy
+	test_replay_schema_failure_remains_retryable_without_mutating_evidence
+	test_quarantine_worker_db_preserves_existing_metadata
+	test_quarantine_worker_db_retries_failed_move
 	test_worker_db_replay_lock_recovers_stale_owner_and_waits_for_pid
 	test_sync_worker_db_migration_metadata_repairs_prewarmed_project_table
 	test_sync_worker_db_migration_metadata_replaces_stale_ledgers
@@ -166,6 +174,7 @@ run_worker_finish_tests() {
 	test_rate_limit_fast_reconciles_session_blockers
 	test_cmd_run_finish_emits_noop_for_zero_output
 	test_cmd_run_finish_preserves_terminal_blocked_outcome
+	test_blocked_signal_accepts_labelled_outcome_lines
 	test_cmd_run_finish_emits_complete_for_real_output
 	test_cmd_run_finish_appends_reconciled_attempt_outcome
 	test_cmd_run_finish_rejects_unverified_post_pr_handoff
@@ -179,6 +188,7 @@ run_worker_finish_tests() {
 	test_begin_worker_runtime_run_refreshes_run_id
 	test_internal_opencode_retries_refresh_run_id
 	test_reconciled_outcome_persistence_retries
+	test_reconciled_outcome_persistence_has_deadline
 	test_reconciled_outcome_requires_explicit_issue
 	test_cmd_run_finish_emits_complete_when_no_workdir
 	test_attempt_orphan_recovery_pr_calls_gh_create
@@ -197,9 +207,21 @@ run_worker_finish_tests() {
 	return 0
 }
 
+run_issue_worker_env_contract_tests() {
+	test_issue_worker_env_contract_rejects_missing_env
+	test_issue_worker_env_contract_rejects_invalid_or_mismatched_issue
+	test_issue_worker_env_contract_rejects_missing_worktree
+	test_issue_worker_env_contract_accepts_valid_precreated_worktree
+	test_triage_env_contract_does_not_require_worker_authority
+	test_standalone_prompt_skips_only_prose_issue_classification
+	test_standalone_prompt_args_refuse_issue_identity
+	return 0
+}
+
 run_worker_worktree_ownership_tests() {
 	test_worker_worktree_claim_transfers_to_runtime_pid
 	test_worker_worktree_claim_reclaims_stale_live_same_task_owner
+	test_worker_worktree_claim_claims_after_dead_owner_vacated
 	test_worker_worktree_claim_reclaims_dispatch_precreate_owner
 	test_worker_worktree_claim_transfers_dispatch_precreate_task_state
 	test_worker_worktree_claim_rejects_dispatch_precreate_task_mismatch
@@ -208,11 +230,14 @@ run_worker_worktree_ownership_tests() {
 	test_worker_worktree_continuation_transfers_ahead_same_task_owner
 	test_worker_worktree_continuation_claims_absent_expected_owner
 	test_worker_worktree_continuation_absent_owner_race_fails_closed
+	test_worker_worktree_continuation_rejects_unavailable_snapshot
 	test_worker_worktree_continuation_classifies_task_mismatch
 	test_worker_worktree_continuation_classifies_owner_mismatch
 	test_worker_worktree_continuation_classifies_concurrent_mutation
 	test_worker_worktree_continuation_classifies_invalid_state
 	test_worker_worktree_clean_without_upstream_blocks_local_commits
+	test_opencode_lockfile_runtime_drift_restores_and_rebases
+	test_opencode_lockfile_real_changes_are_preserved
 	test_worker_worktree_claim_classifies_unreclaimed_live_owner
 	test_worker_worktree_release_uses_generation_contract
 	test_worker_role_context_inherits_matching_pending_permission
@@ -232,6 +257,7 @@ run_cmd_run_orchestration_tests() {
 	test_cmd_run_preserves_validated_ai_research_origin
 	test_cmd_run_attempt_loop_preserves_attempt_exit
 	test_deleted_launch_cwd_recovers_to_work_dir
+	test_detached_worker_log_uses_managed_root
 	return 0
 }
 
@@ -254,12 +280,215 @@ run_private_workload_attempt_identity_tests() {
 	return 0
 }
 
+# Exercise the real attempt/result/metric chain, not only the classifier API.
+test_terminal_attempt_evidence_preserves_classification() {
+	local evidence=""
+	evidence=$(
+		local role="worker" provider="openai" session_key="issue-31676"
+		local selected_model="openai/fixture" output_file="${TEST_ROOT}/terminal-evidence.out"
+		local permission_request_file="${TEST_ROOT}/terminal-permission.json"
+		local work_dir="$TEST_ROOT" metric_work_dir="$TEST_ROOT"
+		local _metric_kill_reason="natural" _metric_session_id="" _metric_output_file="" _metric_excerpt_candidate=""
+		local resource_sampler_pid="" start_ms=0 end_ms=0 duration_ms=0
+		local exit_code=1 status=0 backoff_reason="" backoff_model=""
+		local _rl_fast_sentinel="${TEST_ROOT}/terminal-fast"
+		_hrw_reconcile_session_permission_blockers() { return 0; }
+		attempt_pool_recovery() { return 1; }
+		record_provider_backoff() {
+			backoff_reason="$2"
+			backoff_model="$4"
+			return 0
+		}
+		append_runtime_metric() {
+			printf '%s|%s|%s|%s|%s|%s\n' "$5" "$6" "${15}" "${16}" "${18}" "${19}"
+			if [[ -f "${13}" ]]; then
+				if grep -q 'cause=rate_limit .*provider_status=429' "${13}"; then printf 'classified-diagnostic\n'; fi
+				if grep -q 'cause=unknown' "${13}"; then printf 'incorrect-unknown\n'; fi
+				if grep -q 'WORKER_BLOCKER_EVIDENCE.*Restore directory access' "${13}"; then printf 'actionable-blocker\n'; fi
+			fi
+			return 0
+		}
+		print_info() { return 0; }
+		print_warning() { return 0; }
+		for exit_code in 1 124; do
+			printf '%s\n' 'OpenAI error: You have hit your usage limit. HTTP 429 Too Many Requests' >"$output_file"
+			_append_run_attempt_diagnostics
+			status=0
+			_finish_run_attempt_result || status=$?
+			printf 'exit=%s backoff=%s model=%s\n' "$status" "$backoff_reason" "$backoff_model"
+		done
+		printf 'unexpected local failure\n' >"$output_file"
+		_handle_run_result 1 "$output_file" "$role" "$provider" "$session_key" "$selected_model" "$work_dir" || true
+		printf 'reset=%s|%s|%s\n' "${_run_result_label:-}" "${_run_provider_status:-}" "${_run_classification_source:-}"
+		printf 'OpenAI error: HTTP 429 Too Many Requests\n' >"$output_file"
+		_finish_run_attempt_rate_limit_fast || status=$?
+		printf 'fast-exit=%s\n' "$status"
+		exit_code=0
+		printf '%s\n' '{"type":"text","part":{"text":"BLOCKED: Restore directory access before retrying."}}' >"$output_file"
+		_append_run_attempt_diagnostics
+		_finish_run_attempt_result || status=$?
+		printf 'blocked-exit=%s\n' "$status"
+	)
+	if [[ "$evidence" == *"rate_limit|1|rate_limit|429|trusted_provider|"* &&
+		"$evidence" == *"rate_limit|124|rate_limit|429|trusted_provider|"* &&
+		"$evidence" == *"classified-diagnostic"* && "$evidence" != *"incorrect-unknown"* &&
+		"$evidence" == *"exit=1 backoff=rate_limit model=openai/fixture"* &&
+		"$evidence" == *"reset=local_error||default_local"* &&
+		"$evidence" == *"rate_limit_fast|0|rate_limit|429|rate_limit_fast_monitor|rate_limit_fast_sentinel"* &&
+		"$evidence" == *"fast-exit=80"* && "$evidence" == *"blocked|83|||model_blocked_signal|terminal_blocked"* &&
+		"$evidence" == *"actionable-blocker"* && "$evidence" == *"blocked-exit=83"* ]]; then
+		print_result "terminal attempts retain provider classification, diagnostics and fast-path parity" 0
+	else
+		print_result "terminal attempts retain provider classification, diagnostics and fast-path parity" 1 "$evidence"
+	fi
+	return 0
+}
+
+# GH#34556: run the production _detach_worker with a stub launcher as $0 so no
+# provider runs. Prints "rc=<n>" plus the launcher's stderr.
+_detach_with_stub() {
+	local temp_dir="$1"
+	local session_key="$2"
+	local stub="${TEST_ROOT}/stub launcher"
+	local rc=0 out=""
+	if [[ ! -x "$stub" ]]; then
+		cat >"$stub" <<'STUB'
+#!/usr/bin/env bash
+printf 'stub-run %s\n' "$*"
+: >"$STUB_MARKER"
+STUB
+		chmod 700 "$stub"
+	fi
+	# Clear positional args before sourcing so the helper's main sees none.
+	out=$(STUB_MARKER="${TEST_ROOT}/stub-spawned" bash -c '
+		helper="$1" temp_dir="$2" session_key="$3"
+		set --
+		source "$helper" >/dev/null 2>&1
+		export AIDEVOPS_TEMP_DIR="$temp_dir"
+		_dlw_systemd_user_service_available() { return 1; }
+		_detach_worker "$session_key" --role worker --detach' "$stub" "$HELPER_SCRIPT" "$temp_dir" "$session_key" 2>&1) || rc=$?
+	printf 'rc=%s\n%s\n' "$rc" "$out"
+	return 0
+}
+
+test_detached_worker_log_uses_managed_root() {
+	local root="${TEST_ROOT}/approved logs" out="" second="" path="" path2="" escape_path="" attempt=0 bad_root=""
+	local failures=""
+	mkdir -p "$root" "${TEST_ROOT}/unwritable"
+	chmod 700 "$root"
+	chmod 500 "${TEST_ROOT}/unwritable"
+	ln -s "$root" "${TEST_ROOT}/linked-root"
+	rm -f "${TEST_ROOT}/stub-spawned"
+	out=$(_detach_with_stub "$root" "gh34556-key")
+	path=$(printf '%s\n' "$out" | sed -n 's/^\[INFO\] Detaching worker (log: \(.*\))$/\1/p')
+	for ((attempt = 0; attempt < 50; attempt++)); do
+		[[ -s "$path" ]] && grep -q 'Dispatched PID' <<<"$out" && grep -q '^stub-run run --role worker$' "$path" && break
+		sleep 0.1
+	done
+	[[ "$out" == rc=0* && "${path%/*}" == "$root" && "${path##*/}" == worker-gh34556-key.log.* ]] || failures+=" configured-root"
+	grep -q '^stub-run run --role worker$' "$path" 2>/dev/null || failures+=" log-content"
+	[[ -n "$(find "$path" -perm 600 2>/dev/null)" ]] || failures+=" mode"
+	[[ ! -e /tmp/worker-gh34556-key.log ]] || failures+=" host-tmp"
+	second=$(_detach_with_stub "$root" "gh34556-key")
+	path2=$(printf '%s\n' "$second" | sed -n 's/^\[INFO\] Detaching worker (log: \(.*\))$/\1/p')
+	[[ -n "$path2" && "$path2" != "$path" && -f "$path" ]] || failures+=" separate-attempts"
+	out=$(_detach_with_stub "$root" "../../escape/x")
+	escape_path=$(printf '%s\n' "$out" | sed -n 's/^\[INFO\] Detaching worker (log: \(.*\))$/\1/p')
+	[[ -n "$escape_path" && "${escape_path%/*}" == "$root" ]] || failures+=" path-escape"
+	sleep 0.3
+	rm -f "${TEST_ROOT}/stub-spawned"
+	for bad_root in "" "relative/root" "${TEST_ROOT}/linked-root" "${TEST_ROOT}/unwritable" "${TEST_ROOT}/missing"; do
+		second=$(_detach_with_stub "$bad_root" "gh34556-refused")
+		[[ "$second" == rc=1* && "$second" == *"log root is unusable"* && "$second" != *"Dispatched PID"* ]] || failures+=" refuse:${bad_root:-unset}"
+	done
+	[[ ! -e "${TEST_ROOT}/stub-spawned" ]] || failures+=" spawned-after-refusal"
+	chmod 700 "${TEST_ROOT}/unwritable"
+	print_result "detached worker log uses approved managed root, unique private files, and fails before spawn" \
+		"$([[ -z "$failures" ]] && printf 0 || printf 1)" "failed:${failures}"
+	return 0
+}
+
+# _signing_probe_case <name> <gpgsign:true|unset> <signer:ok|fail>
+# Prints "<status>:<signer-invoked yes|no>" for one real-git probe run.
+_signing_probe_case() {
+	local case_name="$1"
+	local gpgsign="$2"
+	local signer_mode="$3"
+	local case_root="${TEST_ROOT}/signing-probe-${case_name}"
+	local repo_dir="${case_root}/repo"
+	local signer="${case_root}/fake-gpg.sh"
+	local marker="${case_root}/signer-invoked"
+	local status=0 tree_id="" commit_id=""
+	mkdir -p "$repo_dir"
+	# Stub OpenPGP signer: records the call, then signs or refuses (an
+	# unusable key that cannot sign without a prompt).
+	{
+		printf '%s\n' '#!/usr/bin/env bash'
+		printf ': >%q\n' "$marker"
+		if [[ "$signer_mode" == "ok" ]]; then
+			printf '%s\n' "printf '\\n[GNUPG:] SIG_CREATED D 1 8 00 0 FIXTURE\\n' >&2" \
+				"printf '%s\\n' '-----BEGIN PGP SIGNATURE-----' 'fixture' '-----END PGP SIGNATURE-----'" \
+				'exit 0'
+		else
+			printf '%s\n' 'exit 1'
+		fi
+	} >"$signer"
+	chmod 700 "$signer"
+	(
+		unset GIT_CONFIG_COUNT
+		export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+		git -C "$repo_dir" init -q || exit 2
+		git -C "$repo_dir" config user.name "aidevops-test"
+		git -C "$repo_dir" config user.email "aidevops-test@example.invalid"
+		tree_id=$(git -C "$repo_dir" hash-object -w -t tree --stdin </dev/null) || exit 2
+		commit_id=$(git -C "$repo_dir" commit-tree "$tree_id" -m initial </dev/null) || exit 2
+		git -C "$repo_dir" update-ref HEAD "$commit_id" || exit 2
+		git -C "$repo_dir" config gpg.format openpgp
+		git -C "$repo_dir" config gpg.program "$signer"
+		git -C "$repo_dir" config user.signingkey FIXTURE
+		[[ "$gpgsign" == "true" ]] && git -C "$repo_dir" config commit.gpgsign true
+		headless_signing_commit_probe "$repo_dir" 1
+	) >/dev/null 2>&1 || status=$?
+	printf '%s:%s\n' "$status" "$([[ -f "$marker" ]] && printf yes || printf no)"
+	return 0
+}
+
+# GH#36515: commit-tree ignores commit.gpgsign, so the worker probe must pass
+# -S to prove signing; repositories without required signing stay unsigned.
+test_worker_signing_probe_signs_with_real_git() {
+	local unusable="" usable="" unsigned=""
+	unusable=$(_signing_probe_case unusable true fail)
+	usable=$(_signing_probe_case usable true ok)
+	unsigned=$(_signing_probe_case unsigned unset fail)
+	if [[ "$unusable" == "1:yes" && "$usable" == "0:yes" && "$unsigned" == "0:no" ]]; then
+		print_result "worker signing probe signs when required and fails on an unusable key" 0
+	else
+		print_result "worker signing probe signs when required and fails on an unusable key" 1 \
+			"unusable=${unusable} usable=${usable} unsigned=${unsigned}"
+	fi
+	return 0
+}
+
+run_failure_evidence_tests() {
+	test_fast_rate_limit_classifier_requires_trusted_provider_evidence
+	test_fast_rate_limit_monitor_ignores_uuid_metadata
+	test_fast_rate_limit_monitor_stops_attributable_429
+	test_failure_classifier_records_provenance
+	test_terminal_attempt_evidence_preserves_classification
+	test_failure_classifier_distinguishes_quota_exhaustion
+	test_failure_classifier_distinguishes_anthropic_credit_exhaustion
+	return 0
+}
+
 main() {
 	setup_test_env
 	test_appends_escalation_contract
 	test_non_full_loop_prompt_unchanged
 	test_headless_contract_uses_deployed_framework_paths
 	test_parse_initial_model_does_not_set_explicit_override
+	test_initial_model_selection_contract
+	test_opencode_v2_run_command_contract
+	test_opencode_v2_invocation_uses_work_dir
 	test_launch_helpers_tolerate_unset_state_under_nounset
 	test_runtime_temp_files_bypass_group_writable_workspace
 	test_runtime_temp_creation_reports_root_failure
@@ -267,6 +496,8 @@ main() {
 	test_execute_run_attempt_preserves_file_creation_status
 	test_run_attempt_command_reports_cwd_recovery_failure
 	run_worker_signing_contract_tests
+	test_worker_signing_probe_signs_with_real_git
+	test_repository_bound_git_auth_contract
 	run_private_workload_attempt_identity_tests
 	test_startup_no_activity_timeout_returns_watchdog_continue
 	test_startup_no_activity_can_rotate_after_continuation_budget
@@ -275,11 +506,7 @@ main() {
 	test_handle_run_result_tolerates_empty_or_non_numeric_exit_code
 	test_dispatcher_initial_model_can_rotate_after_rate_limit
 	test_explicit_model_override_remains_pinned_on_rate_limit
-	test_issue_worker_env_contract_rejects_missing_env
-	test_issue_worker_env_contract_rejects_invalid_or_mismatched_issue
-	test_issue_worker_env_contract_rejects_missing_worktree
-	test_issue_worker_env_contract_accepts_valid_precreated_worktree
-	test_triage_env_contract_does_not_require_worker_authority
+	run_issue_worker_env_contract_tests
 	run_worker_worktree_ownership_tests
 	run_runtime_ownership_fence_tests
 	test_triage_prepare_drops_worker_authority_and_skips_ownership_fence
@@ -293,13 +520,16 @@ main() {
 	test_clean_prelaunch_exit_is_precise_nonzero_failure
 	test_deleted_cwd_recovery_uses_worker_worktree
 	run_cmd_run_orchestration_tests
+	# Prelaunch and cmd_run cases above reset the launch flag; the finish-path
+	# fixtures below model launched runtimes (GH#37669).
+	_WORKER_RUNTIME_LAUNCH_STARTED=1
 	test_does_not_double_append
 	test_extract_session_id_from_output_returns_latest_session_id
 	test_stale_session_retry_clears_continuation_state
 	test_db_seed_failure_starts_fresh_opencode_session
 	test_provider_sessions_scope_issue_keys_by_repo_slug
 	test_provider_sessions_keep_pulse_unscoped
-	test_blocked_completion_records_blocked_label
+	run_blocked_completion_tests
 	test_capability_escalation_ladder_is_bounded_and_exact
 	test_post_pr_handoff_completion_signal_is_exact
 	test_private_task_complete_requires_exact_model_text_line
@@ -309,9 +539,7 @@ main() {
 	test_headless_sandbox_timeout_budget
 	test_claude_bare_paths_use_resolved_sandbox_timeout
 	test_activity_watchdog_classifiers_detect_rate_limit_and_ci_wait
-	test_failure_classifier_records_provenance
-	test_failure_classifier_distinguishes_quota_exhaustion
-	test_failure_classifier_distinguishes_anthropic_credit_exhaustion
+	run_failure_evidence_tests
 	test_service_interruption_candidate_uses_separate_path
 	test_service_interruption_exhausted_metric_preserves_context
 	test_pr_checkpoint_lifecycle_cases
@@ -334,7 +562,7 @@ main() {
 	test_registered_temp_cleanup_failure_is_reported_and_retained
 	test_public_triage_output_temp_starts_cleanup_guardian
 	test_launch_helpers_tolerate_unset_state
-	test_worker_produced_output_no_commits_returns_noop
+	run_worker_no_output_classification_tests
 	test_worker_produced_output_with_commits_returns_pr_exists_failopen
 	test_worker_produced_output_non_worker_session_returns_pr_exists
 	test_worker_produced_output_invalid_workdir_returns_pr_exists

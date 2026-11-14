@@ -211,7 +211,7 @@ test_single_pass_cache_consolidation() {
 	fi
 
 	# (c) all seven _should_* predicates defined in the actions sub-library
-	local actions_sh="${SCRIPT_DIR}/../pulse-issue-reconcile-actions.sh"
+	local actions_sh; actions_sh="$("${SCRIPT_DIR}/pira-combined-source.sh")"
 	local pred_count
 	pred_count=$(grep -c '^_should_reconcile_persistent_issue()\|^_should_reconcile_external_issue_gate()\|^_should_ciw()\|^_should_rsd()\|^_should_oimp()\|^_should_cpt()\|^_should_lia()' \
 		"${actions_sh}" 2>/dev/null || true)
@@ -268,7 +268,7 @@ test_should_predicates() {
 	# We extract the five _should_* function definitions then call each.
 
 	# Extract all five predicate definitions (stop before the first _action_* helper)
-	local actions_sh="${SCRIPT_DIR}/../pulse-issue-reconcile-actions.sh"
+	local actions_sh; actions_sh="$("${SCRIPT_DIR}/pira-combined-source.sh")"
 	local pred_defs
 	pred_defs=$(sed -n '/^_should_ciw()/,/^_action_ciw_single()/p' "${actions_sh}" |
 		grep -v '^_action_ciw_single()' || true)
@@ -349,7 +349,7 @@ test_should_predicates() {
 # Parent mutation gate: live labels and cached holds fail closed.
 # ---------------------------------------------------------------------------
 test_parent_live_hold_gate() {
-	local actions_sh="${SCRIPT_DIR}/../pulse-issue-reconcile-actions.sh"
+	local actions_sh; actions_sh="$("${SCRIPT_DIR}/pira-combined-source.sh" --module)"
 	local result=""
 	result=$(ACTIONS_SH="$actions_sh" bash -c '
 		_PIR_NMR_LABEL="needs-maintainer-review"
@@ -426,10 +426,142 @@ test_parent_live_hold_gate() {
 }
 
 # ---------------------------------------------------------------------------
+# GH#34180/#34125 class: a maintainer-approved external parent whose approval
+# went stale through lifecycle drift may be closed (only) with graph children.
+# ---------------------------------------------------------------------------
+test_parent_stale_approval_terminal_close() {
+	local actions_sh; actions_sh="$("${SCRIPT_DIR}/pira-combined-source.sh" --module)"
+	local stub_dir="" result=""
+	stub_dir=$(mktemp -d)
+	cat >"${stub_dir}/approval-helper.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "${APPROVAL_STUB_RESULT:-NO_APPROVAL}"
+STUB
+	chmod +x "${stub_dir}/approval-helper.sh"
+	result=$(ACTIONS_SH="$actions_sh" STUB_DIR="$stub_dir" bash -c '
+		_PIR_NMR_LABEL="needs-maintainer-review"
+		_PIR_PERSISTENT_LABEL="persistent"
+		_PIR_PT_LABEL="parent-task"
+		LOGFILE="/dev/null"
+		source "$ACTIONS_SH"
+		_PIR_SCRIPT_DIR="$STUB_DIR"
+		_gh_actor_has_repo_write_authority() { return 1; }
+		gh_issue_edit_safe() { printf "nmr-added\n"; return 0; }
+		gh() {
+			[[ "${1:-}" == "api" && "${2:-}" == "repos/owner/repo/issues/42" ]] || return 1
+			printf "%s\n" "{\"number\":42,\"state\":\"open\",\"labels\":[{\"name\":\"parent-task\"}],\"author_association\":\"CONTRIBUTOR\",\"user\":{\"login\":\"outsider\",\"type\":\"User\"}}"
+			return 0
+		}
+		for APPROVAL_STUB_RESULT in STALE_APPROVAL VERIFIED MALFORMED_APPROVAL; do
+			export APPROVAL_STUB_RESULT
+			_pir_parent_mutation_is_allowed owner/repo 42 open close &&
+				printf "%s-close:allowed:%s\n" "$APPROVAL_STUB_RESULT" "$_PIR_PARENT_TRUST_BASIS" ||
+				printf "%s-close:blocked\n" "$APPROVAL_STUB_RESULT"
+			_pir_parent_mutation_is_allowed owner/repo 42 open &&
+				printf "%s-other:allowed\n" "$APPROVAL_STUB_RESULT" ||
+				printf "%s-other:blocked\n" "$APPROVAL_STUB_RESULT"
+		done
+		_PIR_PARENT_TRUST_BASIS="$_PIR_PARENT_TRUST_STALE_APPROVED_CLOSE"
+		for source in graph graph+body+prose body prose+comments; do
+			_pir_parent_close_evidence_is_trusted "$source" &&
+				printf "stale-evidence-%s:ok\n" "$source" || printf "stale-evidence-%s:rejected\n" "$source"
+		done
+		_PIR_PARENT_TRUST_BASIS="$_PIR_PARENT_TRUST_TRUSTED"
+		_pir_parent_close_evidence_is_trusted body &&
+			printf "trusted-evidence-body:ok\n" || printf "trusted-evidence-body:rejected\n"
+	' 2>/dev/null)
+	rm -rf "$stub_dir"
+
+	local expected="" all_ok=1
+	for expected in \
+		'STALE_APPROVAL-close:allowed:stale-approved-terminal-close' \
+		'STALE_APPROVAL-other:blocked' \
+		'VERIFIED-close:allowed:trusted' \
+		'VERIFIED-other:allowed' \
+		'MALFORMED_APPROVAL-close:blocked' \
+		'MALFORMED_APPROVAL-other:blocked' \
+		'stale-evidence-graph:ok' \
+		'stale-evidence-graph+body+prose:ok' \
+		'stale-evidence-body:rejected' \
+		'stale-evidence-prose+comments:rejected' \
+		'trusted-evidence-body:ok'; do
+		printf '%s\n' "$result" | grep -qxF "$expected" || all_ok=0
+	done
+	if [[ "$all_ok" -eq 1 ]]; then
+		_pass "stale-approved external parent may close only with graph-backed children"
+	else
+		_fail "stale-approved terminal close mismatch: ${result}"
+	fi
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# GH#34281 follow-up: the single-pass stage router must hand a stale-approved
+# external parent to stage 4 (never stages 1-3); the stage-0b block previously
+# consumed it first, so the stale-approved close basis was unreachable.
+# ---------------------------------------------------------------------------
+test_stage0b_routes_stale_approved_parent_to_stage4() {
+	local actions_sh; actions_sh="$("${SCRIPT_DIR}/pira-combined-source.sh" --module)"
+	local stages_fn="" result=""
+	stages_fn=$(sed -n '/^_pir_reconcile_issue_stages()/,/^}/p' "$RECONCILE_SH")
+	result=$(ACTIONS_SH="$actions_sh" STAGES_FN="$stages_fn" bash -c '
+		_PIR_NMR_LABEL="needs-maintainer-review"
+		_PIR_PERSISTENT_LABEL="persistent"
+		_PIR_PT_LABEL="parent-task"
+		LOGFILE="/dev/null"
+		source "$ACTIONS_SH"
+		eval "$STAGES_FN"
+		_should_reconcile_persistent_issue() { return 1; }
+		_action_reconcile_external_issue_gate() {
+			_PIR_EXTERNAL_GATE_MUTATED="$GATE_MUTATED"
+			_PIR_EXTERNAL_GATE_VERIFICATION="$GATE_VERIFICATION"
+			return 0
+		}
+		_should_ciw() { printf "stage1-reached\n"; return 0; }
+		_action_ciw_single() { return 1; }
+		_should_rsd() { printf "stage2-reached\n"; return 1; }
+		_should_oimp() { printf "stage3-reached\n"; return 1; }
+		_pir_reconcile_parent_stage() { printf "stage4-reached\n"; return 0; }
+		slug=owner/repo issue_num=42 issue_title=T issue_body=B
+		issue_author_association=CONTRIBUTOR issue_author_type=User
+		issue_author_is_bot=false issue_author_login=outsider
+		_ciw_rsd_enabled=1 ciw_per_repo=0 ciw_max_repo=5 rsd_per_repo=0 rsd_max_repo=5
+		oimp_total_closed=0 oimp_max=5 external_gated=0 parent_task_nums=""
+		run_case() {
+			local name="$1" out=""
+			labels_csv="$2" GATE_VERIFICATION="$3" GATE_MUTATED="$4"
+			out=$(_pir_reconcile_issue_stages | tr "\n" " ")
+			printf "%s:[%s]\n" "$name" "${out% }"
+		}
+		run_case stale-parent "status:available,parent-task" STALE_APPROVAL 0
+		run_case stale-plain "status:available" STALE_APPROVAL 0
+		run_case stale-parent-nmr "parent-task,needs-maintainer-review" STALE_APPROVAL 0
+		run_case unapproved-parent "status:available,parent-task" NO_APPROVAL 1
+		run_case malformed-parent "status:available,parent-task" MALFORMED_APPROVAL 0
+	' 2>/dev/null)
+
+	local expected="" all_ok=1
+	for expected in \
+		'stale-parent:[stage4-reached]' \
+		'stale-plain:[]' \
+		'stale-parent-nmr:[]' \
+		'unapproved-parent:[]' \
+		'malformed-parent:[]'; do
+		printf '%s\n' "$result" | grep -qxF "$expected" || all_ok=0
+	done
+	if [[ "$all_ok" -eq 1 ]]; then
+		_pass "stage 0b routes only stale-approved parent trackers to stage 4"
+	else
+		_fail "stage 0b stale-parent routing mismatch: ${result}"
+	fi
+	return 0
+}
+
+# ---------------------------------------------------------------------------
 # Test 8b: mergedAt helper prefers gh_pr_view wrapper when available
 # ---------------------------------------------------------------------------
 test_pr_merged_at_prefers_wrapper() {
-	local actions_sh="${SCRIPT_DIR}/../pulse-issue-reconcile-actions.sh"
+	local actions_sh; actions_sh="$("${SCRIPT_DIR}/pira-combined-source.sh")"
 	local helper_defs
 	helper_defs=$(sed -n '/^_pir_pr_merged_at()/,/^}/p' "${actions_sh}")
 
@@ -508,7 +640,10 @@ test_single_pass_wired_in_engine() {
 test_recent_parent_repair_reachable_from_single_pass() {
 	local single_pass_body=""
 	single_pass_body=$(sed -n '/^reconcile_issues_single_pass()/,/^}/p' "$RECONCILE_SH")
-	if printf '%s\n' "$single_pass_body" | grep -q '_repair_recently_closed_parents_cycle' \
+	local repair_body=""
+	repair_body=$(sed -n '/^_pir_reconcile_cycle_repairs()/,/^}/p' "$RECONCILE_SH")
+	if printf '%s\n' "$repair_body" | grep -q '_repair_recently_closed_parents_cycle' \
+		&& printf '%s\n' "$single_pass_body" | grep -q '_pir_reconcile_cycle_repairs' \
 		&& printf '%s\n' "$single_pass_body" | grep -q 'cpt_max_reopens=5' \
 		&& printf '%s\n' "$single_pass_body" | grep -q 'cpt_max_repair_repo_scans=10' \
 		&& printf '%s\n' "$single_pass_body" | grep -q 'cpt_max_repair_candidates=10'; then
@@ -520,7 +655,7 @@ test_recent_parent_repair_reachable_from_single_pass() {
 }
 
 test_recent_parent_repair_cursor_and_candidate_bounds() {
-	local actions_sh="${SCRIPT_DIR}/../pulse-issue-reconcile-actions.sh"
+	local actions_sh; actions_sh="$("${SCRIPT_DIR}/pira-combined-source.sh")"
 	local helper_defs="" tmp_dir="" repos_json="" cursor_file="" result=""
 	local actual_candidates="" expected_candidates="" actual_scans="" expected_scans="" candidate_fixture=""
 	local cycle=0
@@ -917,6 +1052,42 @@ test_gh22802_oimp_lookup_requires_merged_at() {
 	return 0
 }
 
+# Exercise the real REST adapter: a canned mixed list hid the incompatible
+# closed/merged selector and its scan-until-unmerged pagination cost.
+test_oimp_uses_merged_adapter_population() {
+	local helper_def="" tmp_dir="" result=""
+	helper_def=$(sed -n '/^_build_oimp_lookup_for_slug()/,/^}$/p' "${RECONCILE_SH}")
+	tmp_dir=$(mktemp -d)
+	result=$(HOME="$tmp_dir" AIDEVOPS_GH_API_INSTRUMENT_DISABLE=1 bash -c '
+		source "$1/shared-gh-wrappers.sh"
+		eval "$2"
+		calls="$3/calls"
+		: >"$calls"
+		gh_record_call() { return 0; }
+		_rest_api_call() {
+			local endpoint="$4"
+			local page="${endpoint##*page=}"
+			printf "request\n" >>"$calls"
+			if [[ "$page" -gt 3 ]]; then
+				printf "[]\n"
+				return 0
+			fi
+			jq -cn --argjson page "$page" "[range((\$page-1)*100+1;\$page*100+1) | {number:.,merged_at:\"2026-09-04T00:00:00Z\",body:(if . == 1 then \"Resolves #42\" else \"\" end)}]" || return 1
+			return 0
+		}
+		_gh_pr_list_merged() { _rest_pr_list "$@"; return $?; }
+		lookup=$(_build_oimp_lookup_for_slug owner/repo)
+		printf "lookup=%s\ncalls=%s\n" "$lookup" "$(wc -l <"$calls" | tr -d " ")"
+	' _ "${SCRIPT_DIR}/.." "$helper_def" "$tmp_dir" 2>/dev/null)
+	rm -rf "$tmp_dir"
+	if [[ "$result" == $'lookup=|42=1|\ncalls=2' ]]; then
+		_pass "merged reconciliation uses two relevant REST pages, not a discarded unmerged-history scan"
+	else
+		_fail "merged reconciliation adapter population/call budget mismatch: $result"
+	fi
+	return 0
+}
+
 # ---------------------------------------------------------------------------
 # Test 14 (t2985): grep-based lookup avoids prefix-substring false matches
 # ---------------------------------------------------------------------------
@@ -962,7 +1133,7 @@ test_t2985_oimp_lookup_no_prefix_collision() {
 # still uses the 3-arg form.
 # ---------------------------------------------------------------------------
 test_t2985_action_oimp_single_signature() {
-	local actions_sh="${SCRIPT_DIR}/../pulse-issue-reconcile-actions.sh"
+	local actions_sh; actions_sh="$("${SCRIPT_DIR}/pira-combined-source.sh")"
 	local all_ok=1
 
 	# 1. _action_oimp_single body must read the 4th arg as oimp_lookup.
@@ -1005,7 +1176,7 @@ test_t2985_action_oimp_single_signature() {
 # Test 15b (GH#25896): consolidated successor closes when superseded issue was fixed
 # ---------------------------------------------------------------------------
 test_gh25896_oimp_closes_consolidated_successor() {
-	local actions_sh="${SCRIPT_DIR}/../pulse-issue-reconcile-actions.sh"
+	local actions_sh; actions_sh="$("${SCRIPT_DIR}/pira-combined-source.sh" --module)"
 	local tmp_dir out_file log_file result
 	tmp_dir=$(mktemp -d)
 	out_file="${tmp_dir}/gh.out"
@@ -1050,10 +1221,161 @@ test_gh25896_oimp_closes_consolidated_successor() {
 }
 
 # ---------------------------------------------------------------------------
-# Test 15c (GH#27444): recurrent file-size debt uses current outcome
+# Test 15c (GH#32213): superseded evidence requires complete inherited coverage
+# ---------------------------------------------------------------------------
+test_gh32213_oimp_requires_complete_inherited_coverage() {
+	local actions_sh; actions_sh="$("${SCRIPT_DIR}/pira-combined-source.sh" --module)"
+	local tmp_dir out_file log_file verify_file verify_log result
+	tmp_dir=$(mktemp -d)
+	out_file="${tmp_dir}/gh.out"
+	log_file="${tmp_dir}/pulse.log"
+	verify_file="${tmp_dir}/verify-close"
+	verify_log="${tmp_dir}/verify.log"
+	cat >"$verify_file" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$VERIFY_LOG"
+exit 0
+EOF
+	chmod +x "$verify_file"
+
+	result=$(bash -c '
+		actions_sh="$1"; out_file="$2"; log_file="$3"; verify_file="$4"; VERIFY_LOG="$5"
+		LOGFILE="$log_file"; export LOGFILE out_file VERIFY_LOG
+		gh() { printf "%s\n" "$*" >>"$out_file"; return 0; }
+		fast_fail_reset() { return 0; }
+		unlock_issue_after_worker() { return 0; }
+		export -f gh fast_fail_reset unlock_issue_after_worker
+		source "$actions_sh"
+		_action_oimp_single "test/repo" "30100" "$verify_file" "|30001=30101|" $'"'"'_Supersedes #30001 — this issue is the consolidated spec._\n\n## What\nImplement remaining successor-only work.'"'"' || printf "scope_rc=%s\n" "$?"
+		_action_oimp_single "test/repo" "30110" "$verify_file" "|30001=30101|" $'"'"'_Supersedes #30001 — this issue is the consolidated spec._\n_Supersedes #30002 — this issue is the consolidated spec._'"'"' || printf "partial_rc=%s\n" "$?"
+		_action_oimp_single "test/repo" "30120" "$verify_file" "|30001=30101|30002=30102|" $'"'"'_Supersedes #30001 — this issue is the consolidated spec._\n_Supersedes #30002 — this issue is the consolidated spec._'"'"'
+		printf "complete_rc=%s\n" "$?"
+	' -- "$actions_sh" "$out_file" "$log_file" "$verify_file" "$verify_log" 2>&1)
+
+	local all_ok=1
+	if [[ "$result" != *"scope_rc=1"* ]] || grep -q 'issue close 30100' "$out_file" 2>/dev/null; then
+		_fail "GH#32213: successor-only scope was treated as complete: ${result}"
+		all_ok=0
+	fi
+	if [[ "$result" != *"partial_rc=1"* ]] || grep -q 'issue close 30110' "$out_file" 2>/dev/null; then
+		_fail "GH#32213: partial superseded coverage closed the successor: ${result}"
+		all_ok=0
+	fi
+	if [[ "$result" != *"complete_rc=0"* ]] || ! grep -q 'issue close 30120 --repo test/repo' "$out_file" 2>/dev/null; then
+		_fail "GH#32213: complete inherited coverage did not close the successor: ${result}"
+		all_ok=0
+	fi
+	if ! grep -q '^check 30001 30101 test/repo$' "$verify_log" 2>/dev/null ||
+		! grep -q '^check 30002 30102 test/repo$' "$verify_log" 2>/dev/null ||
+		grep -q '^check 30120 ' "$verify_log" 2>/dev/null; then
+		_fail "GH#32213: component PRs were not verified against their superseded source issues"
+		all_ok=0
+	fi
+
+	rm -rf "$tmp_dir"
+	[[ "$all_ok" == "1" ]] && _pass "GH#32213: OIMP preserves successor scope and requires verified complete component coverage"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# Test 15c2 (GH#33687): merged-PR closes respect the latest reopen lifecycle
+# ---------------------------------------------------------------------------
+test_gh33687_reconcile_close_respects_reopen_lifecycle() {
+	local actions_sh; actions_sh="$("${SCRIPT_DIR}/pira-combined-source.sh" --module)"
+	local tmp_dir fix out_file stub dedup result
+	tmp_dir=$(mktemp -d)
+	fix="${tmp_dir}/fix"
+	out_file="${tmp_dir}/gh.out"
+	stub="${tmp_dir}/stub.sh"
+	dedup="${tmp_dir}/dedup"
+	mkdir -p "$fix"
+	cat >"$stub" <<'EOF'
+gh() {
+	printf '%s\n' "$*" >>"$GH_TEST_OUT"
+	local args="$*" n="" calls=0
+	case "$args" in
+	*/events*)
+		n="${args#*issues/}"; n="${n%%/*}"
+		[[ ! -e "${FIX}/events-${n}.fail" ]] || return 1
+		[[ ! -f "${FIX}/events-${n}.calls" ]] || calls=$(<"${FIX}/events-${n}.calls")
+		calls=$((calls + 1)); printf '%s' "$calls" >"${FIX}/events-${n}.calls"
+		if [[ -f "${FIX}/events-${n}.${calls}" ]]; then cat "${FIX}/events-${n}.${calls}"
+		elif [[ -f "${FIX}/events-${n}" ]]; then cat "${FIX}/events-${n}"; fi
+		return 0 ;;
+	*pulls/*) n="${args#*pulls/}"; n="${n%% *}"; cat "${FIX}/pull-${n}" 2>/dev/null; return 0 ;;
+	"pr view "*) n="${args#pr view }"; n="${n%% *}"; cat "${FIX}/pull-${n}" 2>/dev/null; return 0 ;;
+	esac
+	return 0
+}
+fast_fail_reset() { printf 'reset %s\n' "$1" >>"$GH_TEST_OUT"; return 0; }
+unlock_issue_after_worker() { printf 'unlock %s\n' "$1" >>"$GH_TEST_OUT"; return 0; }
+set_solved_label_from_merged_pr() { printf 'solved %s\n' "$1" >>"$GH_TEST_OUT"; return 0; }
+EOF
+	cat >"$dedup" <<'EOF'
+#!/usr/bin/env bash
+printf 'merged PR #500 references issue #%s via keyword\n' "$2"
+EOF
+	chmod +x "$dedup"
+	printf '2026-10-05T19:27:42Z\n' >"${fix}/pull-500"
+	printf '2026-10-05T20:00:00Z\n' >"${fix}/pull-510"
+	local reopen='2026-10-05T19:31:00Z'
+	printf '%s\n' "$reopen" >"${fix}/events-33701"
+	printf '%s\n' "$reopen" >"${fix}/events-33702"
+	: >"${fix}/events-33703.fail"
+	printf '2026-10-05 19:31\n' >"${fix}/events-33704"
+	: >"${fix}/events-33705.1"
+	printf '%s\n' "$reopen" >"${fix}/events-33705.2"
+	printf '%s\n' "$reopen" >"${fix}/events-33706"
+	printf '%s\n' "$reopen" >"${fix}/events-33708"
+
+	result=$(bash -c '
+		LOGFILE="$3"; GH_TEST_OUT="$4"; FIX="$5"; dedup="$6"
+		export LOGFILE GH_TEST_OUT FIX
+		source "$1"
+		source "$2"
+		_action_oimp_single "test/repo" 33701 /bin/true "|33701=500|" "plain"; printf "old=%s\n" "$?"
+		_action_oimp_single "test/repo" 33702 /bin/true "|33702=500|33702=510|" "plain"; printf "newer=%s\n" "$?"
+		_action_oimp_single "test/repo" 33703 /bin/true "|33703=500|" "plain"; printf "apifail=%s\n" "$?"
+		_action_oimp_single "test/repo" 33704 /bin/true "|33704=500|" "plain"; printf "malformed=%s\n" "$?"
+		_action_oimp_single "test/repo" 33705 /bin/true "|33705=500|" "plain"; printf "race=%s\n" "$?"
+		_action_oimp_single "test/repo" 33706 /bin/true "|33600=500|" "_Supersedes #33600 — this issue is the consolidated spec._"; printf "successor=%s\n" "$?"
+		_action_oimp_single "test/repo" 33707 /bin/true "|33707=500|" "plain"; printf "noreopen=%s\n" "$?"
+		_action_ciw_single "test/repo" 33708 "t1 title" "$dedup" /nonexistent ""; printf "ciw_old=%s\n" "$?"
+		_action_ciw_single "test/repo" 33709 "t1 title" "$dedup" /nonexistent ""; printf "ciw_noreopen=%s\n" "$?"
+	' -- "$actions_sh" "$stub" "${tmp_dir}/pulse.log" "$out_file" "$fix" "$dedup" 2>&1)
+
+	local all_ok=1 case_name="" issue="" expected=""
+	for case_name in old:33701:1 newer:33702:0 apifail:33703:1 malformed:33704:1 race:33705:1 \
+		successor:33706:1 noreopen:33707:0 ciw_old:33708:1 ciw_noreopen:33709:0; do
+		issue="${case_name#*:}"; expected="${issue#*:}"; issue="${issue%%:*}"; case_name="${case_name%%:*}"
+		if [[ "$result" != *"${case_name}=${expected}"* ]]; then
+			_fail "GH#33687: ${case_name} expected rc=${expected}: ${result}"
+			all_ok=0
+		fi
+		if [[ "$expected" == "1" ]] && grep -qE "^(issue close|unlock|reset|solved) ${issue}( |$)" "$out_file"; then
+			_fail "GH#33687: ${case_name} mutated #${issue} despite stale or unavailable lifecycle evidence"
+			all_ok=0
+		fi
+		if [[ "$expected" == "0" ]] && ! grep -q "^issue close ${issue} --repo test/repo" "$out_file"; then
+			_fail "GH#33687: ${case_name} did not close #${issue}"
+			all_ok=0
+		fi
+	done
+	if ! grep -q 'linked PR #510 was already merged' "$out_file"; then
+		_fail "GH#33687: current-lifecycle close did not cite the post-reopen merge #510"
+		all_ok=0
+	fi
+
+	rm -rf "$tmp_dir"
+	[[ "$all_ok" == "1" ]] && _pass "GH#33687: merged-PR closes ignore pre-reopen merges and defer on unavailable or racing lifecycle evidence"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# Test 15d (GH#27444): recurrent file-size debt uses current outcome
 # ---------------------------------------------------------------------------
 test_gh27444_recurrent_file_size_debt_current_outcome() {
-	local actions_sh="${SCRIPT_DIR}/../pulse-issue-reconcile-actions.sh"
+	local actions_sh; actions_sh="$("${SCRIPT_DIR}/pira-combined-source.sh" --module)"
 	local tmp_dir repo_dir repos_json out_file log_file result
 	tmp_dir=$(mktemp -d)
 	repo_dir="${tmp_dir}/repo"
@@ -1124,6 +1446,121 @@ test_gh27444_recurrent_file_size_debt_current_outcome() {
 
 	rm -rf "$tmp_dir"
 	[[ "$all_ok" == "1" ]] && _pass "GH#27444: current oversized debt blocks stale close while resolved and unrelated issues close"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# Test 15e (GH#32640/GH#33374): debt closure and open/done healing stay separate.
+# Observed on #28377: stage 1 closed regrown debt citing an old merged PR.
+# ---------------------------------------------------------------------------
+# Runs one stage action with mutations recorded to the caller's fixture log.
+_gh32640_run() {
+	local stage="$1" issue_number="$2" issue_body="$3"
+	bash -c '
+		LOGFILE="${6}/pulse.log" REPOS_JSON="$2" GH_TEST_OUT="$3"
+		export LOGFILE REPOS_JSON GH_TEST_OUT
+		# shellcheck disable=SC1090
+		source "$1"
+		gh() {
+			local command="$1"
+			if [[ "$command" == api ]]; then
+				if [[ "$*" == *comments* ]]; then printf "[[]]\n";
+				elif [[ "$*" == */events* ]]; then :; # GH#33687: --jq projection, never reopened
+				else printf "%s\n" "{\"state\":\"open\",\"labels\":[{\"name\":\"status:done\"}]}"; fi
+			else printf "gh:%s\n" "$*" >>"$GH_TEST_OUT"; fi
+			return 0
+		}
+		set_issue_status() { printf "status:%s\n" "$*" >>"$GH_TEST_OUT"; return 0; }
+		_pir_pr_merged_at() { printf "2026-07-21T02:31:43Z"; return 0; }
+		set_solved_label_from_merged_pr() { return 0; }
+		fast_fail_reset() { return 0; }
+		unlock_issue_after_worker() { return 0; }
+		rc=0
+		"$4" "test/repo" "$5" "title" "$7" /nonexistent "$8" || rc=$?
+		printf "rc=%s\n" "$rc"
+	' -- "$actions_sh" "$repos_json" "$out_file" "$stage" "$issue_number" "$tmp_dir" "$dedup_helper" "$issue_body" 2>&1
+	return 0
+}
+
+test_gh32640_ciw_rsd_recurrent_file_size_debt_gate() {
+	local actions_sh; actions_sh="$("${SCRIPT_DIR}/pira-combined-source.sh")"
+	local tmp_dir repo_dir repos_json out_file dedup_helper result
+	local debt_body='<!-- aidevops:generator=large-file-simplification-gate cited_file=large.sh threshold=3 -->'
+	tmp_dir=$(mktemp -d)
+	repo_dir="${tmp_dir}/repo"
+	repos_json="${tmp_dir}/repos.json"
+	out_file="${tmp_dir}/mutations.out"
+	dedup_helper="${tmp_dir}/dedup-helper.sh"
+	mkdir -p "$repo_dir"
+	printf '{"initialized_repos":[{"slug":"test/repo","path":"%s"}]}' "$repo_dir" >"$repos_json"
+	printf '#!/usr/bin/env bash\nprintf "%%s\\n" "merged PR #28395 references issue"\nexit 0\n' >"$dedup_helper"
+	chmod +x "$dedup_helper"
+
+	local all_ok=1
+	# Regrown debt: file at threshold.
+	printf 'one\ntwo\nthree\n' >"${repo_dir}/large.sh"
+	: >"$out_file"
+	result=$(_gh32640_run _action_ciw_single 28377 "$debt_body")
+	if [[ "$result" != *"rc=1"* ]] || [[ -s "$out_file" ]]; then
+		_fail "GH#32640: stage 1 closed or mutated regrown debt: ${result} $(tr '\n' ' ' <"$out_file")"
+		all_ok=0
+	fi
+	: >"$out_file"
+	result=$(_gh32640_run _action_rsd_single 28377 "$debt_body")
+	if [[ "$result" != *"rc=2"* ]] || grep -q '^gh:issue close' "$out_file" ||
+		! grep -q '^status:28377 test/repo available' "$out_file"; then
+		_fail "GH#32640: stage 2 did not reset regrown debt to available: ${result} $(tr '\n' ' ' <"$out_file")"
+		all_ok=0
+	fi
+
+	# Unmeasurable debt defers closure, but open + done still heals its label.
+	rm -f "${repo_dir}/large.sh"
+	: >"$out_file"
+	result=$(_gh32640_run _action_ciw_single 28377 "$debt_body")
+	local ciw_missing="$result"
+	local ciw_mutated=0
+	[[ ! -s "$out_file" ]] || ciw_mutated=1
+	result=$(_gh32640_run _action_rsd_single 28377 "$debt_body")
+	if [[ "$ciw_missing" != *"rc=1"* || "$result" != *"rc=2"* || "$ciw_mutated" != 0 ]] ||
+		grep -q '^gh:issue close' "$out_file" || ! grep -q '^status:28377 test/repo available' "$out_file"; then
+		_fail "GH#33374: unmeasurable debt closed or failed to heal done: ${ciw_missing} ${result}"
+		all_ok=0
+	fi
+
+	# Stage 1 retains closure; stage 2 only heals invalid open/done labels.
+	printf 'one\ntwo\n' >"${repo_dir}/large.sh"
+	local stage=""
+	for stage in _action_ciw_single _action_rsd_single; do
+		local expected_rc=0 expected_action='^gh:issue close'
+		if [[ "$stage" == _action_rsd_single ]]; then
+			expected_rc=2
+			expected_action='^status:'
+		fi
+		: >"$out_file"
+		result=$(_gh32640_run "$stage" 28377 "$debt_body")
+		if [[ "$result" != *"rc=${expected_rc}"* ]] || ! grep -q "$expected_action" "$out_file"; then
+			_fail "GH#33374: ${stage} did not apply the resolved-debt lifecycle: ${result}"
+			all_ok=0
+		fi
+		if [[ "$stage" == _action_rsd_single ]] && grep -q '^gh:issue close' "$out_file"; then
+			_fail "GH#33374: stale-done healing closed resolved debt"
+			all_ok=0
+		fi
+		: >"$out_file"
+		result=$(_gh32640_run "$stage" 99 "ordinary issue")
+		if [[ "$result" != *"rc=${expected_rc}"* ]] || ! grep -q "$expected_action" "$out_file"; then
+			_fail "GH#32640: ${stage} changed ordinary issue behavior: ${result}"
+			all_ok=0
+		fi
+		if [[ "$stage" == _action_rsd_single ]] && grep -q '^gh:issue close' "$out_file"; then
+			_fail "GH#33374: stale-done healing closed an ordinary open issue"
+			all_ok=0
+		fi
+	done
+
+	unset -f _gh32640_run
+	rm -rf "$tmp_dir"
+	[[ "$all_ok" == "1" ]] && _pass "GH#32640/GH#33374: debt closure gates remain intact; stage 2 heals open/done without closing"
 	return 0
 }
 
@@ -1291,7 +1728,7 @@ test_pr_lookup_uncertainty_preserves_issue_state() {
 	local dedup_helper=""
 	local mutation_log=""
 	local action_log=""
-	local actions_sh="${SCRIPT_DIR}/../pulse-issue-reconcile-actions.sh"
+	local actions_sh; actions_sh="$("${SCRIPT_DIR}/pira-combined-source.sh" --module)"
 	local result=""
 	tmp_dir=$(mktemp -d)
 	dedup_helper="${tmp_dir}/dedup-helper.sh"
@@ -1312,7 +1749,12 @@ EOF
 		LOGFILE="$4"
 		# shellcheck source=/dev/null
 		source "$actions_sh"
-		gh() { printf "gh:%s\n" "$*" >>"$mutation_log"; return 0; }
+		gh() {
+			local command="$1"
+			[[ "$command" != api ]] || return 1
+			printf "gh:%s\n" "$*" >>"$mutation_log"
+			return 0
+		}
 		set_issue_status() { printf "status:%s\n" "$*" >>"$mutation_log"; return 0; }
 		_pir_pr_merged_at() { return 1; }
 		ciw_rc=0
@@ -1334,6 +1776,46 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# GH#34289: a parent close must not start when the remaining reconcile budget
+# is below the mutation reserve (outer stage kill would land mid-action).
+# ---------------------------------------------------------------------------
+test_gh34289_parent_close_deferred_near_budget() {
+	local actions_sh; actions_sh="$("${SCRIPT_DIR}/pira-combined-source.sh" --module)"
+	local logfile=""
+	logfile=$(mktemp)
+	local result=""
+	result=$(ACTIONS_SH="$actions_sh" LOGFILE="$logfile" bash -c '
+		_PIR_SCRIPT_DIR="/nonexistent"
+		source "$ACTIONS_SH"
+		GH_CALLS=0
+		gh() { GH_CALLS=$((GH_CALLS + 1)); return 1; }
+		_t2984_budget=360
+		SECONDS=300
+		_t2984_start_ts=0
+		_try_close_parent_tracker owner/repo 42 43 graph "" && echo "near:ran" || echo "near:deferred"
+		printf "near-gh-calls:%s\n" "$GH_CALLS"
+		_t2984_start_ts=$SECONDS
+		_pir_budget_allows_mutation && echo "fresh:allowed" || echo "fresh:blocked"
+		_t2984_budget=0
+		_pir_budget_allows_mutation && echo "nobudget:allowed" || echo "nobudget:blocked"
+	' 2>/dev/null)
+
+	local all_ok=1
+	printf '%s\n' "$result" | grep -qx 'near:deferred' || all_ok=0
+	printf '%s\n' "$result" | grep -qx 'near-gh-calls:0' || all_ok=0
+	printf '%s\n' "$result" | grep -qx 'fresh:allowed' || all_ok=0
+	printf '%s\n' "$result" | grep -qx 'nobudget:allowed' || all_ok=0
+	grep -q 'deferred: insufficient reconcile budget for parent close #42' "$logfile" 2>/dev/null || all_ok=0
+	rm -f "$logfile"
+	if [[ "$all_ok" -eq 1 ]]; then
+		_pass "parent close deferred (no gh calls, logged) when reconcile budget is nearly exhausted"
+	else
+		_fail "budget-deferral result mismatch: ${result}"
+	fi
+	return 0
+}
+
+# ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
 test_cache_miss_no_file
@@ -1346,6 +1828,8 @@ test_single_pass_cache_consolidation
 test_body_in_prefetch_fetch
 test_should_predicates
 test_parent_live_hold_gate
+test_parent_stale_approval_terminal_close
+test_stage0b_routes_stale_approved_parent_to_stage4
 test_pr_merged_at_prefers_wrapper
 test_single_pass_wired_in_engine
 test_recent_parent_repair_reachable_from_single_pass
@@ -1355,13 +1839,18 @@ test_t2984_time_budget_present
 test_t2984_budget_env_validation
 test_t2985_oimp_lookup_builder
 test_gh22802_oimp_lookup_requires_merged_at
+test_oimp_uses_merged_adapter_population
 test_t2985_oimp_lookup_no_prefix_collision
 test_t2985_action_oimp_single_signature
 test_gh25896_oimp_closes_consolidated_successor
+test_gh32213_oimp_requires_complete_inherited_coverage
+test_gh33687_reconcile_close_respects_reopen_lifecycle
 test_gh27444_recurrent_file_size_debt_current_outcome
+test_gh32640_ciw_rsd_recurrent_file_size_debt_gate
 test_available_feedback_worker_issue_not_assigned
 test_feedback_backfill_uses_label_constants
 test_pr_lookup_uncertainty_preserves_issue_state
+test_gh34289_parent_close_deferred_near_budget
 
 echo ""
 echo "Results: ${pass} passed, ${fail} failed"

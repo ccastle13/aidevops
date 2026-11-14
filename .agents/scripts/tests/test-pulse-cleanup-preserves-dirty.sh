@@ -21,13 +21,21 @@
 
 set -uo pipefail
 
+# Resolve native Git once from the system default PATH (portable to non-FHS
+# hosts such as NixOS); fixtures must bypass the aidevops git wrapper.
+TEST_NATIVE_GIT=$(command -p -v git) || {
+	printf '%s\n' 'Native Git is unavailable on the system PATH' >&2
+	exit 1
+}
+export TEST_NATIVE_GIT
+
 TESTS_RUN=0
 TESTS_FAILED=0
 TEST_ROOT=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PULSE_CLEANUP="${SCRIPT_DIR}/../pulse-cleanup.sh"
-GIT_BIN="${AIDEVOPS_TEST_GIT_BIN:-/usr/bin/git}"
+GIT_BIN="${AIDEVOPS_TEST_GIT_BIN:-${TEST_NATIVE_GIT}}"
 
 # Keep temporary fixture repositories on native Git; canonical mutation-guard
 # behavior is covered by its dedicated tests.
@@ -57,6 +65,20 @@ teardown() {
 	return 0
 }
 
+# GH#34905: cleanup age is confirmed idle time, so backdate every activity
+# signal pulse reads (.git file plus admin HEAD and HEAD reflog).
+backdate_worktree_activity() {
+	local wt_path="$1"
+	local stamp="$2"
+	local admin_dir="" signal=""
+	admin_dir=$(git -C "$wt_path" rev-parse --absolute-git-dir) || return 1
+	for signal in "$wt_path/.git" "$admin_dir/HEAD" "$admin_dir/logs/HEAD"; do
+		[[ -e "$signal" ]] || continue
+		touch -t "$stamp" "$signal" || return 1
+	done
+	return 0
+}
+
 # Create a repo + worktree with the .git file mtime aged to N hours ago so
 # the cleanup logic considers it past the 30m grace period.
 setup_repo_with_worktree_aged() {
@@ -77,15 +99,12 @@ setup_repo_with_worktree_aged() {
 		git worktree add -q -b "$branch_name" "$wt_path" main
 	)
 	# touch -t reads local time, so date must also produce local time
-	# (no -u flag). GNU touch -d accepts free-form relative offsets;
-	# BSD touch needs the -t form. Try -d first, fall back to -t.
-	if ! touch -d "${hours_ago} hours ago" "$wt_path/.git" 2>/dev/null; then
-		local old_ts
-		old_ts=$(date -v-"${hours_ago}"H +%Y%m%d%H%M 2>/dev/null \
-			|| date -d "${hours_ago} hours ago" +%Y%m%d%H%M 2>/dev/null \
-			|| printf '202601010000\n')
-		touch -t "$old_ts" "$wt_path/.git"
-	fi
+	# (no -u flag). BSD date uses -v, GNU date uses -d.
+	local old_ts
+	old_ts=$(date -v-"${hours_ago}"H +%Y%m%d%H%M 2>/dev/null \
+		|| date -d "${hours_ago} hours ago" +%Y%m%d%H%M 2>/dev/null \
+		|| printf '202601010000\n')
+	backdate_worktree_activity "$wt_path" "$old_ts"
 	return 0
 }
 
@@ -158,10 +177,9 @@ test_dirty_worktree_past_grace_skips_removal() {
 	return 0
 }
 
-# Scenario 2: even past 6h, a dirty worktree must be REFUSED permanent
-# removal by the _cleanup_single_worktree defence-in-depth check. The 6h
-# rule used to discard dirty workers; we now treat dirty as "could be an
-# editor session that pgrep missed" and leave the directory alone.
+# Scenario 2: even past 6h, dirty content must survive. Confirmed-idle and
+# rootless visibility guards may refuse the candidate before the older
+# dirty-content guard; no particular guard ordering authorizes data loss.
 test_dirty_worktree_past_6h_still_skips() {
 	local repo_dir="${TEST_ROOT}/repo-dirty-old"
 	local wt_path="${TEST_ROOT}/wt-dirty-old"
@@ -186,7 +204,9 @@ test_dirty_worktree_past_6h_still_skips() {
 	[[ "$cleanup_rc" -eq 1 ]] || rc=1
 	[[ -d "$wt_path" ]] || rc=1
 	[[ -f "$wt_path/slow-edit.txt" ]] || rc=1
-	grep -q 'dirty-content-protect' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
+	grep -qx 'long-running uncommitted edits' "$wt_path/slow-edit.txt" 2>/dev/null || rc=1
+	grep -F "$wt_path" "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null |
+		grep -qE 'dirty-content-protect|idle-unverified-or-pending|cwd-visibility-degraded|degraded-cwd-in-place-quarantine' || rc=1
 	print_result "dirty worktree past 6h refused by defence-in-depth" "$rc" \
 		"cleanup_rc=$cleanup_rc dir_exists=$([[ -d "$wt_path" ]] && echo y || echo n) log=$(cat "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null)"
 	return 0

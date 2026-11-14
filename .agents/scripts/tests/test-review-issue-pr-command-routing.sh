@@ -2,21 +2,19 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2025-2026 Marcus Quinn
 #
-# Regression coverage for unified /review discovery and legacy
+# Regression coverage for unified /review discovery and
 # parent-session /review-issue-pr routing.
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 1
 COMMAND_LIB="${SCRIPT_DIR}/../generate-runtime-config-commands.sh"
-LEGACY_LIB="${SCRIPT_DIR}/../generate-opencode-commands-quality.sh"
 REVIEW_COMMAND_SOURCE="${SCRIPT_DIR}/../commands/review.md"
 FULL_LOOP_SOURCE="${SCRIPT_DIR}/../../workflows/full-loop.md"
 REVIEW_CORE_SOURCE="${SCRIPT_DIR}/../../reference/review-core.md"
 MAINTAINER_WORKFLOW_SOURCE="${SCRIPT_DIR}/../../workflows/review-issue-pr.md"
 TMP_DIR=$(mktemp -d -t aidevops-review-command.XXXXXX) || exit 1
 COMMAND_DIR="${TMP_DIR}/commands"
-CALL_LOG="${TMP_DIR}/legacy-calls"
 
 cleanup() {
 	local tmp_dir="$TMP_DIR"
@@ -58,6 +56,20 @@ grep -Fq 'readiness failure alone must not rewrite an otherwise valid issue verd
 	exit 1
 }
 
+REVIEW_WORKFLOW_SOURCE="${SCRIPT_DIR}/../../workflows/review.md"
+grep -Fq 'blind build' "$REVIEW_WORKFLOW_SOURCE" || {
+	printf 'FAIL review workflow does not document blind packet activation\n' >&2
+	exit 1
+}
+grep -Fq 'Final requirements check' "$FULL_LOOP_SOURCE" || {
+	printf 'FAIL full-loop lacks the final requirements check\n' >&2
+	exit 1
+}
+grep -Fq 'Default closeout output is P0 only' "$REVIEW_CORE_SOURCE" || {
+	printf 'FAIL review core lost the P0-only closeout default\n' >&2
+	exit 1
+}
+
 # shellcheck source=../generate-runtime-config-commands.sh
 source "$COMMAND_LIB"
 
@@ -90,9 +102,16 @@ grep -Fq 'End every completed review with the exact ready-to-run approval comman
 	exit 1
 }
 grep -Fq 'subtask: true' "${COMMAND_DIR}/agent-review.md" || {
-	printf 'FAIL unrelated subtask routing was removed\n' >&2
+	printf 'FAIL agent-review lost its explicit child-session routing\n' >&2
 	exit 1
 }
+if grep -Fq 'subtask: true' "${COMMAND_DIR}/postflight.md"; then
+	printf 'FAIL postflight must stay in the primary session\n' >&2
+	exit 1
+fi
+
+# A stale release file with a forced child session must be replaced.
+printf '%s\n' '---' 'agent: Build+' 'subtask: true' '---' 'stale body' >"${COMMAND_DIR}/release.md"
 
 _generate_hardcoded_commands "opencode" "$COMMAND_DIR" || {
 	printf 'FAIL successful hardcoded generation returned nonzero\n' >&2
@@ -103,36 +122,18 @@ _generate_hardcoded_commands "opencode" "$COMMAND_DIR" || {
 	exit 1
 }
 
-# The one-release fallback generator must preserve the same routing contract.
-create_command() {
-	local name="$1"
-	local description="$2"
-	local agent="$3"
-	local subtask="$4"
-	local body
-	body=$(cat)
-	printf '%s|%s|%s|%s|%s\n' "$name" "$description" "$agent" "$subtask" "$body" >>"$CALL_LOG"
-	return 0
-}
-AGENT_BUILD="Build+"
-# shellcheck source=../generate-opencode-commands-quality.sh
-source "$LEGACY_LIB"
-define_review_commands
-
-grep -Fq 'review-issue-pr|Review external issue or PR - validate problem and evaluate solution|Build+||' "$CALL_LOG" || {
-	printf 'FAIL fallback generator still marks review-issue-pr as a subtask\n' >&2
-	exit 1
-}
-grep -Fq 'workflows/review.md' "$CALL_LOG" || {
-	printf 'FAIL fallback generator does not load the shared review policy\n' >&2
-	exit 1
-}
-grep -Fq 'End every completed review with the exact ready-to-run approval command' "$CALL_LOG" || {
-	printf 'FAIL fallback generator does not require approval command output\n' >&2
-	exit 1
-}
-grep -Fq 'agent-review|Systematic review and improvement of agent instructions|Build+|true|' "$CALL_LOG" || {
-	printf 'FAIL fallback generator changed unrelated subtask routing\n' >&2
+for _cmd in release onboarding setup-aidevops postflight; do
+	grep -Fq 'agent: Build+' "${COMMAND_DIR}/${_cmd}.md" || {
+		printf 'FAIL %s does not target Build+\n' "$_cmd" >&2
+		exit 1
+	}
+	if grep -Fq 'subtask:' "${COMMAND_DIR}/${_cmd}.md"; then
+		printf 'FAIL %s writes a subtask line\n' "$_cmd" >&2
+		exit 1
+	fi
+done
+grep -Fq 'aidevops release [patch|minor|major]' "${COMMAND_DIR}/release.md" || {
+	printf 'FAIL release body lacks the canonical entry point\n' >&2
 	exit 1
 }
 

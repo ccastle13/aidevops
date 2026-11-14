@@ -40,6 +40,8 @@ fi
 # appropriate frontmatter format.
 
 _GENERATED_HARDCODED_COMMAND_COUNT=0
+# Explicit opt-in value for OpenCode child-session routing (subtask: true).
+_SUBTASK_CHILD="true"
 
 # Helper: write a command file for OpenCode format
 _write_opencode_command() {
@@ -54,7 +56,7 @@ _write_opencode_command() {
 		echo "---"
 		echo "description: ${description}"
 		[[ -n "$agent" ]] && echo "agent: ${agent}"
-		[[ "$subtask" == "true" ]] && echo "subtask: true"
+		[[ "$subtask" == "$_SUBTASK_CHILD" ]] && echo "subtask: true"
 		echo "---"
 		echo ""
 		echo "$body"
@@ -286,6 +288,206 @@ _copy_cmd_kimi_skill() {
 # groups them alphabetically in the client's command picker.
 _AIDEVOPS_CMD_PREFIX="aidevops-"
 
+# Hash the full body without runtime-specific frontmatter or outer blank lines.
+_command_body_digest() {
+	local file="$1"
+	local digest
+	digest=$(awk '
+		NR == 1 && /^---$/ { in_fm = 1; next }
+		in_fm && /^---$/ { in_fm = 0; next }
+		in_fm { next }
+		{ lines[++n] = $0 }
+		END {
+			first = 1
+			while (first <= n && lines[first] == "") first++
+			while (n >= first && lines[n] == "") n--
+			for (i = first; i <= n; i++) print lines[i]
+		}
+	' "$file" | shasum -a 256) || return 1
+	printf '%s\n' "${digest%% *}"
+	return 0
+}
+
+# Runtimes whose documented and worker-dispatched prompts use bare command
+# names (`/full-loop Implement issue #N`, `/pulse`, `/review`). These receive
+# both `aidevops-<name>` and `<name>` for every scripts/commands source.
+_runtime_uses_bare_command_aliases() {
+	local runtime_id="$1"
+	case "$runtime_id" in
+	opencode | claude-code) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+# Names written by _generate_hardcoded_commands. Keep in sync with the
+# _maybe_write_hardcoded_command calls below; these names own their bare slot.
+_HARDCODED_COMMAND_NAMES="agent-review review-issue-pr preflight postflight release onboarding setup-aidevops"
+
+# Succeed when a scripts/commands source may own the bare `<name>` alias.
+# Main-agent commands (.agents/commands/<name>.md) and hardcoded commands keep
+# their own names, so a skill alias must never shadow them.
+# Arguments: $1=name $2=main-agent command source dir
+_bare_command_alias_allowed() {
+	local name="$1"
+	local main_src_dir="$2"
+	[[ -e "$main_src_dir/${name}.md" ]] && return 1
+	case " ${_HARDCODED_COMMAND_NAMES} " in
+	*" ${name} "*) return 1 ;;
+	esac
+	return 0
+}
+
+# Print `name:fingerprint|fingerprint` rows for legacy generator output.
+# These SHA-256 body fingerprints come from the literal create_command bodies in
+# generate-opencode-commands-*.sh and maybe_write_command bodies in
+# generate-claude-commands.sh, ignoring frontmatter and outer blank lines.
+_legacy_command_fingerprint_table() {
+	cat <<'LEGACY_COMMANDS'
+autocomplete-research:3ced4a07c86536e082f932b648b8dabc8792e02c1f39470fdf0cc987aeb6852c|8e8432186cf79752c36777bb04755b95ea233744a61638111146acc44030adfa
+bugfix:4eb162e536d21f23909a679bb2e1891bb70027fd8082796e5878dfaacd478f89|df4df13751aae4a828452fd9c2a2c308c400681c20cbd74a2e4f69e65dd59814
+changelog:04c689b6ec618da7bd38215a66884a5bcbb73af821863bf48f63d85f43de91b2|202f3a2098cdd3c3a3a8039561a300f72a697513648c18b8901d744c321dc6c9
+code-audit-remote:e31d369c0719f5f9e3d34ab16729c6cf8e6fecd1630447865bc686eaf892fd61|ef7cbb9b018ebe8a6397d9f90460b6576a41e4f45bc78371c446f476838484d1
+code-simplifier:384f3ecac1dea4f13f01b2a59398b343cca87379f57bc04cefc3d6d73291ea0c|cb38c41ea68ffb16c44bdb07ec7a0a4c1b485d8f18d11fff06b0abf3ea47ce10
+code-standards:251c5d5e3eb0adf047a4705f0ae978f425ced0956696fdd527480ba4bcc4740b|d665b9ee943a713a073e7d0b507977bb32b8561d346f135c991ef63cdcf2b8d4
+create-pr:6cce74d411d3268da56aa9901f4c428859ff10037e162a8be0ad78a915b9363b|e30927aecb53a23a8e1227dd33c4d13089ce010d1db8a7927c355bb3ac8b8e6a
+create-prd:2cc6d1dcb3ec589df30d6345ede7e4a4b9c194173f8a57adcfa29d7d5b37de53|73e90fa8547ce68a7258f858f2d9ecf29232cfa6f4ee62c2374d5e53b7c3e0b4
+feature:4e2af0696cdb9b6c735f79d127f3d4453fe79784b4b44ab50fe09e0985f15bbc|634c3fc232a71133d4123c6f6b0a2becfd561cf3d4a37f40936fb1dbe0b70218
+full-loop:8e4e900fa7e7d59f9610602845178bed1872609847120f9697170dafba890c7e
+generate-tasks:9d05c2a20c6b401678b6eb37086fa63943b847499ff1d773621a13ec06e427eb|d44886fd075b56f5e0a767b61470a9780ac685abd9a9d45bf450f9d99b9e318b
+hotfix:0b491e813ea55bf5278ef87980273174e8ab6f31ebe146b37040408503634fc8|e4952f4b5ee8dc66a42fc1485d54588ca0a0d2b01aa502c6979fc3f0d6883e73
+keyword-research:3cffaf9c4fc4199790417c4f62a6f352864fcf39bf38daa8dc013e0206216a18|f46740c2f36e474aea12c288940896b89b02f270ef0017582ced36d8b36262b2
+keyword-research-extended:82ca24d415658783ab985699278d884810297d26506504ef008e37146a99019a|dbecc763642b76de7d314e8ace3db471a3dafe9937b5c416bdeaf5cd2901c15b
+linters-local:4bc3d359315ae6ace99bcef472928c5104d786e63c304324311c363ec67b22ad|85af0275575d783b84ffa42a1d13a7f71d33358847864d8b593c164d7a34b10e
+list-keys:4c096946158584bdefe03af8bae1d62565679173283d82de35ec8d5591e85a96|b4d1d25005eb3122a1dd2db580d6257d2ff3fa25630ec5f4ec99402fc3e879e1
+list-todo:fce366c1f15fb55b12ef5992efee0aac6b6b17d64591ced6162039a906748f10
+log-time-spent:09b24f667f1e0f1be1ce5ec3c91ea0b5c52c27059211c626354f4be260ce0893|35fef4b7de41f933becfbac755e267b0a54b9a10dd0fe22a010b4387215f8f39
+plan-status:236dbb8970505818ff568f344c8ec22fb2da6e1730804d8bb16a9ffa119e7205|737d1332cef941b888f6463c761eba5c5aadd830d5026c89893e197b57b7b1b9
+postflight-loop:221e154811aa1bd7bda8978d6bc191cc644e3e2f4593dd60e0de97fd06a333ea
+pr:ccfa44ea2a12a000594df2c6cafb05f280f56fe3b6077dc1456692f9ad433a81
+pr-loop:95c9bc2febd41989d9084a92b1f09e4bb5d7353c65488e5472517636cbcc32f3
+preflight-loop:6c8b87ce2aa5d2989833a541bb0f524c49a4cbdcd92e66eb6491edac9b01b985
+recall:67f989582ce662b4cf42e696712c169ed5c5af78cf06b727254c6024b27fda06
+remember:537b6ccb32ce211d80982a3a9e017b8fca9988e94302b40f2f34fc26c7e68028
+save-todo:080938bc6d60ccde9fd2df90a2850bb40decb631511697a0c0a6529fa432ff62
+seo-agent-discovery:016a5dc06d7422ebffbe1cc5661601b557255aa5196a0ac74778e759af398a5b|7a295c552ecc56bc1ecca5c8e33a18ca2f303a1497348d0acfb92cbbc62234e5
+seo-ai-baseline:17f3e2bce58bc56593a766298fbc2578e8bd20ef83eb7e22771b0cb1d5d76ddb|e49411dd970db55f9a579b5d353c45256d19138728f0e88949873420d59fcbe8
+seo-ai-readiness:728425623c3f9972a6c622e6fea2acf6bd7c9d8f1fc7b54a2763ccc1e404afd8|c5352415eb286a8a6dd1bcbeffd97dfaa1f0b3ea8e338d6de6f0b8279750e54e
+seo-fanout:668d2b0b2ca567491e40d129e7c28635bcf78f3566a7b26917fb315441362b40|a5b63898f22e3972f52a5e73ffaf1ac1962df20b220b3a95e85e9dc78f5d18ce
+seo-geo:3f0eca92f0934798b90e8b695e7f93b6509c050bad174457f61b3b2c1addd93b|eaf719a37f02442c5aba3a8acc043c44096da7a965d81d2bab90eaf36f138502
+seo-hallucination-defense:2f3b6fb40d192de0407d8e08efee47810a868c8f6bf393e2480d6fdff786dc1d|b5b02c91796d342c9bdde873e55723168fcabf07231a7a4ca50cba983a976622
+seo-sro:5c57b180a3c60bb86b7ad5d177e916541e37f35b89cc5573bdda96638cddb9cc|7d34a6e8df1105f7f71ddd56d18634b6727b323ca43a1fa6b26fbbdb63bbe499
+session-review:07dd5b12eca536c6cf69c61ee35f184f6e40ed2ee15ccbfc2a0a40e38ab85b2b|b8c8eddcac9ea25251e8fc1cc8a60ca60de2af1fb0403386b82a1c2bd74a7329
+version-bump:86a27ab1e52f6e944541d7e9e920afdda603380e33dd966d0ae0b4ac487cbca8|fdcc820a4a3d76dea54483c88bd97a798ba38087237be128bc31dee5d2cd87d6
+webmaster-keywords:6d5209db6a31e40c76ab5036f4a93ab2f931c2cf53b78ed20a890e5035ba267e|dc1a717e189d2a41bddc8cdb4cba11dd2edc7388d66ac9eb90b91d2a3e8a6d6f
+LEGACY_COMMANDS
+	return 0
+}
+
+# Succeed when a body digest is a known legacy generator fingerprint for name.
+_is_legacy_command_fingerprint() {
+	local name="$1"
+	local digest="$2"
+	local row_name fingerprints
+	while IFS=: read -r row_name fingerprints; do
+		[[ "$row_name" == "$name" ]] || continue
+		case "|${fingerprints}|" in
+		*"|${digest}|"*) return 0 ;;
+		esac
+	done < <(_legacy_command_fingerprint_table)
+	return 1
+}
+
+# Prune only known, unchanged legacy output. A path reference or filename alone
+# cannot establish ownership: users can write their own commands with either.
+# Unknown variants survive. Names with a live scripts/commands source are bare
+# aliases owned by _deploy_bare_command_alias (GH#33484), so never prune them:
+# workers and docs invoke `/full-loop`, `/pr-loop`, `/recall` and friends.
+# Names still written by _generate_hardcoded_commands are excluded.
+_prune_legacy_commands() {
+	local runtime_id="$1"
+	local cmd_dir="$2"
+	_runtime_uses_bare_command_aliases "$runtime_id" || return 0
+
+	local name fingerprints file digest
+	while IFS=: read -r name fingerprints; do
+		[[ -f "$HOME/.aidevops/agents/scripts/commands/${name}.md" ]] && continue
+		file="${cmd_dir}/${name}.md"
+		# Never follow symlinks or remove directories, even at an allowlisted name.
+		[[ -f "$file" && ! -L "$file" ]] || continue
+		digest=$(_command_body_digest "$file") || return 1
+		case "|${fingerprints}|" in
+		*"|${digest}|"*)
+			rm -- "$file" || return 1
+			print_info "Removed stale legacy command: $file"
+			;;
+		esac
+	done < <(_legacy_command_fingerprint_table)
+	return 0
+}
+
+# Deploy the bare `<name>` alias for a scripts/commands source (GH#33484).
+# Ownership rules for an existing file at the bare name:
+#   - symlink or non-regular entry: never follow or replace; warn and keep it
+#   - identical to the generated output: leave untouched
+#   - known legacy generator fingerprint: replace
+#   - any other regular file: copy to the backup dir, then replace
+# No-op for runtimes without bare aliases and for main-agent/hardcoded names.
+# Arguments: $1=runtime_id $2=source file $3=bare name $4=cmd_dir
+#            $5=main-agent command source dir
+# Returns: 0 on success (including skips and kept entries), 1 on failure.
+_deploy_bare_command_alias() {
+	local runtime_id="$1"
+	local src="$2"
+	local name="$3"
+	local cmd_dir="$4"
+	local main_src_dir="$5"
+	local dest="${cmd_dir}/${name}.md"
+	local stage_dir digest backup_dir backup_file
+
+	_runtime_uses_bare_command_aliases "$runtime_id" || return 0
+	_bare_command_alias_allowed "$name" "$main_src_dir" || return 0
+	if [[ -L "$dest" ]] || { [[ -e "$dest" ]] && [[ ! -f "$dest" ]]; }; then
+		print_warning "Keeping non-regular command entry $dest; use /${_AIDEVOPS_CMD_PREFIX}${name}"
+		return 0
+	fi
+
+	stage_dir=$(mktemp -d) || return 1
+	if ! _deploy_one_command "$runtime_id" "$src" "$name" "$stage_dir"; then
+		rm -rf "$stage_dir"
+		print_warning "Failed to render bare command alias $name"
+		return 1
+	fi
+
+	if [[ -f "$dest" ]]; then
+		if cmp -s "$stage_dir/${name}.md" "$dest"; then
+			rm -rf "$stage_dir"
+			return 0
+		fi
+		digest=$(_command_body_digest "$dest") || {
+			rm -rf "$stage_dir"
+			return 1
+		}
+		if ! _is_legacy_command_fingerprint "$name" "$digest"; then
+			backup_dir="${AIDEVOPS_COMMAND_BACKUP_DIR:-$HOME/.aidevops/.agent-workspace/backups/commands}/${runtime_id}"
+			backup_file="${backup_dir}/${name}.md.$(date +%Y%m%dT%H%M%S)"
+			if ! mkdir -p "$backup_dir" || ! cp -p "$dest" "$backup_file"; then
+				rm -rf "$stage_dir"
+				print_warning "Could not back up $dest; keeping it unchanged"
+				return 1
+			fi
+			print_info "Backed up replaced command $dest -> $backup_file"
+		fi
+	fi
+
+	if ! mv -f "$stage_dir/${name}.md" "$dest"; then
+		rm -rf "$stage_dir"
+		print_warning "Failed to install bare command alias $dest"
+		return 1
+	fi
+	rm -rf "$stage_dir"
+	return 0
+}
+
 # Deploy one source command file to a runtime's command directory,
 # applying the correct per-runtime format transform.
 # Arguments:
@@ -364,7 +566,9 @@ _deploy_one_command() {
 #   1. ~/.aidevops/agents/commands/        -- main-agent symlinks (already
 #                                            prefixed with `aidevops-`)
 #   2. ~/.aidevops/agents/scripts/commands/ -- skills/workflows/utilities
-#                                            (prefix is applied at deploy time)
+#                                            (prefix is applied at deploy time;
+#                                            OpenCode/Claude Code also get the
+#                                            bare name, e.g. /full-loop)
 # Gated on the per-runtime `commands` feature flag.
 #
 # Arguments: $1=runtime_id
@@ -444,6 +648,8 @@ _generate_commands_for_runtime() {
 				return 1
 			fi
 			command_count=$((command_count + 1))
+			# Bare alias keeps `/full-loop Implement issue #N` working (GH#33484).
+			_deploy_bare_command_alias "$runtime_id" "$cmd_file" "$cmd_name" "$cmd_dir" "$main_src_dir" || return 1
 		done
 	fi
 
@@ -452,8 +658,14 @@ _generate_commands_for_runtime() {
 	_generate_hardcoded_commands "$runtime_id" "$cmd_dir" || return 1
 	command_count=$((command_count + _GENERATED_HARDCODED_COMMAND_COUNT))
 
+	# Only prune after replacements have been deployed successfully.
+	_prune_legacy_commands "$runtime_id" "$cmd_dir" || return 1
+
 	if [[ "$skipped_count" -gt 0 ]]; then
 		print_warning "$display_name: skipped $skipped_count command file(s) that disappeared during generation"
+	fi
+	if [[ "$runtime_id" == "codex" ]]; then
+		python3 "${SCRIPT_DIR}/codex-setup.py" skills || return 1
 	fi
 	print_success "$display_name: $command_count commands in $cmd_dir"
 	return 0
@@ -468,7 +680,11 @@ _generate_commands_for_runtime() {
 #   $3 - command name
 #   $4 - description
 #   $5 - body content
-#   $6 - OpenCode subtask flag (optional, defaults to true)
+#   $6 - OpenCode subtask flag (optional). Omitted/empty writes no subtask
+#        line, so the command runs in the invoking primary session. Pass
+#        "true" only with a comment justifying a child session; "false" is
+#        written explicitly. Frontmatter only affects user-typed slash commands;
+#        explicit Task delegation and headless dispatch are unaffected.
 # Returns: 0 when written
 _maybe_write_hardcoded_command() {
 	local runtime_id="$1"
@@ -476,7 +692,7 @@ _maybe_write_hardcoded_command() {
 	local name="$3"
 	local description="$4"
 	local body="$5"
-	local subtask="${6:-true}"
+	local subtask="${6:-}"
 
 	case "$runtime_id" in
 	opencode)
@@ -498,6 +714,8 @@ _generate_hardcoded_quality_commands() {
 	local count=0
 
 	# --- Agent Review ---
+	# Decision: child session (subtask true). Read-mostly, output-heavy rubric
+	# review with no worktree-owned operations or git side effects.
 	# shellcheck disable=SC2016
 	if _maybe_write_hardcoded_command "$runtime_id" "$cmd_dir" "agent-review" \
 		"Systematic review and improvement of agent instructions" \
@@ -505,7 +723,8 @@ _generate_hardcoded_quality_commands() {
 
 Review target: $ARGUMENTS
 
-If no target is provided, review the instruction surfaces used in this session.'; then
+If no target is provided, review the instruction surfaces used in this session.' \
+		"$_SUBTASK_CHILD"; then
 		count=$((count + 1))
 	fi
 
@@ -537,6 +756,8 @@ End every completed review with the exact ready-to-run approval command when the
 	fi
 
 	# --- Preflight ---
+	# Decision: child session (subtask true). Read-only quality checks with
+	# bulky output; no bounded operations or git side effects.
 	# shellcheck disable=SC2016
 	if _maybe_write_hardcoded_command "$runtime_id" "$cmd_dir" "preflight" \
 		"Run quality checks before version bump and release" \
@@ -548,11 +769,15 @@ This includes:
 1. Code quality checks (ShellCheck, SonarCloud, secrets scan)
 2. Markdown formatting validation
 3. Version consistency verification
-4. Git status check (clean working tree)'; then
+4. Git status check (clean working tree)' \
+		"$_SUBTASK_CHILD"; then
 		count=$((count + 1))
 	fi
 
 	# --- Postflight ---
+	# Decision: primary session (subtask omitted). Default is read-only, but its
+	# rollback/hotfix paths create linked worktrees and revert commits, which a
+	# child cannot own for the invoking session.
 	# shellcheck disable=SC2016
 	if _maybe_write_hardcoded_command "$runtime_id" "$cmd_dir" "postflight" \
 		"Check code audit feedback on latest push (branch or PR)" \
@@ -588,6 +813,9 @@ _generate_hardcoded_lifecycle_commands() {
 	local count=0
 
 	# --- Release ---
+	# Decision: primary session (subtask omitted). workflows/release.md
+	# (GH#33488) requires OpenCode releases to run in the session owning the
+	# linked worktree; a child cannot start aidevops_bounded_operation there.
 	# shellcheck disable=SC2016
 	if _maybe_write_hardcoded_command "$runtime_id" "$cmd_dir" "release" \
 		"Full release workflow with version bump, tag, and GitHub release" \
@@ -596,17 +824,20 @@ _generate_hardcoded_lifecycle_commands() {
 Release type: $ARGUMENTS (valid: major, minor, patch)
 
 **Steps:**
-1. Run `git log v$(cat VERSION 2>/dev/null || echo "0.0.0")..HEAD --oneline` to see commits since last release
+1. Pick the baseline: if `VERSION` exists use `v$(cat VERSION)`, else the latest tag (`git describe --tags --abbrev=0`), else the root commit. Run `git log <baseline>..HEAD --oneline`
 2. If no release type provided, determine it from commits
-3. Run the single release command:
+3. Read `~/.aidevops/agents/workflows/release.md`. For the aidevops repository on OpenCode, run this inline in this session (do not launch a Task child) through `aidevops_bounded_operation` with `cwd` set to the session-owned linked worktree:
    ```bash
-   .agents/scripts/version-manager.sh release [type] --skip-preflight --force
+   aidevops release [patch|minor|major] <merged-pr-number> [incremental|full]
    ```
+   Release requires a merged PR and explicit user release intent; follow the workflow for status/reconcile. Otherwise (any other managed repository) do NOT run that script or pass `--skip-preflight --force` to project scripts. Follow the repository'"'"'s documented release process (`RELEASING.md`, `CONTRIBUTING.md` Releasing section, or `package.json` release scripts): bump versions in a linked worktree and PR, merge with `full-loop-helper.sh merge`, then tag. See `workflows/release.md` "Manual Release (Non-aidevops Repos)"
 4. Report the result with the GitHub release URL'; then
 		count=$((count + 1))
 	fi
 
 	# --- Onboarding ---
+	# Decision: primary session (subtask omitted). Conversational multi-turn
+	# wizard; a child returns a single result and cannot converse with the user.
 	# shellcheck disable=SC2016
 	if _maybe_write_hardcoded_command "$runtime_id" "$cmd_dir" "onboarding" \
 		"Interactive onboarding wizard - discover services, configure integrations" \
@@ -617,6 +848,8 @@ Arguments: $ARGUMENTS'; then
 	fi
 
 	# --- Setup ---
+	# Decision: primary session (subtask omitted). Runs setup.sh whose output
+	# the user must see in the invoking session.
 	# shellcheck disable=SC2016
 	if _maybe_write_hardcoded_command "$runtime_id" "$cmd_dir" "setup-aidevops" \
 		"Deploy latest aidevops agent changes locally" \

@@ -8,12 +8,97 @@
 [[ -n "${_TEST_HEADLESS_RUNTIME_CONTRACT_TESTS_LOADED:-}" ]] && return 0
 _TEST_HEADLESS_RUNTIME_CONTRACT_TESTS_LOADED=1
 
+# Shared synthetic fixture: no account credentials, API calls, or model sessions.
+_test_git_auth_token_fixture() {
+	local fixture_home="$1"
+	local token_dir="${fixture_home}/.aidevops/.agent-workspace/tokens"
+	mkdir -p "$token_dir"
+	chmod 700 "$token_dir"
+	printf '%s' 'fixture-only-not-a-credential' >"${token_dir}/worker-fixture.token"
+	printf '%s\n' '{"repo":"owner/repo","strategy":"delegated","expires_at":"2099-01-01T00:00:00Z"}' >"${token_dir}/worker-fixture.meta"
+	chmod 600 "${token_dir}/worker-fixture.token" "${token_dir}/worker-fixture.meta"
+	return 0
+}
+
+test_repository_bound_git_auth_contract() {
+	local root="" scripts="" result=0
+	root=$(mktemp -d)
+	root=$(cd "$root" && pwd -P)
+	scripts=$(cd "${BASH_SOURCE[0]%/*}/.." && pwd -P)
+	_test_git_auth_token_fixture "$root"
+	(
+		export HOME="$root"
+		local SCRIPT_DIR="$scripts"
+		# shellcheck source=../headless-runtime-lib.sh
+		source "$scripts/headless-runtime-lib.sh"
+		export WORKER_REPO_SLUG=owner/repo
+		export AIDEVOPS_GIT_AUTH_TOKEN_FILE="$root/.aidevops/.agent-workspace/tokens/worker-fixture.token"
+		export AIDEVOPS_GIT_AUTH_EXPECTED_ORIGIN=https://github.com/owner/repo
+		export GIT_ASKPASS="$scripts/../scripts/github-auth-askpass.sh" GIT_TERMINAL_PROMPT=0
+		export GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid
+		export GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid
+		prepare_headless_git_auth_sandbox_env worker || exit 1
+		[[ "$GIT_ASKPASS" == "$scripts/github-auth-askpass.sh" ]] || exit 1
+		_headless_git_auth_sandbox_env_is_normalized || exit 1
+		# Real BSD/GNU parsers must honor UTC expiry, not the runner timezone.
+		local zone="" expiry="" offset="" token_meta="${AIDEVOPS_GIT_AUTH_TOKEN_FILE%.token}.meta"
+		for zone in Europe/London Asia/Tokyo America/Los_Angeles UTC; do
+			for offset in 1200 -1200; do
+				expiry=$(python3 -c 'import datetime,sys; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=int(sys.argv[1]))).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$offset")
+				jq --arg expiry "$expiry" '.expires_at=$expiry' "$token_meta" >"${token_meta}.new"
+				mv "${token_meta}.new" "$token_meta"
+				chmod 600 "$token_meta"
+				if [[ "$offset" -gt 0 ]]; then
+					TZ="$zone" prepare_headless_git_auth_sandbox_env worker || exit 1
+				elif TZ="$zone" prepare_headless_git_auth_sandbox_env worker 2>/dev/null; then
+					exit 1
+				fi
+			done
+		done
+		_test_git_auth_token_fixture "$root"
+		local reason="" output=""
+		for reason in repository_mismatch askpass_mismatch identity_invalid token_invalid; do
+			output=$(
+				exec 2>&1
+				# Parenthesized patterns keep Bash 3.2's command-substitution
+				# parser from treating the first pattern terminator as its end.
+				case "$reason" in
+				(repository_mismatch) export WORKER_REPO_SLUG=owner/other ;;
+				(askpass_mismatch) export GIT_ASKPASS=/bin/true ;;
+				(identity_invalid) export GIT_COMMITTER_NAME=other ;;
+				(token_invalid) chmod 644 "$AIDEVOPS_GIT_AUTH_TOKEN_FILE" ;;
+				esac
+				if prepare_headless_git_auth_sandbox_env worker; then exit 1; fi
+				[[ -z "${_AIDEVOPS_HEADLESS_GIT_AUTH_ENV_CONFIGURED:-}" ]] || exit 1
+			) || exit 1
+			[[ "$output" == "worker_git_auth_rejected reason=$reason" ]] || exit 1
+		done
+		chmod 600 "$AIDEVOPS_GIT_AUTH_TOKEN_FILE"
+		cleanup_headless_git_auth
+		[[ ! -e "$root/.aidevops/.agent-workspace/tokens/worker-fixture.token" ]] || exit 1
+		export AIDEVOPS_GIT_AUTH_TOKEN_FILE="$root/.aidevops/.agent-workspace/tokens/worker-fixture.token"
+		export GIT_ASKPASS="$scripts/github-auth-askpass.sh" GIT_TERMINAL_PROMPT=0
+		export GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid
+		export GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid
+		export AIDEVOPS_GIT_AUTH_EXPECTED_ORIGIN=https://github.com/owner/repo
+		if prepare_headless_git_auth_sandbox_env worker 2>"$root/rejection"; then exit 1; fi
+		[[ "$(<"$root/rejection")" == 'worker_git_auth_rejected reason=token_invalid' ]] || exit 1
+	) || result=1
+	rm -rf "$root"
+	print_result "repository-bound contract normalizes exact helper aliases and rejects invalid/revoked fixtures without secrets" "$result"
+	return 0
+}
+
 test_appends_escalation_contract() {
 	local prompt='/full-loop Implement issue #14964'
 	local output
 	output=$(append_worker_headless_contract "$prompt")
 
 	if [[ "$output" == *'HEADLESS_CONTINUATION_CONTRACT_V9'* ]] &&
+		[[ "$output" == *"prefix it with \$WORKER_WORKTREE_PATH"* ]] &&
+		[[ "$output" == *'not Glob/Read there, even for AGENTS.md or .agents/ files'* ]] &&
+		[[ "$output" == *'Do not search the canonical checkout for .venv or project dependencies'* ]] &&
+		[[ "$output" == *'Never seek a broad external_directory grant'* ]] &&
 		[[ "$output" == *'Read the issue body FIRST'* ]] &&
 		[[ "$output" == *"gh issue view \"\$WORKER_ISSUE_NUMBER\" --repo \"\$WORKER_REPO_SLUG\" --json body --jq"* ]] &&
 		[[ "$output" == *'Look for a "Worker Guidance" or "How" section'* ]] &&
@@ -24,6 +109,8 @@ test_appends_escalation_contract() {
 		[[ "$output" == *'Incremental WIP commits (GH#23677)'* ]] &&
 		[[ "$output" == *'A first WIP commit makes the worktree cleanup-visible as active real work even before a PR exists'* ]] &&
 		[[ "$output" == *'Progressive context loading'* ]] &&
+		[[ "$output" == *'An <img> URL in text is not proof the pixels were seen'* ]] &&
+		[[ "$output" == *'report access-blocked with a safe wake condition rather than inventing a preview'* ]] &&
 		[[ "$output" == *'Load only referenced workflow/reference docs'* ]] &&
 		[[ "$output" == *'Stop reading once target files, reference pattern, constraints, and verification are clear.'* ]] &&
 		[[ "$output" == *'Never ask for user confirmation, approval, or next steps. No user will respond.'* ]] &&
@@ -89,6 +176,142 @@ test_parse_initial_model_does_not_set_explicit_override() {
 
 	print_result "--initial-model does not set explicit model override" 1 \
 		"initial_model=${initial_model:-<empty>} model_override=${model_override:-<empty>} tier=${tier_override:-<empty>}"
+	return 0
+}
+
+test_initial_model_selection_contract() {
+	local scenario="" evidence="" expected=""
+	for scenario in healthy backoff missing-auth cooling invalid outside-tier excluded exhausted pin replay adaptive vault; do
+		evidence=$(
+			local role="worker" session_key="selection-fixture" title="fixture" prompt="fixture"
+			local model_override="" initial_model="anthropic/preferred" tier_override="thinking" selected_model=""
+			local status=0 outcome="" finished="" checked_model="" command_model="" arg="" previous=""
+			local expected_model="anthropic/preferred"
+			get_configured_models() {
+				printf '%s\n' openai/fallback openai/cheaper
+				[[ "$scenario" == excluded ]] || printf '%s\n' anthropic/preferred
+				return 0
+			}
+			model_tier_candidate_index() {
+				[[ "$1" == thinking && ("$2" == anthropic/preferred || "$2" == openai/fallback) ]]
+			}
+			provider_auth_available() { [[ "$scenario" != missing-auth || "$1" != anthropic ]]; }
+			provider_oauth_pool_available() { [[ "$scenario" != cooling || "$1" != anthropic ]]; }
+			model_backoff_active() {
+				[[ "$scenario" == exhausted && "$1" != openai/cheaper ]] ||
+					[[ ("$scenario" == backoff || "$scenario" == pin || "$scenario" == replay) && "$1" == anthropic/preferred ]]
+			}
+			set_last_provider() { return 0; }
+			model_tier_for_model() { printf '%s' thinking; }
+			_hrff_write_external_outcome() {
+				outcome="$2:$4"
+				return 0
+			}
+			_cmd_run_finish() {
+				finished="$2"
+				return 0
+			}
+			vault_data_policy_check() {
+				checked_model="$1"
+				[[ "$scenario" != vault ]]
+			}
+			_detect_opencode_server() { return 1; }
+			case "$scenario" in
+			(invalid)
+				initial_model="invalid"
+				expected_model="openai/fallback"
+				;;
+			(outside-tier)
+				initial_model="openai/cheaper"
+				expected_model="openai/fallback"
+				;;
+			(backoff | missing-auth | cooling | excluded) expected_model="openai/fallback" ;;
+			(exhausted | pin) expected_model="" ;;
+			(adaptive)
+				initial_model=""
+				expected_model="openai/fallback"
+				;;
+			esac
+			if [[ "$scenario" == pin || "$scenario" == replay ]]; then
+				model_override="anthropic/preferred"
+				initial_model="openai/fallback"
+			fi
+			[[ "$scenario" != replay ]] || role="$HEADLESS_ROLE_MODEL_REPLAY"
+			_select_cmd_run_model || status=$?
+			[[ "$selected_model" == "$expected_model" ]] || exit 1
+			if [[ "$scenario" == exhausted || "$scenario" == pin ]]; then
+				[[ "$status" -eq 75 && "$outcome" == "model_selection_failed:$_HRFF_RETRY_CLASS_INFRASTRUCTURE" &&
+					"$finished" == "$_HRW_STATUS_FAIL" && -z "$checked_model" ]] || exit 2
+			elif [[ "$scenario" == vault ]]; then
+				[[ "$status" -eq 64 && "$outcome" == "protected_data_policy_blocked:$_HRFF_RETRY_CLASS_MAINTAINER_GATE" &&
+					"$finished" == "$_HRW_STATUS_FAIL" && "$checked_model" == "$expected_model" ]] || exit 3
+			else
+				[[ "$status" -eq 0 && -z "$outcome$finished" && "$checked_model" == "$expected_model" ]] || exit 4
+				while IFS= read -r -d '' arg; do
+					[[ "$previous" != -m ]] || command_model="$arg"
+					previous="$arg"
+				done < <(_build_run_cmd "$selected_model" "$TEST_ROOT" "$prompt" "$title" "" "" "")
+				[[ "$command_model" == "$expected_model" ]] || exit 5
+			fi
+			[[ "$tier_override" == thinking ]] || exit 7
+			printf '%s' verified
+		) || true
+		expected="verified"
+		if [[ "$evidence" == "$expected" ]]; then
+			print_result "initial-model selection contract: $scenario" 0
+		else
+			print_result "initial-model selection contract: $scenario" 1 "evidence=$evidence"
+		fi
+	done
+	return 0
+}
+
+test_opencode_v2_run_command_contract() {
+	local -a command=()
+	local arg=""
+	local previous=""
+	local command_model=""
+	local standalone=0
+	local legacy_flag=0
+	local AIDEVOPS_OPENCODE_PROFILE=v2
+	local HEADLESS_OPENCODE_BIN=opencode2
+	while IFS= read -r -d '' arg; do command+=("$arg"); done < <(
+		_build_run_cmd "openai/gpt-5.6" "$TEST_ROOT" "prompt" "title" "high" "build" "session-1"
+	)
+	for arg in "${command[@]}"; do
+		[[ "$previous" != "-m" ]] || command_model="$arg"
+		[[ "$arg" != "--standalone" ]] || standalone=1
+		case "$arg" in
+		--dir | --variant | --attach | --password) legacy_flag=1 ;;
+		esac
+		previous="$arg"
+	done
+
+	if [[ "${command[0]}" == "opencode2" && "$command_model" == "openai/gpt-5.6#high" &&
+		"$standalone" -eq 1 && "$legacy_flag" -eq 0 ]]; then
+		print_result "OpenCode V2 run command uses standalone mode and embedded model variants" 0
+		return 0
+	fi
+
+	print_result "OpenCode V2 run command uses standalone mode and embedded model variants" 1 \
+		"model=$command_model standalone=$standalone legacy_flag=$legacy_flag"
+	return 0
+}
+
+test_opencode_v2_invocation_uses_work_dir() {
+	local work_dir="$TEST_ROOT/opencode-v2-cwd"
+	mkdir -p "$work_dir"
+	if (
+		AIDEVOPS_OPENCODE_PROFILE=v2
+		_invoke_work_dir="$work_dir"
+		exit_code_file="$TEST_ROOT/opencode-v2-cwd.exit"
+		_invoke_opencode_set_working_directory
+		[[ "$PWD" == "$work_dir" ]]
+	); then
+		print_result "OpenCode V2 invocation enters the requested work directory" 0
+	else
+		print_result "OpenCode V2 invocation enters the requested work directory" 1
+	fi
 	return 0
 }
 
@@ -328,6 +551,72 @@ test_worker_signing_sandbox_env_excludes_ambient_git_config() {
 	return 0
 }
 
+test_claude_worker_sandbox_normalizes_signing_git_config() {
+	# GH#33117: the Claude runtime path must normalize signing env like OpenCode.
+	local signing_public_key="${TEST_ROOT}/claude-sandbox-worker-signing-key.pub"
+	local output_file="${TEST_ROOT}/claude-sandbox-signing.out"
+	local exit_code_file="${TEST_ROOT}/claude-sandbox-signing.exit"
+	printf '%s\n' 'ssh-ed25519 AAAAC3NzaClaudeSandboxFixture aidevops-headless-signing' >"$signing_public_key"
+	: >"$output_file"
+	: >"$exit_code_file"
+	local result="" status=0
+	result=$(
+		export _AIDEVOPS_HEADLESS_SIGNING_ENV_CONFIGURED=1
+		export _AIDEVOPS_HEADLESS_SIGNING_GIT_CONFIG_START=1
+		export GIT_CONFIG_COUNT=4
+		export GIT_CONFIG_KEY_0="http.extraHeader" GIT_CONFIG_VALUE_0="unrelated"
+		export GIT_CONFIG_KEY_1="gpg.format" GIT_CONFIG_VALUE_1="ssh"
+		export GIT_CONFIG_KEY_2="user.signingkey" GIT_CONFIG_VALUE_2="$signing_public_key"
+		export GIT_CONFIG_KEY_3="commit.gpgsign" GIT_CONFIG_VALUE_3="true"
+		export AIDEVOPS_WORKER_EGRESS_MODE=off
+		unset AIDEVOPS_HEADLESS_SANDBOX_DISABLED AIDEVOPS_GIT_AUTH_TOKEN_FILE _HEADLESS_CLAUDE_STDIN_FILE 2>/dev/null || true
+		_invoke_role="worker"
+		_invoke_provider="anthropic"
+		_invoke_claude "$output_file" "$exit_code_file" "$TEST_ROOT" \
+			git config --get-regexp '^(gpg\.format|user\.signingkey|commit\.gpgsign|http\.extraheader)$' >/dev/null 2>&1
+		printf 'exit=%s\n' "$(<"$exit_code_file")"
+		cat "$output_file"
+	) || status=$?
+	if [[ "$status" -eq 0 && "$result" == *"exit=0"* && "$result" == *"gpg.format ssh"* &&
+		"$result" == *"user.signingkey ${signing_public_key}"* && "$result" == *"commit.gpgsign true"* &&
+		"$result" != *"http.extraheader"* ]]; then
+		print_result "claude worker sandbox receives only validated signing Git configuration" 0
+	else
+		print_result "claude worker sandbox receives only validated signing Git configuration" 1 \
+			"status=$status result=${result:-<empty>}"
+	fi
+	return 0
+}
+
+test_claude_worker_sandbox_fails_closed_on_unisolated_signing() {
+	local output_file="${TEST_ROOT}/claude-sandbox-signing-reject.out"
+	local exit_code_file="${TEST_ROOT}/claude-sandbox-signing-reject.exit"
+	local launched_marker="${TEST_ROOT}/claude-sandbox-signing-reject.launched"
+	: >"$output_file"
+	: >"$exit_code_file"
+	rm -f "$launched_marker"
+	(
+		export _AIDEVOPS_HEADLESS_SIGNING_ENV_CONFIGURED=1
+		export _AIDEVOPS_HEADLESS_SIGNING_GIT_CONFIG_START=1
+		# Count mismatch: the signing entries cannot be proven contiguous.
+		export GIT_CONFIG_COUNT=5
+		export AIDEVOPS_WORKER_EGRESS_MODE=off
+		unset AIDEVOPS_HEADLESS_SANDBOX_DISABLED 2>/dev/null || true
+		_invoke_role="worker"
+		_invoke_claude "$output_file" "$exit_code_file" "$TEST_ROOT" \
+			touch "$launched_marker" >/dev/null 2>&1
+	)
+	local exit_code=""
+	exit_code=$(<"$exit_code_file")
+	if [[ "$exit_code" == "87" && ! -e "$launched_marker" ]]; then
+		print_result "claude worker sandbox fails closed when signing env cannot be isolated" 0
+	else
+		print_result "claude worker sandbox fails closed when signing env cannot be isolated" 1 \
+			"exit=${exit_code:-<empty>} launched=$([[ -e "$launched_marker" ]] && printf yes || printf no)"
+	fi
+	return 0
+}
+
 test_worker_signing_preflight_accepts_proven_existing_signing() {
 	local result="" status=0
 	result=$(
@@ -391,6 +680,62 @@ test_worker_signing_config_rejects_unusable_existing_signing() {
 	else
 		print_result "worker signing migration rejects an unusable existing signing configuration" 1 \
 			"status=$status"
+	fi
+	return 0
+}
+
+# GH#33064: a signer reachable only through the launcher's ssh-agent must not
+# pass the probe when the worker will run in the sandbox, which never receives
+# SSH_AUTH_SOCK. The git stub signs only when an agent socket is visible.
+_run_agent_only_signing_probe() {
+	local sandbox_disabled="$1"
+	local record_file="$2"
+	: >"$record_file"
+	(
+		git() {
+			case "$*" in
+			*"config --bool commit.gpgsign"*) printf 'true\n' ;;
+			*"rev-parse"*) printf '%s\n' 4b825dc642cb6eb9a060e54bf8d69288fbee4904 ;;
+			*"commit-tree"*)
+				printf 'sock=%s pid=%s\n' "${SSH_AUTH_SOCK:-<unset>}" "${SSH_AGENT_PID:-<unset>}" >>"$record_file"
+				[[ -n "${SSH_AUTH_SOCK:-}" ]] || return 1
+				;;
+			esac
+			return 0
+		}
+		unset _AIDEVOPS_HEADLESS_SIGNING_ENV_CONFIGURED 2>/dev/null || true
+		export SSH_AUTH_SOCK="${TEST_ROOT}/launcher-agent.sock" SSH_AGENT_PID=4242
+		AIDEVOPS_HEADLESS_SANDBOX_DISABLED="$sandbox_disabled" \
+			AIDEVOPS_HEADLESS_SIGNING_PUBLIC_KEY="${TEST_ROOT}/missing-worker-signing-key.pub" \
+			_configure_headless_worker_signing_env "$TEST_ROOT"
+	)
+	return $?
+}
+
+test_worker_signing_probe_ignores_launcher_agent_when_sandboxed() {
+	local record_file="${TEST_ROOT}/signing-probe-sandboxed" status=0
+	_run_agent_only_signing_probe 0 "$record_file" || status=$?
+	local record=""
+	record=$(<"$record_file")
+	if [[ "$status" -eq 1 && "$record" == "sock=<unset> pid=<unset>" ]]; then
+		print_result "worker signing probe ignores the launcher ssh-agent for sandboxed workers" 0
+	else
+		print_result "worker signing probe ignores the launcher ssh-agent for sandboxed workers" 1 \
+			"status=$status record=${record:-<empty>}"
+	fi
+	return 0
+}
+
+test_worker_signing_probe_keeps_agent_when_sandbox_disabled() {
+	local record_file="${TEST_ROOT}/signing-probe-unsandboxed" status=0
+	_run_agent_only_signing_probe 1 "$record_file" || status=$?
+	local record=""
+	record=$(<"$record_file")
+	if [[ "$status" -eq 0 && "$record" == "sock=${TEST_ROOT}/launcher-agent.sock pid=4242" ]]; then
+		print_result "worker signing probe honours the ssh-agent when the sandbox is disabled" 0
+	else
+		print_result "worker signing probe honours the ssh-agent when the sandbox is disabled" 1 \
+			"status=$status record=${record:-<empty>}"
 	fi
 	return 0
 }
@@ -459,9 +804,13 @@ run_worker_signing_contract_tests() {
 	test_worker_signing_preflight_skips_unsigned_repositories
 	test_worker_signing_config_is_process_scoped_and_idempotent
 	test_worker_signing_sandbox_env_excludes_ambient_git_config
+	test_claude_worker_sandbox_normalizes_signing_git_config
+	test_claude_worker_sandbox_fails_closed_on_unisolated_signing
 	test_worker_signing_preflight_accepts_proven_existing_signing
 	test_worker_signing_sandbox_preserves_proven_existing_config
 	test_worker_signing_config_rejects_unusable_existing_signing
+	test_worker_signing_probe_ignores_launcher_agent_when_sandboxed
+	test_worker_signing_probe_keeps_agent_when_sandbox_disabled
 	test_worker_signing_preflight_self_heals_agent_once
 	test_worker_signing_preflight_fails_before_runtime_attempt
 	return 0
@@ -868,7 +1217,7 @@ test_private_workload_arguments_are_fail_closed() {
 
 	local invalid_provider_status=0
 	prompt="$PRIVATE_WORKLOAD_PROMPT"
-	model_override="anthropic/claude-sonnet-4-6"
+	model_override="anthropic/claude-sonnet-5-5"
 	_validate_private_workload_args >/dev/null 2>&1 || invalid_provider_status=$?
 
 	local missing_allowlist_status=0
@@ -1235,7 +1584,7 @@ test_startup_no_activity_can_rotate_after_continuation_budget() {
 		_run_should_retry=0
 		_HRW_STATUS_FAIL="fail"
 		print_warning() { return 0; }
-		choose_model() { printf '%s' 'anthropic/claude-sonnet-4-6'; return 0; }
+		choose_model() { printf '%s' 'anthropic/claude-sonnet-5-5'; return 0; }
 		_cmd_run_finish() { return 0; }
 		local retry_status=0
 		_cmd_run_prepare_retry "worker" "issue-24949" "" 1 3 "openai/gpt-5.5" 78 || retry_status=$?
@@ -1243,7 +1592,7 @@ test_startup_no_activity_can_rotate_after_continuation_budget() {
 	)
 	IFS='|' read -r status action next_model <<<"$result"
 
-	if [[ "$status" -eq 0 && "$action" == "switch" && "$next_model" == "anthropic/claude-sonnet-4-6" ]]; then
+	if [[ "$status" -eq 0 && "$action" == "switch" && "$next_model" == "anthropic/claude-sonnet-5-5" ]]; then
 		print_result "startup no-activity can rotate after continuation budget" 0
 		return 0
 	fi
@@ -1348,7 +1697,7 @@ test_dispatcher_initial_model_can_rotate_after_rate_limit() {
 		_run_should_retry=0
 		_HRW_STATUS_FAIL="fail"
 		print_warning() { return 0; }
-		choose_model() { printf '%s' 'anthropic/claude-sonnet-4-6'; return 0; }
+		choose_model() { printf '%s' 'anthropic/claude-sonnet-5-5'; return 0; }
 		_cmd_run_finish() { return 0; }
 		local retry_status=0
 		_cmd_run_prepare_retry "worker" "issue-22862" "" 1 3 "openai/gpt-5.5" 124 || retry_status=$?
@@ -1356,7 +1705,7 @@ test_dispatcher_initial_model_can_rotate_after_rate_limit() {
 	)
 	IFS='|' read -r status action next_model <<<"$result"
 
-	if [[ "$status" -eq 0 && "$action" == "switch" && "$next_model" == "anthropic/claude-sonnet-4-6" ]]; then
+	if [[ "$status" -eq 0 && "$action" == "switch" && "$next_model" == "anthropic/claude-sonnet-5-5" ]]; then
 		print_result "dispatcher-selected initial model can rotate after rate limit" 0
 		return 0
 	fi

@@ -18,7 +18,7 @@
 #                          Key: (file, 'NEST'); value: max depth.
 #                          (t2171; replaces pulse-simplification.sh proximity scanner.)
 #
-#   file-size            — .sh and .py files over 1500 lines.
+#   file-size            — non-README Markdown over 1000 lines at root, 500 elsewhere.
 #                          Key: (file, 'SIZE'); value: line count.
 #                          (t2171)
 #
@@ -42,7 +42,9 @@
 #
 #   check --base <sha> [--head <sha> | --working-tree] [--output-md <file>]
 #         [--allow-increase] [--dry-run] [--metric <name>]
-#         Full regression check using git worktrees. Main entry point.
+#         Full regression check. Main entry point. Changed files are read
+#         from the object store into unregistered temp snapshots; no Git
+#         worktree is created (GH#34905).
 #
 # Exit codes:
 #   0 — no new violations (or --allow-increase / --dry-run)
@@ -52,35 +54,38 @@
 set -uo pipefail
 
 SCRIPT_NAME=$(basename "$0")
+# shellcheck source=git-ref-snapshot-lib.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/git-ref-snapshot-lib.sh" || {
+	printf '[%s] ERROR: cannot load git-ref-snapshot-lib.sh\n' "$SCRIPT_NAME" >&2
+	exit 2
+}
 TMP_DIR=""
 BASE_WORKTREE=""
 HEAD_WORKTREE=""
 COMPLEXITY_APPLICABLE_EXTENSIONS="sh py rb md"
 COMPLEXITY_APPLICABLE_EXTENSION_REGEX="\\.(${COMPLEXITY_APPLICABLE_EXTENSIONS// /|})$"
 
+# Base/head snapshots are plain directories inside TMP_DIR with no Git
+# worktree registration (GH#34905), so removing TMP_DIR is the whole cleanup.
 cleanup() {
-	if [ -n "$BASE_WORKTREE" ] && [ -d "$BASE_WORKTREE" ]; then
-		# Path-shape assertion (t2974): only remove paths matching the fixture pattern
-		if [[ "$BASE_WORKTREE" != */base-worktree ]]; then
-			log "WARN: Path '$BASE_WORKTREE' does not match fixture pattern — skipping remove"
-		else
-			git worktree remove --force "$BASE_WORKTREE" >/dev/null 2>&1 || true
-		fi
-	fi
-	if [ -n "$HEAD_WORKTREE" ] && [ -d "$HEAD_WORKTREE" ]; then
-		# Path-shape assertion (t2974): only remove paths matching the fixture pattern
-		if [[ "$HEAD_WORKTREE" != */head-worktree ]]; then
-			log "WARN: Path '$HEAD_WORKTREE' does not match fixture pattern — skipping remove"
-		else
-			git worktree remove --force "$HEAD_WORKTREE" >/dev/null 2>&1 || true
-		fi
-	fi
 	if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
 		rm -rf "$TMP_DIR"
 	fi
 	return 0
 }
 trap cleanup EXIT
+# Bash skips the EXIT trap when a fatal signal terminates it; exit explicitly
+# so timeouts and interrupts still remove TMP_DIR.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Create TMP_DIR or die: a failed mktemp must never yield root-relative paths.
+_init_tmp_dir() {
+	TMP_DIR=$(mktemp -d) && [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ] ||
+		die "cannot create temporary directory"
+	return 0
+}
 
 log() {
 	local _msg="$1"
@@ -391,7 +396,7 @@ scan_dir_nesting_depth() {
 # ---------------------------------------------------------------------------
 # scan_dir_file_size <dir> [<out-file>] [<files-filter>]
 #
-# Non-code Markdown files over 500 lines, excluding README.md. Code file
+# Markdown over 1000 lines at repository root, 500 elsewhere; README.md exempt. Code file
 # length is intentionally not gated here; code scalability is covered by
 # function-complexity and nesting-depth gates, which produce more actionable
 # work than whole-file line counts for cohesive helper modules. Output:
@@ -420,7 +425,7 @@ scan_dir_file_size() {
 	local _result_file
 	_result_file=$(_open_result_file "$_out")
 
-	local _file _rel_file _lc
+	local _file _rel_file _lc _limit
 	while IFS= read -r _file; do
 		[ -n "$_file" ] || continue
 		[ -f "$_file" ] || continue
@@ -428,8 +433,12 @@ scan_dir_file_size() {
 		case "$_rel_file" in
 		README.md | */README.md) continue ;;
 		esac
+		case "$_rel_file" in
+		*/*) _limit=500 ;;
+		*) _limit=1000 ;;
+		esac
 		_lc=$(wc -l <"$_file" 2>/dev/null | tr -d ' ')
-		if [ "${_lc:-0}" -gt 500 ] 2>/dev/null; then
+		if [ "${_lc:-0}" -gt "$_limit" ] 2>/dev/null; then
 			printf '%s\tSIZE\t%s\n' "$_rel_file" "$_lc" >>"$_result_file"
 		fi
 	done <<<"$_files"
@@ -585,7 +594,7 @@ metric_unit() {
 	case "$_metric" in
 	function-complexity) printf 'function(s) >100 lines' ;;
 	nesting-depth) printf 'file(s) with nesting depth >8' ;;
-	file-size) printf 'non-README Markdown file(s) >500 lines' ;;
+	file-size) printf 'non-README Markdown file(s) >1000 lines at root / >500 elsewhere' ;;
 	bash32-compat) printf 'bash 3.2-incompatible construct(s)' ;;
 	*) printf 'violation(s)' ;;
 	esac
@@ -786,7 +795,7 @@ write_report() {
 
 		if [ "$_new_count" -gt 0 ]; then
 			printf '### New violations\n\n'
-			printf '%s' "$_headers"
+			printf '%s\n' "$_headers"
 			while IFS=$'\t' read -r _col1 _col2 _col3; do
 				[ -n "$_col1" ] || continue
 				# shellcheck disable=SC2016
@@ -803,12 +812,15 @@ write_report() {
 					_lines=$(_bash32_current_lines "$_head_dir" "$_col1" "$_col2")
 					if [ -n "$_lines" ]; then
 						# shellcheck disable=SC2016
-						printf '- `%s` %s: lines %s\n' "$_col1" "$_col2" "$_lines"
+						printf -- '- `%s` %s: lines %s\n' "$_col1" "$_col2" "$_lines"
 					fi
 				done <"$_new_file"
 				printf '\n</details>\n\n'
 			fi
 
+			if [ "$_metric" = "file-size" ]; then
+				printf '> First make the whole document more concise without losing detail; split or bypass only if that is not enough.\n'
+			fi
 			# shellcheck disable=SC2016
 			printf '> To override (with justification), add the `complexity-bump-ok` label to this PR\n'
 			# shellcheck disable=SC2016
@@ -920,7 +932,7 @@ cmd_diff() {
 	[ -f "$_base_file" ] || die "diff: base-file not found: $_base_file"
 	[ -f "$_head_file" ] || die "diff: head-file not found: $_head_file"
 
-	TMP_DIR=$(mktemp -d)
+	_init_tmp_dir
 	local _new_file="$TMP_DIR/new-violations.tsv"
 
 	local _new_count _base_total _head_total
@@ -958,7 +970,7 @@ cmd_diff() {
 # ---------------------------------------------------------------------------
 _check_dry_run() {
 	local _metric="${1:-function-complexity}"
-	TMP_DIR=$(mktemp -d)
+	_init_tmp_dir
 	local _head_scan="$TMP_DIR/head.tsv"
 	log "[$_metric] dry-run: scanning current tree"
 	scan_dir "." "$_head_scan" "$_metric"
@@ -978,8 +990,139 @@ _check_dry_run() {
 }
 
 # ---------------------------------------------------------------------------
+_log_file_size_remediation() {
+	local _metric="$1"
+	if [ "$_metric" = "file-size" ]; then
+		log "Markdown limits: root 1000 / elsewhere 500; README.md exempt. First make the whole document more concise without losing detail; split or bypass only if that is not enough."
+	fi
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# _changed_applicable_paths <base_sha> <head_sha> <working_tree>
+#
+# Print applicable changed paths (root-relative, newline-separated). With
+# <working_tree>=1, compare base with the working tree plus untracked files.
+# Discovery is NUL-delimited (GH#34943), so names with non-ASCII, tabs,
+# quotes or backslashes stay raw and match the extension filter and the
+# literal pathspecs used for snapshots; newline names are reported, skipped.
+# ---------------------------------------------------------------------------
+_changed_applicable_paths() {
+	local _base_sha="$1"
+	local _head_sha="$2"
+	local _working_tree="$3"
+	if [ "$_working_tree" -eq 1 ]; then
+		{
+			git diff --name-only -z "$_base_sha" -- 2>/dev/null || true
+			git ls-files -z --others --exclude-standard 2>/dev/null || true
+		} | _nul_paths_to_lines | grep -E "$COMPLEXITY_APPLICABLE_EXTENSION_REGEX" | sort -u || true
+	else
+		git diff --name-only -z "$_base_sha" "$_head_sha" 2>/dev/null | _nul_paths_to_lines |
+			grep -E "$COMPLEXITY_APPLICABLE_EXTENSION_REGEX" || true
+	fi
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# _renamed_applicable_pairs <base_sha> <head_sha> <working_tree>
+#
+# Print "old<TAB>new" for each rename between base and head (or base and the
+# working tree when <working_tree>=1) whose destination is applicable. Git's
+# default -M similarity (50%) applies, so renamed-and-edited files keep their
+# identity exactly like in-place edits. `git diff --name-only` reports only the
+# destination of a rename; without this map the base snapshot has no file at
+# that path and every existing violation in a moved file looks new (GH#36897).
+# Paths containing a tab or newline cannot be represented in the TSV scan
+# output and are skipped. An unstaged plain `mv` appears as delete+untracked
+# and is not detected; `git mv` and committed renames are.
+# ---------------------------------------------------------------------------
+_renamed_applicable_pairs() {
+	local _base_sha="$1"
+	local _head_sha="$2"
+	local _working_tree="$3"
+	local _status _old _new
+	local _nl='
+'
+	local _tab
+	_tab=$(printf '\t')
+	local -a _range=("$_base_sha")
+	[ "$_working_tree" -eq 1 ] || _range+=("$_head_sha")
+
+	while IFS= read -r -d '' _status; do
+		IFS= read -r -d '' _old || break
+		IFS= read -r -d '' _new || break
+		case "$_status" in
+		R*) ;;
+		*) continue ;;
+		esac
+		case "${_old}${_new}" in
+		*"$_nl"* | *"$_tab"*) continue ;;
+		esac
+		[[ "$_new" =~ $COMPLEXITY_APPLICABLE_EXTENSION_REGEX ]] || continue
+		printf '%s\t%s\n' "$_old" "$_new"
+	done < <(git diff -z -M --name-status --diff-filter=R "${_range[@]}" -- 2>/dev/null || true)
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# _remap_scan_paths <scan-file> <rename-map-file>
+#
+# Rewrite column 1 of <scan-file> from rename sources to destinations using
+# <rename-map-file> ("old<TAB>new" rows) so base violations keep their identity
+# after a move. Rename sources are deleted at head, so no path collides.
+# ---------------------------------------------------------------------------
+_remap_scan_paths() {
+	local _scan="$1"
+	local _map="$2"
+	[ -s "$_scan" ] && [ -s "$_map" ] || return 0
+	local _tmp="${_scan}.remap"
+	awk -F '\t' -v OFS='\t' 'NR==FNR { m[$1]=$2; next } ($1 in m) { $1=m[$1] } { print }' \
+		"$_map" "$_scan" >"$_tmp" || return 1
+	mv "$_tmp" "$_scan" || return 1
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# _scan_base_with_renames <base_sha> <head_sha> <working_tree> <metric>
+#                         <changed_source> <base_scan>
+#
+# Materialize and scan the base snapshot into <base_scan>, sets BASE_WORKTREE.
+# Renamed files are scanned at their base path and remapped to the head path,
+# so a move carries existing violations over instead of making them look new
+# (GH#36897). Requires _init_tmp_dir.
+# ---------------------------------------------------------------------------
+_scan_base_with_renames() {
+	local _base_sha="$1"
+	local _head_sha="$2"
+	local _working_tree="$3"
+	local _metric="$4"
+	local _changed_source="$5"
+	local _base_scan="$6"
+	local _rename_map="$TMP_DIR/renames.tsv"
+	local _base_paths="$_changed_source"
+
+	_renamed_applicable_pairs "$_base_sha" "$_head_sha" "$_working_tree" >"$_rename_map"
+	if [ -s "$_rename_map" ]; then
+		_base_paths=$({
+			printf '%s\n' "$_changed_source"
+			cut -f1 "$_rename_map"
+		} | sort -u)
+		log "[$_metric] $(wc -l <"$_rename_map" | tr -d ' ') renamed file(s) compared against their base path"
+	fi
+
+	BASE_WORKTREE="$TMP_DIR/base-snapshot"
+	log "[$_metric] materializing changed files at base ${_base_sha:0:7}"
+	if ! _materialize_ref_paths "$_base_sha" "$BASE_WORKTREE" "$_base_paths" 2>/dev/null; then
+		die "failed to materialize base snapshot for $_base_sha"
+	fi
+	log "[$_metric] scanning base (${_base_sha:0:7})"
+	scan_dir "$BASE_WORKTREE" "$_base_scan" "$_metric" "$_base_paths"
+	_remap_scan_paths "$_base_scan" "$_rename_map" || die "failed to remap renamed base paths"
+	return 0
+}
+
 # _check_regression <base_sha> <head_sha> <output_md> <allow_increase> [<metric>]
-# Scan base+head via worktrees, compute diff, optionally write report.
+# Scan base+head via snapshots, compute diff, optionally write report.
 # Exits 0 (no regression), 1 (regression), or 2 (error).
 #
 # Diff-scoped optimisation (t2827): computes applicable source and Markdown
@@ -997,17 +1140,8 @@ _check_regression() {
 	local _metric="${5:-function-complexity}"
 	local _working_tree="${6:-0}"
 
-	# Resolve applicable changed files before creating worktrees.
 	local _changed_source
-	if [ "$_working_tree" -eq 1 ]; then
-		_changed_source=$({
-			git diff --name-only "$_base_sha" -- 2>/dev/null || true
-			git ls-files --others --exclude-standard 2>/dev/null || true
-		} | grep -E "$COMPLEXITY_APPLICABLE_EXTENSION_REGEX" | sort -u || true)
-	else
-		_changed_source=$(git diff --name-only "$_base_sha" "$_head_sha" 2>/dev/null |
-			grep -E "$COMPLEXITY_APPLICABLE_EXTENSION_REGEX" || true)
-	fi
+	_changed_source=$(_changed_applicable_paths "$_base_sha" "$_head_sha" "$_working_tree")
 	if [ -z "$_changed_source" ]; then
 		log "[$_metric] no applicable changes between ${_base_sha:0:7}..${_head_sha:0:7} — skipping"
 		# Write a clean "no applicable changes" report so any previously-posted
@@ -1030,27 +1164,22 @@ _check_regression() {
 	_changed_count=$(printf '%s\n' "$_changed_source" | wc -l | tr -d ' ')
 	log "[$_metric] diff-scoped: ${_changed_count} applicable file(s) changed — scanning only those"
 
-	TMP_DIR=$(mktemp -d)
+	_init_tmp_dir
 	local _base_scan="$TMP_DIR/base.tsv"
 	local _head_scan="$TMP_DIR/head.tsv"
 	local _new_file="$TMP_DIR/new-violations.tsv"
 
-	BASE_WORKTREE="$TMP_DIR/base-worktree"
-	log "[$_metric] creating base worktree at ${_base_sha:0:7}"
-	if ! git worktree add --detach --force "$BASE_WORKTREE" "$_base_sha" >/dev/null 2>&1; then
-		die "failed to create base worktree for $_base_sha"
-	fi
-	log "[$_metric] scanning base (${_base_sha:0:7})"
-	scan_dir "$BASE_WORKTREE" "$_base_scan" "$_metric" "$_changed_source"
+	_scan_base_with_renames "$_base_sha" "$_head_sha" "$_working_tree" \
+		"$_metric" "$_changed_source" "$_base_scan"
 
 	if [ "$_working_tree" -eq 1 ]; then
 		log "[$_metric] scanning current working tree"
 		scan_dir "." "$_head_scan" "$_metric" "$_changed_source"
 	else
-		HEAD_WORKTREE="$TMP_DIR/head-worktree"
-		log "[$_metric] creating head worktree at ${_head_sha:0:7}"
-		if ! git worktree add --detach --force "$HEAD_WORKTREE" "$_head_sha" >/dev/null 2>&1; then
-			die "failed to create head worktree for $_head_sha"
+		HEAD_WORKTREE="$TMP_DIR/head-snapshot"
+		log "[$_metric] materializing changed files at head ${_head_sha:0:7}"
+		if ! _materialize_ref_paths "$_head_sha" "$HEAD_WORKTREE" "$_changed_source" 2>/dev/null; then
+			die "failed to materialize head snapshot for $_head_sha"
 		fi
 		log "[$_metric] scanning head (${_head_sha:0:7})"
 		scan_dir "$HEAD_WORKTREE" "$_head_scan" "$_metric" "$_changed_source"
@@ -1079,6 +1208,7 @@ _check_regression() {
 
 	if [ "$_new_count" -gt 0 ] && [ "$_allow_increase" -eq 0 ]; then
 		log "[$_metric] REGRESSION: $_new_count new violation(s)"
+		_log_file_size_remediation "$_metric"
 		exit 1
 	fi
 

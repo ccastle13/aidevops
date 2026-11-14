@@ -127,6 +127,8 @@ define_helper_under_test() {
 	local helper_src
 	# shellcheck source=/dev/null
 	source "$REST_STATE_SCRIPT"
+	# shellcheck source=/dev/null
+	source "${SCRIPT_DIR}/../pulse-merge-timing.sh"
 	helper_src=$(awk '
 		/^_pmp_update_branch_conflict_cooldown_file\(\) \{/,/^}$/ { print }
 		/^_pmp_update_branch_conflict_cooldown_active\(\) \{/,/^}$/ { print }
@@ -455,9 +457,11 @@ test_nmr_guard_exists_before_close() {
 	fi
 
 	# NMR guard must appear BEFORE the _close_conflicting_pr call.
-	local nmr_pos close_pos
-	nmr_pos=$(printf '%s\n' "$block" | grep -n 'needs-maintainer-review' | head -1 | cut -d: -f1)
-	close_pos=$(printf '%s\n' "$block" | grep -n '_close_conflicting_pr' | head -1 | cut -d: -f1)
+	# grep -m1 on a here-string instead of `printf | grep | head -1`: no
+	# early-exit reader under pipefail, so no SIGPIPE flake (GH#35943).
+	local nmr_pos="" close_pos=""
+	nmr_pos=$(grep -n -m1 -- 'needs-maintainer-review' <<<"$block" | cut -d: -f1) || nmr_pos=""
+	close_pos=$(grep -n -m1 -- '_close_conflicting_pr' <<<"$block" | cut -d: -f1) || close_pos=""
 	if [[ -z "$nmr_pos" || -z "$close_pos" ]] || [[ "$nmr_pos" -ge "$close_pos" ]]; then
 		print_result "NMR guard + update-branch structure present" 1 \
 			"NMR guard must appear before _close_conflicting_pr (nmr_pos=${nmr_pos}, close_pos=${close_pos})"
@@ -465,8 +469,8 @@ test_nmr_guard_exists_before_close() {
 	fi
 
 	# update-branch must also appear BEFORE the final close.
-	local ub_pos
-	ub_pos=$(printf '%s\n' "$block" | grep -n '_attempt_pr_update_branch' | head -1 | cut -d: -f1)
+	local ub_pos=""
+	ub_pos=$(grep -n -m1 -- '_attempt_pr_update_branch' <<<"$block" | cut -d: -f1) || ub_pos=""
 	if [[ -z "$ub_pos" ]] || [[ "$ub_pos" -ge "$close_pos" ]]; then
 		print_result "NMR guard + update-branch structure present" 1 \
 			"update-branch must appear before _close_conflicting_pr (ub_pos=${ub_pos}, close_pos=${close_pos})"

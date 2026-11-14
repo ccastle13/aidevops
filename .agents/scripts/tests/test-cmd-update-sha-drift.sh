@@ -27,6 +27,14 @@
 
 set -uo pipefail
 
+# Resolve native Git once from the system default PATH (portable to non-FHS
+# hosts such as NixOS); fixtures must bypass the aidevops git wrapper.
+TEST_NATIVE_GIT=$(command -p -v git) || {
+	printf '%s\n' 'Native Git is unavailable on the system PATH' >&2
+	exit 1
+}
+export TEST_NATIVE_GIT
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKTREE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
@@ -63,30 +71,35 @@ AUTO_UPDATE_CHECK_SH="$WORKTREE_ROOT/.agents/scripts/auto-update-helper-check.sh
 UPDATE_CHECK_SH="$WORKTREE_ROOT/.agents/scripts/aidevops-update-check.sh"
 UPDATE_LIB="$WORKTREE_ROOT/.agents/scripts/aidevops-cli/aidevops-update-lib.sh"
 
-# Test 1: aidevops.sh cmd_update references .deployed-sha in the VERSION-match branch
+# Test 1: the already-current update path checks deployed stamp drift and redeploys code.
 if grep -q '\.deployed-sha' "$AIDEVOPS_SH" &&
-	grep -q 't2706' "$AIDEVOPS_SH"; then
-	print_result "aidevops.sh cmd_update has stamp-drift check (t2706 marker)" 0
+	grep -q "\"\$deployed_sha\" != \"\$local_hash\"" "$AIDEVOPS_SH" &&
+	grep -q "diff --name-only \"\$deployed_sha\" \"\$local_hash\" -- .agents/scripts/" "$AIDEVOPS_SH" &&
+	grep -q "_run_update_setup_transaction \"\$update_output_mode\" \"\$local_hash\"" "$AIDEVOPS_SH"; then
+	print_result "aidevops.sh already-current update redeploys stamped code drift" 0
 else
-	print_result "aidevops.sh cmd_update has stamp-drift check (t2706 marker)" 1 \
-		"(expected .deployed-sha reference and t2706 marker)"
+	print_result "aidevops.sh already-current update redeploys stamped code drift" 1 \
+		"(expected stamp comparison, framework-code diff and incremental setup)"
 fi
 
 if grep -q '_update_repo_verify_files_changed' "$UPDATE_LIB" &&
-	grep -q 'skip_project_sync.*reconcile_repo_verify' "$AIDEVOPS_SH"; then
+	grep -q "_update_repo_verify_files_changed \"\$deployed_sha\" \"\$local_hash\"" "$AIDEVOPS_SH" &&
+	grep -q 'skip_project_sync.*_AIDEVOPS_UPDATE_RECONCILE_REPO_VERIFY' "$AIDEVOPS_SH" &&
+	grep -q '_update_reconcile_repo_verify' "$AIDEVOPS_SH"; then
 	print_result "lint reconciliation is changed-file gated and honours project-sync skip" 0
 else
 	print_result "lint reconciliation is changed-file gated and honours project-sync skip" 1 \
 		"(expected changed-file helper and skip_project_sync gate)"
 fi
 
-# Test 2: aidevops.sh filters for framework code paths (skips docs-only drift)
-if grep -q '\.agents/scripts/' "$AIDEVOPS_SH" &&
-	grep -q 'has_code_drift' "$AIDEVOPS_SH"; then
-	print_result "aidevops.sh filters for framework code paths" 0
+# Test 2: session-start drift detection filters framework code (skips docs-only drift).
+if grep -q '\.agents/scripts/\* | .agents/agents/\*' "$UPDATE_CHECK_SH" &&
+	grep -q 'has_code_drift=1' "$UPDATE_CHECK_SH" &&
+	grep -q "\"\$has_code_drift\" -eq 0" "$UPDATE_CHECK_SH"; then
+	print_result "aidevops-update-check.sh filters for framework code paths" 0
 else
-	print_result "aidevops.sh filters for framework code paths" 1 \
-		"(expected .agents/scripts/ case and has_code_drift variable)"
+	print_result "aidevops-update-check.sh filters for framework code paths" 1 \
+		"(expected framework path case, code-drift flag and docs-only skip)"
 fi
 
 # Test 2b: aidevops.sh uses the AI-session setup scope for update redeploys.
@@ -167,57 +180,64 @@ SETUP_CALLS_LOG="${TEST_ROOT}/setup_calls.log"
 mkdir -p "$SANDBOX_HOME" "$SANDBOX_AIDEVOPS/agents"
 
 # Build sandbox framework repo with a script change + docs-only commit
-/usr/bin/git init -q "$SANDBOX_REPO" 2>/dev/null
-/usr/bin/git -C "$SANDBOX_REPO" config user.email "test@test.local"
-/usr/bin/git -C "$SANDBOX_REPO" config user.name "Test"
-/usr/bin/git -C "$SANDBOX_REPO" config commit.gpgsign false
+"$TEST_NATIVE_GIT" init -q "$SANDBOX_REPO" 2>/dev/null
+"$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" config user.email "test@test.local"
+"$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" config user.name "Test"
+"$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" config commit.gpgsign false
 
 # Baseline — deployed state
 mkdir -p "$SANDBOX_REPO/.agents/scripts"
 printf '#!/usr/bin/env bash\necho v1\n' >"$SANDBOX_REPO/.agents/scripts/foo.sh"
 printf 'v1\n' >"$SANDBOX_REPO/VERSION"
-/usr/bin/git -C "$SANDBOX_REPO" add -A
-/usr/bin/git -C "$SANDBOX_REPO" commit -qm "initial" 2>/dev/null
-DEPLOYED_SHA=$(/usr/bin/git -C "$SANDBOX_REPO" rev-parse HEAD)
+"$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" add -A
+"$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" commit -qm "initial" 2>/dev/null
+DEPLOYED_SHA=$("$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" rev-parse HEAD)
 
 # Add a framework-code drift commit
 printf '#!/usr/bin/env bash\necho v2\n' >"$SANDBOX_REPO/.agents/scripts/foo.sh"
-/usr/bin/git -C "$SANDBOX_REPO" add -A
-/usr/bin/git -C "$SANDBOX_REPO" commit -qm "update script" 2>/dev/null
-HEAD_SHA=$(/usr/bin/git -C "$SANDBOX_REPO" rev-parse HEAD)
+"$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" add -A
+"$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" commit -qm "update script" 2>/dev/null
+HEAD_SHA=$("$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" rev-parse HEAD)
 
 # Add a docs-only commit on top
 mkdir -p "$SANDBOX_REPO/.agents/reference"
 printf '# doc\n' >"$SANDBOX_REPO/.agents/reference/readme.md"
-/usr/bin/git -C "$SANDBOX_REPO" add -A
-/usr/bin/git -C "$SANDBOX_REPO" commit -qm "update docs" 2>/dev/null
-HEAD_WITH_DOCS_SHA=$(/usr/bin/git -C "$SANDBOX_REPO" rev-parse HEAD)
+"$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" add -A
+"$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" commit -qm "update docs" 2>/dev/null
+HEAD_WITH_DOCS_SHA=$("$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" rev-parse HEAD)
 
 # Add a setup.sh-only drift commit (per Gemini feedback on PR #20342:
 # setup.sh drift must trigger redeploy because it controls what gets deployed).
 printf '#!/usr/bin/env bash\necho setup v2\n' >"$SANDBOX_REPO/setup.sh"
-/usr/bin/git -C "$SANDBOX_REPO" add -A
-/usr/bin/git -C "$SANDBOX_REPO" commit -qm "update setup.sh" 2>/dev/null
-HEAD_WITH_SETUP_DRIFT_SHA=$(/usr/bin/git -C "$SANDBOX_REPO" rev-parse HEAD)
+"$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" add -A
+"$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" commit -qm "update setup.sh" 2>/dev/null
+HEAD_WITH_SETUP_DRIFT_SHA=$("$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" rev-parse HEAD)
 
 # Add an aidevops.sh-only drift commit (per Gemini feedback on PR #20342:
 # aidevops.sh is the deployed CLI entry point, drift must trigger redeploy).
 printf '#!/usr/bin/env bash\necho aidevops v2\n' >"$SANDBOX_REPO/aidevops.sh"
-/usr/bin/git -C "$SANDBOX_REPO" add -A
-/usr/bin/git -C "$SANDBOX_REPO" commit -qm "update aidevops.sh" 2>/dev/null
-HEAD_WITH_AIDEVOPS_DRIFT_SHA=$(/usr/bin/git -C "$SANDBOX_REPO" rev-parse HEAD)
+"$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" add -A
+"$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" commit -qm "update aidevops.sh" 2>/dev/null
+HEAD_WITH_AIDEVOPS_DRIFT_SHA=$("$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" rev-parse HEAD)
+
+# GH#36372: equal-version runtime module drift must not be mistaken for docs.
+mkdir -p "$SANDBOX_REPO/.agents/worker-lifecycle"
+printf 'SCHEMA_VERSION = 2\n' >"$SANDBOX_REPO/.agents/worker-lifecycle/registry.py"
+"$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" add -A
+"$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" commit -qm "update lifecycle module" 2>/dev/null
+HEAD_WITH_LIFECYCLE_DRIFT_SHA=$("$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" rev-parse HEAD)
 
 # Add an intentional linked-worktree-style hotfix deployment ahead of the
 # canonical HEAD, then return the sandbox checkout to the canonical commit.
 printf '#!/usr/bin/env bash\necho hotfix\n' >"$SANDBOX_REPO/.agents/scripts/foo.sh"
-/usr/bin/git -C "$SANDBOX_REPO" add -A
-/usr/bin/git -C "$SANDBOX_REPO" commit -qm "active hotfix" 2>/dev/null
-DEPLOYED_AHEAD_SHA=$(/usr/bin/git -C "$SANDBOX_REPO" rev-parse HEAD)
-/usr/bin/git -C "$SANDBOX_REPO" checkout -q --detach "$HEAD_WITH_AIDEVOPS_DRIFT_SHA"
+"$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" add -A
+"$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" commit -qm "active hotfix" 2>/dev/null
+DEPLOYED_AHEAD_SHA=$("$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" rev-parse HEAD)
+"$TEST_NATIVE_GIT" -C "$SANDBOX_REPO" checkout -q --detach "$HEAD_WITH_LIFECYCLE_DRIFT_SHA"
 
 if [[ -z "$DEPLOYED_SHA" || -z "$HEAD_SHA" || -z "$HEAD_WITH_DOCS_SHA" ||
 	-z "$HEAD_WITH_SETUP_DRIFT_SHA" || -z "$HEAD_WITH_AIDEVOPS_DRIFT_SHA" ||
-	-z "$DEPLOYED_AHEAD_SHA" ]]; then
+	-z "$HEAD_WITH_LIFECYCLE_DRIFT_SHA" || -z "$DEPLOYED_AHEAD_SHA" ]]; then
 	printf '%sSETUP FAILED%s sandbox repo SHAs empty\n' "$TEST_RED" "$TEST_RESET"
 	exit 1
 fi
@@ -226,6 +246,13 @@ fi
 FAKE_SETUP="${SANDBOX_REPO}/setup.sh"
 printf '#!/usr/bin/env bash\nprintf "called %%s\n" "$$" >> "%s"\n' "$SETUP_CALLS_LOG" >"$FAKE_SETUP"
 chmod +x "$FAKE_SETUP"
+
+# Execute the production branch rather than maintaining a second drift filter.
+awk '/^_update_already_current\(\)/ { capture=1 } capture { print } capture && /^}/ { exit }' \
+	"$AIDEVOPS_SH" >"$TEST_ROOT/already-current.sh"
+# Extract only the foreground detector; never launch the background redeployer.
+awk '/^_check_script_drift\(\)/ { capture=1 } capture { print } capture && /^}/ { exit }' \
+	"$UPDATE_CHECK_SH" >"$TEST_ROOT/script-drift.sh"
 
 # Sync VERSION file to "current" so only the stamp/SHA triggers the redeploy
 printf 'v1\n' >"$SANDBOX_AIDEVOPS/agents/VERSION"
@@ -247,31 +274,20 @@ run_cmd_update_stamp_branch() {
 		rm -f "$SANDBOX_AIDEVOPS/.deployed-sha"
 	fi
 
-	# Inline stamp check mirroring the t2706 addition in aidevops.sh cmd_update.
-	# This is a structural copy, not a source reference, because the logic lives
-	# inside a much larger function that is not safely sourceable.
-	# Pattern updated per Gemini code-review on PR #20342 to match aidevops.sh
-	# and auto-update-helper.sh (path filter + grep -q . + expanded path list).
 	HOME="$SANDBOX_HOME" bash -c '
-		set +e
-		INSTALL_DIR="'"$SANDBOX_REPO"'"
-		local_hash="'"$head_sha"'"
-		stamp_file="$HOME/.aidevops/.deployed-sha"
-		if [[ -f "$stamp_file" ]]; then
-			deployed_sha=$(tr -d "[:space:]" <"$stamp_file" 2>/dev/null) || deployed_sha=""
-			if [[ -n "$deployed_sha" && "$deployed_sha" != "$local_hash" ]]; then
-				has_code_drift=0
-				if /usr/bin/git -C "$INSTALL_DIR" diff --name-only "$deployed_sha" "$local_hash" -- \
-					.agents/scripts/ .agents/agents/ .agents/workflows/ .agents/prompts/ .agents/hooks/ \
-					setup.sh .agents/scripts/setup/modules/ aidevops.sh 2>/dev/null | grep -q .; then
-					has_code_drift=1
-				fi
-				if [[ "$has_code_drift" -eq 1 ]]; then
-					bash "$INSTALL_DIR/setup.sh" --stage ai-session >/dev/null 2>&1
-				fi
-			fi
-		fi
-	' 2>/dev/null
+		INSTALL_DIR="$1"
+		source "$3"
+		print_success() { return 0; }
+		print_warning() { return 0; }
+		print_info() { return 0; }
+		_update_repo_verify_files_changed() { return 1; }
+		_update_check_workflow_drift() { return 0; }
+		_run_update_setup_transaction() {
+			bash "$INSTALL_DIR/setup.sh" --stage ai-session
+			return $?
+		}
+		_update_already_current "$2" compact
+	' _ "$SANDBOX_REPO" "$head_sha" "$TEST_ROOT/already-current.sh" 2>/dev/null
 	return 0
 }
 
@@ -386,6 +402,32 @@ fi
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
+rm -f "$SETUP_CALLS_LOG"
+run_cmd_update_stamp_branch "$HEAD_WITH_AIDEVOPS_DRIFT_SHA" "$HEAD_WITH_LIFECYCLE_DRIFT_SHA"
+if [[ "$(count_setup_calls)" -eq 1 ]]; then
+	print_result "normal update schedules lifecycle-only drift deployment" 0
+else
+	print_result "normal update schedules lifecycle-only drift deployment" 1
+fi
+
+rm -f "$SETUP_CALLS_LOG"
+run_auto_update_stale_check "$HEAD_WITH_AIDEVOPS_DRIFT_SHA"
+if [[ "$(count_setup_calls)" -eq 1 ]]; then
+	print_result "auto-update schedules lifecycle-only drift deployment" 0
+else
+	print_result "auto-update schedules lifecycle-only drift deployment" 1
+fi
+
+# A non-executable sandbox setup returns the detection message without spawning.
+chmod -x "$FAKE_SETUP"
+session_drift=$(HOME="$SANDBOX_HOME" AIDEVOPS_FRAMEWORK_REPO="$SANDBOX_REPO" \
+	bash -c 'source "$1"; _check_script_drift' _ "$TEST_ROOT/script-drift.sh")
+if [[ "$session_drift" == *"Script drift detected"* ]]; then
+	print_result "session-start detects lifecycle-only drift" 0
+else
+	print_result "session-start detects lifecycle-only drift" 1
+fi
+
 echo ""
 if [[ "$TESTS_FAILED" -eq 0 ]]; then
 	printf '%sAll %d tests passed.%s\n' "$TEST_GREEN" "$TESTS_RUN" "$TEST_RESET"

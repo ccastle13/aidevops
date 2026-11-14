@@ -163,6 +163,13 @@ mkdir -p "$OPENAI_OAUTH_STUB_DIR"
 cat >"${OPENAI_OAUTH_STUB_DIR}/curl" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${OPENAI_OAUTH_CURL_LOG:?}"
+# GH#37627: Codex-backend probe returns only the HTTP code (default: rejected).
+case "$*" in
+	*backend-api/codex*)
+		printf '%s' "${OPENAI_OAUTH_STUB_CODEX_CODE:-401}"
+		exit 0
+		;;
+esac
 case "${OPENAI_OAUTH_STUB_MODE:-success}" in
 	success)
 		printf 'HTTP/2 200\n\n{"data":[{"id":"gpt-5.5"}]}\n0.001\n200\n'
@@ -403,6 +410,35 @@ else
 		"(got rc=$rc — expected 3; invalid OAuth token must not record healthy)"
 fi
 
+# Assertion 4b.3c.1 — GH#37627: ChatGPT-only account rejected by the platform
+# API but accepted by the Codex backend is healthy; Codex rejection is not.
+rc=$(
+	OPENAI_OAUTH_STUB_MODE=auth OPENAI_OAUTH_STUB_CODEX_CODE=200 \
+		OPENAI_OAUTH_CURL_LOG="$OPENAI_OAUTH_CURL_LOG" \
+		PATH="${OPENAI_OAUTH_STUB_DIR}:${PATH}" \
+		_probe_check_oauth_fallback openai true "gopass:OPENAI_API_KEY" >/dev/null
+	printf '%s\n' "$?"
+)
+if [[ "$rc" -eq 0 ]]; then
+	print_result "openai-oauth-chatgpt-only: Codex backend success returns healthy (GH#37627)" 0
+else
+	print_result "openai-oauth-chatgpt-only: Codex backend success returns healthy (GH#37627)" 1 \
+		"(got rc=$rc — expected 0)"
+fi
+rc=$(
+	OPENAI_OAUTH_STUB_MODE=auth OPENAI_OAUTH_STUB_CODEX_CODE=403 \
+		OPENAI_OAUTH_CURL_LOG="$OPENAI_OAUTH_CURL_LOG" \
+		PATH="${OPENAI_OAUTH_STUB_DIR}:${PATH}" \
+		_probe_check_oauth_fallback openai true "gopass:OPENAI_API_KEY" >/dev/null
+	printf '%s\n' "$?"
+)
+if [[ "$rc" -eq 3 ]]; then
+	print_result "openai-oauth-chatgpt-only: Codex backend rejection stays key-invalid" 0
+else
+	print_result "openai-oauth-chatgpt-only: Codex backend rejection stays key-invalid" 1 \
+		"(got rc=$rc — expected 3)"
+fi
+
 # Assertion 4b.3d — Network failure while verifying OAuth fails closed.
 rc=$(
 	OPENAI_OAUTH_STUB_MODE=network \
@@ -542,7 +578,17 @@ else
 		"(got rc=$rc — expected 0; gpt-5.4-pro should be blocked under ChatGPT OAuth)"
 fi
 
-# 5c — gpt-5.5 (non-pro) allowed under ChatGPT OAuth
+# 5c — dated snapshots of denied models are denied under ChatGPT OAuth
+_chatgpt_oauth_denylist_check openai gpt-5.5-pro-2026-01-15
+rc=$?
+if [[ "$rc" -eq 0 ]]; then
+	print_result "chatgpt-oauth-denylist: dated gpt-5.5-pro snapshot denied (rc=0)" 0
+else
+	print_result "chatgpt-oauth-denylist: dated gpt-5.5-pro snapshot denied (rc=0)" 1 \
+		"(got rc=$rc — expected 0; dated snapshots of denied models must be blocked)"
+fi
+
+# 5d — supported and prefix-only model IDs remain allowed under ChatGPT OAuth
 _chatgpt_oauth_denylist_check openai gpt-5.5
 rc=$?
 if [[ "$rc" -ne 0 ]]; then
@@ -552,7 +598,25 @@ else
 		"(got rc=$rc — expected 1; gpt-5.5 is supported and must not be blocked)"
 fi
 
-# 5d — denylist no-ops when no OAuth is present (API key auth)
+_chatgpt_oauth_denylist_check openai gpt-5.6-sol-pro
+rc=$?
+if [[ "$rc" -ne 0 ]]; then
+	print_result "chatgpt-oauth-denylist: unrelated gpt-5.6-sol-pro allowed (rc=1)" 0
+else
+	print_result "chatgpt-oauth-denylist: unrelated gpt-5.6-sol-pro allowed (rc=1)" 1 \
+		"(got rc=$rc — expected 1; unrelated Pro models must not be blocked)"
+fi
+
+_chatgpt_oauth_denylist_check openai gpt-5.5-pro-max
+rc=$?
+if [[ "$rc" -ne 0 ]]; then
+	print_result "chatgpt-oauth-denylist: prefix-only gpt-5.5-pro-max allowed (rc=1)" 0
+else
+	print_result "chatgpt-oauth-denylist: prefix-only gpt-5.5-pro-max allowed (rc=1)" 1 \
+		"(got rc=$rc — expected 1; prefix-only matches must not be blocked)"
+fi
+
+# 5e — denylist no-ops when no OAuth is present (API key auth)
 rm -f "$AUTH_FILE"
 _chatgpt_oauth_denylist_check openai gpt-5.5-pro
 rc=$?
@@ -563,7 +627,7 @@ else
 		"(got rc=$rc — expected 1; denylist must not fire when auth.json has no OpenAI OAuth)"
 fi
 
-# 5e — denylist no-ops for non-openai provider
+# 5f — denylist no-ops for non-openai provider
 cat >"$AUTH_FILE" <<JSON
 {
   "openai": {
@@ -583,6 +647,73 @@ else
 fi
 
 rm -f "$AUTH_FILE"
+
+# =============================================================================
+# Static-auth presence must never execute credential configuration.
+# All files and values below belong to this suite's synthetic HOME.
+# =============================================================================
+unset ANTHROPIC_API_KEY OPENAI_API_KEY GOOGLE_API_KEY GEMINI_API_KEY
+mkdir -p "${HOME}/.config/aidevops"
+static_auth_credentials="${HOME}/.config/aidevops/credentials.sh"
+static_auth_expected=1
+command -v node >/dev/null 2>&1 && static_auth_expected=0
+cat >"$static_auth_credentials" <<'SH'
+export OPENAI_API_KEY='synthetic-static-key'
+printf unsafe >"${HOME}/static-auth-command-marker"
+SH
+output=$(
+	gopass() { return 1; }
+	_probe_has_static_auth_for_provider openai 2>/dev/null
+)
+rc=$?
+if [[ "$rc" -eq "$static_auth_expected" && -z "$output" && ! -e "${HOME}/static-auth-command-marker" ]]; then
+	print_result "static-auth: parses a literal without executing commands or printing the value" 0
+else
+	print_result "static-auth: parses a literal without executing commands or printing the value" 1
+fi
+
+cat >"$static_auth_credentials" <<'SH'
+OPENAI_API_KEY=synthetic-static-key 2>"${HOME}/static-auth-redirection-marker"
+SH
+output=$(
+	gopass() { return 1; }
+	_probe_has_static_auth_for_provider openai 2>/dev/null
+)
+rc=$?
+if [[ "$rc" -eq "$static_auth_expected" && -z "$output" && ! -e "${HOME}/static-auth-redirection-marker" ]]; then
+	print_result "static-auth: treats redirections as data without executing them" 0
+else
+	print_result "static-auth: treats redirections as data without executing them" 1
+fi
+
+printf '%s\n' "OPENAI_API_KEY='synthetic-static-key'" >"$static_auth_credentials"
+output=$(
+	gopass() { return 1; }
+	timeout_sec() {
+		printf '%s' 'synthetic-partial-value'
+		return 124
+	}
+	_probe_has_static_auth_for_provider openai 2>/dev/null
+)
+rc=$?
+if [[ "$rc" -eq 1 && -z "$output" ]]; then
+	print_result "static-auth: discards partial parser output on timeout" 0
+else
+	print_result "static-auth: discards partial parser output on timeout" 1
+fi
+
+output=$(
+	export OPENAI_API_KEY=synthetic-env-key
+	gopass() { return 1; }
+	timeout_sec() { return 124; }
+	_probe_has_static_auth_for_provider openai 2>/dev/null
+)
+rc=$?
+if [[ "$rc" -eq 0 && -z "$output" ]]; then
+	print_result "static-auth: environment presence does not depend on the file parser" 0
+else
+	print_result "static-auth: environment presence does not depend on the file parser" 1
+fi
 
 # =============================================================================
 # Summary

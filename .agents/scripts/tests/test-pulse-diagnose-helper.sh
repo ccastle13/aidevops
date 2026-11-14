@@ -281,14 +281,18 @@ JSON
 fi
 if [[ "$*" == *"issue view"*"21860"* ]]; then
   cat <<'JSON'
-{"number":21860,"title":"t3206: worker re-dispatch loops on same branch","state":"OPEN","author":{"login":"marcusquinn"},"createdAt":"2026-04-26T08:00:00Z","closedAt":null,"labels":[{"name":"auto-dispatch"},{"name":"status:queued"}],"assignees":[]}
+{"number":21860,"title":"t3206: worker re-dispatch loops on same branch","state":"OPEN","author":{"login":"marcusquinn"},"createdAt":"2026-04-26T08:00:00Z","closedAt":null,"closedByPullRequestsReferences":[{"number":21876}],"labels":[{"name":"auto-dispatch"},{"name":"status:queued"}],"assignees":[]}
 JSON
   exit 0
 fi
 if [[ "$*" == *"issue view"*"99998"* ]]; then
   cat <<'JSON'
-{"number":99998,"title":"ghost issue","state":"CLOSED","author":{"login":"marcusquinn"},"createdAt":"2026-04-01T00:00:00Z","closedAt":"2026-04-02T00:00:00Z","labels":[],"assignees":[]}
+{"number":99998,"title":"ghost issue","state":"CLOSED","author":{"login":"marcusquinn"},"createdAt":"2026-04-01T00:00:00Z","closedAt":"2026-04-02T00:00:00Z","closedByPullRequestsReferences":[{"number":99999}],"labels":[],"assignees":[]}
 JSON
+  exit 0
+fi
+if [[ "$*" == *"issue view"*"99997"* ]]; then
+  echo '{"number":99997,"title":"issue without PR","state":"OPEN","author":{"login":"marcusquinn"},"createdAt":"2026-04-01T00:00:00Z","closedAt":null,"closedByPullRequestsReferences":[],"labels":[],"assignees":[]}'
   exit 0
 fi
 if [[ "$*" == *"issue view"*"28780"* ]]; then
@@ -650,6 +654,7 @@ cat >> "$FIXTURE_LOGFILE" <<'ISSUE_FIXTURE'
 2026-04-27T10:06:00Z [dispatch-backoff] BACKOFF_ACTIVE #21860 (marcusquinn/aidevops) count=2 cooldown=1800s wait=1500s next=2026-04-27T10:31:00
 2026-04-27T10:07:00Z [pulse-wrapper] Launch validation failed for issue #21860 (marcusquinn/aidevops) — prelaunch failure reason=worker_worktree_continuation_state_rejected detected in worker.log
 2026-04-27T10:08:00Z [pulse-wrapper] Launch validation failed for issue #21860 (marcusquinn/aidevops) — prelaunch failure reason=worker_worktree_owner_concurrent_mutation detected in worker.log
+2026-04-27T10:09:00Z [pulse-wrapper] Dispatch_max: skipping #21860 (marcusquinn/aidevops) — DISPATCH_BLOCK_REASON reason=dirty_worktree_evidence_unavailable evidence_kind=transport_deferred attempted=false deferred_by=local_admission retry_at=1893456000 exit_code=75
 ISSUE_FIXTURE
 
 now_epoch=$(date +%s)
@@ -677,6 +682,8 @@ assert_contains "shows issue labels" "auto-dispatch" "$output"
 assert_contains "shows lifecycle comments section" "Lifecycle comments:" "$output"
 assert_contains "shows worker progress blockers section" "Worker progress blockers:" "$output"
 assert_contains "shows current blocker count" "Currently active: 0" "$output"
+assert_contains "shows typed dirty-worktree evidence hold" "Reason: dirty_worktree_evidence_unavailable" "$output"
+assert_contains "shows dirty-worktree transport deferral" "Deferred by: local_admission" "$output"
 assert_contains "shows non-grantable blocker reason" "permission_non_grantable" "$output"
 assert_contains "shows terminal blocker lifecycle event" "issue_closed_completed" "$output"
 assert_contains "shows WORKER_BRANCH_ORPHAN comment" "WORKER_BRANCH_ORPHAN" "$output"
@@ -691,6 +698,8 @@ assert_contains "shows dispatch backoff log event" "BACKOFF_ACTIVE #21860" "$out
 assert_contains "shows linked PRs section" "Linked/worker PRs:" "$output"
 assert_contains "shows linked PR number" "PR #21876" "$output"
 assert_contains "shows linked PR branch" "feature/auto-20260427-gh21860" "$output"
+linked_pr_rows=$(printf '%s' "$output" | grep -c '^  PR #21876  ' 2>/dev/null || true)
+assert_eq "deduplicates timeline and closing PR evidence" "1" "$linked_pr_rows"
 
 # --- Test 14: issue pulse log events for linked PR ---
 printf '\nTest 14: issue #21860 — linked PR pulse events\n'
@@ -703,8 +712,8 @@ output=$(PULSE_DIAGNOSE_LOGFILE="$FIXTURE_LOGFILE" \
 assert_contains "shows pulse events for linked PR" "pmc-close-conflicting" "$output"
 assert_contains "shows pulse event count" "pulse events" "$output"
 
-# --- Test 15: issue with no linked PRs or lifecycle comments ---
-printf '\nTest 15: issue #99998 — no linked PRs or lifecycle comments\n'
+# --- Test 15: closed issue discovers its merged closing PR without comments ---
+printf '\nTest 15: issue #99998 — closing PR reference without lifecycle comments\n'
 output=$(PULSE_DIAGNOSE_LOGFILE="$FIXTURE_LOGFILE" \
 	PULSE_DIAGNOSE_LOGDIR="$TMPDIR_TEST" \
 	PATH="${TMPDIR_TEST}:${PATH}" \
@@ -712,7 +721,15 @@ output=$(PULSE_DIAGNOSE_LOGFILE="$FIXTURE_LOGFILE" \
 
 assert_contains "shows issue number" "Issue #99998" "$output"
 assert_contains "no comments found" "no comments found" "$output"
-assert_contains "no linked PRs" "no linked or worker PRs found" "$output"
+assert_contains "shows closing PR reference" "PR #99999" "$output"
+assert_contains "shows merged closing PR state" "MERGED" "$output"
+
+# An empty closing relationship with no timeline or worker branch stays empty.
+output=$(PULSE_DIAGNOSE_LOGFILE="$FIXTURE_LOGFILE" \
+	PULSE_DIAGNOSE_LOGDIR="$TMPDIR_TEST" \
+	PATH="${TMPDIR_TEST}:${PATH}" \
+	"$HELPER" issue 99997 --repo marcusquinn/aidevops 2>&1) || true
+assert_contains "preserves no-linked-PR result" "no linked or worker PRs found" "$output"
 
 # --- Test 16: issue --json output ---
 printf '\nTest 16: issue --json output\n'
@@ -770,6 +787,10 @@ if command -v jq >/dev/null 2>&1; then
 	assert_eq "JSON progress_blockers event_total" "4" "$json_blocker_events"
 	json_active_blockers=$(echo "$output" | jq '.progress_blockers.active_total' 2>/dev/null || echo 0)
 	assert_eq "JSON progress_blockers active_total" "0" "$json_active_blockers"
+	json_dirty_reason=$(echo "$output" | jq -r '.dirty_worktree_hold.reason // ""' 2>/dev/null || echo "")
+	assert_eq "JSON dirty-worktree hold reason" "dirty_worktree_evidence_unavailable" "$json_dirty_reason"
+	json_dirty_deferred_by=$(echo "$output" | jq -r '.dirty_worktree_hold.latest.deferred_by // ""' 2>/dev/null || echo "")
+	assert_eq "JSON dirty-worktree hold transport metadata" "local_admission" "$json_dirty_deferred_by"
 fi
 
 # --- Test 17: issue --verbose shows raw log lines ---
@@ -914,6 +935,91 @@ if command -v jq >/dev/null 2>&1; then
 	json_cooldown=$(echo "$output" | jq -r '.secondary_cooldown_state' 2>/dev/null || echo "")
 	assert_contains "JSON api-budget secondary cooldown" "active=yes" "$json_cooldown"
 fi
+
+# --- Test 23 (GH#33330): permission hold names request, age and both exits ---
+printf '\nTest 23: permission hold diagnostics\n'
+PERM_ISSUE='{"labels":[{"name":"needs-maintainer-permissions"}]}'
+PERM_COMMENTS=$(jq -cn '[
+	{id: 1, author_association: "MEMBER", created_at: "2026-09-18T00:00:00Z",
+	 body: "<!-- aidevops-permission-request -->\n~~~json\n{\"request_id\": \"perm-0123456789abcdef\"}\n~~~"},
+	{id: 2, author_association: "NONE", created_at: "2026-09-18T00:01:00Z",
+	 body: "<!-- aidevops-signed-permission-withdrawal --> perm-0123456789abcdef"},
+	{id: 3, author_association: "OWNER", created_at: "2026-09-18T01:00:00Z", body: "CLAIM_RELEASED reason=process_exit"}
+]')
+PERM_HOLD=$(bash -c 'source "$1"; _issue_permission_hold_json 77 owner/repo "$2" "$3"' \
+	_ "$SCRIPT_DIR/../pulse-diagnose-issue.sh" "$PERM_ISSUE" "$PERM_COMMENTS" 2>/dev/null)
+assert_eq "permission hold names latest trusted request" "perm-0123456789abcdef" "$(printf '%s' "$PERM_HOLD" | jq -r '.request_id')"
+assert_eq "untrusted decision comment is ignored" "none true" "$(printf '%s' "$PERM_HOLD" | jq -r '"\(.decision) \(.active)"')"
+assert_eq "terminal owner session is reported" "true" "$(printf '%s' "$PERM_HOLD" | jq -r '.owner_session_terminal')"
+assert_contains "withdraw command is request-specific" \
+	"sudo aidevops approve permissions issue 77 owner/repo --request perm-0123456789abcdef --withdraw" \
+	"$(printf '%s' "$PERM_HOLD" | jq -r '.withdraw_command')"
+assert_eq "request age is computed" "true" "$(printf '%s' "$PERM_HOLD" | jq -r '.age_seconds > 0')"
+PERM_TEXT=$(bash -c 'source "$1"; _render_issue_permission_hold_text "$2"' _ "$SCRIPT_DIR/../pulse-diagnose-issue.sh" "$PERM_HOLD" 2>/dev/null)
+assert_contains "text names grant command" "Grant (signs the listed capabilities)" "$PERM_TEXT"
+assert_contains "text names withdraw command" "Withdraw (grants nothing, resumes dispatch)" "$PERM_TEXT"
+
+# GH#33589: trusted discussion comments are not permission requests.
+PERM_QUOTED_COMMENTS=$(printf '%s' "$PERM_COMMENTS" | jq '. + [
+	{id: 4, author_association: "OWNER", body: "Review quotes <!-- aidevops-permission-request --> for perm-fedcba9876543210"}
+]')
+PERM_QUOTED_HOLD=$(bash -c 'source "$1"; _issue_permission_hold_json 77 owner/repo "$2" "$3"' \
+	_ "$SCRIPT_DIR/../pulse-diagnose-issue.sh" "$PERM_ISSUE" "$PERM_QUOTED_COMMENTS" 2>/dev/null)
+assert_eq "quoted marker does not shadow actual request" "perm-0123456789abcdef true" \
+	"$(printf '%s' "$PERM_QUOTED_HOLD" | jq -r '"\(.request_id) \(.active)"')"
+PERM_QUOTED_ONLY=$(printf '%s' "$PERM_QUOTED_COMMENTS" | jq '[last]')
+PERM_QUOTED_ONLY_HOLD=$(bash -c 'source "$1"; _issue_permission_hold_json 77 owner/repo "$2" "$3"' \
+	_ "$SCRIPT_DIR/../pulse-diagnose-issue.sh" '{"labels":[]}' "$PERM_QUOTED_ONLY" 2>/dev/null)
+assert_eq "quoted marker alone does not create a permission hold" "false null" \
+	"$(printf '%s' "$PERM_QUOTED_ONLY_HOLD" | jq -r '"\(.active) \(.request_id)"')"
+
+# GH#33575: a comment history above the argv caps (Linux 128 KiB per string,
+# macOS 1 MiB total) must still name the request; the payload reaches the
+# function from a file, not argv.
+PERM_BIG_FILE=$(mktemp)
+head -c 1100000 /dev/zero | tr '\0' 'x' |
+	jq -Rsc --argjson base "$PERM_COMMENTS" '[{id: 0, author_association: "NONE", created_at: "2026-09-17T00:00:00Z", body: .}] + $base' \
+		>"$PERM_BIG_FILE"
+PERM_BIG_HOLD=$(bash -c 'source "$1"; _issue_permission_hold_json 77 owner/repo "$2" "$(cat "$3")"' \
+	_ "$SCRIPT_DIR/../pulse-diagnose-issue.sh" "$PERM_ISSUE" "$PERM_BIG_FILE" 2>/dev/null)
+rm -f "$PERM_BIG_FILE"
+assert_eq "oversized comment history still names the request" "perm-0123456789abcdef true" \
+	"$(printf '%s' "$PERM_BIG_HOLD" | jq -r '"\(.request_id) \(.active)"')"
+
+# GH#33575: an evaluation failure with the label present fails closed.
+PERM_BAD_HOLD=$(bash -c 'source "$1"; _issue_permission_hold_json 77 owner/repo "$2" "not-json"' \
+	_ "$SCRIPT_DIR/../pulse-diagnose-issue.sh" "$PERM_ISSUE" 2>/dev/null)
+assert_eq "evaluation failure keeps label-present hold active" "true true true" \
+	"$(printf '%s' "$PERM_BAD_HOLD" | jq -r '"\(.active) \(.label_present) \(.evaluation_error)"')"
+PERM_BAD_TEXT=$(bash -c 'source "$1"; _render_issue_permission_hold_text "$2"' _ "$SCRIPT_DIR/../pulse-diagnose-issue.sh" "$PERM_BAD_HOLD" 2>/dev/null)
+assert_contains "text points to verify-permissions on evaluation failure" "aidevops approve verify-permissions" "$PERM_BAD_TEXT"
+
+# --- Test 24 (GH#34110): terminal-only blockers are visible, not "no records" ---
+printf '\nTest 24: terminal blocker diagnostics\n'
+TB_RELEASE='<!-- ops:start -->\nCLAIM_RELEASED reason=blocked runner=r1 ts=2026-10-01T00:00:00Z\n\nTerminal blocker: reason=permission_required owner=permission-maintainer task=77 attempt=abcdef0123456789.\nProjected state: status:available.\nNext action: x\n<!-- ops:end -->'
+TB_COMMENTS=$(jq -cn --arg body "$(printf '%b' "$TB_RELEASE")" '[
+	{id: 1, author_association: "MEMBER", created_at: "2026-10-01T00:00:00Z", body: $body},
+	{id: 2, author_association: "MEMBER", created_at: "2026-10-01T01:00:00Z", body: $body},
+	{id: 3, author_association: "NONE", created_at: "2026-10-01T02:00:00Z",
+	 body: "Terminal blocker: reason=target_code_blocker owner=target-maintainer task=77"}
+]')
+TB_JSON=$(bash -c 'source "$1"; _issue_terminal_blocker_json "$2"' _ "$SCRIPT_DIR/../pulse-diagnose-issue.sh" "$TB_COMMENTS" 2>/dev/null)
+assert_eq "terminal blocker uses latest trusted projection" "permission_required permission-maintainer 2 status:available" \
+	"$(printf '%s' "$TB_JSON" | jq -r '"\(.reason) \(.owner) \(.observations) \(.projected_state)"')"
+TB_EXCERPTS=$(mktemp -d)
+printf 'BLOCKED: redacted\n' >"$TB_EXCERPTS/issue-77-20261001T000000Z-1.log"
+printf 'BLOCKED: redacted\n' >"$TB_EXCERPTS/issue-77-20261001T010000Z-2.log"
+printf 'other issue\n' >"$TB_EXCERPTS/issue-770-20261001T020000Z-3.log"
+TB_TEXT=$(AIDEVOPS_WORKER_FAILURE_EXCERPT_DIR="$TB_EXCERPTS" bash -c 'source "$1"; _render_issue_terminal_blocker_text "$2" "{\"request_id\":null}" 77' \
+	_ "$SCRIPT_DIR/../pulse-diagnose-issue.sh" "$TB_JSON" 2>/dev/null)
+assert_contains "terminal-only permission report names absent request" "Permission request: none recorded" "$TB_TEXT"
+assert_contains "terminal-only permission report points at runner capability class" "runner_capability_unmet" "$TB_TEXT"
+assert_contains "desired operation points at newest local excerpt for this issue only" \
+	"excerpts (2 on this runner), newest: $TB_EXCERPTS/issue-77-20261001T010000Z-2.log" "$TB_TEXT"
+rm -rf "$TB_EXCERPTS"
+TB_NONE=$(bash -c 'source "$1"; _render_issue_terminal_blocker_text "$(_issue_terminal_blocker_json "[]")" "{}" 77' \
+	_ "$SCRIPT_DIR/../pulse-diagnose-issue.sh" 2>/dev/null)
+assert_eq "no terminal blocker renders nothing" "" "$TB_NONE"
 
 # =============================================================================
 # Summary

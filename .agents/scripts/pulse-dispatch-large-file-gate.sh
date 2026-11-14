@@ -22,6 +22,10 @@
 [[ -n "${_PULSE_DISPATCH_LARGE_FILE_GATE_LOADED:-}" ]] && return 0
 _PULSE_DISPATCH_LARGE_FILE_GATE_LOADED=1
 
+# Directory of this module, for lazily sourcing sibling libraries.
+_LFG_SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
+[[ "$_LFG_SCRIPT_DIR" != "${BASH_SOURCE[0]}" ]] || _LFG_SCRIPT_DIR="."
+
 # Module-level skip pattern used by the large-file gate — files that are
 # large by nature and can't/shouldn't be "simplified" (lockfiles, generated
 # data, JSON/YAML configs, binary-adjacent formats). GH#17897: also skips
@@ -39,6 +43,9 @@ _LFG_SURGICAL_EXEMPTED_FILES=""
 _LFG_FOUND_LARGE=false
 _LFG_LARGE_FILES=""
 _LFG_LARGE_FILE_PATHS=""
+# Pinned measurement source, populated only after all lagging-mirror targets
+# have been verified. Reset per candidate so another repository cannot reuse it.
+_LFG_REMOTE_MEASUREMENT_SHA=""
 
 #######################################
 # Label-based early-exit precheck for the large-file gate.
@@ -57,6 +64,9 @@ _large_file_gate_precheck_labels() {
 	local repo_slug="$2"
 	local issue_labels="$3"
 	local force_recheck="$4"
+	local labels_tokenized=",${issue_labels},"
+	local simplification_label_token=",needs-"
+	simplification_label_token+="simplification,"
 
 	# GH#18042: Never gate simplification tasks behind the large-file gate.
 	# Issues tagged "simplification", "file-size-debt", or "function-complexity-debt"
@@ -64,11 +74,11 @@ _large_file_gate_precheck_labels() {
 	# can never be simplified because the simplification issue is held by the gate.
 	# "simplification-debt" kept for backward compat during label migration.
 	# If the label was already applied (e.g., before this fix), auto-clear it.
-	if [[ ",$issue_labels," == *",simplification,"* ]] ||
-		[[ ",$issue_labels," == *",file-size-debt,"* ]] ||
-		[[ ",$issue_labels," == *",function-complexity-debt,"* ]] ||
-		[[ ",$issue_labels," == *",simplification-debt,"* ]]; then
-		if [[ ",$issue_labels," == *",needs-simplification,"* ]]; then
+	if [[ "$labels_tokenized" == *",simplification,"* ]] ||
+		[[ "$labels_tokenized" == *",file-size-debt,"* ]] ||
+		[[ "$labels_tokenized" == *",function-complexity-debt,"* ]] ||
+		[[ "$labels_tokenized" == *",simplification-debt,"* ]]; then
+		if [[ "$labels_tokenized" == *"$simplification_label_token"* ]]; then
 			if gh issue edit "$issue_number" --repo "$repo_slug" \
 				--remove-label "needs-simplification" >/dev/null 2>&1; then
 				echo "[pulse-wrapper] Simplification gate auto-cleared for #${issue_number} (${repo_slug}) — issue is itself a simplification task (GH#18042)" >>"$LOGFILE"
@@ -81,27 +91,26 @@ _large_file_gate_precheck_labels() {
 		return 1
 	fi
 
-	# t2088: Never gate parent-task / meta issues behind the large-file gate.
-	# Parent tasks are never dispatched directly — dispatch is unconditionally
-	# blocked by _is_assigned_check_parent_task() in dispatch-dedup-helper.sh
-	# (t1986). Applying needs-simplification to them creates confusing label
-	# churn: the label is re-added every cycle even after manual removal because
-	# the target file is still large, misleading maintainers into thinking
-	# simplification is the only remaining gate when in fact the parent-task
-	# block is permanent and independent of file size.
+	# t2088: Parent-task/meta issues are blocked independently of file size by
+	# _is_assigned_check_parent_task() in dispatch-dedup-helper.sh (t1986).
+	# Gating them only creates misleading needs-simplification label churn.
+	# GH#35623: Consolidation tasks only rewrite the parent issue body, not
+	# its referenced source files. Gating them can deadlock file-size-debt
+	# parents waiting for consolidation before simplification can dispatch.
 	# If the label was already applied (e.g., before this fix), auto-clear it.
-	if [[ ",$issue_labels," == *",parent-task,"* ]] ||
-		[[ ",$issue_labels," == *",meta,"* ]]; then
-		if [[ ",$issue_labels," == *",needs-simplification,"* ]]; then
+	if [[ "$labels_tokenized" == *",parent-task,"* ]] ||
+		[[ "$labels_tokenized" == *",meta,"* ]] ||
+		[[ "$labels_tokenized" == *",consolidation-task,"* ]]; then
+		if [[ "$labels_tokenized" == *"$simplification_label_token"* ]]; then
 			if gh issue edit "$issue_number" --repo "$repo_slug" \
 				--remove-label "needs-simplification" >/dev/null 2>&1; then
-				echo "[pulse-wrapper] Simplification gate auto-cleared for #${issue_number} (${repo_slug}) — issue is a parent-task/meta, never dispatched directly (t2088)" >>"$LOGFILE"
+				echo "[pulse-wrapper] Simplification gate auto-cleared for #${issue_number} (${repo_slug}) — issue is a parent-task/meta or issue-body-only consolidation-task (t2088/GH#35623)" >>"$LOGFILE"
 			else
 				echo "[pulse-wrapper] WARN: failed to remove needs-simplification label from #${issue_number} (${repo_slug}); will retry next cycle (t2088)" >>"$LOGFILE"
 			fi
 		fi
-		# Always return 1 (don't gate) — parent tasks are never dispatched
-		# directly, regardless of whether the label removal succeeded.
+		# Always return 1 (don't gate) — these issues don't edit source files,
+		# regardless of whether the label removal succeeded.
 		return 1
 	fi
 
@@ -113,29 +122,37 @@ _large_file_gate_precheck_labels() {
 	# #18346 and any similar stale issue impossible to unstick even after
 	# the target file had been simplified below threshold.
 	if [[ "$force_recheck" != "true" ]] &&
-		[[ ",$issue_labels," == *",needs-simplification,"* ]]; then
+		[[ "$labels_tokenized" == *"$simplification_label_token"* ]]; then
 		return 2
 	fi
 	# Skip if simplification was already done
-	if [[ ",$issue_labels," == *",simplified,"* ]]; then
+	if [[ "$labels_tokenized" == *",simplified,"* ]]; then
 		return 1
 	fi
 
-	# GH#17958: Skip if issue is already dispatched (worker actively running).
-	# A second pulse cycle can re-evaluate the same issue and post a spurious
-	# simplification comment even though the worker is mid-implementation.
-	# The gate should only fire for issues that haven't been claimed yet.
-	if [[ ",$issue_labels," == *",status:queued,"* ]] ||
-		[[ ",$issue_labels," == *",status:in-progress,"* ]]; then
+	# GH#17958/GH#31678: Skip if issue is already dispatched (worker actively
+	# running). During forced re-evaluation, an existing simplification label
+	# must remain a gate result rather than a generic "no gate" result. The
+	# triage caller interprets return 1 as proof that the label was cleared; using
+	# that result while a claim is in flight posts a false CLEARED comment and
+	# leaves the still-present label orphaning later dispatch cycles.
+	if [[ "$labels_tokenized" == *",status:queued,"* ]] ||
+		[[ "$labels_tokenized" == *",status:in-progress,"* ]]; then
+		if [[ "$force_recheck" == "true" ]] &&
+			[[ "$labels_tokenized" == *"$simplification_label_token"* ]]; then
+			return 2
+		fi
 		return 1
 	fi
 	# Also skip if assigned with origin:worker — worker was dispatched even if
 	# status label hasn't been applied yet (race window between assign and label).
-	if [[ ",$issue_labels," == *",origin:worker,"* ]]; then
+	if [[ "$labels_tokenized" == *",origin:worker,"* ]]; then
 		local assignee_count
 		assignee_count=$(gh_issue_view "$issue_number" --repo "$repo_slug" \
 			--json assignees --jq '.assignees | length' 2>/dev/null) || assignee_count="0"
 		if [[ "$assignee_count" -gt 0 ]]; then
+			# GH#33883: preserve the GH#31678 gate contract before status labeling.
+			[[ "$force_recheck" == "true" && "$labels_tokenized" == *"$simplification_label_token"* ]] && return 2
 			return 1
 		fi
 	fi
@@ -162,6 +179,7 @@ _large_file_gate_extract_paths() {
 	# which threw away the one piece of information needed to tell "targeted
 	# edit in a 30-line range" from "rewrite the whole 3000-line file".
 	local file_paths
+	# Explicit agents/scripts targets intentionally accept any extension.
 	# shellcheck disable=SC2016  # `\s` is grep-regex escape, not shell expansion.
 	file_paths=$(printf '%s' "$issue_body" | grep -oE '(EDIT|NEW|File):?\s+[`"]?\.?agents/scripts/[^`"[:space:],]+' 2>/dev/null |
 		sed 's/^[A-Z]*:*[[:space:]]*//' | sed 's/^[`"]//' | sed 's/[`"]*$//' | sort -u) || file_paths=""
@@ -189,10 +207,12 @@ _large_file_gate_extract_paths() {
 	# t2024: Also preserve line qualifiers here. A list-item reference like
 	#   - EDIT: `pulse-ancillary-dispatch.sh:221-253`
 	# should be parsed as "file + range", not stripped to bare "file".
+	# GH#33343: End the code extension at the closing backtick or numeric
+	# line qualifier; otherwise .json/.jsonl match through the .js prefix.
 	local backtick_paths
 	# shellcheck disable=SC2016  # Backtick chars in regex are literals, not command subst.
 	backtick_paths=$(printf '%s' "$issue_body" | grep -E '^\s*[-*]\s+(EDIT|NEW|File):|^(EDIT|NEW|File):' 2>/dev/null |
-		grep -oE '`[^`]*\.(sh|py|js|ts)[^`]*`' 2>/dev/null |
+		grep -oE '`[^`]*\.(sh|py|js|jsx|mjs|cjs|ts|tsx)(:[0-9]+(-[0-9]+)?)?`' 2>/dev/null |
 		tr -d '`' | grep -v '^#' | sort -u) || backtick_paths=""
 
 	printf '%s\n%s' "$file_paths" "$backtick_paths" | sort -u | grep -v '^$' || true
@@ -206,17 +226,19 @@ _large_file_gate_extract_paths() {
 # (checking bare, .agents/, and .-prefixed variants), handles single-line
 # and scoped-range citations, then compares `wc -l` to LARGE_FILE_LINE_THRESHOLD.
 #
-# Arguments: raw_target, repo_path, issue_number
+# Arguments: raw_target, repo_path, issue_number, optional pinned remote commit
 # Stdout: "fpath|line_count" when the file exceeds threshold (exit 0)
 # Exit codes:
 #   0 - file is large, output emitted on stdout
 #   1 - file is under threshold
 #   2 - target was skipped (invalid, missing, skip-pattern, single-line, scoped-range)
+#   3 - pinned remote measurement unavailable (defer the candidate)
 #######################################
 _large_file_gate_evaluate_target() {
 	local raw_target="$1"
 	local repo_path="$2"
 	local issue_number="$3"
+	local remote_sha="${4:-}"
 	[[ -n "$raw_target" ]] || return 2
 
 	# t2024: Parse optional line qualifier off the end of the target.
@@ -236,7 +258,7 @@ _large_file_gate_evaluate_target() {
 	# Skip non-simplifiable files (lockfiles, generated data, configs)
 	local basename_fpath
 	basename_fpath=$(basename "$fpath")
-	if printf '%s' "$basename_fpath" | grep -qE "$_LFG_SKIP_PATTERN" 2>/dev/null; then
+	if printf '%s' "$basename_fpath" | grep -E "$_LFG_SKIP_PATTERN" >/dev/null 2>&1; then
 		return 2
 	fi
 
@@ -276,7 +298,18 @@ _large_file_gate_evaluate_target() {
 	fi
 
 	local line_count=0
-	line_count=$(wc -l <"$full_path" 2>/dev/null | tr -d ' ') || line_count=0
+	if [[ -n "$remote_sha" ]]; then
+		local entry="" mode="" object_type="" object_sha="" entry_path=""
+		entry=$(git -C "$repo_path" --literal-pathspecs ls-tree "$remote_sha" -- "${full_path#"${repo_path}/"}" 2>/dev/null) || return 3
+		[[ -n "$entry" && "$entry" != *$'\n'* ]] || return 3
+		read -r mode object_type object_sha entry_path <<<"$entry"
+		[[ "$mode" == "100644" || "$mode" == "100755" ]] || return 3
+		[[ "$object_type" == "blob" && -n "$object_sha" ]] || return 3
+		line_count=$(set -o pipefail; git -C "$repo_path" cat-file blob "$object_sha" 2>/dev/null | wc -l | tr -d ' ') || return 3
+		[[ "$line_count" =~ ^[0-9]+$ ]] || return 3
+	else
+		line_count=$(wc -l <"$full_path" 2>/dev/null | tr -d ' ') || line_count=0
+	fi
 	if [[ "$line_count" -ge "$LARGE_FILE_LINE_THRESHOLD" ]]; then
 		printf '%s|%s\n' "$fpath" "$line_count"
 		return 0
@@ -322,12 +355,14 @@ _large_file_gate_resolve_full_path() {
 _large_file_gate_remote_default_line_count() {
 	local repo_slug="$1"
 	local lf_path="$2"
-	local default_branch=""
+	local default_branch="${3:-}"
 	local content_json=""
 	local line_count=""
 
 	[[ "$repo_slug" == */* && -n "$lf_path" ]] || return 1
-	default_branch=$(gh api "repos/${repo_slug}" --jq '.default_branch // empty' 2>/dev/null) || return 1
+	if [[ -z "$default_branch" ]]; then
+		default_branch=$(gh api "repos/${repo_slug}" --jq '.default_branch // empty' 2>/dev/null) || return 1
+	fi
 	[[ -n "$default_branch" ]] || return 1
 	content_json=$(gh api --method GET "repos/${repo_slug}/contents/${lf_path}" \
 		-f "ref=${default_branch}" 2>/dev/null) || return 1
@@ -344,19 +379,58 @@ _large_file_gate_remote_default_line_count() {
 }
 
 #######################################
-# Verify that a local repository is currently at the remote default-branch
-# commit. Large-file measurements are unsafe when this check fails because a
-# just-merged split may not exist in the runner's canonical checkout yet.
-# Arguments: repo_path
-# Returns: 0 when exact, 1 when stale or unverifiable
+# Verify that measurements from a lagging mirror can use target blobs
+# from the pinned remote commit. This reads existing objects only: it neither
+# fetches per candidate nor modifies a checkout to recover dispatch capacity.
+#######################################
+_large_file_gate_targets_match_remote_default() {
+	local repo_path="$1"
+	local remote_sha="$2"
+	local targets="$3"
+	local target="" full_path="" relative_path="" entry="" candidate=""
+	local mode="" object_type="" object_sha="" entry_path=""
+	[[ -n "$targets" ]] || return 1
+	git -C "$repo_path" cat-file -e "${remote_sha}^{commit}" 2>/dev/null || return 1
+	while IFS= read -r target; do
+		[[ -n "$target" ]] || continue
+		if [[ "$target" =~ ^(.+):([0-9]+(-[0-9]+)?)$ ]]; then
+			target="${BASH_REMATCH[1]}"
+		fi
+		if ! full_path=$(_large_file_gate_resolve_full_path "$target" "$repo_path"); then
+			# Missing locally is safe only when every resolver variant is also
+			# absent at the pinned remote commit. An upstream addition must defer.
+			for candidate in "$target" ".agents/$target" ".$target"; do
+				entry=$(git -C "$repo_path" --literal-pathspecs ls-tree "$remote_sha" -- "$candidate" 2>/dev/null) || return 1
+				[[ -z "$entry" ]] || return 1
+			done
+			continue
+		fi
+		relative_path="${full_path#"${repo_path}/"}"
+		entry=$(git -C "$repo_path" --literal-pathspecs ls-tree "$remote_sha" -- "$relative_path" 2>/dev/null) || return 1
+		[[ -n "$entry" && "$entry" != *$'\n'* ]] || return 1
+		read -r mode object_type object_sha entry_path <<<"$entry"
+		[[ "$mode" == "100644" || "$mode" == "100755" ]] || return 1
+		[[ "$object_type" == "blob" && -n "$object_sha" ]] || return 1
+		git -C "$repo_path" cat-file -e "${object_sha}^{blob}" 2>/dev/null || return 1
+	done <<<"$targets"
+	return 0
+}
+
+#######################################
+# Verify the remote default commit or, for a lagging mirror, every target's
+# pinned blob. Record the commit for measurement without changing mirror state.
+# Arguments: repo_path, optional newline-separated targets
+# Returns: 0 when measurements are current, 1 when stale or unverifiable
 #######################################
 _large_file_gate_repo_matches_remote_default() {
 	local repo_path="$1"
+	local targets="${2:-}"
 	local default_branch=""
 	local current_branch=""
 	local local_sha=""
 	local remote_line=""
 	local remote_sha=""
+	_LFG_REMOTE_MEASUREMENT_SHA=""
 
 	[[ -n "$repo_path" ]] || return 1
 	default_branch=$(git -C "$repo_path" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) || return 1
@@ -368,8 +442,11 @@ _large_file_gate_repo_matches_remote_default() {
 	remote_line=$(git -C "$repo_path" ls-remote --heads origin "refs/heads/${default_branch}" 2>/dev/null) || return 1
 	[[ -n "$remote_line" && "$remote_line" != *$'\n'* ]] || return 1
 	remote_sha="${remote_line%%[[:space:]]*}"
-	[[ "$remote_sha" =~ ^[0-9a-fA-F]{40}$ && "$local_sha" == "$remote_sha" ]]
-	return $?
+	[[ "$remote_sha" =~ ^[0-9a-fA-F]{40}$ ]] || return 1
+	[[ "$local_sha" == "$remote_sha" ]] && return 0
+	_large_file_gate_targets_match_remote_default "$repo_path" "$remote_sha" "$targets" || return 1
+	_LFG_REMOTE_MEASUREMENT_SHA="$remote_sha"
+	return 0
 }
 
 #######################################
@@ -523,6 +600,13 @@ _large_file_gate_normalize_debt_issue() {
 	local issue_number="$1"
 	local repo_slug="$2"
 
+	# The simplification gate runs independently of dispatch and must not
+	# undo a brief-owner hold for the same body on each pulse cycle.
+	if declare -F issue_brief_hold_blocks_auto_release >/dev/null 2>&1 &&
+		issue_brief_hold_blocks_auto_release "$issue_number" "$repo_slug"; then
+		echo "[pulse-wrapper] large-file-gate: preserving brief hold for #${issue_number} in ${repo_slug}" >>"${LOGFILE:-/dev/null}"
+		return 0
+	fi
 	# Route the complete transition through the canonical lifecycle helper so
 	# sibling status labels converge atomically and repeated calls are no-ops.
 	set_issue_status "$issue_number" "$repo_slug" "available" \
@@ -532,7 +616,9 @@ _large_file_gate_normalize_debt_issue() {
 		--remove-label "simplification-incomplete" \
 		--remove-label "duplicate" \
 		--remove-label "already-fixed" \
-		--remove-label "wontfix" >/dev/null 2>&1
+		--remove-label "wontfix" \
+		--remove-label "solved:worker" \
+		--remove-label "solved:interactive" >/dev/null 2>&1
 	return $?
 }
 
@@ -565,14 +651,60 @@ _large_file_gate_close_duplicate_debt_issues() {
 }
 
 #######################################
+# Close resolved exact-marker debt issues before their simplification exemption
+# allows dispatch. Never infer resolution from a local checkout or a missing file.
+# Arguments: issue_number, repo_slug, issue_body
+# Returns: 0 only when the current candidate was closed (block its dispatch).
+#######################################
+_large_file_gate_close_resolved_debt_issues() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local issue_body="$3"
+	local lf_path="" marker="" branch="" sha="" count="" matches="" numbers=""
+	local debt_issue="" current_closed=false extra=""
+	[[ "$issue_body" =~ generator=large-file-simplification-gate\ cited_file=([^[:space:]]+)\  ]] || return 1
+	lf_path="${BASH_REMATCH[1]}"
+	marker="generator=large-file-simplification-gate"
+	marker+=" cited_file=${lf_path} "
+	branch=$(gh api "repos/${repo_slug}" --jq '.default_branch // empty' 2>/dev/null) || return 1
+	[[ -n "$branch" ]] || return 1
+	sha=$(gh api "repos/${repo_slug}/commits/${branch}" --jq '.sha // empty' 2>/dev/null) || return 1
+	[[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+	count=$(_large_file_gate_remote_default_line_count "$repo_slug" "$lf_path" "$sha") || return 1
+	[[ "$count" =~ ^[0-9]+$ && "$count" -lt "$LARGE_FILE_LINE_THRESHOLD" ]] || return 1
+	# The current issue is closed from its validated marker and measurement,
+	# independent of search (which may lag or return []). Search only adds duplicates.
+	numbers="$issue_number"
+	if matches=$(gh_issue_list --repo "$repo_slug" --state open --label "file-size-debt" \
+		--search "\"${lf_path}\" large-file-simplification-gate in:body sort:created-asc" \
+		--json number,body --limit 100 2>/dev/null); then
+		extra=$(printf '%s' "$matches" | jq -r --arg marker "$marker" \
+			'[.[] | select((.body // "") | contains($marker)) | .number
+			| select(type == "number" and . > 0 and . == floor)] | .[]' 2>/dev/null) || extra=""
+		[[ -z "$extra" ]] || numbers+=$'\n'"$extra"
+	fi
+	numbers=$(printf '%s\n' "$numbers" | awk 'NF && !seen[$0]++')
+	while IFS= read -r debt_issue; do
+		if gh issue close "$debt_issue" --repo "$repo_slug" --reason completed \
+			--comment "Resolved file-size debt: ${lf_path} has ${count} lines (below ${LARGE_FILE_LINE_THRESHOLD}) on default branch ${branch} at commit ${sha}. Verified from the pinned remote file content." >/dev/null 2>&1; then
+			[[ "$debt_issue" != "$issue_number" ]] || current_closed=true
+		fi
+	done <<<"$numbers"
+	[[ "$current_closed" == true ]] || return 1
+	return 0
+}
+
+#######################################
 # Reopen the canonical debt issue when its cited file remains oversized.
 # Reusing the durable issue identity prevents close/create/auto-dispatch loops.
-# Arguments: issue_number, lf_path, repo_slug
+# Arguments: issue_number, lf_path, repo_slug, parent_issue (optional; names
+#   the held issue when an outdated body is refreshed)
 #######################################
 _large_file_gate_reopen_debt_issue() {
 	local issue_number="$1"
 	local lf_path="$2"
 	local repo_slug="$3"
+	local parent_issue="${4:-}"
 
 	if ! gh issue reopen "$issue_number" --repo "$repo_slug" >/dev/null 2>&1; then
 		echo "[pulse-wrapper] WARN: failed to reopen canonical file-size-debt #${issue_number} for ${lf_path}; deferring" >>"$LOGFILE"
@@ -582,8 +714,149 @@ _large_file_gate_reopen_debt_issue() {
 		echo "[pulse-wrapper] WARN: reopened file-size-debt #${issue_number} but failed to normalize labels; next pulse will retry" >>"$LOGFILE"
 		return 1
 	fi
+	# A failed refresh leaves the old body; the next pass retries (GH#37989).
+	if ! _large_file_gate_refresh_debt_issue_body "$issue_number" "$lf_path" "$repo_slug" "$parent_issue"; then
+		echo "[pulse-wrapper] WARN: reopened file-size-debt #${issue_number} but failed to refresh its body; next pulse will retry" >>"$LOGFILE"
+	fi
 	echo "[pulse-wrapper] Reopened canonical file-size-debt issue #${issue_number} for ${lf_path}" >>"$LOGFILE"
 	printf '#%s (reopened)' "$issue_number"
+	return 0
+}
+
+#######################################
+# Print the current file-size-debt issue body template. Pure: no GitHub calls.
+# New issues and refreshed reused issues share this one template (GH#37989).
+# Arguments: lf_path, parent_issue, prior_attempt_issue (optional)
+#######################################
+_large_file_gate_debt_issue_body() {
+	local lf_path="$1"
+	local parent_issue="$2"
+	local prior_attempt_issue="${3:-}"
+
+	local _prior_attempt_ref=""
+	if [[ -n "$prior_attempt_issue" ]]; then
+		_prior_attempt_ref="
+
+**Prior attempt:** #${prior_attempt_issue} closed without reducing file size below the ${LARGE_FILE_LINE_THRESHOLD}-line threshold (current size verified by gate). This issue is the file-size follow-up."
+	fi
+
+	# A split creates sibling modules, so the scope must admit them up front;
+	# otherwise the worker stops on files_scope_excluded. Drop a -helper suffix
+	# to follow the helper/lib precedent (issue-sync-helper.sh -> issue-sync-lib.sh).
+	local _split_scope_line=""
+	if [[ "${lf_path##*/}" == *.* ]]; then
+		local _lf_stem="${lf_path%.*}"
+		_split_scope_line="
+- NEW: \`${_lf_stem%-helper}-*.${lf_path##*.}\`"
+	fi
+
+	local _create_body
+	_create_body="<!-- aidevops:generator=large-file-simplification-gate cited_file=${lf_path} threshold=${LARGE_FILE_LINE_THRESHOLD} -->
+
+## What
+Simplify \`${lf_path}\` — currently over ${LARGE_FILE_LINE_THRESHOLD} lines. Break into smaller, focused modules.
+
+## Why
+Issue #${parent_issue} is blocked by the large-file gate. Workers dispatched against this file spend most of their context budget reading it, leaving insufficient capacity for implementation.${_prior_attempt_ref}
+
+### Files Scope
+
+- EDIT: \`${lf_path}\`${_split_scope_line}
+
+## How
+- Extract cohesive function groups into separate files
+- Keep a thin orchestrator in the original file that sources the extracted modules
+- Verify: \`wc -l ${lf_path}\` should be below ${LARGE_FILE_LINE_THRESHOLD}
+- Verify: \`python3 ~/.aidevops/agents/scripts/file-split-verify.py --base origin/main --head HEAD\` exits 0 (pure move: \`removed-only=0 review=0 gated=0\`); paste its summary line into the PR body (playbook section 7.5)
+
+**Reference pattern:** \`.agents/reference/large-file-split.md\` (playbook for file splits — covers identity-key preservation, CI false-positives, and PR body template).
+
+**Precedent in this repo:** \`issue-sync-helper.sh\` + \`issue-sync-lib.sh\` (simple split) and \`headless-runtime-lib.sh\` + sub-libraries (complex split). For shell scripts, copy the include-guard and SCRIPT_DIR-fallback pattern from the simple precedent.
+
+**Expected CI gate overrides:** This PR will likely trigger a complexity regression from the file-split identity-key change. Apply the \`complexity-bump-ok\` label AND include a \`## Complexity Bump Justification\` section in the PR body citing scanner evidence. See the playbook section 4 (Known CI False-Positive Classes).
+
+_Created by large-file simplification gate (pulse-dispatch-core.sh)_"
+	printf '%s' "$_create_body"
+	return 0
+}
+
+#######################################
+# Return 0 when a body carries a non-empty canonical Files Scope. Uses the
+# pre-dispatch validator's rule so the gate and the validator never disagree;
+# falls back to the same heading + literal-path rule if the library is absent.
+# Arguments: issue_body
+#######################################
+_large_file_gate_body_has_scope_path() {
+	local issue_body="$1"
+	local scope_lib="${_LFG_SCRIPT_DIR}/pre-dispatch-validator-lib-brief-scope.sh"
+
+	if ! declare -F _brief_files_scope_has_path >/dev/null 2>&1 && [[ -f "$scope_lib" ]]; then
+		# shellcheck source=./pre-dispatch-validator-lib-brief-scope.sh
+		# shellcheck disable=SC1091
+		source "$scope_lib" >/dev/null 2>&1 || true
+	fi
+	if declare -F _brief_files_scope_has_path >/dev/null 2>&1; then
+		_brief_files_scope_has_path "$issue_body"
+		return $?
+	fi
+	# shellcheck disable=SC2016 # literal Markdown backticks and regex anchors
+	printf '%s' "$issue_body" | awk '
+		/^## Files Scope[[:space:]]*$/ { found=1; level=2; next }
+		/^### Files Scope[[:space:]]*$/ { found=1; level=3; next }
+		found && level == 2 && /^## / { found=0 }
+		found && level == 3 && (/^# / || /^## / || /^### /) { found=0 }
+		found { print }
+	' | grep -E '^[[:space:]]*-[[:space:]]*((EDIT|NEW):[[:space:]]*)?`?[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*`?[[:space:]]*$' >/dev/null
+	return $?
+}
+
+#######################################
+# Bring a reused debt issue's body up to the current template when it carries
+# this gate's exact marker for the path but no canonical Files Scope path.
+# Bodies written before the template gained `### Files Scope` fail the
+# pre-dispatch validator on every pass, so the debt issue is never worked and
+# the issue it holds stays held (GH#37989). Bodies without the marker, or that
+# already declare a scope (a maintainer may have edited them), are left alone.
+# aidevops:trust-boundary — only file-size-debt issues with the exact marker
+# that duplicate/closure reconciliation already trusts are rewritten.
+# Arguments: issue_number, lf_path, repo_slug, parent_issue
+# Returns: 0 when no write is needed or the refresh succeeded; 1 on failure.
+#######################################
+_large_file_gate_refresh_debt_issue_body() {
+	local issue_number="$1"
+	local lf_path="$2"
+	local repo_slug="$3"
+	local parent_issue="${4:-}"
+	local marker="generator=large-file-simplification-gate"
+	local issue_json="" body="" has_label="" new_body="" body_file=""
+	marker+=" cited_file=${lf_path} "
+
+	# The template names the held issue; without one there is nothing to write.
+	[[ "$parent_issue" =~ ^[0-9]+$ ]] || return 0
+	# Same rule as label normalization: never rewrite a body an owner holds.
+	if declare -F issue_brief_hold_blocks_auto_release >/dev/null 2>&1 &&
+		issue_brief_hold_blocks_auto_release "$issue_number" "$repo_slug"; then
+		return 0
+	fi
+	issue_json=$(gh_issue_view "$issue_number" --repo "$repo_slug" \
+		--json body,labels 2>/dev/null) || return 1
+	body=$(printf '%s' "$issue_json" | jq -r '.body // ""' 2>/dev/null) || return 1
+	has_label=$(printf '%s' "$issue_json" |
+		jq -r 'any((.labels // [])[]; .name == "file-size-debt")' 2>/dev/null) || return 1
+	[[ "$has_label" == "true" ]] || return 0
+	[[ "$body" == *"$marker"* ]] || return 0
+	_large_file_gate_body_has_scope_path "$body" && return 0
+
+	new_body=$(_large_file_gate_debt_issue_body "$lf_path" "$parent_issue" "")
+	body_file=$(mktemp) || return 1
+	printf '%s\n' "$new_body" >"$body_file"
+	if ! gh_issue_edit_safe "$issue_number" --repo "$repo_slug" \
+		--body-file "$body_file" >/dev/null 2>&1; then
+		rm -f "$body_file"
+		return 1
+	fi
+	rm -f "$body_file"
+	echo "[pulse-wrapper] Refreshed file-size-debt #${issue_number} body to the current template for ${lf_path} (holding #${parent_issue}; GH#37989)" >>"${LOGFILE:-/dev/null}"
 	return 0
 }
 
@@ -599,13 +872,6 @@ _large_file_gate_file_new_debt_issue() {
 	local repo_slug="$3"
 	local prior_attempt_issue="${4:-}"
 
-	local _prior_attempt_ref=""
-	if [[ -n "$prior_attempt_issue" ]]; then
-		_prior_attempt_ref="
-
-**Prior attempt:** #${prior_attempt_issue} closed without reducing file size below the ${LARGE_FILE_LINE_THRESHOLD}-line threshold (current size verified by gate). This issue is the file-size follow-up."
-	fi
-
 	# GH#18644: ensure the `file-size-debt` label exists before creation.
 	gh label create "file-size-debt" \
 		--repo "$repo_slug" \
@@ -613,28 +879,8 @@ _large_file_gate_file_new_debt_issue() {
 		--color "D93F0B" \
 		--force 2>/dev/null || true
 
-	local _new_num _create_body _create_combined
-	_create_body="<!-- aidevops:generator=large-file-simplification-gate cited_file=${lf_path} threshold=${LARGE_FILE_LINE_THRESHOLD} -->
-
-## What
-Simplify \`${lf_path}\` — currently over ${LARGE_FILE_LINE_THRESHOLD} lines. Break into smaller, focused modules.
-
-## Why
-Issue #${parent_issue} is blocked by the large-file gate. Workers dispatched against this file spend most of their context budget reading it, leaving insufficient capacity for implementation.${_prior_attempt_ref}
-
-## How
-- EDIT: \`${lf_path}\`
-- Extract cohesive function groups into separate files
-- Keep a thin orchestrator in the original file that sources the extracted modules
-- Verify: \`wc -l ${lf_path}\` should be below ${LARGE_FILE_LINE_THRESHOLD}
-
-**Reference pattern:** \`.agents/reference/large-file-split.md\` (playbook for file splits — covers identity-key preservation, CI false-positives, and PR body template).
-
-**Precedent in this repo:** \`issue-sync-helper.sh\` + \`issue-sync-lib.sh\` (simple split) and \`headless-runtime-lib.sh\` + sub-libraries (complex split). For shell scripts, copy the include-guard and SCRIPT_DIR-fallback pattern from the simple precedent.
-
-**Expected CI gate overrides:** This PR will likely trigger a complexity regression from the file-split identity-key change. Apply the \`complexity-bump-ok\` label AND include a \`## Complexity Bump Justification\` section in the PR body citing scanner evidence. See the playbook section 4 (Known CI False-Positive Classes).
-
-_Created by large-file simplification gate (pulse-dispatch-core.sh)_"
+	local _new_num="" _create_body="" _create_combined=""
+	_create_body=$(_large_file_gate_debt_issue_body "$lf_path" "$parent_issue" "$prior_attempt_issue")
 	# t2115: Use gh_create_issue wrapper for origin label + signature auto-append.
 	_create_combined=$(gh_create_issue --repo "$repo_slug" \
 		--title "file-size-debt: ${lf_path} exceeds ${LARGE_FILE_LINE_THRESHOLD} lines" \
@@ -695,7 +941,8 @@ _Created by large-file simplification gate (pulse-dispatch-core.sh)_"
 #
 # Arguments: lf_path, parent_issue, repo_slug, repo_path
 # Stdout: "#NNN (existing)" or "#NNN (new)" or
-#         "#NNN (recently-closed — continuation)" on success; empty on failure
+#         "#NNN (reopened)", "#NNN (recently-closed — continuation)", or
+#         "pending (lookup deferred)"; empty on other failures
 # Exit: 0 always (non-fatal; failure is logged)
 #######################################
 _large_file_gate_create_debt_issue() {
@@ -713,6 +960,7 @@ _large_file_gate_create_debt_issue() {
 	_existing_combined=$(_large_file_gate_find_existing_debt_issue "$repo_slug" "$lf_path") || _lookup_rc=$?
 	if [[ "$_lookup_rc" -eq 2 ]]; then
 		echo "[pulse-wrapper] file-size-debt dedup lookup failed for ${lf_path} (parent #${parent_issue}); deferring filing to next cycle (t2995)" >>"$LOGFILE"
+		printf 'pending (lookup deferred)'
 		return 0
 	fi
 	if [[ -n "$_existing_combined" && "$_existing_combined" == *:* ]]; then
@@ -731,6 +979,9 @@ _large_file_gate_create_debt_issue() {
 			echo "[pulse-wrapper] WARN: failed to normalize canonical file-size-debt #${_existing}; deferring" >>"$LOGFILE"
 			return 0
 		fi
+		if ! _large_file_gate_refresh_debt_issue_body "$_existing" "$lf_path" "$repo_slug" "$parent_issue"; then
+			echo "[pulse-wrapper] WARN: failed to refresh canonical file-size-debt #${_existing} body; next pulse will retry" >>"$LOGFILE"
+		fi
 		printf '#%s (existing)' "$_existing"
 		return 0
 	fi
@@ -747,11 +998,58 @@ _large_file_gate_create_debt_issue() {
 		fi
 		# The file remains oversized. Reopen the durable per-path issue instead
 		# of creating a successor that can feed an unbounded dispatch loop.
-		_large_file_gate_reopen_debt_issue "$_existing" "$lf_path" "$repo_slug" || true
+		# The helper emits the reopened reference on success.
+		_large_file_gate_reopen_debt_issue "$_existing" "$lf_path" "$repo_slug" "$parent_issue" || true
 		return 0
 	fi
 
 	_large_file_gate_file_new_debt_issue "$lf_path" "$parent_issue" "$repo_slug" ""
+	return 0
+}
+
+#######################################
+# Repair an unresolved gate comment during forced re-evaluation. Preserve
+# the original body/footer and edit only its debt references. Fail closed
+# on comment lookup errors; the next re-evaluation can retry safely.
+# Arguments: issue_number, repo_slug, debt_refs
+#######################################
+_large_file_gate_refresh_debt_comment() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local debt_refs="$3"
+	local comments="" comment_id="" updated_body="" body_file=""
+	comments=$(gh api "repos/${repo_slug}/issues/${issue_number}/comments?per_page=100" \
+		--paginate --slurp) || return 1
+	# Only repair framework gate comments from trusted repository writers.
+	# aidevops:trust-boundary
+	# Inspect the debt line, not unrelated #NNN references elsewhere in the body.
+	comment_id=$(printf '%s' "$comments" | jq -r '
+		flatten | .[]
+		| select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR")
+		| select((.body // "") | startswith("## Large File Simplification Gate"))
+		| select((.body | split("\n") | map(select(startswith("**Simplification issues:**"))) | join("\n"))
+			| (test("#[0-9]+") | not) or contains("pending"))
+		| .id') || return 1
+	# Multiple legacy comments may exist; never pass multiple IDs to PATCH.
+	local id
+	while IFS= read -r id; do
+		[[ "$id" =~ ^[0-9]+$ ]] || continue
+		updated_body=$(printf '%s' "$comments" | jq -r --arg id "$id" --arg refs "$debt_refs" '
+			flatten | .[] | select((.id | tostring) == $id) | .body
+			| select((split("\n") | map(select(startswith("**Simplification issues:**"))) | join("\n"))
+				!= "**Simplification issues:** " + $refs)
+			| split("\n") | map(if startswith("**Simplification issues:**")
+				then "**Simplification issues:** " + $refs else . end) | join("\n")') || return 1
+		[[ -n "$updated_body" ]] || continue
+		body_file=$(mktemp) || return 1
+		printf '%s' "$updated_body" >"$body_file"
+		if ! gh api "repos/${repo_slug}/issues/comments/${id}" --method PATCH \
+			-F "body=@${body_file}" >/dev/null; then
+			rm -f "$body_file"
+			return 1
+		fi
+		rm -f "$body_file"
+	done <<<"$comment_id"
 	return 0
 }
 
@@ -770,6 +1068,7 @@ _large_file_gate_create_debt_issue() {
 #   $3 - large_files_display ("path (N lines), " comma-trailed display string)
 #   $4 - large_file_paths (newline-separated paths, may contain \n escapes)
 #   $5 - repo_path (filesystem path to repo for wc -l verification, optional)
+#   $6 - force_recheck (optional; refresh unresolved debt references)
 #######################################
 _large_file_gate_apply() {
 	local issue_number="$1"
@@ -777,6 +1076,7 @@ _large_file_gate_apply() {
 	local large_files_display="$3"
 	local large_file_paths="$4"
 	local repo_path="${5:-}"
+	local force_recheck="${6:-false}"
 
 	# Add label to hold dispatch
 	gh label create "needs-simplification" \
@@ -797,9 +1097,7 @@ _large_file_gate_apply() {
 	while IFS= read -r _lf_path; do
 		[[ -z "$_lf_path" ]] && continue
 		_debt_ref=$(_large_file_gate_create_debt_issue "$_lf_path" "$issue_number" "$repo_slug" "$repo_path")
-		if [[ -n "$_debt_ref" ]]; then
-			_created_issues="${_created_issues}${_debt_ref}, "
-		fi
+		_created_issues="${_created_issues}${_debt_ref:-pending (link unavailable)}, "
 	done < <(printf '%b' "$large_file_paths")
 
 	_created_issues="${_created_issues%, }"
@@ -814,6 +1112,11 @@ Workers dispatched against large files spend most of their context budget readin
 **Status:** Held from dispatch until simplification completes. The \`needs-simplification\` label will be removed automatically when the target file(s) are below threshold.
 
 _Automated by \`_issue_targets_large_files()\` in pulse-wrapper.sh_"
+
+	if [[ "$force_recheck" == "true" ]]; then
+		_large_file_gate_refresh_debt_comment "$issue_number" "$repo_slug" \
+			"${_created_issues:-pending (link unavailable)}" || return 0
+	fi
 
 	_gh_idempotent_comment "$issue_number" "$repo_slug" \
 		"## Large File Simplification Gate" "$simplification_body"
@@ -977,11 +1280,13 @@ _large_file_gate_issue_title() {
 #   $1 - all_paths (newline-separated, from _large_file_gate_extract_paths)
 #   $2 - repo_path
 #   $3 - issue_number
+#   $4 - optional pinned remote commit
 #######################################
 _large_file_gate_collect_large_files() {
 	local all_paths="$1"
 	local repo_path="$2"
 	local issue_number="$3"
+	local remote_sha="${4:-}"
 
 	_LFG_FOUND_LARGE=false
 	_LFG_LARGE_FILES=""
@@ -991,7 +1296,8 @@ _large_file_gate_collect_large_files() {
 	while IFS= read -r raw_target; do
 		[[ -z "$raw_target" ]] && continue
 		eval_rc=0
-		eval_output=$(_large_file_gate_evaluate_target "$raw_target" "$repo_path" "$issue_number") || eval_rc=$?
+		eval_output=$(_large_file_gate_evaluate_target "$raw_target" "$repo_path" "$issue_number" "$remote_sha") || eval_rc=$?
+		[[ "$eval_rc" -ne 3 ]] || return 1
 		if [[ "$eval_rc" -eq 0 && -n "$eval_output" ]]; then
 			local _f="${eval_output%|*}" _c="${eval_output##*|}"
 			_LFG_FOUND_LARGE=true
@@ -1039,6 +1345,31 @@ _large_file_gate_issue_labels() {
 	return 0
 }
 
+# Measure verified targets without changing canonical state. Pulse requires a
+# current remote source; standalone callers retain local measurement behavior.
+# Arguments: all_paths, repo_path, issue_number, repo_slug
+# Returns: 0 when measured, 1 when safely deferred before any issue mutation
+_large_file_gate_measure_verified_targets() {
+	local all_paths="$1"
+	local repo_path="$2"
+	local issue_number="$3"
+	local repo_slug="$4"
+	_LFG_REMOTE_MEASUREMENT_SHA=""
+	if declare -F _pulse_refresh_repo >/dev/null 2>&1 \
+		&& ! _large_file_gate_repo_matches_remote_default "$repo_path" "$all_paths"; then
+		echo "[pulse-wrapper] Large-file gate: deferring #${issue_number} (${repo_slug}); ${repo_path} is not at the verified remote default-branch commit" >>"$LOGFILE"
+		return 1
+	fi
+	if ! _large_file_gate_collect_large_files "$all_paths" "$repo_path" "$issue_number" "$_LFG_REMOTE_MEASUREMENT_SHA"; then
+		echo "[pulse-wrapper] Large-file gate: deferring #${issue_number} (${repo_slug}); pinned remote target measurement unavailable" >>"$LOGFILE"
+		return 1
+	fi
+	if [[ -n "$_LFG_REMOTE_MEASUREMENT_SHA" ]]; then
+		echo "[pulse-wrapper] Large-file gate: measured #${issue_number} targets from pinned remote blob ${_LFG_REMOTE_MEASUREMENT_SHA} (canonical lagging)" >>"$LOGFILE"
+	fi
+	return 0
+}
+
 #######################################
 # Thin orchestrator for the large-file gate. Delegates label precheck,
 # path extraction, per-target evaluation, gate application, and stale-label
@@ -1080,7 +1411,15 @@ _issue_targets_large_files() {
 	[[ -d "$repo_path" ]] || return 1
 
 	local issue_labels=""
+	local issue_labels_tokenized=""
+	local simplification_gate_label="needs-simplification"
 	issue_labels=$(_large_file_gate_issue_labels "$issue_number" "$repo_slug" "$pre_fetched_json")
+	issue_labels_tokenized=",${issue_labels},"
+
+	if [[ "$issue_labels_tokenized" == *",file-size-debt,"* ]] &&
+		_large_file_gate_close_resolved_debt_issues "$issue_number" "$repo_slug" "$issue_body"; then
+		return 0
+	fi
 
 	local _precheck_rc=0
 	_large_file_gate_precheck_labels "$issue_number" "$repo_slug" "$issue_labels" "$force_recheck" || _precheck_rc=$?
@@ -1100,7 +1439,7 @@ _issue_targets_large_files() {
 		# comment but the label persisted; 17 min of zero label events after
 		# pulse restart confirmed the extractor fix worked but the stale label
 		# required human intervention to clear.
-		if [[ ",$issue_labels," == *",needs-simplification,"* ]]; then
+		if [[ "$issue_labels_tokenized" == *",$simplification_gate_label,"* ]]; then
 			_large_file_gate_clear_stale_label "$issue_number" "$repo_slug" || return 0
 		fi
 		return 1
@@ -1117,35 +1456,26 @@ _issue_targets_large_files() {
 	if _large_file_gate_check_surgical_brief \
 		"$_surgical_title" "$all_paths" "$repo_path"; then
 		echo "[pulse-wrapper] Large-file gate EXEMPTED for #${issue_number} (${repo_slug}): surgical brief with line ranges for ${_LFG_SURGICAL_EXEMPTED_FILES}" >>"$LOGFILE"
-		if [[ ",$issue_labels," == *",needs-simplification,"* ]]; then
+		if [[ "$issue_labels_tokenized" == *",$simplification_gate_label,"* ]]; then
 			_large_file_gate_clear_stale_label "$issue_number" "$repo_slug" || return 0
 		fi
 		return 1
 	fi
 
-	# `_pulse_refresh_repo` is best-effort and canonical recovery may be delayed
-	# or unavailable on a contributor runner. When the pulse orchestration is
-	# loaded, require exact remote-default freshness before any local wc -l.
-	# A stale/unverifiable checkout blocks this candidate for one cycle without
-	# mutating issue labels or reopening debt issues.
-	if declare -F _pulse_refresh_repo >/dev/null 2>&1 \
-		&& ! _large_file_gate_repo_matches_remote_default "$repo_path"; then
-		echo "[pulse-wrapper] Large-file gate: deferring #${issue_number} (${repo_slug}); ${repo_path} is not at the verified remote default-branch commit" >>"$LOGFILE"
-		return 0
-	fi
-
-	_large_file_gate_collect_large_files "$all_paths" "$repo_path" "$issue_number"
+	# Canonical recovery is best-effort: use verified pinned blobs when lagging,
+	# or defer unverifiable measurements without labels or debt-issue mutations.
+	_large_file_gate_measure_verified_targets "$all_paths" "$repo_path" "$issue_number" "$repo_slug" || return 0
 
 	if [[ "$_LFG_FOUND_LARGE" == "true" ]]; then
 		# t2164: thread repo_path through so _large_file_gate_create_debt_issue
 		# can verify recently-closed continuations actually reduced the file size.
-		_large_file_gate_apply "$issue_number" "$repo_slug" "$_LFG_LARGE_FILES" "$_LFG_LARGE_FILE_PATHS" "$repo_path"
+		_large_file_gate_apply "$issue_number" "$repo_slug" "$_LFG_LARGE_FILES" "$_LFG_LARGE_FILE_PATHS" "$repo_path" "$force_recheck"
 		return 0
 	fi
 
 	# If was_already_labeled but no large files found (e.g., all files now
 	# excluded by skip pattern or simplified below threshold), auto-clear.
-	if [[ ",$issue_labels," == *",needs-simplification,"* ]]; then
+	if [[ "$issue_labels_tokenized" == *",$simplification_gate_label,"* ]]; then
 		_large_file_gate_clear_stale_label "$issue_number" "$repo_slug" || return 0
 	fi
 

@@ -155,18 +155,8 @@ print_final_instructions() {
 	echo "• Serper                 - Google Search API"
 	echo "• Ahrefs                 - Backlink and keyword data"
 	echo ""
-	echo "DSPy & DSPyGround Integration:"
-	echo "• ./.agents/scripts/dspy-helper.sh        - DSPy prompt optimization toolkit"
-	echo "• ./.agents/scripts/dspyground-helper.sh  - DSPyGround playground interface"
-	echo "• python-env/dspy-env/              - Python virtual environment for DSPy"
-	echo "• data/dspy/                        - DSPy projects and datasets"
-	echo "• data/dspyground/                  - DSPyGround projects and configurations"
-	echo ""
 	echo "Task Management:"
-	echo "• Beads CLI (bd)                    - Task graph visualization"
-	echo "• beads-sync-helper.sh              - Sync TODO.md/PLANS.md with Beads"
-	echo "• todo-ready.sh                     - Show tasks with no open blockers"
-	echo "• Run: aidevops init beads          - Initialize Beads in a project"
+	echo "• TODO.md and todo/                 - Durable task and plan records"
 	echo ""
 	echo "Autonomous Orchestration:"
 	echo "• Supervisor pulse         - Dispatches workers, merges PRs, evaluates results"
@@ -215,15 +205,18 @@ setup_tabby() {
 	fi
 
 	print_info "Tabby terminal detected"
-
-	# Ensure default local profile uses /bin/zsh (macOS).
-	# After macOS updates, Tabby can fall back to bash when this is unset.
-	bash "$tabby_helper" fix-shell || true
+	# Recovery markers otherwise leak into new and restored plain-shell tabs.
+	if declare -F setup_tabby_recovery_shell_guard >/dev/null; then
+		setup_tabby_recovery_shell_guard || true
+	fi
 
 	if [[ "$NON_INTERACTIVE" == "true" ]]; then
-		# Non-interactive: sync silently, warn on failure
-		if ! bash "$tabby_helper" sync; then
-			print_warning "Tabby profile sync failed — run manually: aidevops tabby sync"
+		# Repair and validate the complete config before applying the narrower
+		# default-shell patch. Keep routine updates automatic and non-interactive.
+		if bash "$tabby_helper" sync >/dev/null 2>&1; then
+			bash "$tabby_helper" fix-shell >/dev/null 2>&1 || true
+		else
+			print_warning "Tabby configuration reconciliation encountered a blocker"
 		fi
 		return 0
 	fi
@@ -235,7 +228,10 @@ setup_tabby() {
 	local sync_tabby=""
 	setup_prompt sync_tabby "Sync Tabby profiles and detected workspaces? [Y/n]: " "Y"
 	if [[ "$sync_tabby" =~ ^[Yy]?$ ]]; then
-		bash "$tabby_helper" sync
+		if bash "$tabby_helper" sync; then
+			# After macOS updates, Tabby can fall back to bash when this is unset.
+			bash "$tabby_helper" fix-shell || true
+		fi
 	else
 		print_info "Skipped. Run later: aidevops tabby sync"
 	fi

@@ -17,11 +17,13 @@ const IS_MACOS = platform() === "darwin";
 const AGENT_MCP_TOOLS = {
   // Browser / automation
   "chrome-devtools": ["chrome-devtools_*"],
+  "opencode-browse": ["browse_*"],
   playwright: ["playwright_*"],
   playwriter: ["playwriter_*"],
   "macos-automator": IS_MACOS ? ["macos-automator_*"] : [],
   mac: IS_MACOS ? ["macos-automator_*"] : [],
   "ios-simulator-mcp": IS_MACOS ? ["ios-simulator_*"] : [],
+  "mobile-mcp": ["mobile-mcp_*"],
   // Context / search
   context7: ["context7_*"],
   "openapi-search": ["openapi-search_*"],
@@ -30,17 +32,24 @@ const AGENT_MCP_TOOLS = {
   // SEO / analytics
   "google-search-console": ["gsc_*"],
   dataforseo: ["dataforseo_*"],
+  "seo-utils": ["seo-utils_*"],
   "google-analytics": ["google-analytics-mcp_*"],
+  posthog: ["posthog_*"],
   // Monitoring
   sentry: ["sentry_*"],
   socket: ["socket_*"],
   // UI
   shadcn: ["shadcn_*"],
+  blender: ["blender-lab_*"],
+  freecad: ["freecad_*"],
+  ableton: ["ableton_*"],
+  "davinci-resolve": ["davinci-resolve_*"],
   // Data / accounting
   outscraper: ["outscraper_*"],
   mainwp: ["localwp_*"],
   localwp: ["localwp_*"],
   quickfile: ["quickfile_*"],
+  "backblaze-b2": ["backblaze-b2_*"],
   "amazon-order-history": ["amazon-order-history_*"],
   // AI tooling
   "claude-code": ["claude-code-mcp_*"],

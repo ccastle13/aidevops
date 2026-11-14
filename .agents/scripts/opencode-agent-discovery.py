@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import sys
@@ -9,10 +10,22 @@ from agent_config import (
     discover_primary_agents, validate_subagent_refs,
     apply_disabled_agents, display_to_filename,
 )
+from opencode_operator_agents import extend_opencode_operator_subagents
 from mcp_config import (
     apply_mcp_loading_policy, remove_deprecated_mcps,
     register_standard_mcps, EAGER_MCPS, LAZY_MCPS,
 )
+
+
+def parse_args(argv):
+    """Parse CLI arguments before opening the live OpenCode configuration."""
+    parser = argparse.ArgumentParser(
+        description="Discover and apply aidevops primary agents to OpenCode."
+    )
+    parser.parse_args(argv)
+
+
+parse_args(sys.argv[1:])
 
 config_path = os.path.expanduser("~/.config/opencode/opencode.json")
 agents_dir = os.path.expanduser("~/.aidevops/agents")
@@ -38,9 +51,11 @@ config['autoupdate'] = False
 # =============================================================================
 
 primary_agents, sorted_agents, subagent_filtered_count = discover_primary_agents(agents_dir)
+operator_subagents = extend_opencode_operator_subagents(primary_agents)
 
 # Validate subagent references
-missing_refs = validate_subagent_refs(primary_agents, agents_dir, display_to_filename)
+missing_refs = validate_subagent_refs(primary_agents, agents_dir, display_to_filename,
+                                      operator_subagents)
 if missing_refs:
     for agent, ref in missing_refs:
         print(f"  Warning: {agent} references subagent '{ref}' but no {ref}.md found", file=sys.stderr)
@@ -58,7 +73,7 @@ else:
     print("  Disabled default 'build' and 'plan' agents")
     print("  Disabled 'Plan+', 'AI-DevOps', 'Browser-Extension-Dev', 'Mobile-App-Dev' (available as @subagents)")
 
-    config['agent'] = sorted_agents
+    config['agent'] = {**config.get('agent', {}), **sorted_agents}
 
     # Set Build+ as the default agent (first in Tab cycle, auto-selected on startup)
     config['default_agent'] = "Build+"
@@ -69,7 +84,12 @@ else:
 # =============================================================================
 instructions_path = os.path.expanduser("~/.aidevops/agents/AGENTS.md")
 if os.path.exists(instructions_path):
-    config['instructions'] = [instructions_path]
+    existing = config.get('instructions', [])
+    if not isinstance(existing, list):
+        existing = [existing] if existing else []
+    if instructions_path not in existing:
+        existing.append(instructions_path)
+    config['instructions'] = existing
     print("  Added instructions: ~/.aidevops/agents/AGENTS.md (auto-loaded every session)")
 else:
     print("  Warning: ~/.aidevops/agents/AGENTS.md not found - run setup.sh first")
@@ -82,7 +102,7 @@ if subagent_filtered_count > 0:
 # Count agents with custom prompts
 prompt_count = sum(1 for name, cfg in sorted_agents.items() if "prompt" in cfg)
 if prompt_count > 0:
-    print(f"  Custom system prompts: {prompt_count} agents use prompts/build.txt")
+    print(f"  Canonical source prompts: {prompt_count} primary agents")
 
 # Count agents with model routing
 model_count = sum(1 for name, cfg in sorted_agents.items() if "model" in cfg)

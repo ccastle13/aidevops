@@ -373,7 +373,64 @@ _merge_worker_db() {
 		print_warning "[lifecycle] db_merge_sql_error detail=${merge_error:0:500}"
 		return 1
 	fi
+	_record_worker_sessions "$worker_db" || print_warning "[lifecycle] worker_session_ledger_write_failed pid=$$"
 	return 0
+}
+
+#######################################
+# Record every session in a merged worker DB (parents and subagent children)
+# in the headless ledger, so opencode-db-archive.sh applies worker retention
+# (GH#35492). Best-effort: the merge already succeeded, and an unrecorded
+# session simply keeps the longer interactive retention.
+# Args: $1 = worker opencode.db path.
+#######################################
+_record_worker_sessions() {
+	local worker_db="$1"
+	local state_db="${STATE_DB:-}"
+	local worker_db_sql
+	[[ -n "$state_db" && -f "$worker_db" ]] || return 0
+	[[ -f "$state_db" ]] || return 0
+	worker_db_sql=$(sql_escape "$worker_db")
+	sqlite3 "$state_db" >/dev/null 2>&1 <<-SQL || return 1
+		.bail on
+		.timeout 5000
+		CREATE TABLE IF NOT EXISTS worker_sessions (
+			session_id TEXT PRIMARY KEY,
+			recorded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+		);
+		ATTACH DATABASE '${worker_db_sql}' AS worker;
+		INSERT OR IGNORE INTO main.worker_sessions (session_id) SELECT id FROM worker.session;
+		DETACH DATABASE worker;
+	SQL
+	return 0
+}
+
+#######################################
+# Make an archived session resumable: move it (and subagent children) from the
+# shared archive DB back into the shared active DB. Worker sessions leave the
+# active DB after 7 days of inactivity (GH#35492), but a blocked issue can be
+# re-dispatched weeks later; restoring keeps `--session <id> --continue` intact.
+# Returns 0 when the session is now active, 1 otherwise.
+# Args: $1 = shared opencode.db path, $2 = session id.
+#######################################
+_restore_archived_worker_session() {
+	local shared_db="$1"
+	local session_id="$2"
+	local lib_dir="${BASH_SOURCE[0]%/*}"
+	local archive_helper="${OPENCODE_DB_ARCHIVE_HELPER:-${lib_dir}/opencode-db-archive.sh}"
+	local restore_output=""
+	[[ "$lib_dir" != "${BASH_SOURCE[0]}" ]] || archive_helper="${OPENCODE_DB_ARCHIVE_HELPER:-./opencode-db-archive.sh}"
+	[[ -x "$archive_helper" ]] || archive_helper="${HOME}/.aidevops/agents/scripts/opencode-db-archive.sh"
+	[[ -x "$archive_helper" ]] || return 1
+	[[ -f "${shared_db%/*}/opencode-archive.db" ]] || return 1
+	if restore_output=$(OPENCODE_DB_PATH="$shared_db" OPENCODE_ARCHIVE_DB="${shared_db%/*}/opencode-archive.db" \
+		"$archive_helper" restore --session "$session_id" 2>&1); then
+		print_info "[lifecycle] archived_session_restored session=${session_id} pid=$$"
+		return 0
+	fi
+	restore_output="${restore_output//$'\n'/ }"
+	print_warning "[lifecycle] archived_session_restore_failed session=${session_id} detail=${restore_output:0:300}"
+	return 1
 }
 
 #######################################
@@ -543,26 +600,72 @@ _release_worker_db_replay_lock() {
 }
 
 #######################################
+# Quarantine confirmed corruption under the replay lock without changing evidence.
+# The original directory name and all artifacts remain together. Only a disposable
+# copy is opened by SQLite: even a read can checkpoint WAL or change SHM bytes.
+# Args: $1 = retained directory, $2 = recovery root.
+#######################################
+_quarantine_worker_db() {
+	local recovery_dir="$1"
+	local recovery_root="$2"
+	local quarantine_root="${recovery_root}/.quarantine"
+	local destination="${quarantine_root}/${recovery_dir##*/}"
+	[[ ! -e "$destination" ]] || return 1
+	mkdir -p "$quarantine_root" || return 1
+	chmod 700 "$quarantine_root" || return 1
+	if ! (
+		umask 077
+		set -C # Never overwrite existing provenance or follow a metadata symlink.
+		printf 'classification=sqlite_corruption\noriginal_directory=%s\nclassified_at=%s\nnext_action=Inspect a separate copy privately; retain originals and sidecars. Requeue only a validated copy through the existing verified replay contract; never repair or import originals in place.\n' \
+			"$recovery_dir" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"${recovery_dir}/quarantine.txt"
+	); then
+		return 1
+	fi
+	if ! mv "$recovery_dir" "$destination"; then
+		# Roll back only the metadata just created exclusively above, not evidence.
+		# Otherwise noclobber would prevent retry after a transient move failure.
+		rm -f "${recovery_dir}/quarantine.txt"
+		return 1
+	fi
+	print_warning "[lifecycle] db_merge_recovery_quarantined path=${destination} reason=sqlite_corruption next_action=inspect_private_copy metadata=quarantine.txt"
+	return 0
+}
+
+#######################################
 # Replay retained worker DBs. Artifacts are deleted only after graph verification.
-# Returns 0 when every attempted artifact merged or no artifacts exist.
+# Confirmed corruption is retained outside the automatic retry queue. Other SQL
+# failures (locks, permissions, schema drift) remain retryable, not quarantined.
+# Returns 0 when every attempted artifact merged or was safely quarantined.
 #######################################
 _replay_preserved_worker_dbs() {
 	local recovery_root="${AIDEVOPS_WORKER_DB_RECOVERY_DIR:-${HOME}/.aidevops/.agent-workspace/work/worker-db-recovery}"
 	local shared_db="${HOME}/.local/share/opencode/opencode.db"
 	local replay_lock="${recovery_root}/.replay.lock"
-	local recovery_db recovery_dir replay_dir replay_failed=0
+	local recovery_db recovery_dir replay_dir suffix check_result check_status copy_failed replay_failed=0
 	[[ -d "$recovery_root" && -f "$shared_db" ]] || return 0
 	_acquire_worker_db_replay_lock "$replay_lock" || return 0
 	for recovery_db in "$recovery_root"/*/opencode.db; do
 		[[ -f "$recovery_db" ]] || continue
 		recovery_dir="${recovery_db%/opencode.db}"
 		replay_dir=$(mktemp -d "${recovery_root}/.replay-XXXXXX") || { replay_failed=1; continue; }
-		if ! ln -s "$recovery_dir" "${replay_dir}/opencode" 2>/dev/null; then
+		copy_failed=0
+		mkdir "${replay_dir}/opencode" || copy_failed=1
+		for suffix in "" -wal -shm; do
+			[[ -f "${recovery_db}${suffix}" ]] || continue
+			cp -p "${recovery_db}${suffix}" "${replay_dir}/opencode/opencode.db${suffix}" || copy_failed=1
+		done
+		if [[ "$copy_failed" -ne 0 ]]; then
 			rm -rf "$replay_dir"
 			replay_failed=1
 			continue
 		fi
-		if _merge_worker_db "$replay_dir" && _verify_worker_db_merge "$recovery_db" "$shared_db"; then
+		check_status=0
+		check_result=$(sqlite3_with_timeout "${replay_dir}/opencode/opencode.db" 'PRAGMA quick_check(1);' 2>&1) || check_status=$?
+		if { [[ "$check_status" -eq 0 && "$check_result" != "ok" && -n "$check_result" ]]; } ||
+			[[ "$check_result" == *"database disk image is malformed"* || "$check_result" == *"file is not a database"* ]]; then
+			_quarantine_worker_db "$recovery_dir" "$recovery_root" || replay_failed=1
+		elif [[ "$check_status" -eq 0 && "$check_result" == "ok" ]] &&
+			_merge_worker_db "$replay_dir" && _verify_worker_db_merge "${replay_dir}/opencode/opencode.db" "$shared_db"; then
 			rm -f "$recovery_db" "${recovery_db}-wal" "${recovery_db}-shm"
 			rmdir "$recovery_dir" 2>/dev/null || true
 			print_info "[lifecycle] db_merge_recovery_replayed path=${recovery_db}"
@@ -574,6 +677,24 @@ _replay_preserved_worker_dbs() {
 	done
 	_release_worker_db_replay_lock "$replay_lock"
 	[[ "$replay_failed" -eq 0 ]]
+}
+
+#######################################
+# Succeed when the session is in the shared active DB, restoring it from the
+# archive first when needed (inactive worker sessions are archived after 7 days).
+# Args: $1 = shared opencode.db path, $2 = session id.
+#######################################
+_ensure_shared_session_active() {
+	local shared_db="$1"
+	local session_id="$2"
+	local session_id_sql session_exists
+	session_id_sql=$(sql_escape "$session_id")
+	session_exists=$(sqlite3_with_timeout "$shared_db" "${_HEADLESS_SQL_SELECT} COUNT(*) FROM session WHERE id = '${session_id_sql}';" 2>/dev/null) || return 1
+	[[ "$session_exists" != "1" ]] || return 0
+	_restore_archived_worker_session "$shared_db" "$session_id" || return 1
+	session_exists=$(sqlite3_with_timeout "$shared_db" "${_HEADLESS_SQL_SELECT} COUNT(*) FROM session WHERE id = '${session_id_sql}';" 2>/dev/null) || return 1
+	[[ "$session_exists" == "1" ]] || return 1
+	return 0
 }
 
 #######################################
@@ -590,7 +711,7 @@ _seed_worker_db_session_context() {
 	local current_work_dir="${3:-}"
 	local worker_db="${isolated_dir}/opencode/opencode.db"
 	local shared_db="${HOME}/.local/share/opencode/opencode.db"
-	local shared_db_sql session_id_sql current_work_dir_sql="" session_exists column_list
+	local shared_db_sql session_id_sql current_work_dir_sql="" column_list
 	local session_tables project_tables table_name table_identifier
 	local clear_session_sql="" copy_session_sql=""
 	local clear_project_sql="" copy_project_sql=""
@@ -601,8 +722,7 @@ _seed_worker_db_session_context() {
 	[[ -f "$shared_db" ]] || return 1
 	mkdir -p "${isolated_dir}/opencode" 2>/dev/null || return 1
 	session_id_sql=$(sql_escape "$session_id")
-	session_exists=$(sqlite3_with_timeout "$shared_db" "${_HEADLESS_SQL_SELECT} COUNT(*) FROM session WHERE id = '${session_id_sql}';" 2>/dev/null) || return 1
-	[[ "$session_exists" == "1" ]] || return 1
+	_ensure_shared_session_active "$shared_db" "$session_id" || return 1
 
 	# Build a schema-only DB, then synchronise migration ledgers. This avoids a
 	# multi-gigabyte full backup while preserving OpenCode migration state.

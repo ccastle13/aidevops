@@ -30,10 +30,17 @@ import { fileURLToPath } from "url";
 import { execSync } from "child_process";
 
 // Extracted modules
-import { createConfigHook } from "./config-hook.mjs";
+import { createConfigHook, getAstraContextHealth, getGpt6ContextHealth } from "./config-hook.mjs";
+import { createContextBudget } from "./context-budget.mjs";
+import { adaptToolDefinition } from "./tool-definition.mjs";
 import { createMcpSessionRuntime, getOnDemandMcpAgents } from "./mcp-registry.mjs";
 import { enforceManagedMcpArtifactPath } from "./mcp-activation-tool.mjs";
+import { normalizeMcpArtifactPaths } from "./mcp-artifact-paths.mjs";
 import { createQualityHooks } from "./quality-hooks.mjs";
+import { releasePreEditSessionOwnership } from "./pre-edit-check-process.mjs";
+import { createPlaywriterSelectionGuard } from "./playwriter-selection-guard.mjs";
+import { createInstructionReminderCompactor } from "./instruction-reminders.mjs";
+import { createSourceAccessRuntime } from "./source-access-runtime.mjs";
 import {
   createSessionModelStore,
   createShellEnvHook,
@@ -41,6 +48,10 @@ import {
 } from "./shell-env.mjs";
 import { compactingHook } from "./compaction.mjs";
 import { createCompactionAutoContinueGuard } from "./compaction-lifecycle.mjs";
+import { createCompactionLoopGuard } from "./compaction-loop-guard.mjs";
+import { createCompactionInputReplay } from "./compaction-pinned-input.mjs";
+import { applyCompactionEffort } from "./compaction-effort.mjs";
+import { createCompactionResidencyWarning } from "./compaction-routing.mjs";
 import { INTENT_FIELD } from "./intent-tracing.mjs";
 import { createGreetingHandler } from "./greeting.mjs";
 import { applyImageSizeGuard } from "./quality-hooks-image.mjs";
@@ -57,11 +68,21 @@ import { loadModelRouting } from "./model-routing.mjs";
 import { createSessionContinuationGuard } from "./session-continuation-guard.mjs";
 import { createSessionRecoveryMarkerHandler } from "./session-recovery-marker.mjs";
 import { createSessionStallRecovery } from "./session-stall-recovery.mjs";
+import { createSessionTurnDiagnostics } from "./session-turn-diagnostics.mjs";
+import { stampCommandPrompt } from "./tui-prompts.mjs";
+import { installDbActivityHeartbeat } from "./db-activity-heartbeat.mjs";
+import { createSessionBusHooks, remoteBusContext } from "./session-bus-plugin.mjs";
 import { createPermissionBroker } from "./permission-broker.mjs";
 import { createSubagentCancellationReceipt } from "./subagent-cancellation-receipt.mjs";
+import { createNativeDesktopFocusGuard } from "./native-desktop-focus-guard.mjs";
+import {
+  BoundedInteractiveOperationManager,
+} from "./bounded-interactive-operation.mjs";
+import { createOutputSandboxReader, createOutputSandboxRecorder } from "./bounded-operation-output.mjs";
 import { createRoutingFeedbackHandler } from "./routing-feedback-handler.mjs";
 import { createSessionBoundaryAdvisory } from "./session-boundary-advisory.mjs";
 import { createProviderErrorHandler } from "./provider-error-diagnostics.mjs";
+import { createObjectiveReceiptTool } from "./objective-receipt-tool.mjs";
 import {
   appendConversationSystemContext,
   applyConversationRootVariant,
@@ -72,26 +93,45 @@ import {
   isRemoteInteractiveConversation,
 } from "./team-interface-context.mjs";
 import { enforceConversationPathAccess } from "./team-interface-path-guard.mjs";
+import { assertLocalOnlyEgress, initLocalOnlyPolicy } from "./local-only-policy.mjs";
 
 // Existing modules
-import { createTools } from "./tools.mjs";
+import { createTools, tool } from "./tools.mjs";
+import { moveToolsOnDemand } from "./on-demand-tools.mjs";
+import { createSchemaGatedTools } from "./tool-schema.mjs";
 import {
   initObservability,
   getRoutingFeedback,
   handleEvent,
+  objectiveContextForSession,
+  recordObjectiveDecision,
   recordRoutingDecision,
   recordSubagentCancellationReceipt,
   recordSubagentOutcome,
 } from "./observability.mjs";
-import { createSessionStartGreetingGate, createTtsrHooks } from "./ttsr.mjs";
-import { createPoolAuthHook, createPoolTool, initPoolAuth, getAccounts } from "./oauth-pool.mjs";
+import { createTtsrHooks } from "./ttsr.mjs";
+import { createRootSessionGreetingGate, openCodeV1SessionLookup } from "./root-session-greeting-gate.mjs";
+import {
+  createPoolAuthHook,
+  createPoolTool,
+  getAccounts,
+  initPoolAuth,
+  rotateOpenAIPoolToken,
+  selectOpenAIRequestAccount,
+} from "./oauth-pool.mjs";
+import { DETECTED_OPENCODE_RUNTIME_VERSION } from "./oauth-pool-token-endpoint.mjs";
 import { createProviderAuthHook } from "./provider-auth.mjs";
 import { installOpenAIProviderFetchRotation } from "./openai-provider-auth.mjs";
 import { startCursorProxy, ensureCursorProxyServer } from "./cursor-proxy.mjs";
 import { startGoogleProxy, ensureGoogleProxyServer } from "./google-proxy.mjs";
 import { startClaudeProxy } from "./claude-proxy.mjs";
-import { isHeadless } from "./proxy-lifecycle.mjs";
+import { isAcpServer, isHeadless } from "./proxy-lifecycle.mjs";
 import { pluginHealthProbeRequested, recordPluginHealthStage } from "./plugin-health.mjs";
+import { annotateTurnTimesSafely } from "./turn-time-annotation.mjs";
+
+// Preserve the runtime-native fetch before any plugin factory installs the
+// OpenAI OAuth rotation wrapper. API-key image requests need an isolated route.
+const IMAGE_FETCH = globalThis.fetch?.bind(globalThis);
 
 // ---------------------------------------------------------------------------
 // Directory constants
@@ -170,6 +210,20 @@ function run(cmd, timeout = 5000) {
 }
 
 /**
+ * Run a shell command while preserving failures for user-facing tool calls.
+ * @param {string} cmd
+ * @param {number} [timeout=5000]
+ * @returns {string}
+ */
+function runChecked(cmd, timeout = 5000) {
+  return execSync(cmd, {
+    encoding: "utf-8",
+    timeout,
+    stdio: ["pipe", "pipe", "pipe"],
+  }).trim();
+}
+
+/**
  * Read a file if it exists, or return empty string.
  * @param {string} filepath
  * @returns {string}
@@ -206,7 +260,7 @@ installPluginConsoleRouter({
   debug: process.env.AIDEVOPS_PLUGIN_DEBUG === "1",
 });
 
-function createConversationHooks({client, conversation, directory}) {
+function createConversationHooks({client, conversation, directory, localOnlyPolicy}) {
   const configHook = createConfigHook({
     agentsDir: AGENTS_DIR,
     workspaceDir: WORKSPACE_DIR,
@@ -220,13 +274,17 @@ function createConversationHooks({client, conversation, directory}) {
   ]);
   return {
     config: configHook,
+    "tool.definition": adaptToolDefinition,
     "chat.message": async () => 0,
-    "chat.params": async (input, output) => applyConversationRootVariant(
-      input,
-      output,
-      conversation,
-      {client, resolveVariant: resolveTierReasoning, tierReasoning},
-    ),
+    "chat.params": async (input, output) => {
+      assertLocalOnlyEgress(localOnlyPolicy, input, "chat");
+      return applyConversationRootVariant(
+        input,
+        output,
+        conversation,
+        {client, resolveVariant: resolveTierReasoning, tierReasoning},
+      );
+    },
     "tool.execute.before": async (input, output) => enforceConversationPathAccess(
       input.tool,
       output.args || {},
@@ -273,6 +331,13 @@ function prepareLocalProviderProxies(client) {
 // Main Plugin Export
 // ---------------------------------------------------------------------------
 
+function applyBoundedOperationPermission(config) {
+  if (!config.permission || typeof config.permission !== "object") config.permission = {};
+  if (config.permission["*"] !== "deny" && config.permission.aidevops_bounded_operation === undefined) {
+    config.permission.aidevops_bounded_operation = "ask";
+  }
+}
+
 /**
  * aidevops OpenCode Plugin
  *
@@ -291,13 +356,16 @@ function prepareLocalProviderProxies(client) {
  */
 export async function AidevopsPlugin({ directory, client }) {
   const initializedAtMs = Date.now();
+  // GH#34125 #aidevops:trust-boundary: bind local-only policy from the launch
+  // environment before any hook can run; later env mutation cannot change it.
+  const localOnlyPolicy = initLocalOnlyPolicy(process.env);
   const conversation = loadTeamInterfaceConversation(process.env, AGENTS_DIR, {
     pluginEntryPath: PLUGIN_ENTRY_PATH,
     repositoryDir: directory,
   });
 
   if (isRestrictedConversation(conversation)) {
-    return createConversationHooks({client, conversation, directory});
+    return createConversationHooks({client, conversation, directory, localOnlyPolicy});
   }
 
   const mcpRuntime = createMcpSessionRuntime(WORKSPACE_DIR, { repositoryDir: directory });
@@ -328,6 +396,8 @@ export async function AidevopsPlugin({ directory, client }) {
         const result = await configHook(config);
         recordPluginHealthStage("config_applied", {
           gpt56_limits: config.provider?.openai?.models?.["gpt-5.6-sol"]?.limit || null,
+          astra_context: getAstraContextHealth(config),
+          gpt6_context: getGpt6ContextHealth(config),
           terminal_title_status: true,
         });
         return result;
@@ -337,7 +407,11 @@ export async function AidevopsPlugin({ directory, client }) {
   }
 
   // Initialise LLM observability
-  initObservability({ aidevopsVersion: currentAidevopsVersion() });
+  initObservability({
+    aidevopsVersion: currentAidevopsVersion(),
+    runtimeVersion: DETECTED_OPENCODE_RUNTIME_VERSION,
+    adapterId: "opencode-v1",
+  });
 
   // Cursor gRPC proxy — prepare models/provider in the background so OpenCode
   // startup never waits on network-bound model discovery or OAuth refresh.
@@ -357,13 +431,47 @@ export async function AidevopsPlugin({ directory, client }) {
   // that brought cursor + google onto the same lazy-start pattern.
 
   // Create tools
-  const baseTools = createTools(SCRIPTS_DIR, run, {
-    sessionOrigin: process.env.AIDEVOPS_SESSION_ORIGIN,
-    poolToolFactory: () => createPoolTool(client),
-    mcpClient: client.mcp,
-    mcpDirectory: directory,
-    managedMcpNames: getOnDemandMcpAgents().map((mcp) => mcp.name),
-    managedMcpWorkspaces: mcpRuntime.workspaces,
+  // Use the module-load capture so later plugin factories cannot inherit the
+  // global OAuth fetch wrapper from an earlier OpenCode workspace.
+  const boundedOperationManager = new BoundedInteractiveOperationManager({
+    projectRoot: directory,
+    scriptsDir: SCRIPTS_DIR,
+    recordOutput: createOutputSandboxRecorder(join(SCRIPTS_DIR, "output-sandbox-helper.sh")),
+    readOutput: createOutputSandboxReader(join(SCRIPTS_DIR, "output-sandbox-helper.sh")),
+  });
+  process.once("exit", () => boundedOperationManager.dispose());
+  // t18886: presence for every root session; the tool and wakes only in
+  // interactive TUI/serve/ACP processes. t18905: headless workers receive
+  // messages at tool results and turns. The loggers are bound lazily.
+  const sessionBus = createSessionBusHooks({
+    client,
+    directory,
+    headless: isHeadless(),
+    remote: remoteBusContext(conversation),
+    onError: (label, err) => debugEventError(label, err),
+    log: (level, message) => qualityLog(level, message),
+  });
+  const baseTools = createSchemaGatedTools(tool, () => {
+    const tools = createTools(SCRIPTS_DIR, run, {
+      aidevopsRun: runChecked,
+      sessionOrigin: process.env.AIDEVOPS_SESSION_ORIGIN,
+      poolToolFactory: () => createPoolTool(client),
+      imageFetch: IMAGE_FETCH,
+      imageOAuthAccountResolver: selectOpenAIRequestAccount,
+      imageOAuthAccountRotator: (skipEmail) => rotateOpenAIPoolToken(client, skipEmail),
+      projectRoot: directory,
+      mcpClient: client.mcp,
+      mcpDirectory: directory,
+      managedMcpNames: getOnDemandMcpAgents().map((mcp) => mcp.name),
+      managedMcpWorkspaces: mcpRuntime.workspaces,
+      boundedOperationManager,
+    });
+    tools.aidevops_objective_receipt = createObjectiveReceiptTool(tool, recordObjectiveDecision);
+    sessionBus.addTool(tools, tool);
+    // GH#32592: V1 sends every tool schema on every request, so rarely used
+    // tools sit behind one compact dispatcher. V2's Code Mode already defers them.
+    moveToolsOnDemand(tools, tool);
+    return tools;
   });
 
   // Create hooks from extracted modules
@@ -373,6 +481,7 @@ export async function AidevopsPlugin({ directory, client }) {
     join(AGENTS_DIR, "configs", "model-routing-table.json"),
   ]);
   const agentRoutingState = { tiers: new Map(), pinned: new Set() };
+  const contextBudget = createContextBudget();
   const configHook = createConfigHook({
     agentsDir: AGENTS_DIR,
     workspaceDir: WORKSPACE_DIR,
@@ -389,13 +498,20 @@ export async function AidevopsPlugin({ directory, client }) {
     checkpointHelper: join(SCRIPTS_DIR, "session-checkpoint-helper.sh"),
   });
   const sessionModels = createSessionModelStore();
+  const sourceAccessRuntime = createSourceAccessRuntime({
+    client, directory, scriptsDir: SCRIPTS_DIR,
+    tempDir: join(WORKSPACE_DIR, "tmp"), enabled: !isHeadless(),
+  });
   const { toolExecuteBefore, toolExecuteAfter, qualityLog } = createQualityHooks({
+    client,
     activeScriptsDir: join(ACTIVE_AGENTS_DIR, "scripts"),
     scriptsDir: SCRIPTS_DIR,
     logsDir: LOGS_DIR,
     repositoryDir: directory,
     continuationGuard,
+    sourceAccessRuntime,
     resolveSessionModel: (sessionId) => sessionModels.resolve(sessionId),
+    ownedListenerRoots: (sessionId) => boundedOperationManager.ownedListenerRoots(sessionId),
   });
 
   const shellEnvHook = createShellEnvHook({
@@ -403,27 +519,51 @@ export async function AidevopsPlugin({ directory, client }) {
     agentsDir: AGENTS_DIR,
     scriptsDir: SCRIPTS_DIR,
     workspaceDir: WORKSPACE_DIR,
+    sourceAccessRuntime,
     onSessionIdentity: (sessionId, modelId) => sessionModels.remember(sessionId, modelId),
   });
   const tierReasoning = Object.fromEntries(
     Object.entries(modelRouting.tiers).map(([tier, route]) => [tier, route.reasoning]),
   );
+  const objectiveAwareSubagentOutcome = (evidence) => recordSubagentOutcome(evidence);
+  objectiveAwareSubagentOutcome.objectiveContext = objectiveContextForSession;
   const subagentEffortHooks = createSubagentEffortHooks(client, {
     tierReasoning,
     modelRouting,
     agentRoutingState,
     onRoutingDecision: recordRoutingDecision,
-    onSubagentOutcome: recordSubagentOutcome,
+    onSubagentOutcome: objectiveAwareSubagentOutcome,
     isHeadless,
     qualityLog,
   });
-  const shouldInjectGreeting = createSessionStartGreetingGate(client, isHeadless);
+  // Same root-session gate as OpenCode 2: an identical greeting on every root
+  // request keeps the prompt-cache prefix stable (GH#32592).
+  const shouldInjectGreeting = createRootSessionGreetingGate({
+    getSession: openCodeV1SessionLookup(client),
+    isHeadless,
+    isAcpServer,
+    log: qualityLog,
+  });
   const permissionBroker = createPermissionBroker({ client, isHeadless });
+  const playwriterSelectionGuard = createPlaywriterSelectionGuard({ client, isHeadless, log: qualityLog });
   const compactionContinuation = createCompactionAutoContinueGuard(client, { qualityLog });
+  // GH#37997: stop and rerun compaction summaries that loop on repeated text;
+  // a rerun continues under the same autocontinue policy as OpenCode's own.
+  // Its hooks are fail-open internally.
+  const compactionLoopGuard = createCompactionLoopGuard({ client, isHeadless, qualityLog, continuation: compactionContinuation });
+  // GH#35186: replay verbatim user input and images hidden by compaction.
+  const compactionInputReplay = createCompactionInputReplay(client, { qualityLog });
+  // GH#35893: flag a local session compacted on a non-local provider.
+  const compactionResidencyWarning = createCompactionResidencyWarning({ log: qualityLog });
   const cancellationReceipt = createSubagentCancellationReceipt(client, {
     qualityLog,
     recordReceipt: recordSubagentCancellationReceipt,
   });
+  // GH#35528: bound focus-changing native desktop calls per session turn.
+  const nativeFocusGuard = createNativeDesktopFocusGuard({ log: qualityLog });
+
+  // Duplicate AGENTS.md Read reminders (GH#32444); OpenCode 1 only.
+  const instructionReminders = createInstructionReminderCompactor();
 
   // TTSR hooks
   const {
@@ -440,6 +580,10 @@ export async function AidevopsPlugin({ directory, client }) {
     isHeadless,
     shouldInjectGreeting,
     initializedAtMs,
+    // Resolved versions keep the block deterministic and independent of the
+    // refreshing greeting cache.
+    runtimeName: "OpenCode",
+    runtimeVersion: DETECTED_OPENCODE_RUNTIME_VERSION || undefined,
   });
 
   // Lazy-start dispatch table for local proxies. Keys are OpenCode
@@ -463,6 +607,7 @@ export async function AidevopsPlugin({ directory, client }) {
   // request — the underlying provider call will surface a clearer error
   // if the proxy is genuinely unreachable.
   const systemTransformHook = async (input, output) => {
+    instructionReminders.rememberSystem(input?.sessionID, output?.system);
     const providerID = input?.model?.providerID;
     if (providerID && !isHeadless()) {
       const starter = proxyStarters[providerID];
@@ -480,11 +625,20 @@ export async function AidevopsPlugin({ directory, client }) {
     }
   };
 
-  // Composed messages transform: TTSR enforcement + image size guard (GH#21793).
-  // The image guard runs after TTSR so corrections are applied to the final
-  // message list. Fail-open — errors in the guard must not block the message.
+  // Composed messages transform: compaction input replay (GH#35186) + TTSR
+  // enforcement + image size guard (GH#21793). Replay runs first so later
+  // hooks see the final head of the request. The image guard runs after TTSR
+  // so corrections are applied to the final message list. Fail-open — errors
+  // in any step must not block the message.
   const messagesTransformHook = async (input, output) => {
+    // GH#37997: first, so replay and later hooks see the repaired history.
+    compactionLoopGuard.transformMessages(input, output);
+    await compactionInputReplay.inject(input, output);
+    await annotateTurnTimesSafely(input, output, { client, isHeadless }, qualityLog);
+    // GH#35529: attach receipts to interrupted Task results (fail-open).
+    await cancellationReceipt.injectReceipts(input, output);
     await ttsrMessagesTransformHook(input, output);
+    continuationGuard.injectSteering(input, output);
     try {
       applyImageSizeGuard(output, qualityLog);
     } catch (err) {
@@ -492,9 +646,12 @@ export async function AidevopsPlugin({ directory, client }) {
     }
   };
 
-  // Compose recovery completion validation after TTSR annotations. The guard
-  // only changes explicit terminal claims; ordinary progress remains intact.
+  // Observe completed text for TTSR violations and continuation steering.
+  // GH#34123: neither hook modifies the user-visible text; model corrections
+  // travel through messagesTransformHook as synthetic messages. The only
+  // rewrite is GH#37997: repeated runs in a compaction summary are collapsed.
   const completionTextHook = async (input, output) => {
+    compactionLoopGuard.completeText(input, output);
     await textCompleteHook(input, output);
     continuationGuard.completeText(input, output);
   };
@@ -513,6 +670,7 @@ export async function AidevopsPlugin({ directory, client }) {
     activeAgentsDir: ACTIVE_AGENTS_DIR,
     agentsDir: AGENTS_DIR,
     client,
+    isHeadless,
   });
   const sessionTitleStatusHandler = createSessionTitleStatusHandler({ isHeadless });
   const routingFeedbackHandler = createRoutingFeedbackHandler({ client, isHeadless, getFeedback: getRoutingFeedback });
@@ -541,6 +699,16 @@ export async function AidevopsPlugin({ directory, client }) {
     workDir: process.env.AIDEVOPS_WORK_DIR || join(WORKSPACE_DIR, "work"),
     log: qualityLog,
   });
+  // GH#34138: diagnostics-only; never aborts, prompts or retries a session.
+  const sessionTurnDiagnostics = createSessionTurnDiagnostics({
+    client,
+    directory,
+    isHeadless,
+    schedule: !isHeadless(),
+    log: qualityLog,
+  });
+  // GH#35517: busy/idle heartbeat consumed by the OpenCode DB archive idle gate.
+  const dbActivityHeartbeat = installDbActivityHeartbeat();
 
   const debugEventError = (label, err) => {
     if (process.env.AIDEVOPS_PLUGIN_DEBUG) {
@@ -557,13 +725,18 @@ export async function AidevopsPlugin({ directory, client }) {
   return {
     // Config: agent index, MCP registration, OAuth pool injection
     config: async (config) => {
+      contextBudget.capture(config);
       // HOTFIX: run initPoolAuth non-blocking — OpenCode 1.4.8 blocks
       // on client.auth.set() inside the config hook. Fire-and-forget so
       // the config hook can complete and the session becomes responsive.
       initPoolAuth(client).catch(() => {});
       const result = await configHook(config);
+      contextBudget.restore(config);
+      applyBoundedOperationPermission(config);
       recordPluginHealthStage("config_applied", {
         gpt56_limits: config.provider?.openai?.models?.["gpt-5.6-sol"]?.limit || null,
+        astra_context: getAstraContextHealth(config),
+        gpt6_context: getGpt6ContextHealth(config),
         terminal_title_status: true,
       });
       return result;
@@ -571,14 +744,28 @@ export async function AidevopsPlugin({ directory, client }) {
 
     // Custom tools + pool management
     tool: baseTools,
+    "tool.definition": adaptToolDefinition,
 
-    // Record routed request identity and select parent-safe child effort.
-    "chat.message": subagentEffortHooks.chatMessage,
+    // Record routed request identity and select parent-safe child effort,
+    // then deliver pending session-bus messages on the user turn (t18886).
+    "chat.message": async (input, output) => {
+      const result = await subagentEffortHooks.chatMessage(input, output);
+      await sessionBus.chatMessage(input, output);
+      return result;
+    },
     "chat.params": async (input, output) => {
+      // GH#34125: first, so a bound session never reaches the provider stream
+      // (parent turns, subagents, compaction and resumed sessions alike).
+      assertLocalOnlyEgress(localOnlyPolicy, input, "chat");
+      contextBudget.apply(input);
       const { sessionId, modelId } = sessionModelIdentity(input);
+      // Before remember(): compare against the parent's model, not this request's.
+      compactionResidencyWarning(input, sessionModels.resolve(sessionId));
+      // GH#37997: remember the compaction's parent agent/model/variant for a rerun.
+      compactionLoopGuard.chatParams(input);
       sessionModels.remember(sessionId, modelId);
       await subagentEffortHooks.chatParams(input, output);
-      return applyConversationRootVariant(
+      const applied = await applyConversationRootVariant(
         input,
         output,
         isRestrictedConversation(conversation) ? conversation : null,
@@ -588,26 +775,49 @@ export async function AidevopsPlugin({ directory, client }) {
         tierReasoning,
         },
       );
+      // GH#32934/GH#36169: last, so no earlier hook can change compaction effort.
+      applyCompactionEffort(input, output, modelRouting, { log: qualityLog });
+      return applied;
     },
 
     // Quality hooks
     "tool.execute.before": async (input, output) => {
+      await playwriterSelectionGuard(input, output);
       enforceManagedMcpArtifactPath(input, output, mcpRuntime.workspaces);
+      nativeFocusGuard.beforeTool(input, output);
       sessionStallRecovery.beforeTool(input, output);
       permissionBroker.recordToolCall(input, output);
       cancellationReceipt.beforeTool(input, output);
       subagentEffortHooks.beforeTool(input, output);
-      return toolExecuteBefore(input, output);
+      const result = await toolExecuteBefore(input, output);
+      // t18905: after the gates, so only tools that will run are published.
+      sessionBus.toolBefore(input);
+      return result;
     },
     "tool.execute.after": async (input, output) => {
+      normalizeMcpArtifactPaths(input, output, mcpRuntime.workspaces);
+      try {
+        const replaced = instructionReminders.compactReadOutput(input, output);
+        if (replaced > 0) qualityLog("INFO", `[instruction-reminders] replaced ${replaced} duplicate instruction reminder(s)`);
+      } catch (err) {
+        qualityLog("WARN", `[instruction-reminders] skipped: ${err?.message ?? err}`);
+      }
       sessionStallRecovery.afterTool(input, output);
       await cancellationReceipt.afterTool(input, output);
       await subagentEffortHooks.afterTool(input, output);
+      // Before quality hooks, so output scrubbing also covers peer messages.
+      sessionBus.toolAfter(input, output);
       return toolExecuteAfter(input, output);
     },
 
     // Shell environment
     "shell.env": shellEnvHook,
+
+    // Record the typed slash command on its template part for the TUI
+    // Prompts sidebar; OpenCode persists only the expanded template.
+    "command.execute.before": async (input, output) => {
+      stampCommandPrompt(input, output);
+    },
 
     // Soft TTSR — rule enforcement
     "experimental.chat.system.transform": systemTransformHook,
@@ -622,7 +832,12 @@ export async function AidevopsPlugin({ directory, client }) {
         handleEvent(input, { resolveSessionModel: (sessionId) => sessionModels.resolve(sessionId) }),
         Promise.resolve(subagentEffortHooks.handleEvent(input)),
         compactionContinuation.handleEvent(input),
+        Promise.resolve(compactionLoopGuard.handleEvent(input)),
         Promise.resolve(cancellationReceipt.handleEvent(input)),
+        Promise.resolve(nativeFocusGuard.handleEvent(input)),
+        Promise.resolve(boundedOperationManager.handleEvent(input)),
+        releasePreEditSessionOwnership(input).catch((err) => debugEventError("session ownership release", err)),
+        Promise.resolve(sourceAccessRuntime.handleEvent(input)),
         permissionBroker.handleEvent(input).catch((err) => debugEventError("permission broker", err)),
         sessionTitleStatusHandler(input).catch((err) => debugEventError("title status handler", err)),
         routingFeedbackHandler(input).catch((err) => debugEventError("routing feedback handler", err)),
@@ -632,6 +847,9 @@ export async function AidevopsPlugin({ directory, client }) {
         sessionTitleFallbackHandler(input).catch((err) => debugEventError("title fallback handler", err)),
         sessionRecoveryMarkerHandler(input).catch((err) => debugEventError("session recovery marker", err)),
         Promise.resolve(sessionStallRecovery.handleEvent(input)),
+        sessionTurnDiagnostics.handleEvent(input).catch((err) => debugEventError("turn diagnostics", err)),
+        Promise.resolve().then(() => dbActivityHeartbeat.handleEvent(input)).catch((err) => debugEventError("db activity heartbeat", err)),
+        sessionBus.handleEvent(input),
         greetingHandler(input).catch((err) => debugEventError("greeting handler", err)),
       ]);
     },
@@ -644,7 +862,7 @@ export async function AidevopsPlugin({ directory, client }) {
     auth: (() => {
       const poolHook = createPoolAuthHook(client);
       const providerHook = createProviderAuthHook(client);
-      installOpenAIProviderFetchRotation(client);
+      installOpenAIProviderFetchRotation(client, { version: currentAidevopsVersion() });
       return {
         provider: "anthropic",
         methods: poolHook.methods,
@@ -659,6 +877,7 @@ export async function AidevopsPlugin({ directory, client }) {
         input,
         output,
         directory,
+        { host: "opencode1" },
       ),
     "experimental.compaction.autocontinue": compactionContinuation.autoContinue,
   };

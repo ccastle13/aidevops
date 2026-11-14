@@ -8,9 +8,10 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { pathToFileURL } from "node:url";
+import { isDirectEntrypoint } from "./entrypoint-guard.mjs";
 import { runCli } from "./runtime-events-cli.mjs";
 import { normaliseEventType, normaliseIdentifier } from "./runtime-events-identifiers.mjs";
+import { validateObjectiveRuntimeEvent } from "./runtime-events-objectives.mjs";
 import {
   RUNTIME_EVENT_PAYLOAD_MAX_BYTES,
   prepareRuntimePayload,
@@ -69,6 +70,7 @@ function normaliseOccurredAt(value) {
 
 /** Build a validated, redacted runtime-event envelope without writing it. */
 export function createRuntimeEventEnvelope(input, { redactPaths = true, strictTopLevel = true } = {}) {
+  validateObjectiveRuntimeEvent(input?.eventType, input?.payload);
   const eventId = normaliseIdentifier(input?.eventId || randomUUID(), { required: true });
   const sessionId = normaliseIdentifier(input?.sessionId || process.env.AIDEVOPS_SESSION_ID || process.env.OPENCODE_SESSION_ID);
   const workerId = normaliseIdentifier(
@@ -267,7 +269,7 @@ export function appendProjectedState(input, mode = "auto", options = {}) {
   return null;
 }
 
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+if (isDirectEntrypoint(import.meta.url)) {
   runCli(process.argv.slice(2), {
     appendProjectedState,
     appendRuntimeEventSync,

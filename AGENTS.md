@@ -14,7 +14,7 @@
 
 **File Structure**: `TODO.md` (tasks), `todo/` (plans, PRDs), `.agents/` (agents, tools, services, workflows, scripts).
 
-**Before extending**: Read `.agents/aidevops/architecture.md` (design patterns, conventions, extension guide).
+**Before extending**: Read `.agents/aidevops/architecture.md` (design patterns, conventions, extension guide) and `.agents/aidevops/purpose.md` (value, ownership, and decision criteria).
 
 <!-- AI-CONTEXT-END -->
 
@@ -54,7 +54,7 @@ From `.agents/tools/build-agent/build-agent.md`:
 2. **Universal applicability**: Every instruction relevant to >80% of tasks
 3. **Progressive disclosure**: Pointers to subagents, not inline content
 4. **Code examples**: Only when authoritative; otherwise use stable `rg "pattern"` search references or section headings
-5. **Self-assessment**: Flag issues with evidence, complete task first
+5. **Ambient self-improvement**: Inherit `reference/self-improvement.md`; preserve the current outcome, then capture or fix evidenced lessons without requiring a command
 
 Contributor rule: changes that add or expand always-loaded guidance (`AGENTS.md`,
 `.agents/AGENTS.md`, `.agents/prompts/build.txt`) must prefer a short pointer plus a
@@ -83,6 +83,10 @@ find .agents/scripts/ -name "*.sh" -exec shellcheck {} \;
 
 From `.agents/tools/build-agent/build-agent.md`:
 
-- **Triggers**: Observable failure, user correction, contradiction, staleness
-- **Process**: Complete task, cite evidence, check duplicates, propose fix
+- **Triggers**: Observable failure, user correction, contradiction, staleness, repeated friction, reusable success
+- **Process**: Preserve the outcome, cite evidence, classify scope/sensitivity, check duplicates, then fix and verify or route
 - **Duplicates**: Always `rg "pattern" .agents/` before adding instructions
+
+## Search targets
+
+Search keywords, AI-answer questions and search entities live in `context/keywords.md` and `context/keywords/` (standard: `~/.aidevops/agents/seo/keywords-standard.md`). Read them, or run `aidevops keywords brief`, before naming, copy, metadata, schema, media, social or PR work. If the files are missing in a clone, run `aidevops keywords sync`.

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2025-2026 Marcus Quinn
 # Browser QA Helper — Playwright-based visual testing for milestone validation (t1359)
-# Commands: run | screenshot | links | a11y | smoke | help
+# Commands: run | screenshot | links | a11y | smoke | stability | transition | frames | journey | help
 # Integrates with mission milestone validation pipeline.
 # Uses Playwright (fastest) with fallback guidance for Stagehand (self-healing).
 #
@@ -39,6 +39,12 @@ source "${SCRIPT_DIR}/browser-qa-helper-a11y.sh"
 # shellcheck source=./browser-qa-helper-tests.sh
 # shellcheck disable=SC1091  # sub-library resolved at runtime via $SCRIPT_DIR
 source "${SCRIPT_DIR}/browser-qa-helper-tests.sh"
+
+# shellcheck source=./browser-qa-helper-transition.sh
+source "${SCRIPT_DIR}/browser-qa-helper-transition.sh"
+
+# shellcheck source=./browser-qa-helper-frames.sh
+source "${SCRIPT_DIR}/browser-qa-helper-frames.sh"
 
 # =============================================================================
 # Broken Link Detection
@@ -89,7 +95,7 @@ cmd_links() {
 const playwrightImport = await import(process.env.AIDEVOPS_PLAYWRIGHT_MODULE);
 const { chromium } = playwrightImport.chromium ? playwrightImport : playwrightImport.default;
 
-const baseUrl = process.argv[2].replace(/\/$/, '');
+const baseUrl = process.argv[2];
 const maxDepth = parseInt(process.argv[3] || '2', 10);
 const timeout = parseInt(process.argv[4] || '30000', 10);
 
@@ -175,12 +181,15 @@ _generate_stability_script() {
 	local timeout="$5"
 	local poll_interval="$6"
 	local poll_max_wait="$7"
+	local pages_default="${8:-true}"
 
 	cat >"$script_file" <<SCRIPT
 const playwrightImport = await import(process.env.AIDEVOPS_PLAYWRIGHT_MODULE);
 const { chromium } = playwrightImport.chromium ? playwrightImport : playwrightImport.default;
 
-const baseUrl = '${safe_url}'.replace(/\/\$/, '');
+const baseUrl = '${safe_url}';
+const pagesDefault = ${pages_default};
+$(_page_url_js)
 const pages = [${pages_array}];
 const reloads = ${reloads};
 const timeout = ${timeout};
@@ -239,7 +248,7 @@ async function run() {
   const allResults = [];
 
   for (const pagePath of pages) {
-    const url = baseUrl + pagePath;
+    const url = resolvePageUrl(baseUrl, pagePath, pagesDefault);
     const reloadResults = [];
     let stable = true;
     let baseFingerprint = null;
@@ -270,7 +279,8 @@ async function run() {
       let status = 0;
 
       try {
-        const response = await page.goto(url, { waitUntil: 'networkidle', timeout });
+        const response = await page.goto(url, { waitUntil: 'load', timeout });
+        await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
         status = response ? response.status() : 0;
         await waitForNetworkQuiescence(page);
       } catch (err) {
@@ -367,6 +377,9 @@ Commands:
   a11y         Run accessibility checks (contrast, ARIA, structure)
   smoke        Check for console errors and basic rendering
   stability    Reload pages N times and verify DOM/network quiescence
+  transition   Measure the source page during a held document navigation
+  frames       Record per-frame destination DOM states through load + settle
+  journey      Opt-in authenticated read-only journey (--config FILE --environment NAME)
   help         Show this help message
 
 Common Options:
@@ -378,10 +391,40 @@ Common Options:
   --output-dir DIR    Directory for screenshots and reports
   --max-dim PX        Resize screenshots to this max dimension (default: 4000, Anthropic hard limit: 8000)
 
+Screenshot-specific Options:
+  --full-page         Capture the whole page (never for AI review; use --scroll-to)
+  --color-schemes S   Comma-separated light,dark,no-preference: one capture per scheme
+  --scroll-to SEL     Centre the first match in the viewport before capturing
+  --measure-file FILE JavaScript function expression run in the page after capture
+  --label NAME        Filename prefix ([A-Za-z0-9._-]+) so before/after runs share a directory
+  Every result records httpStatus and consoleErrors.
+
 Stability-specific Options:
   --reloads N         Number of reloads per page (default: 3, minimum: 1)
   --poll-interval MS  Quiescence poll interval in milliseconds (default: 500)
   --poll-max-wait MS  Maximum wait for network quiescence per reload (default: 10000)
+
+Transition-specific Options:
+  --from PATH         Starting path relative to --url (default: /)
+  --click SELECTOR    Link/element to click (required)
+  --hold SUBSTRING    Navigation URL substring to hold (required)
+  --hold-ms MS        Hold duration (default: 4000, maximum: 60000)
+  --at-ms MS,MS       Measurement times after click (default: 600,1200; below hold-ms)
+  --measure-file FILE JavaScript function expression returning JSON-able data (required)
+  --storage-state FILE  Optional Playwright storage state (sensitive)
+  --screencast        Save held-state frames (maximum dimension 1568px)
+
+Frames-specific Options:
+  --measure-file FILE Trusted synchronous function expression returning JSON (required)
+  --ready SELECTOR   Start sampling when this element exists (default: body)
+  --widths LIST      Fresh context per width (default: 1280; height: 900)
+  --cpu N            CPU throttling rate, 1-100 (default: 1)
+  --from URL         Warm visit before measured navigation and CPU throttling
+  --after-selector S Install sentinel after this element exists (default: body available)
+  --no-after         Disable sentinel, sample only before ResizeObservers
+  --transform-file F Trusted main-document HTML transform function
+  --settle-ms N      Record until load + N ms (default: 1000; maximum: 60000)
+  --output-dir DIR   Private evidence directory; frames.json must not already exist
 
 Examples:
   browser-qa-helper.sh run --url http://localhost:3000 --pages "/ /about /dashboard"
@@ -391,11 +434,17 @@ Examples:
   browser-qa-helper.sh smoke --url http://localhost:3000 --pages "/ /login"
   browser-qa-helper.sh stability --url http://localhost:3000 --pages "/ /dashboard" --reloads 5
   browser-qa-helper.sh stability --url http://localhost:3000 --format markdown --reloads 3
+  browser-qa-helper.sh journey --config journey.json --environment staging
+  browser-qa-helper.sh screenshot --url http://127.0.0.1:3000 --pages / --color-schemes light,dark \
+    --scroll-to '#pricing' --measure-file measure.js --label after --max-dim 1568
 
 Prerequisites:
   - Node.js and npm installed
-  - Importable Playwright Node package (CLI presence alone is insufficient)
-  - Playwright browser binary: npx playwright install chromium
+  - Importable Playwright Node package (CLI presence alone is insufficient).
+    Setup installs it in ~/.aidevops/runtimes/playwright. If missing, run:
+    node ~/.aidevops/agents/scripts/playwright-runtime.mjs install
+    or set AIDEVOPS_PLAYWRIGHT_MODULE. Do not install ad-hoc duplicate copies.
+  - Brave installed (preferred), or the Chromium installed by the command above
 
 Integration:
   Used by milestone-validation.md (Phase 3: Browser QA) during mission orchestration.
@@ -411,6 +460,10 @@ HELP
 main() {
 	local command="${1:-help}"
 	shift || true
+	if [[ "$command" == "frames" && "${1:-}" == "--help" ]]; then
+		cmd_help
+		return 0
+	fi
 	if [[ "$command" != "help" && "$command" != "--help" && "$command" != "-h" ]]; then
 		check_playwright || return 1
 	fi
@@ -422,6 +475,9 @@ main() {
 	a11y) cmd_a11y "$@" ;;
 	smoke) cmd_smoke "$@" ;;
 	stability) cmd_stability "$@" ;;
+	transition) cmd_transition "$@" ;;
+	frames) cmd_frames "$@" ;;
+	journey) cmd_journey "$@" ;;
 	help | --help | -h) cmd_help ;;
 	*)
 		log_error "${ERROR_UNKNOWN_COMMAND}: ${command}"

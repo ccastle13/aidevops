@@ -66,6 +66,11 @@ gh() {
 	return 1
 }
 
+_pulse_merge_ready_pr_json_fields() {
+	printf '%s' 'number,state,author,title,isDraft,labels,updatedAt,headRefOid,headRefName,baseRefName,createdAt'
+	return 0
+}
+
 printf '%s=== GH#22303: PR backlog priority tests ===%s\n' "$TEST_BLUE" "$TEST_NC"
 
 merge_ready_pr='{"number":1,"mergeable":"MERGEABLE","reviewDecision":"APPROVED","isDraft":false,"labels":[],"statusCheckRollup":[{"status":"COMPLETED","conclusion":"SUCCESS"}]}'
@@ -132,6 +137,69 @@ unsorted_json="[$human_pr,$dirty_pr,$checks_in_progress_pr,$small_fix_pr,$merge_
 sorted_numbers=$(_pmp_sort_prs_by_backlog_priority "$unsorted_json" | jq -r '[.[].number] | join(",")')
 assert_eq "2: backlog sort processes merge-ready then fix-needed before lower-value buckets" \
 	"1,3,2,4,5" "$sorted_numbers"
+
+second_ready=$(printf '%s' "$merge_ready_pr" | jq -c '.number = 6')
+_pulse_merge_queue_priority_keys() { printf '|6|5|'; return 0; }
+sorted_numbers=$(_pmp_sort_prs_by_backlog_priority "[$human_pr,$dirty_pr,$checks_in_progress_pr,$small_fix_pr,$merge_ready_pr,$second_ready]" owner/repo | jq -r '[.[].number] | join(",")')
+assert_eq "2b: dirty hints break ties without overriding readiness priorities" \
+	"6,1,3,2,4,5" "$sorted_numbers"
+unset -f _pulse_merge_queue_priority_keys
+
+_pulse_merge_queue_priority_keys() { printf '|99|'; return 0; }
+gh_pr_view() {
+	local pr_number="$1"
+	[[ "$pr_number" == 99 ]] || return 1
+	printf '%s\n' '{"number":99,"state":"OPEN","mergeable":"CONFLICTING","reviewDecision":"APPROVED","isDraft":false,"labels":[],"statusCheckRollup":[]}'
+	return 0
+}
+queued_json=$(_pmp_include_queued_pr_targets owner/repo "[$merge_ready_pr]")
+assert_eq "2c: due exact retry target outside the broad list is prepended" \
+	"99,1" "$(printf '%s' "$queued_json" | jq -r '[.[].number] | join(",")')"
+assert_eq "2d: due exact retry target is processed before ordinary backlog priorities" \
+	"99,1" "$(_pmp_sort_prs_by_backlog_priority "$queued_json" owner/repo | jq -r '[.[].number] | join(",")')"
+unset -f _pulse_merge_queue_priority_keys gh_pr_view
+
+# Exercise the real generation-aware queue with an isolated database and API
+# fixtures. No live queue or GitHub mutations are permitted in this test.
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/pulse-merge-dirty-queue.sh"
+export AIDEVOPS_PULSE_MERGE_DIRTY_QUEUE_ENABLED=1
+export AIDEVOPS_PULSE_MERGE_DIRTY_QUEUE_DIR="$TEST_TMPDIR/dirty-queue"
+export DRY_RUN=0
+gh_pr_view() {
+	local pr_number="$1" response_state="$TERMINAL_STATE"
+	printf 'read\n' >>"$TEST_TMPDIR/terminal-reads"
+	if [[ $(wc -l <"$TEST_TMPDIR/terminal-reads") -gt 1 ]]; then
+		response_state="$REFRESH_STATE"
+		[[ "$response_state" != API_ERROR ]] || return 1
+		if [[ "$response_state" == NEW_EVENT ]]; then
+			_pulse_merge_queue_enqueue owner/repo "$pr_number" >/dev/null
+			response_state=MERGED
+		fi
+	fi
+	printf '{"number":%s,"state":"%s"}\n' "$pr_number" "$response_state"
+	return 0
+}
+for terminal_case in MERGED CLOSED REOPENED API_ERROR NEW_EVENT UNKNOWN; do
+	# Separate queues avoid retry backoff from one case affecting another.
+	export AIDEVOPS_PULSE_MERGE_DIRTY_QUEUE_DIR="$TEST_TMPDIR/dirty-$terminal_case"
+	TERMINAL_STATE=MERGED
+	REFRESH_STATE="$terminal_case"
+	[[ "$terminal_case" != REOPENED ]] || REFRESH_STATE=OPEN
+	[[ "$terminal_case" != UNKNOWN ]] || TERMINAL_STATE=UNKNOWN
+	: >"$TEST_TMPDIR/terminal-reads"
+	_pulse_merge_queue_enqueue owner/repo 99 >/dev/null
+	queued_json=$(_pmp_include_queued_pr_targets owner/repo "[$merge_ready_pr]")
+	assert_eq "terminal $terminal_case never enters the merge list" \
+		"1" "$(printf '%s' "$queued_json" | jq -r '[.[].number] | join(",")')"
+	# Inspect rows rather than due priority: a failed refresh may defer retries.
+	queue_rows=$(python3 -c 'import sqlite3, sys; print(sqlite3.connect(sys.argv[1]).execute("SELECT count(*) FROM work").fetchone()[0])' \
+		"$AIDEVOPS_PULSE_MERGE_DIRTY_QUEUE_DIR/work.sqlite3")
+	expected_rows=1
+	case "$terminal_case" in MERGED | CLOSED) expected_rows=0 ;; esac
+	assert_eq "terminal $terminal_case preserves only unfinished/new generations" "$expected_rows" "$queue_rows"
+done
+unset -f _pulse_merge_queue_priority_keys gh_pr_view
 
 : >"$LOGFILE"
 _pmp_log_pr_backlog_counts "owner/repo" "$unsorted_json"

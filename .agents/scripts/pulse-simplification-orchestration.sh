@@ -222,7 +222,7 @@ Run locally to see current violators:
 git ls-files '*.sh' | while read -r f; do
   d=\$(awk 'BEGIN{d=0;m=0} /^[[:space:]]*#/{next} /[[:space:]]*(if|for|while|until|case)[[:space:]]/{d++;if(d>m)m=d} /[[:space:]]*(fi|done|esac)[[:space:]]*\$||/^[[:space:]]*(fi|done|esac)\$/{if(d>0)d--} END{print m}' \"\$f\")
   [ \"\$d\" -gt 8 ] && echo \"\$d \$f\"
-done | sort -rn | head -20
+done | sort -rn | sed -n '1,20p'
 \`\`\`"
 
 	# Append signature footer
@@ -539,11 +539,30 @@ run_weekly_complexity_scan() {
 	_complexity_scan_check_interval "$now_epoch" || return 0
 
 	_complexity_scan_permission_gate "$aidevops_slug" || return 0
+	# GH#37554: lift legacy co-admin creation holds so held debt can dispatch.
+	_complexity_release_creation_holds "$aidevops_slug"
 
 	local aidevops_path
 	aidevops_path=$(_complexity_scan_find_repo "$repos_json" "$aidevops_slug" "$now_epoch") || return 0
 
-	_complexity_scan_pull_latest "$aidevops_path" || return 0
+	# GH#34426: scan a private origin/main tree; never mutate the canonical checkout.
+	local scan_tree scan_rc=0
+	scan_tree=$(_complexity_scan_pull_latest "$aidevops_path") || return 0
+	_run_weekly_complexity_scan_in "$scan_tree" "$repos_json" "$aidevops_slug" "$now_epoch" || scan_rc=$?
+	# Remove the temporary tree on success and failure (never the canonical path).
+	if [[ -n "$scan_tree" && "$scan_tree" != "$aidevops_path" ]]; then
+		rm -rf "$scan_tree"
+	fi
+	return "$scan_rc"
+}
+
+# _run_weekly_complexity_scan_in — scan phases against a prepared tree (GH#34426)
+# Arguments: $1 - aidevops_path (scan tree), $2 - repos_json, $3 - slug, $4 - now_epoch
+_run_weekly_complexity_scan_in() {
+	local aidevops_path="$1"
+	local repos_json="$2"
+	local aidevops_slug="$3"
+	local now_epoch="$4"
 
 	# GH#15285: O(1) tree hash check — skip file iteration if no tracked files changed.
 	local tree_changed=true

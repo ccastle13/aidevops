@@ -6,13 +6,12 @@
 // optional user override for the opus-4-7 context window.
 //
 // Why this module exists (t2435):
-//   The opus-4-7 context window is intentionally capped at 250K (not the 1M
-//   API ceiling) so OpenCode's 80% auto-compact threshold triggers right at
-//   the 200K MRCR reliability boundary. That default protects most users
-//   from coherence collapse past 200K. Some users want to opt into the full
-//   1M window anyway — to experiment, or because their prompts don't hit
-//   the cold-retrieval failure mode. The AIDEVOPS_OPUS_47_CONTEXT env var
-//   is the opt-in.
+//   The Claude CLI proxy originally advertised 250K for Opus 4.7 under an
+//   80% auto-compact threshold. Native Anthropic now uses a request-time 200K
+//   usable-input cap instead of adding an obsolete picker entry. Some users
+//   want to opt into the full 1M window anyway — to experiment, or because
+//   their prompts don't hit the cold-retrieval failure mode. The
+//   AIDEVOPS_OPUS_47_CONTEXT env var is the opt-in.
 //
 //   Previously the limits table lived inline in config-hook.mjs and a
 //   drift-prone copy lived in claude-proxy.mjs (`getClaudeProxyModels`).
@@ -40,6 +39,71 @@ export const GPT56_INPUT_DEFAULT = 260000;
 
 /** Maximum GPT-5.6 response size advertised by OpenCode's model registry. */
 export const GPT56_OUTPUT_DEFAULT = 128000;
+
+/** Managed Astra compaction target, not a claim about provider capacity. */
+export const ASTRA_COMPACTION_TARGET = 400000;
+export const ASTRA_COMPACTION_BUDGET_TARGET = 240000;
+export const ASTRA_OUTPUT_DEFAULT = 128000;
+
+/**
+ * Default GPT-6 Sol/Luna compaction target, not a provider capacity claim.
+ * GPT-6.1 Sol and Terra advertise 922K input natively; the cap keeps sessions
+ * below OpenAI's 272K short-context price boundary.
+ */
+export const GPT6_COMPACTION_TARGET = 240000;
+export const GPT6_OUTPUT_DEFAULT = 128000;
+export const GPT6_MODEL_IDS = [
+  "gpt-6.1-sol",
+  "gpt-6.1-sol-fast",
+  "gpt-6.1-terra",
+  "gpt-6.1-terra-fast",
+  "gpt-6-sol",
+  "gpt-6-sol-fast",
+  "gpt-6-luna",
+  "gpt-6-luna-fast",
+];
+
+/**
+ * xAI Grok compaction target (GH#34538), not a provider capacity claim.
+ * xAI bills every token of a request at 2x once its prompt reaches 200K
+ * (docs.x.ai/developers/pricing: Grok 4.3-4.7 and 4.20), so the shared 240K
+ * target sits inside the long-context band. 190K leaves ~10K for one turn of
+ * tool output before OpenCode's post-step overflow check compacts.
+ */
+export const XAI_GROK_COMPACTION_TARGET = 190000;
+
+/**
+ * Match Grok on xAI and on routers, clouds or custom providers (for example
+ * `x-ai/grok-4.6`, `xai.grok-4.6`), where xAI's price tiers still apply.
+ * @param {{providerID?: string, id?: string}} model
+ * @returns {boolean}
+ */
+export function isXaiGrokModel(model) {
+  if (model?.providerID === "xai") return true;
+  return /(?:^|[/:.-])grok-/i.test(String(model?.id ?? ""));
+}
+
+/** OpenCode's default request output clamp (`ProviderTransform.OUTPUT_TOKEN_MAX`). */
+export const HOST_OUTPUT_TOKEN_MAX = 32000;
+
+/**
+ * Input space left in a window after the output the host will actually request.
+ * Many catalogues (xAI Grok 4.5+, Kimi K3, GLM-5.x and others) advertise output
+ * equal to, or close to, the whole window. Without an explicit input limit,
+ * OpenCode compacts at context minus its request-output clamp (32K, or
+ * OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX), so measuring those windows against
+ * the advertised output skipped the managed budget (GH#34538). An explicit
+ * input limit with a smaller advertised output keeps the conservative
+ * context-minus-output ceiling.
+ * @param {{context: number, output: number, input?: number}} limit
+ * @returns {number}
+ */
+export function physicalInputLimit(limit) {
+  if (limit.input !== undefined && limit.output < limit.context) return limit.context - limit.output;
+  const override = Number.parseInt(process.env.OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX ?? "", 10);
+  const clamp = Number.isSafeInteger(override) && override > 0 ? override : HOST_OUTPUT_TOKEN_MAX;
+  return limit.context - Math.min(limit.output, clamp);
+}
 
 /** GPT-5.6 model IDs currently exposed by the OpenAI provider. */
 export const GPT56_MODEL_IDS = [
@@ -99,14 +163,19 @@ export function describeOpus47Override() {
 
 /**
  * Single source of truth for Claude model limits.
- * Both the anthropic provider models (config-hook.mjs) and the Claude CLI
- * proxy models (claude-proxy.mjs) derive their context/output values from
- * this table.
+ * The Claude CLI proxy models (config-hook.mjs and claude-proxy.mjs) derive
+ * context/output values from this table. Native Anthropic models retain the
+ * host's registry metadata; context-budget-policy.mjs applies their budget
+ * when each resolved model is first used.
  */
 export const CLAUDE_MODEL_LIMITS = {
-  "claude-haiku-4-5":  { context: 1000000, output: 32000 },
+  "claude-haiku-4-5":  { context:  200000, output: 32000 },
+  // Haiku 5.5: Anthropic's model overview publishes 1M context / 128K output.
+  "claude-haiku-5-5":  { context: 1000000, output: 128000 },
   "claude-sonnet-4-5": { context:  200000, output: 64000 },
   "claude-sonnet-4-6": { context: 1000000, output: 64000 },
+  // Sonnet 5.5: models.dev publishes 1M context / 128K output.
+  "claude-sonnet-5-5": { context: 1000000, output: 128000 },
   "claude-opus-4-5":   { context:  200000, output: 64000 },
   "claude-opus-4-6":   { context: 1000000, output: 64000 },
   // Opus 4.7 context default 250K (not the 1M API ceiling). Anthropic's own

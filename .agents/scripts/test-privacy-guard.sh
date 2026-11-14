@@ -93,7 +93,11 @@ printf '%sRunning privacy-guard tests%s\n' "$BLUE" "$NC"
 # -----------------------------------------------------------------------------
 # Test 5: enumerate
 # -----------------------------------------------------------------------------
+# Known-public visibility keeps a pulse-enabled repo out of the list
+# (unknown visibility on pulse-enabled repos fails closed).
+printf '{"testorg/public-repo": {"private": false, "checked_at": %s}}\n' "$(date +%s)" >"$PRIVACY_CACHE_FILE"
 slugs=$(privacy_enumerate_private_slugs 2>/dev/null)
+rm -f "$PRIVACY_CACHE_FILE"
 if printf '%s\n' "$slugs" | grep -q '^testorg/private-mirror$' &&
 	printf '%s\n' "$slugs" | grep -q '^testorg/local-only$'; then
 	pass "enumerate picks up mirror_upstream and local_only entries"
@@ -107,6 +111,68 @@ if printf '%s\n' "$slugs" | grep -q '^testorg/public-repo$'; then
 else
 	pass "enumerate excludes non-private testorg/public-repo slug"
 fi
+
+# Expired public entries must not suppress the pulse-enabled fallback. Private
+# cache entries remain protected regardless of age (including non-pulse repos).
+for cache_entry in \
+	'{"private":false,"checked_at":1}' \
+	'{"private":false}' \
+	'{"private":true,"checked_at":1}'; do
+	printf '{"testorg/public-repo":%s}\n' "$cache_entry" >"$PRIVACY_CACHE_FILE"
+	slugs=$(privacy_enumerate_private_slugs 2>/dev/null)
+	if printf '%s\n' "$slugs" | grep -q '^testorg/public-repo$'; then
+		pass "enumerate protects pulse repo with stale visibility: $cache_entry"
+	else
+		fail "enumerate missed pulse repo with stale visibility: $cache_entry"
+	fi
+done
+
+# A public observation older than the 10-minute push-probe TTL but inside the
+# enumeration window stays known-public: enumeration never refreshes the cache,
+# so expiring it at PRIVACY_CACHE_TTL turned every public pulse repo private.
+printf '{"testorg/public-repo":{"private":false,"checked_at":%s}}\n' "$(($(date +%s) - 3600))" >"$PRIVACY_CACHE_FILE"
+slugs=$(PRIVACY_ENUM_PUBLIC_TTL=604800 privacy_enumerate_private_slugs 2>/dev/null)
+if printf '%s\n' "$slugs" | grep -q '^testorg/public-repo$'; then
+	fail "enumerate treated a 1-hour-old public observation as private"
+else
+	pass "enumerate keeps a 1-hour-old public observation known-public"
+fi
+printf '{"testorg/public-repo":{"private":false,"checked_at":%s}}\n' "$(($(date +%s) - 8 * 86400))" >"$PRIVACY_CACHE_FILE"
+slugs=$(PRIVACY_ENUM_PUBLIC_TTL=604800 privacy_enumerate_private_slugs 2>/dev/null)
+if printf '%s\n' "$slugs" | grep -q '^testorg/public-repo$'; then
+	pass "enumerate fails closed on an 8-day-old public observation"
+else
+	fail "enumerate trusted a public observation beyond PRIVACY_ENUM_PUBLIC_TTL"
+fi
+
+# A non-numeric TTL must not make jq drop the whole cached-visibility class.
+printf '{"testorg/public-repo":{"private":true,"checked_at":%s}}\n' "$(date +%s)" >"$PRIVACY_CACHE_FILE"
+slugs=$(PRIVACY_ENUM_PUBLIC_TTL=7d privacy_enumerate_private_slugs 2>/dev/null)
+if printf '%s\n' "$slugs" | grep -q '^testorg/public-repo$'; then
+	pass "enumerate keeps cached-private coverage with an invalid TTL"
+else
+	fail "invalid PRIVACY_ENUM_PUBLIC_TTL dropped cached-private slugs"
+fi
+
+# An explicit repos.json private flag wins over a fresh public cache entry.
+printf '{"testorg/public-repo":{"private":false,"checked_at":%s}}\n' "$(date +%s)" >"$PRIVACY_CACHE_FILE"
+printf '{"initialized_repos":[{"slug":"testorg/public-repo","private":true,"pulse":false}]}\n' >"${TMP}/explicit-private.json"
+slugs=$(PRIVACY_REPOS_CONFIG="${TMP}/explicit-private.json" privacy_enumerate_private_slugs 2>/dev/null)
+if printf '%s\n' "$slugs" | grep -q '^testorg/public-repo$'; then
+	pass "enumerate honours explicit private:true despite a public cache entry"
+else
+	fail "fresh public cache entry overrode explicit private:true"
+fi
+
+printf '{"testorg/public-repo":{"private":true,"checked_at":1}}\n' >"$PRIVACY_CACHE_FILE"
+printf '{"initialized_repos":[{"slug":"testorg/public-repo","pulse":false}]}\n' >"${TMP}/nonpulse.json"
+slugs=$(PRIVACY_REPOS_CONFIG="${TMP}/nonpulse.json" privacy_enumerate_private_slugs 2>/dev/null)
+if printf '%s\n' "$slugs" | grep -q '^testorg/public-repo$'; then
+	pass "enumerate retains expired private entries for non-pulse repos"
+else
+	fail "enumerate dropped expired private entry for non-pulse repo"
+fi
+rm -f "$PRIVACY_CACHE_FILE"
 
 # -----------------------------------------------------------------------------
 # Test 4: extra slug file
@@ -182,6 +248,26 @@ if [[ "$rc" -eq 1 ]] && printf '%s' "$hits" | grep -q 'testorg/private-mirror'; 
 	pass "diff with private slug in TODO.md is flagged"
 else
 	fail "diff with private slug not flagged (rc=$rc hits=$hits)"
+fi
+
+# The public push fast path must retain lines containing only a basename.
+(
+	cd "$REPO" || exit 1
+	printf '%s\n' 'gettext_private-mirror' >README.md
+	git add README.md
+	git commit -m 'add private basename' --quiet
+) || fail "could not seed basename diff"
+base=$(git -C "$REPO" rev-parse HEAD~1)
+head=$(git -C "$REPO" rev-parse HEAD)
+printf 'repo\ttestorg/private-mirror\n' >"${TMP}/basename-entities.tsv"
+pushd "$REPO" >/dev/null || exit 1
+hits=$(privacy_scan_public_diff "$base" "$head" "${TMP}/basename-entities.tsv")
+rc=$?
+popd >/dev/null || exit 1
+if [[ "$rc" -eq 1 && "$hits" == *'[private-repo]'* ]]; then
+	pass "public README diff with identifier basename is flagged"
+else
+	fail "public README basename diff" "rc=$rc hits=$hits"
 fi
 
 # -----------------------------------------------------------------------------
@@ -341,23 +427,20 @@ else
 	fail "is_target_public: unparseable URL should return 2 (got $rc)"
 fi
 
-# Test: stale cache entry (older than TTL) is NOT used — the function should
-# fall through to a fresh probe. We can't stub gh, so we seed a stale private
-# entry for a slug we KNOW is public (our own aidevops repo), set TTL=1, and
-# verify the result matches the live state rather than the stale cache.
-# If gh is unavailable, this test is skipped (fail-open returns 2, not a bug).
-if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-	_seed_cache "marcusquinn/aidevops" true 9999
-	PRIVACY_CACHE_TTL=1 privacy_is_target_public "git@github.com:marcusquinn/aidevops.git"
-	rc=$?
-	# Live aidevops repo is public → fresh probe should return 0, overriding the stale private entry
-	if [[ "$rc" -eq 0 ]]; then
-		pass "is_target_public: stale cache entry is refreshed via fresh probe"
-	else
-		fail "is_target_public: stale cache should have been refreshed (got $rc)"
-	fi
+# A stale cache must trigger a fresh probe. Stub only the probe transport so
+# GitHub availability and account-level cooldowns cannot change this test.
+cat >"${TMP}/fresh-public-probe" <<'PROBE'
+#!/usr/bin/env bash
+printf 'false\n'
+PROBE
+chmod +x "${TMP}/fresh-public-probe"
+_seed_cache "owner/stale-public" true 9999
+PRIVACY_GH_BIN="${TMP}/fresh-public-probe" PRIVACY_CACHE_TTL=1 privacy_is_target_public "git@github.com:owner/stale-public.git"
+rc=$?
+if [[ "$rc" -eq 0 ]]; then
+	pass "is_target_public: stale cache entry is refreshed via fresh probe"
 else
-	pass "is_target_public: stale cache refresh test skipped (gh unavailable)"
+	fail "is_target_public: stale cache should have been refreshed (got $rc)"
 fi
 
 # Reset cache for hook-dispatch tests
@@ -407,7 +490,7 @@ else
 		PRIVACY_REPOS_CONFIG="$PRIVACY_REPOS_CONFIG" \
 			PRIVACY_CACHE_FILE="$PRIVACY_CACHE_FILE" \
 			printf '%s\n' "$ref_line" |
-			bash "$HOOK" "$remote_name" "$remote_url" >/dev/null 2>&1
+			bash "$HOOK" "$remote_name" "$remote_url" >"${TMP}/hook-output" 2>&1
 		local rc=$?
 		popd >/dev/null || return 99
 		return "$rc"
@@ -494,11 +577,166 @@ else
 	else
 		fail "hook dispatch: branch deletion should exit 0 without scanning (got $rc)"
 	fi
+
+	# GH#34504: an existing feature imports a public entity from the default tip.
+	(
+		cd "$HOOK_REPO" || exit 1
+		git checkout -qb feature "$CLEAN_HEAD"
+		printf 'feature content\n' >feature.txt
+		git add feature.txt
+		git commit -qm 'feature base'
+		git update-ref refs/remotes/origin/main "$LEAK_HEAD"
+		git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+		git merge --no-ff -qm 'merge public main' "$LEAK_HEAD"
+	) || fail "hook dispatch: could not seed default-branch merge"
+	MERGED_HEAD=$(git -C "$HOOK_REPO" rev-parse HEAD)
+	FEATURE_BASE=$(git -C "$HOOK_REPO" rev-parse HEAD^1)
+	_seed_cache "test/public" false 0
+	_run_hook origin "git@github.com:test/public.git" \
+		"refs/heads/feature ${MERGED_HEAD} refs/heads/feature ${FEATURE_BASE}"
+	rc=$?
+	if [[ "$rc" -eq 0 ]]; then
+		pass "hook dispatch: merge imports already-public entity → allowed"
+	else
+		fail "hook dispatch: public default-branch line should be excluded (got $rc)"
+	fi
+
+	(
+		cd "$HOOK_REPO" || exit 1
+		printf 'testorg/local-only new feature entity\n' >>TODO.md
+		git add TODO.md
+		git commit -qm 'new feature entity'
+	) || fail "hook dispatch: could not seed feature entity"
+	FEATURE_LEAK=$(git -C "$HOOK_REPO" rev-parse HEAD)
+	for ENTITY_BASE in "$FEATURE_BASE" "$MERGED_HEAD"; do
+		_run_hook origin "git@github.com:test/public.git" \
+			"refs/heads/feature ${FEATURE_LEAK} refs/heads/feature ${ENTITY_BASE}"
+		rc=$?
+		if [[ "$rc" -eq 1 ]] && grep -q 'TODO.md:2:' "${TMP}/hook-output" &&
+			! grep -q 'TODO.md:1:' "${TMP}/hook-output"; then
+			pass "hook dispatch: own entity blocked, only new line reported (base=$ENTITY_BASE)"
+		else
+			fail "hook dispatch: own entity must block without reporting public line (got $rc)"
+		fi
+	done
+	_run_hook origin "git@github.com:test/public.git" \
+		"refs/heads/new ${MERGED_HEAD} refs/heads/new 0000000000000000000000000000000000000000"
+	rc=$?
+	if [[ "$rc" -eq 0 ]]; then
+		pass "hook dispatch: new clean branch retains merge-base behavior"
+	else
+		fail "hook dispatch: new clean branch should pass (got $rc)"
+	fi
+	_run_hook origin "git@github.com:test/public.git" \
+		"refs/heads/new ${FEATURE_LEAK} refs/heads/new 0000000000000000000000000000000000000000"
+	rc=$?
+	if [[ "$rc" -eq 1 ]] && grep -q 'TODO.md:2:' "${TMP}/hook-output"; then
+		pass "hook dispatch: new branch still blocks own entity"
+	else
+		fail "hook dispatch: new branch with entity should block (got $rc)"
+	fi
+	git -C "$HOOK_REPO" update-ref -d refs/remotes/origin/HEAD
+	git -C "$HOOK_REPO" update-ref refs/tags/origin/main "$FEATURE_LEAK"
+	_run_hook origin "git@github.com:test/public.git" \
+		"refs/heads/feature ${FEATURE_LEAK} refs/heads/feature ${FEATURE_BASE}"
+	rc=$?
+	if [[ "$rc" -eq 1 ]] && grep -q 'TODO.md:2:' "${TMP}/hook-output"; then
+		pass "hook dispatch: local tag cannot impersonate public default tip"
+	else
+		fail "hook dispatch: local tag must not exempt unpublished content (got $rc)"
+	fi
+	git -C "$HOOK_REPO" update-ref -d refs/tags/origin/main
+	(
+		cd "$HOOK_REPO" || exit 1
+		git checkout -qb edge-public "$LEAK_HEAD"
+		printf 'testorg/private-\000mirror\n' >binary.txt
+		printf '%s\n' '-----BEGIN PRI''VATE KEY-----' 'synthetic fixture only' >secret.txt
+		git add binary.txt secret.txt
+		git commit -qm 'public edge fixtures'
+		git update-ref refs/remotes/origin/main HEAD
+	) || fail "hook dispatch: could not seed edge fixtures"
+	EDGE_PUBLIC=$(git -C "$HOOK_REPO" rev-parse HEAD)
+	pushd "$HOOK_REPO" >/dev/null || exit 1
+	EDGE_DIFF=$'diff --git a/TODO.md b/TODO.md\n+++ b/TODO.md\n@@ -0,0 +1 @@\n+- [x] rNNN testorg/private-mirror leak test\ndiff --git "a/z\\tquoted.txt" "b/z\\tquoted.txt"\n+++ "b/z\\tquoted.txt"\n@@ -0,0 +1 @@\n+- [x] rNNN testorg/private-mirror leak test\ndiff --git a/binary.txt b/binary.txt\n+++ b/binary.txt\n@@ -0,0 +1 @@\n+testorg/private-mirror\ndiff --git a/new.txt b/new.txt\n+++ b/new.txt\n@@ -0,0 +1 @@\n+- [x] rNNN testorg/private-mirror leak test'
+	EDGE_OUTPUT=$(_privacy_exclude_public_lines "$EDGE_DIFF" "$EDGE_PUBLIC")
+	rc=$?
+	popd >/dev/null || exit 1
+	if [[ "$rc" -eq 0 ]] && [[ $(printf '%s\n' "$EDGE_OUTPUT" | grep -c '^+-') -eq 2 ]]; then
+		pass "public filter: quoted and missing paths cannot borrow another file's exemption"
+	else
+		fail "public filter: exact public line must be excluded only in its own file"
+	fi
+	if printf '%s\n' "$EDGE_OUTPUT" | grep -q '^+testorg/private-mirror$'; then
+		pass "public filter: NUL bytes cannot create an exact-line match"
+	else
+		fail "public filter: binary public blob must not exempt different text"
+	fi
+	_run_hook origin "git@github.com:test/public.git" \
+		"refs/heads/feature ${EDGE_PUBLIC} refs/heads/feature ${FEATURE_BASE}"
+	rc=$?
+	if [[ "$rc" -eq 1 ]] && grep -q 'secret/private-key material' "${TMP}/hook-output"; then
+		pass "hook dispatch: already-public secret material still blocks"
+	else
+		fail "hook dispatch: public entity exemption must not affect secret scan (got $rc)"
+	fi
+	(
+		cd "$HOOK_REPO" || exit 1
+		printf -- '- [x] rNNN testorg/private-mirror leak test\n' >>TODO.md
+		printf -- '- [x] rNNN testorg/private-mirror leak test\n' >$'z\tquoted.txt'
+		git add TODO.md $'z\tquoted.txt'
+		git commit -qm 'quoted-path feature entity'
+	) || fail "hook dispatch: could not seed quoted-path entity"
+	QUOTED_HEAD=$(git -C "$HOOK_REPO" rev-parse HEAD)
+	_run_hook origin "git@github.com:test/public.git" \
+		"refs/heads/feature ${QUOTED_HEAD} refs/heads/feature ${EDGE_PUBLIC}"
+	rc=$?
+	if [[ "$rc" -eq 1 ]] && grep -q 'private references' "${TMP}/hook-output"; then
+		pass "hook dispatch: candidate filtering preserves quoted-path exemption boundary"
+	else
+		fail "hook dispatch: quoted-path entity must remain blocked after filtering (got $rc)"
+	fi
+	git -C "$HOOK_REPO" update-ref -d refs/remotes/origin/HEAD
+	git -C "$HOOK_REPO" update-ref -d refs/remotes/origin/main
+	_run_hook origin "git@github.com:test/public.git" \
+		"refs/heads/feature ${MERGED_HEAD} refs/heads/feature ${FEATURE_BASE}"
+	rc=$?
+	if [[ "$rc" -eq 1 ]] && grep -q 'TODO.md:1:' "${TMP}/hook-output"; then
+		pass "hook dispatch: unknown default tip retains full entity scan"
+	else
+		fail "hook dispatch: unknown default tip must not exempt entities (got $rc)"
+	fi
 fi
 
 # =============================================================================
 # privacy_scan_text tests (GH#21004 — review feedback on PR #20974)
 # =============================================================================
+
+# Public target paths are narrow exemptions; other scanners remain active.
+for path in \~/Git/public-repo/.agents \~/Git/testorg/public-repo/subdir; do
+	hits=$(privacy_scan_local_paths "$path" 'testorg/public-repo' 2>"${TMP}/allow-log")
+	rc=$?
+	if [[ "$rc" -eq 0 ]] && grep -q '\[privacy-scan\]\[ALLOW\]' "${TMP}/allow-log"; then
+		pass "target repository path allowed with audit log"
+	else
+		fail "target repository path should be allowed (rc=$rc)"
+	fi
+done
+for path in \~/Git/private-repo \~/Git/public-repo-extra \~/Git/public-repo/../private-repo /ho"me"/example/Git/public-repo /Us"ers"/example/Git/public-repo; do
+	hits=$(privacy_scan_local_paths "$path" 'testorg/public-repo')
+	rc=$?
+	if [[ "$rc" -eq 1 && "$hits" == *'[local-path]'* ]]; then
+		pass "non-exempt local path blocked"
+	else
+		fail "non-exempt local path must be blocked (rc=$rc)"
+	fi
+done
+tilde='~'
+redacted=$(privacy_redact_local_paths "${tilde}/Git/public-repo/docs ${tilde}/Git/private-repo" 'testorg/public-repo')
+if [[ "$redacted" == "${tilde}/Git/public-repo/docs [local-path]" ]]; then
+	pass "redaction preserves only target repository path"
+else
+	fail "redaction should preserve target repository path"
+fi
 
 TEXT_SLUGS_FILE="${TMP}/text-slugs.txt"
 printf 'testorg/private-mirror\ntestorg/local-only\n' >"$TEXT_SLUGS_FILE"

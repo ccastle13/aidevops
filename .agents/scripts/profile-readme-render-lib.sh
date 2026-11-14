@@ -132,9 +132,71 @@ _get_top_apps() {
 # Tables — Model Usage Table Rendering
 # =============================================================================
 
+# --- Merge model rows that share a display name ---
+# Dated IDs (claude-opus-4-6-20250610) and their undated alias render with the
+# same cleaned name; summing them avoids duplicate table rows (GH#32744).
+# Session hours stay unknown (null) when any merged row lacks them; a session
+# that used both IDs is counted once per ID.
+_merge_model_rows_by_display_name() {
+	local model_json="$1"
+	local merged
+	merged=$(printf '%s' "$model_json" | jq -c --arg array_type "${PROFILE_JSON_ARRAY_TYPE:-array}" '
+		if type != $array_type then . else
+			map(. + {model: ((.model // "") | sub("-[0-9]{8}$"; ""))})
+			| group_by(.model)
+			| map(
+				if length == 1 then .[0] else
+					reduce .[] as $row (.[0] + {requests: 0, input_tokens: 0, output_tokens: 0,
+						cache_read_tokens: 0, cache_write_tokens: 0, session_count: 0, session_hours: 0, cost_total: 0};
+						.requests += ($row.requests // 0)
+						| .input_tokens += ($row.input_tokens // 0)
+						| .output_tokens += ($row.output_tokens // 0)
+						| .cache_read_tokens += ($row.cache_read_tokens // 0)
+						| .cache_write_tokens += ($row.cache_write_tokens // 0)
+						| .session_count += ($row.session_count // 0)
+						| .cost_total += ($row.cost_total // 0)
+						| .session_hours = (if .session_hours == null or $row.session_hours == null
+							then null else .session_hours + $row.session_hours end))
+				end)
+		end' 2>/dev/null) || merged=""
+	if [[ -n "$merged" ]]; then
+		printf '%s\n' "$merged"
+	else
+		printf '%s\n' "$model_json"
+	fi
+	return 0
+}
+
+# --- Render one model usage table row ---
+# Hit rate is the share of all prompt tokens served from cache. Cache writes are
+# uncached prompt tokens (Anthropic reports them separately from input), so
+# omitting them overstated Claude rows as 100% (GH#32744).
+_render_model_usage_row() {
+	local row="$1"
+	local model requests input output cache cache_write cache_hit_pct session_count session_hours
+	IFS=$'\t' read -r model requests input output cache cache_write cache_hit_pct session_count session_hours < <(
+		echo "$row" | jq -r '
+			((.input_tokens // 0) + (.cache_write_tokens // 0) + (.cache_read_tokens // 0)) as $prompt
+			| [.model, (.requests // 0), (.input_tokens // 0), (.output_tokens // 0), (.cache_read_tokens // 0),
+				(.cache_write_tokens // 0),
+				(if $prompt > 0 then (((.cache_read_tokens // 0) / $prompt * 1000 | round) / 10) else 0 end),
+				(.session_count // 0), (.session_hours // "unknown")]
+			| @tsv'
+	)
+	local f_session_hours="—"
+	if [[ "$session_hours" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+		f_session_hours="$(_format_number "$(_format_hours "$session_hours")")h"
+	fi
+	printf '| %s | %s | %s | %s | %s | %s | %s%% | %s | %s |' \
+		"$(_clean_model_name "$model")" "$(_format_number "$requests")" "$(_format_tokens "$input")" \
+		"$(_format_tokens "$output")" "$(_format_tokens "$cache")" "$(_format_tokens "$cache_write")" \
+		"$(_format_hours "$cache_hit_pct")" "$(_format_number "$session_count")" "$f_session_hours"
+	return 0
+}
+
 # --- Render a model usage table ---
 # Usage: _render_model_usage_table <heading> <model_json> <token_totals_json>
-# Outputs a markdown table with model usage stats, savings calculations, and footer.
+# Outputs a markdown table with model usage, cache efficiency, and session totals.
 _render_model_usage_table() {
 	local heading="$1"
 	local model_json="$2"
@@ -142,72 +204,47 @@ _render_model_usage_table() {
 
 	# Skip entirely if no model data
 	local model_count
-	model_count=$(echo "$model_json" | jq -r 'if type == "array" then [.[] | select(.cost_total >= 0.05)] | length else 0 end' 2>/dev/null)
+	model_count=$(echo "$model_json" | jq -r 'if type == "array" then [.[] | select((.requests // 0) > 0)] | length else 0 end' 2>/dev/null)
 	if [[ "${model_count:-0}" == "0" ]]; then
 		return 0
 	fi
+	model_json=$(_merge_model_rows_by_display_name "$model_json")
 
-	local total_requests=0 total_input=0 total_output=0 total_cache=0 total_cost=0
-	local total_cache_savings="0" total_model_savings="0"
-	local model_rows=""
+	local total_sessions=0
+	local model_rows="" row
+	total_sessions=$(echo "$model_json" | jq -r '[.[] | .total_session_count // 0] | max // 0' 2>/dev/null || printf '0\n')
+	if [[ "$total_sessions" -eq 0 ]]; then
+		total_sessions=$(echo "$model_json" | jq -r '[.[] | .session_count // 0] | add // 0' 2>/dev/null || printf '0\n')
+	fi
 
 	while IFS= read -r row; do
-		local model requests input output cache cost
-		model=$(echo "$row" | jq -r '.model')
-		requests=$(echo "$row" | jq -r '.requests')
-		input=$(echo "$row" | jq -r '.input_tokens')
-		output=$(echo "$row" | jq -r '.output_tokens')
-		cache=$(echo "$row" | jq -r '.cache_read_tokens')
-		cost=$(echo "$row" | jq -r '.cost_total')
-
-		total_requests=$((total_requests + requests))
-		total_input=$((total_input + input))
-		total_output=$((total_output + output))
-		total_cache=$((total_cache + cache))
-		total_cost=$(echo "$total_cost + $cost" | bc)
-
-		# Compute per-row savings (cache + model routing vs all-Opus baseline)
-		local savings row_cache_savings row_model_savings
-		savings=$(_compute_model_row_savings "$model" "$input" "$output" "$cache")
-		row_cache_savings=$(echo "$savings" | cut -d'|' -f1)
-		row_model_savings=$(echo "$savings" | cut -d'|' -f2)
-		total_cache_savings=$(echo "$total_cache_savings + $row_cache_savings" | bc)
-		total_model_savings=$(echo "$total_model_savings + $row_model_savings" | bc)
-
-		local clean_model
-		clean_model=$(_clean_model_name "$model")
-		local f_requests f_input f_output f_cache
-		f_requests=$(_format_number "$requests")
-		f_input=$(_format_tokens "$input")
-		f_output=$(_format_tokens "$output")
-		f_cache=$(_format_tokens "$cache")
-
-		# Format cost and both savings with commas and 2 decimal places
-		local f_cost f_csavings f_msavings
-		f_cost=$(_format_cost "$cost")
-		f_csavings=$(_format_cost "$row_cache_savings")
-		f_msavings=$(_format_cost "$row_model_savings")
-
-		model_rows="${model_rows}| ${clean_model} | ${f_requests} | ${f_input} | ${f_output} | ${f_cache} | \$${f_cost} | \$${f_csavings} | \$${f_msavings} |
+		model_rows="${model_rows}$(_render_model_usage_row "$row")
 "
-	done < <(echo "$model_json" | jq -c '.[] | select(.cost_total >= 0.05)')
+	done < <(echo "$model_json" | jq -c 'sort_by(-(.requests // 0)) | .[] | select((.requests // 0) > 0)')
 
-	# Format totals
-	local f_total_req f_total_in f_total_out f_total_cache
-	local f_total_csavings f_total_msavings
+	# Totals over the same rendered rows; hours stay unknown if any row lacks them.
+	local total_requests total_input total_output total_cache total_cache_write total_session_hours
+	IFS=$'\t' read -r total_requests total_input total_output total_cache total_cache_write total_session_hours < <(
+		echo "$model_json" | jq -r '[.[] | select((.requests // 0) > 0)]
+			| [(map(.requests // 0) | add), (map(.input_tokens // 0) | add), (map(.output_tokens // 0) | add),
+				(map(.cache_read_tokens // 0) | add), (map(.cache_write_tokens // 0) | add),
+				(if all(.[]; (.session_hours | type) == "number" and .session_hours >= 0)
+					then (map(.session_hours) | add) else "unknown" end)]
+			| @tsv'
+	)
+
+	local f_total_req f_total_in f_total_out f_total_cache f_total_cache_write f_total_sessions f_total_session_hours
 	f_total_req=$(_format_number "$total_requests")
 	f_total_in=$(_format_tokens "$total_input")
 	f_total_out=$(_format_tokens "$total_output")
 	f_total_cache=$(_format_tokens "$total_cache")
-	local f_total_cost
-	f_total_cost=$(_format_cost "$total_cost")
-	f_total_csavings=$(_format_cost "$total_cache_savings")
-	f_total_msavings=$(_format_cost "$total_model_savings")
-
-	# Combined savings for footer
-	local combined_savings f_combined_savings
-	combined_savings=$(echo "$total_cache_savings + $total_model_savings" | bc)
-	f_combined_savings=$(_format_cost "$combined_savings")
+	f_total_cache_write=$(_format_tokens "$total_cache_write")
+	f_total_sessions=$(_format_number "$total_sessions")
+	if [[ "$total_session_hours" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+		f_total_session_hours="$(_format_number "$(_format_hours "$total_session_hours")")h"
+	else
+		f_total_session_hours="—"
+	fi
 
 	# Token totals for footer
 	local all_tokens cache_pct
@@ -220,15 +257,11 @@ _render_model_usage_table() {
 
 ## ${heading}
 
-| Model | Requests | Input | Output | Cache read | API Cost | Cache savings | Model savings |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-${model_rows}| **Total** | **${f_total_req}** | **${f_total_in}** | **${f_total_out}** | **${f_total_cache}** | **\$${f_total_cost}** | **\$${f_total_csavings}** | **\$${f_total_msavings}** |
+| Model | Requests | Input | Output | Cache read | Cache write | Cache Hit-Rate % | Session Count | Session Hours |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+${model_rows}| **Total** | **${f_total_req}** | **${f_total_in}** | **${f_total_out}** | **${f_total_cache}** | **${f_total_cache_write}** | **${cache_pct}%** | **${f_total_sessions}** | **${f_total_session_hours}** |
 
 _${f_all_tokens} total tokens processed. ${cache_pct}% cache hit rate._
-
-_\$${f_combined_savings} total saved (\$${f_total_csavings} caching + \$${f_total_msavings} model routing vs all-Opus)._
-
-_Model savings are modest because ~${cache_pct}% of tokens are cache reads, where price differences between models are small._
 EOF
 
 	return 0
@@ -327,11 +360,15 @@ EOF
 }
 
 # --- Generate the Work with AI markdown table ---
-# Usage: _generate_work_with_ai_table <screen_json> <day_json> <week_json> <month_json> <year_json>
+# Usage: _generate_work_with_ai_table <screen_json> <day_json> <week_json> <month_json> <year_json> [input_json]
 _generate_screen_time_vars() {
 	local screen_json="$1"
 	local values screen_today screen_week screen_month screen_year screen_status year_estimated screen_source
-	if ! values=$(printf '%s' "$screen_json" | jq -er --arg unavailable "$PROFILE_STATUS_UNAVAILABLE" '
+	local screen_detail screen_note none="none"
+	# screen_detail names why periods are unavailable (e.g. no sampler samples
+	# yet); screen_note dates the start of Linux input sampling inside the
+	# 28-day window so partial early periods are not read as low usage.
+	if ! values=$(printf '%s' "$screen_json" | jq -er --arg unavailable "$PROFILE_STATUS_UNAVAILABLE" --arg none "$none" --arg unknown unknown '
 		if type != "object" then error("screen payload must be an object") else . end |
 		[
 			(if .today_hours == null then $unavailable else ((.today_hours * 10 | round / 10 | tostring) + "h") end),
@@ -340,22 +377,70 @@ _generate_screen_time_vars() {
 			(if .year_hours == null then $unavailable else ((.year_hours | round | tostring) + "h") end),
 			([.periods?.day?.status // $unavailable, .periods?.week?.status // $unavailable, .periods?.month?.status // $unavailable, .periods?.year?.status // $unavailable] | unique | join(", ")),
 			(.periods?.year?.estimated // false),
-			(.periods?.month?.source // $unavailable)
+			(.periods?.month?.source // $unavailable),
+			(.periods | if type == "object" then [.[] | objects | select(.status == $unavailable) | .reason | strings | select(. != $unknown)] else [] end |
+				unique | if length > 0 then " (" + join(", ") + ")" else $none end),
+			(.periods?.month? // {} | if (.observed_since_epoch | type) == "number" and .observed_since_epoch > (.period_start_epoch // 0)
+				then " Input sampling began " + (.observed_since_epoch | floor | strflocaltime("%Y-%m-%d")) +
+					((.coverage_days | numbers | " (" + tostring + " of 28 days sampled)") // "") +
+					"; earlier days are not counted."
+				else $none end)
 		] | @tsv
 	'); then
 		echo "Warning: screen-time payload is invalid; rendering unavailable values" >&2
-		printf -v values '%s\t%s\t%s\t%s\t%s\tfalse\t%s' \
+		printf -v values '%s\t%s\t%s\t%s\t%s\tfalse\t%s\t%s\t%s' \
 			"$PROFILE_STATUS_UNAVAILABLE" "$PROFILE_STATUS_UNAVAILABLE" "$PROFILE_STATUS_UNAVAILABLE" \
-			"$PROFILE_STATUS_UNAVAILABLE" "$PROFILE_STATUS_UNAVAILABLE" "$PROFILE_STATUS_UNAVAILABLE"
+			"$PROFILE_STATUS_UNAVAILABLE" "$PROFILE_STATUS_UNAVAILABLE" "$PROFILE_STATUS_UNAVAILABLE" "$none" "$none"
 	fi
-	IFS=$'\t' read -r screen_today screen_week screen_month screen_year screen_status year_estimated screen_source <<<"$values"
+	IFS=$'\t' read -r screen_today screen_week screen_month screen_year screen_status year_estimated screen_source screen_detail screen_note <<<"$values"
+	[[ "$screen_detail" == "$none" ]] && screen_detail=""
+	[[ "$screen_note" == "$none" ]] && screen_note=""
 	local year_prefix="" year_suffix=""
 	if [[ "$year_estimated" == "$PROFILE_BOOLEAN_TRUE" ]]; then
 		year_prefix="~"
 		year_suffix="*"
 	fi
-	printf 'screen_today=%q screen_week=%q screen_month=%q screen_year=%q screen_status=%q screen_source=%q year_prefix=%q year_suffix=%q\n' \
-		"$screen_today" "$screen_week" "$screen_month" "$screen_year" "$screen_status" "$screen_source" "$year_prefix" "$year_suffix"
+	printf 'screen_today=%q screen_week=%q screen_month=%q screen_year=%q screen_status=%q screen_source=%q year_prefix=%q year_suffix=%q screen_detail=%q screen_note=%q\n' \
+		"$screen_today" "$screen_week" "$screen_month" "$screen_year" "$screen_status" "$screen_source" "$year_prefix" "$year_suffix" \
+		"$screen_detail" "$screen_note"
+	return 0
+}
+
+# --- macOS input-activity row and footnote (same 5-minute idle rule as Linux) ---
+# Usage: _generate_input_activity_vars <input_json> <label>
+# Emits input_row and input_note assignments for eval.
+_generate_input_activity_vars() {
+	local input_json="$1"
+	local label="$2"
+	local screen_today screen_week screen_month screen_year screen_status screen_source year_prefix year_suffix screen_detail screen_note
+	eval "$(_generate_screen_time_vars "$input_json")"
+	local input_row input_note estimate_note=""
+	[[ -n "$year_suffix" ]] && estimate_note=" *365-day estimate uses sampled calendar coverage."
+	input_row="| ${label} | ${screen_today} | ${screen_week} | ${screen_month} | ${year_prefix}${screen_year}${year_suffix} |"
+	input_note="_Input activity from ${screen_source} (time from each keyboard, mouse or trackpad input until 5 idle minutes); collection status: ${screen_status}${screen_detail}.${screen_note}${estimate_note}_"
+	printf 'input_row=%q input_note=%q\n' "$input_row" "$input_note"
+	return 0
+}
+
+# --- Describe which Linux input sources the latest sample could read ---
+# Usage: _input_evidence_note <screen_json>
+# Outputs a sentence (leading space) or nothing when evidence is absent.
+_input_evidence_note() {
+	local screen_json="$1"
+	printf '%s' "$screen_json" | jq -r '
+		[(.evidence // []) | arrays | .[]] as $kinds |
+		if ($kinds | length) == 0 then ""
+		else
+			($kinds | any(. == "gnome-idle-monitor" or . == "screensaver-idle" or . == "xprintidle" or . == "logind-idle-hint" or . == "fixture-desktop-idle")) as $desktop |
+			($kinds | any(. == "tty-atime")) as $terminal |
+			" Latest sample measured: " + (
+				if $desktop and $terminal then "desktop and terminal input"
+				elif $desktop then "desktop input"
+				elif ($kinds | any(. == "graphical-idle-unavailable")) then "terminal input only; a desktop session was present but its idle time was unreadable, so desktop work is not counted"
+				elif ($kinds | any(. == "locked")) then "no input (session locked)"
+				elif $terminal then "terminal input only; no desktop session on this host"
+				else "no readable input source" end) + "."
+		end' 2>/dev/null || true
 	return 0
 }
 
@@ -411,8 +496,10 @@ _generate_work_with_ai_table() {
 	local week_json="$3"
 	local month_json="$4"
 	local year_json="$5"
+	# Optional macOS input-activity payload (screen-time-helper.sh input-stats).
+	local input_json="${6:-}"
 
-	local screen_today screen_week screen_month screen_year screen_status screen_source year_prefix year_suffix
+	local screen_today screen_week screen_month screen_year screen_status screen_source year_prefix year_suffix screen_detail screen_note
 	eval "$(_generate_screen_time_vars "$screen_json")"
 
 	# Extract and format session time variables for all periods
@@ -435,20 +522,35 @@ _generate_work_with_ai_table() {
 	eval "$(_period_unavailable_assignments "$month_json" month_human month_interactive_machine month_worker_human month_worker f_month_total f_month_int f_month_wrk)"
 	eval "$(_period_unavailable_assignments "$year_json" year_human year_interactive_machine year_worker_human year_worker f_year_total f_year_int f_year_wrk)"
 
-	# Determine platform label for screen time row
-	local os_type screen_label
+	# Platform labels: macOS screen time is display-on time; Linux has no display
+	# store, so its row is input activity. A macOS input-activity row uses the
+	# Linux rule so the two platforms can be compared like for like.
+	local os_type screen_label note_label="Screen time" input_row="" input_note="" evidence_note=""
 	os_type="$(uname -s)"
 	case "$os_type" in
 	Darwin)
 		screen_label="Screen time (Mac)"
+		if [[ -n "$input_json" ]]; then
+			eval "$(_generate_input_activity_vars "$input_json" "Input activity (Mac)")"
+		fi
 		;;
 	Linux)
-		screen_label="Screen time (Linux)"
+		screen_label="Input activity (Linux)"
+		note_label="Input activity"
+		evidence_note=$(_input_evidence_note "$screen_json")
 		;;
 	*)
 		screen_label="Screen time"
 		;;
 	esac
+	local screen_rows="| ${screen_label} | ${screen_today} | ${screen_week} | ${screen_month} | ${year_prefix}${screen_year}${year_suffix} |"
+	local year_estimate_note=""
+	[[ -n "$year_suffix" ]] && year_estimate_note=" *365-day estimate uses observed calendar coverage."
+	local screen_notes="_${note_label} from ${screen_source}; collection status: ${screen_status}${screen_detail}.${screen_note}${evidence_note}${year_estimate_note}_"
+	if [[ -n "$input_row" ]]; then
+		screen_rows+=$'\n'"${input_row}"
+		screen_notes+=$'\n\n'"${input_note}"
+	fi
 
 	local session_coverage_note=""
 	local session_observed_days
@@ -463,7 +565,7 @@ _generate_work_with_ai_table() {
 
 | Metric | Yesterday | Prior 7 Days | Prior 28 Days | Prior 365 Days |
 | --- | ---: | ---: | ---: | ---: |
-| ${screen_label} | ${screen_today} | ${screen_week} | ${screen_month} | ${year_prefix}${screen_year}${year_suffix} |
+${screen_rows}
 | Interactive human attention | $(_format_work_hour_cell "$day_human") | $(_format_work_hour_cell "$week_human") | $(_format_work_hour_cell "$month_human") | $(_format_work_hour_cell "$year_human") |
 | Interactive AI generation | $(_format_work_hour_cell "$day_interactive_machine") | $(_format_work_hour_cell "$week_interactive_machine") | $(_format_work_hour_cell "$month_interactive_machine") | $(_format_work_hour_cell "$year_interactive_machine") |
 | Worker-classified human attention | $(_format_work_hour_cell "$day_worker_human") | $(_format_work_hour_cell "$week_worker_human") | $(_format_work_hour_cell "$month_worker_human") | $(_format_work_hour_cell "$year_worker_human") |
@@ -472,7 +574,7 @@ _generate_work_with_ai_table() {
 | Interactive sessions | ${f_day_int} | ${f_week_int} | ${f_month_int} | ${f_year_int} |
 | Worker sessions | ${f_day_wrk} | ${f_week_wrk} | ${f_month_wrk} | ${f_year_wrk} |
 
-_Screen time from ${screen_source}; collection status: ${screen_status}.$([ -n "$year_suffix" ] && echo " *365-day estimate uses observed calendar coverage.")_
+${screen_notes}
 
 _Periods are completed local calendar days ending at midnight; today is excluded._
 
@@ -484,8 +586,12 @@ EOF
 # --- Generate the stats markdown ---
 cmd_generate() {
 	# Gather all data
-	local screen_json
+	local screen_json input_json=""
 	screen_json=$(_get_screen_time)
+	# Linux screen time already is input activity; macOS adds a matching row.
+	if [[ "$(uname -s)" == "Darwin" ]]; then
+		input_json=$(_get_input_activity)
+	fi
 
 	local session_periods day_json week_json month_json year_json
 	session_periods=$(_get_profile_session_times)
@@ -525,7 +631,7 @@ EOF
 		return 0
 	fi
 
-	_generate_work_with_ai_table "$screen_json" "$day_json" "$week_json" "$month_json" "$year_json"
+	_generate_work_with_ai_table "$screen_json" "$day_json" "$week_json" "$month_json" "$year_json" "$input_json"
 	_render_model_usage_table "AI Model Usage (last 30 days)" "$model_json_30d" "$token_totals_30d"
 	_render_model_usage_table "AI Model Usage (all time)" "$model_json_all" "$token_totals_all"
 	_generate_top_apps_section

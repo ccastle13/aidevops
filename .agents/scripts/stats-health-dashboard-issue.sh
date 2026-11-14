@@ -39,6 +39,63 @@ _HEALTH_OPERATOR_LABEL_PREFIX="operator:"
 # --- Functions ---
 
 #######################################
+# Provision labels needed by a legacy health dashboard without changing existing
+# repository label metadata. Returns non-zero when inventory or creation fails.
+# Arguments:
+#   $1 - repo slug
+#   $2 - runner user
+#   $3 - runner role (supervisor|contributor)
+#   $4 - canonical operator identity
+#######################################
+_ensure_health_dashboard_labels() {
+	local repo_slug="$1"
+	local runner_user="$2"
+	local runner_role="$3"
+	local canonical_identity="$4"
+	local operator_label="${_HEALTH_OPERATOR_LABEL_PREFIX}${canonical_identity}"
+	local role_label role_label_color role_label_desc
+	if [[ "$runner_role" == "$_ROLE_SUPERVISOR" ]]; then
+		role_label="$_ROLE_SUPERVISOR"
+		role_label_color="1D76DB"
+		role_label_desc="Supervisor health dashboard"
+	else
+		role_label="$_ROLE_CONTRIBUTOR"
+		role_label_color="A2EEEF"
+		role_label_desc="Contributor health dashboard"
+	fi
+	local labels_json rc=0
+
+	labels_json=$(gh label list --repo "$repo_slug" --limit 1000 --json name 2>/dev/null) || rc=$?
+	if [[ $rc -ne 0 || -z "$labels_json" ]]; then
+		echo "[stats] Health issue: label provisioning inventory failed for ${repo_slug} (rc=${rc})" \
+			>>"${LOGFILE:-/dev/null}"
+		return 1
+	fi
+
+	local label_name label_color label_description
+	while IFS='|' read -r label_name label_color label_description; do
+		if printf '%s' "$labels_json" | jq -e --arg name "$label_name" \
+			'any(.[]; .name == $name)' >/dev/null 2>&1; then
+			continue
+		fi
+		if ! gh label create "$label_name" --repo "$repo_slug" --color "$label_color" \
+			--description "$label_description" 2>/dev/null; then
+			echo "[stats] Health issue: failed to provision label ${label_name} in ${repo_slug}" \
+				>>"${LOGFILE:-/dev/null}"
+			return 1
+		fi
+	done <<EOF
+${_HEALTH_PERSISTENT_LABEL}|FBCA04|Persistent issue — do not close
+source:health-dashboard|C2E0C6|Auto-created by stats-functions.sh health dashboard
+${role_label}|${role_label_color}|${role_label_desc}
+${runner_user}|0E8A16|Health dashboard runner: ${runner_user}
+${operator_label}|0E8A16|Canonical dashboard operator: ${canonical_identity}
+origin:worker|C5DEF5|Created by a headless worker
+EOF
+	return 0
+}
+
+#######################################
 # List open health issues matching a role + runner_user pair, filtered
 # by title-prefix. Helper centralises the jq filter so `_find_health_issue`
 # and `_periodic_health_issue_dedup` share one query definition.
@@ -144,6 +201,12 @@ _normalize_health_issue_labels() {
 		opposite_role_label="$_ROLE_CONTRIBUTOR"
 	fi
 	local canonical_label="${_HEALTH_OPERATOR_LABEL_PREFIX}${canonical_identity}"
+	if ! _ensure_health_dashboard_labels "$repo_slug" "$runner_user" \
+		"$runner_role" "$canonical_identity"; then
+		echo "[stats] Health issue: failed to normalize labels for #${issue_number} in ${repo_slug}" \
+			>>"${LOGFILE:-/dev/null}"
+		return 0
+	fi
 
 	local -a edit_args=()
 	local expected_label
@@ -167,6 +230,7 @@ _normalize_health_issue_labels() {
 			or . == "origin:interactive"
 			or . == "origin:worker-takeover"
 			or startswith("status:")
+			or startswith("tier:")
 		)')
 
 	[[ ${#edit_args[@]} -eq 0 ]] && return 0
@@ -524,9 +588,10 @@ _create_health_issue() {
 	gh label create "$_HEALTH_PERSISTENT_LABEL" --repo "$repo_slug" --color "FBCA04" \
 		--description "Persistent issue — do not close" --force 2>/dev/null || true
 
-	local aliases_csv
-	aliases_csv=$(printf '%s\n' "$identity_aliases" | paste -sd ', ' -)
-	local health_body="Live ${runner_role} status for **${runner_user}**. Canonical operator: **${canonical_identity}**. Identity aliases: ${aliases_csv}. Updated each pulse. Pin this issue for at-a-glance monitoring."
+	# Aliases are dedup metadata and may include local OS account names; keep
+	# them out of the public body (GH#32730).
+	: "$identity_aliases"
+	local health_body="Live ${runner_role} status for **${runner_user}** (canonical operator: **${canonical_identity}**). Updated by the stats process; this issue is a status surface, not a task."
 	local sig_footer=""
 	sig_footer=$("${HOME}/.aidevops/agents/scripts/gh-signature-helper.sh" footer --body "$health_body" 2>/dev/null || true)
 	health_body="${health_body}${sig_footer}"
@@ -893,5 +958,250 @@ _unpin_health_issue() {
 			}
 		}" >/dev/null 2>&1 || true
 
+	return 0
+}
+
+#######################################
+# Convert an ISO8601 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ) to epoch seconds.
+# Output: epoch, or empty on parse failure
+#######################################
+_health_iso_to_epoch() {
+	local iso="$1"
+	[[ "$iso" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 0
+	if [[ "$OSTYPE" == darwin* ]]; then
+		date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$iso" +%s 2>/dev/null || true
+	else
+		date -u -d "$iso" +%s 2>/dev/null || true
+	fi
+	return 0
+}
+
+#######################################
+# Select open health dashboards whose operator has stopped refreshing them.
+#
+# Pure filter over `gh issue list --json number,body,labels` output. A
+# dashboard is stale when its `last_refresh:` freshness marker is older than
+# the threshold. Dashboards of the current canonical operator, and dashboards
+# without a parseable marker, are never selected (fail-safe).
+#
+# Arguments:
+#   $1 - issues JSON array
+#   $2 - current canonical identity
+#   $3 - now epoch
+#   $4 - threshold seconds
+# Output: "number|last_refresh" lines
+#######################################
+_select_stale_operator_dashboards() {
+	local issues_json="$1"
+	local canonical_identity="$2"
+	local now_epoch="$3"
+	local threshold="$4"
+	local own_label="${_HEALTH_OPERATOR_LABEL_PREFIX}${canonical_identity}"
+	local number last_refresh refreshed_epoch
+
+	while IFS='|' read -r number last_refresh; do
+		[[ "$number" =~ ^[0-9]+$ ]] || continue
+		refreshed_epoch=$(_health_iso_to_epoch "$last_refresh")
+		[[ "$refreshed_epoch" =~ ^[0-9]+$ ]] || continue
+		[[ $((now_epoch - refreshed_epoch)) -gt "$threshold" ]] || continue
+		printf '%s|%s\n' "$number" "$last_refresh"
+	done < <(printf '%s' "$issues_json" | jq -r --arg own "$own_label" '
+		.[]
+		| select(((.labels // []) | map(.name) | index($own)) | not)
+		| ((.body // "") | capture("last_refresh: (?<ts>[0-9T:Z-]+)")? | .ts) as $ts
+		| select($ts != null)
+		| "\(.number)|\($ts)"
+	' 2>/dev/null)
+	return 0
+}
+
+#######################################
+# Close health dashboards of operators who stopped refreshing them.
+#
+# Persistent dashboards from inactive operators keep publishing stale queue
+# counts to collaborators and the public indefinitely. The supervisor closes
+# them after two weeks of silence (dashboards refresh at least hourly while the
+# operator's stats process runs); the operator's own stats process recreates a
+# fresh dashboard automatically if it runs again, because cached lookups drop
+# CLOSED issues. The persistent label is stripped first so the issue-sync
+# "Reopen Persistent Issues" workflow does not revive them.
+#
+# Arguments:
+#   $1 - repo slug
+#   $2 - current canonical identity (its own dashboards are never touched)
+# Env:
+#   HEALTH_STALE_DASHBOARD_SECONDS  - staleness threshold (default 1209600,
+#                                     minimum 604800)
+#   HEALTH_STALE_DASHBOARD_INTERVAL - seconds between scans (default 86400)
+# Returns: 0 always (best-effort)
+#######################################
+_archive_stale_operator_dashboards() {
+	local repo_slug="$1"
+	local canonical_identity="$2"
+	[[ -n "$repo_slug" && -n "$canonical_identity" ]] || return 0
+
+	local threshold="${HEALTH_STALE_DASHBOARD_SECONDS:-1209600}"
+	local interval="${HEALTH_STALE_DASHBOARD_INTERVAL:-86400}"
+	[[ "$threshold" =~ ^[0-9]+$ && "$threshold" -ge 604800 ]] || threshold=1209600
+	[[ "$interval" =~ ^[0-9]+$ ]] || interval=86400
+
+	local state_file="${HOME}/.aidevops/logs/health-stale-archive-last-scan-${repo_slug//\//-}"
+	if [[ -f "$state_file" ]]; then
+		local last_scan now_check
+		last_scan=$(_file_mtime_epoch "$state_file")
+		now_check=$(date +%s)
+		[[ $((now_check - last_scan)) -lt "$interval" ]] && return 0
+	fi
+
+	local issues_json rc=0
+	issues_json=$(gh_issue_list --repo "$repo_slug" \
+		--label "$_HEALTH_PERSISTENT_LABEL" --label "source:health-dashboard" \
+		--state open --json number,body,labels --limit 100 2>/dev/null) || rc=$?
+	if [[ $rc -ne 0 ]]; then
+		echo "[stats] Health issue: stale dashboard scan failed for ${repo_slug} (rc=${rc}) — will retry" >>"${LOGFILE:-/dev/null}"
+		return 0
+	fi
+
+	local now_epoch number last_refresh threshold_days=$((threshold / 86400))
+	now_epoch=$(date +%s)
+	while IFS='|' read -r number last_refresh; do
+		[[ -n "$number" ]] || continue
+		_unpin_health_issue "$number" "$repo_slug"
+		_strip_persistent_label_before_close "$number" "$repo_slug"
+		gh issue close "$number" --repo "$repo_slug" --reason "not planned" \
+			--comment "Archiving this health dashboard: its operator has not refreshed it since ${last_refresh} (more than ${threshold_days} days), so its figures no longer describe the repository. If that operator's stats process runs again it creates a fresh dashboard automatically." \
+			>/dev/null 2>&1 || true
+		echo "[stats] Health issue: archived stale dashboard #${number} in ${repo_slug} (last_refresh=${last_refresh})" >>"${LOGFILE:-/dev/null}"
+	done < <(_select_stale_operator_dashboards "${issues_json:-[]}" "$canonical_identity" "$now_epoch" "$threshold")
+
+	mkdir -p "${state_file%/*}" 2>/dev/null || true
+	touch "$state_file" 2>/dev/null || true
+	return 0
+}
+
+#######################################
+# One sanitized line from the latest maintainer-side decision comment's
+# "Recommended path" (worker-discipline.md decision-ready comment). Only
+# OWNER/MEMBER/COLLABORATOR comments count; output keeps plain words and
+# punctuation only (no URLs, markup or pipes), at most 160 characters.
+# Args: $1=repo slug, $2=issue number
+# Output: one line (empty when no decision comment exists)
+#######################################
+_health_hold_recommendation() {
+	local repo_slug="$1" issue_number="$2" comments=""
+	[[ "$repo_slug" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$issue_number" =~ ^[1-9][0-9]*$ ]] || return 0
+	comments=$(gh api "repos/${repo_slug}/issues/${issue_number}/comments?per_page=100" --paginate --slurp 2>/dev/null) || return 0
+	jq -r '[.[][] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR")
+		| (.body // "") | capture("(?i)recommended path\\W*(?<t>[^\\n]*)")? | .t] | last // ""
+		| gsub("https?://[^ ]*"; "") | gsub("[^A-Za-z0-9 .,;:()/_-]"; "") | .[0:160]' <<<"$comments" 2>/dev/null || true
+	return 0
+}
+
+#######################################
+# Aged maintainer-decision holds for the supervisor health issue: every open
+# `hold-for-review` issue older than HEALTH_HOLD_AGE_DAYS (default 3), oldest
+# first, bounded to 10 rows. Read-only: never removes a hold, approves or
+# dispatches. Empty output (no section) when nothing is aged.
+# Args: $1=repo slug
+# Output: markdown table (or nothing)
+#######################################
+_health_aged_hold_section() {
+	local repo_slug="$1"
+	local age_days="${HEALTH_HOLD_AGE_DAYS:-3}"
+	local max_rows=10 issues_json="" rows="" total=0 number age url title rec
+	[[ "$repo_slug" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || return 0
+	[[ "$age_days" =~ ^[0-9]+$ ]] || age_days=3
+	issues_json=$(gh api "repos/${repo_slug}/issues?labels=hold-for-review&state=open&per_page=100" \
+		--paginate --slurp 2>/dev/null) || {
+		printf 'Maintainer decision holds are unavailable: the issue fetch failed this cycle. The next pulse will retry.\n'
+		return 0
+	}
+	rows=$(jq -r --argjson days "$age_days" '
+		[.[][] | select(has("pull_request") | not)
+			| {number, title, url: .html_url, createdAt: .created_at}
+			| select(.url | test("^https://github\\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/issues/[0-9]+$"))
+			| .created_epoch = (.createdAt | fromdateiso8601)
+			| select((now - .created_epoch) > ($days * 86400))
+			| {number, url, title: ((.title // "") | gsub("[^A-Za-z0-9 .,:()/_#-]"; "") | .[0:70] | if . == "" then "untitled" else . end),
+				created_epoch, age: (((now - .created_epoch) / 86400) | floor)}]
+		| sort_by(.created_epoch)
+		| ., length' <<<"${issues_json:-[]}" 2>/dev/null) || return 0
+	total=$(jq -s '.[1] // 0' <<<"$rows" 2>/dev/null) || return 0
+	[[ "$total" =~ ^[0-9]+$ && "$total" -gt 0 ]] || return 0
+	printf 'Maintainer decision holds older than %s days (%s). Surfacing grants nothing: the hold stays until a maintainer decides.\n\n' "$age_days" "$total"
+	printf '| Age | Issue | Recommended path | URL |\n| --- | --- | --- | --- |\n'
+	while IFS=$'\t' read -r number age title url; do
+		[[ "$number" =~ ^[1-9][0-9]*$ ]] || continue
+		rec=$(_health_hold_recommendation "$repo_slug" "$number")
+		printf '| %sd | #%s %s | %s | %s |\n' "$age" "$number" "$title" "${rec:-No decision comment yet}" "$url"
+	done < <(jq -rs '.[0][0:10][] | [.number, .age, .title, .url] | @tsv' <<<"$rows" 2>/dev/null)
+	[[ "$total" -le "$max_rows" ]] || printf '\n_%s more not shown._\n' "$((total - max_rows))"
+	return 0
+}
+
+#######################################
+# Read-only, budget-limited snapshot of aged blocked draft checkpoints.
+# Search bounds candidates to 100; only trusted attention and release comments
+# contribute metadata. Never execute the displayed recovery commands.
+#######################################
+_health_checkpoint_comments() {
+	local repo_slug="$1" number="$2" page=1 batch="" count=0 all='[]'
+	while [[ "$page" -le 10 ]]; do
+		_health_dashboard_optional_work_has_budget "${refresh_start_epoch:-0}" || return 1
+		batch=$(gh api "repos/${repo_slug}/issues/${number}/comments?per_page=100&page=${page}" 2>/dev/null) || return 1
+		count=$(jq -er 'if type == "array" then length else error("invalid comments") end' <<<"$batch") || return 1
+		all=$(jq -cn --argjson all "$all" --argjson batch "$batch" '$all + $batch') || return 1
+		if [[ "$count" -lt 100 ]]; then
+			printf '%s\n' "$all"
+			return 0
+		fi
+		page=$((page + 1))
+	done
+	# Do not infer the newest comment from an incomplete history.
+	return 1
+}
+
+_health_aged_checkpoint_section() {
+	local repo_slug="$1" age_hours="${HEALTH_CHECKPOINT_AGE_HOURS:-24}"
+	local candidates="" comments="" evidence="" pr_json="" rows="" number pr release attempt age reason owner created
+	[[ "$repo_slug" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || return 0
+	[[ "$age_hours" =~ ^[0-9]{1,5}$ ]] || age_hours=24
+	_health_dashboard_optional_work_has_budget "${refresh_start_epoch:-0}" || return 0
+	candidates=$(gh api -X GET search/issues -f "q=repo:${repo_slug} is:issue is:open BLOCKED_CHECKPOINT_ATTENTION in:comments" \
+		-f per_page=100 -f sort=created -f order=asc 2>/dev/null) || return 0
+	while IFS= read -r number; do
+		[[ "$number" =~ ^[1-9][0-9]*$ ]] || continue
+		_health_dashboard_optional_work_has_budget "${refresh_start_epoch:-0}" || break
+		comments=$(_health_checkpoint_comments "$repo_slug" "$number") || continue
+		evidence=$(jq -r --arg hours "$age_hours" '
+			[.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR")]
+			| . as $comments
+			| [ .[] | select((.body // "") | test("(?m)^BLOCKED_CHECKPOINT_ATTENTION pr=")) ]
+			| sort_by(.created_at, .id) | last // empty
+			| . as $attention
+			| select((now - (.created_at | fromdateiso8601)) > (($hours | tonumber) * 3600))
+			| (.body | capture("(?m)^BLOCKED_CHECKPOINT_ATTENTION pr=(?<pr>[0-9]+) head=[0-9a-fA-F]+ release_comment=(?<release>[0-9]+) attempt=(?<attempt>[A-Za-z0-9:_-]+)")) as $marker
+			| [$comments[] | select((.id | tostring) == $marker.release) | .body
+				| capture("(?m)^Terminal blocker: reason=(?<reason>[A-Za-z0-9_-]+) owner=(?<owner>[A-Za-z0-9_-]+)")?] | last // empty
+			| [$marker.pr, $marker.release, $marker.attempt, $attention.created_at, .reason, .owner] | @tsv' <<<"$comments" 2>/dev/null) || continue
+		[[ -n "$evidence" ]] || continue
+		IFS=$'\t' read -r pr release attempt created reason owner <<<"$evidence"
+		[[ "$pr" =~ ^[1-9][0-9]*$ && "$release" =~ ^[1-9][0-9]*$ ]] || continue
+		_health_dashboard_optional_work_has_budget "${refresh_start_epoch:-0}" || break
+		pr_json=$(gh api "repos/${repo_slug}/pulls/${pr}" 2>/dev/null) || continue
+		jq -e '.state == "open" and .draft == true' <<<"$pr_json" >/dev/null 2>&1 || continue
+		age=$(jq -nr --arg date "$created" '((now - ($date | fromdateiso8601)) / 3600 | floor)') || continue
+		rows+="${created}"$'\t'"${age}"$'\t'"${number}"$'\t'"${pr}"$'\t'"${release}"$'\t'"${attempt}"$'\t'"${reason}"$'\t'"${owner}"$'\n'
+	done < <(jq -r '.items[]?.number' <<<"$candidates" 2>/dev/null)
+	[[ -n "$rows" ]] || return 0
+	printf 'Aged blocked checkpoints (read-only; surfacing grants nothing). Resolve the blocker before generating an approval; alternatively close the draft. Runner capability releases may instead resume on a capable runner. This snapshot scans at most 100 candidate issues.\n\n'
+	printf '| Age | Issue | Draft PR | Reason | Owner | Exits |\n| --- | --- | --- | --- | --- | --- |\n'
+	while IFS=$'\t' read -r created age number pr release attempt reason owner; do
+		[[ -n "$created" ]] || continue
+		# Literal backticks delimit a displayed command, never execute it.
+		# shellcheck disable=SC2016
+		printf '| %sh | [#%s](https://github.com/%s/issues/%s) | [#%s](https://github.com/%s/pull/%s) | %s | %s | `pr-checkpoint-continuation-helper.sh approval-template %s %s %s %s %s` or close draft |\n' \
+			"$age" "$number" "$repo_slug" "$number" "$pr" "$repo_slug" "$pr" "$reason" "$owner" "$repo_slug" "$pr" "$number" "$release" "$attempt"
+	done < <(printf '%s' "$rows" | LC_ALL=C sort | jq -Rsc 'split("\n") | map(select(length > 0)) | .[0:10][]' -r)
 	return 0
 }

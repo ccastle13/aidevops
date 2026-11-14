@@ -36,17 +36,19 @@ source "${SCRIPT_DIR}/worker-lifecycle-common.sh"
 source "${SCRIPT_DIR}/worker-failure-evidence.sh"
 
 # SSH agent integration for commit signing (t1882)
-# Source persisted agent.env so workers can sign commits without passphrase prompts.
-if [[ -f "$HOME/.ssh/agent.env" ]]; then
-	# shellcheck source=/dev/null
-	. "$HOME/.ssh/agent.env" >/dev/null 2>&1 || true
-fi
+# Source persisted agent.env so workers can sign commits without passphrase
+# prompts. GH#36493: restart the agent when agent.env outlived it (reboot).
+# shellcheck source=./headless-ssh-agent-lib.sh
+source "${SCRIPT_DIR}/headless-ssh-agent-lib.sh"
+headless_ssh_agent_ensure "${SCRIPT_DIR}/signing-setup.sh" || true
 
 # Absolute fallback when both pool and routing table are unavailable (GH#17769)
-readonly DEFAULT_HEADLESS_MODELS="anthropic/claude-sonnet-4-6"
+readonly DEFAULT_HEADLESS_MODELS="anthropic/claude-sonnet-5-5"
 readonly STATE_DIR="${AIDEVOPS_HEADLESS_RUNTIME_DIR:-${HOME}/.aidevops/.agent-workspace/headless-runtime}"
 readonly STATE_DB="${STATE_DIR}/state.db"
-readonly OPENCODE_BIN_DEFAULT="${OPENCODE_BIN:-opencode}"
+_opencode_profile_binary=$(aidevops_opencode_profile_value binary 2>/dev/null || printf 'opencode')
+readonly OPENCODE_BIN_DEFAULT="${OPENCODE_BIN:-$_opencode_profile_binary}"
+unset _opencode_profile_binary
 # Linux headless dispatch may bind this to an aidevops-managed exact-version
 # runtime without mutating the general/interactive OpenCode installation.
 HEADLESS_OPENCODE_BIN="$OPENCODE_BIN_DEFAULT"
@@ -78,6 +80,10 @@ readonly HEADLESS_ROLE_TRIAGE="triage"
 readonly HEADLESS_ROLE_MODEL_REPLAY="model-replay"
 readonly HEADLESS_EGRESS_MODE_AUTO="auto"
 readonly HEADLESS_EGRESS_MODE_REQUIRED="required"
+
+# Shared session-key lock ownership and stale-state reconciliation.
+# shellcheck source=./headless-session-locks.sh
+source "${SCRIPT_DIR}/headless-session-locks.sh"
 
 # Resolve the public-triage whole-process egress posture. Triage always uses at
 # least auto mode: a configured backend becomes fail-closed required mode, while
@@ -195,6 +201,11 @@ _finalize_isolated_runtime_data() {
 	local runtime_role="$2"
 	local ephemeral_run=0
 	[[ -n "$isolated_data_dir" && -d "$isolated_data_dir" ]] || return 0
+	# GH#37527: count attempt activity before merge/discard so exit
+	# classification cannot read a false zero from the shared DB.
+	if declare -F _hrff_snapshot_attempt_activity >/dev/null 2>&1; then
+		_hrff_snapshot_attempt_activity "${isolated_data_dir}/opencode/opencode.db"
+	fi
 	if _headless_run_is_ephemeral "$runtime_role"; then
 		ephemeral_run=1
 		print_info "[lifecycle] ephemeral_db_discarded role=$runtime_role pid=$$"
@@ -522,7 +533,12 @@ _derive_worker_failure_evidence() {
 		next_action="resume_existing_session"
 		;;
 	watchdog_stall_killed)
-		launch_failure_cause="stall_hard_killed"
+		# GH#34068: a cap kill after recent liveness evidence is not a stall.
+		if [[ "$kill_reason" == "hard_kill_cap_active" ]]; then
+			launch_failure_cause="elapsed_cap_while_active"
+		else
+			launch_failure_cause="stall_hard_killed"
+		fi
 		next_action="redispatch_worker"
 		;;
 	rate_limit | rate_limit_fast)
@@ -570,7 +586,7 @@ _derive_worker_failure_evidence() {
 }
 
 #######################################
-# Return success when a hard-killed worker already handed off an open PR.
+# Return success when a worker already handed off a durable PR.
 #
 # This guards worker-failure metrics before the later claim-release recovery path
 # runs. A watchdog hard-kill after PR creation is a monitoring handoff when the
@@ -580,7 +596,12 @@ _derive_worker_failure_evidence() {
 # Args:
 #   $1 - session key
 #   $2 - work dir
-# Returns: 0 when an exact-head, non-draft open PR has a merge summary.
+# Returns: 0 for an exact-head, linked, summarised ready PR, or a merged PR
+#          with the same evidence whose issue is confirmed closed.
+# Sets _WORKER_POST_PR_HANDOFF_STATE to the observed exact-head state so a
+# caller can separate unreadable GitHub state (`unknown`,
+# `merged_issue_unreadable`) from a definitive rejection (GH#36171).
+# `rejected` means the identity or local preconditions failed.
 #######################################
 _worker_post_pr_handoff_confirmed() {
 	local session_key="$1"
@@ -588,10 +609,22 @@ _worker_post_pr_handoff_confirmed() {
 	local repo_slug="${DISPATCH_REPO_SLUG:-}"
 	local branch_name
 	local local_head
-	local issue_number="${session_key#issue-}"
+	local issue_number=""
+	_WORKER_POST_PR_HANDOFF_STATE="rejected"
 
-	[[ "$session_key" == issue-* ]] || return 1
-	[[ -n "$repo_slug" ]] || return 1
+	# aidevops:trust-boundary — accept only launcher-defined identities. Manual
+	# sessions must bind to trusted dispatch metadata, never digits in prompt text.
+	if [[ "$session_key" =~ ^issue-([1-9][0-9]*)$ ]]; then
+		issue_number="${BASH_REMATCH[1]}"
+	elif [[ "$session_key" =~ ^manual-cli-([1-9][0-9]*)-[0-9]+$ ]]; then
+		issue_number="${BASH_REMATCH[1]}"
+		[[ "${WORKER_ISSUE_NUMBER:-}" == "$issue_number" ]] || return 1
+	else
+		return 1
+	fi
+	[[ "${WORKER_ISSUE_NUMBER:-$issue_number}" == "$issue_number" ]] || return 1
+	[[ "$repo_slug" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+	[[ "${WORKER_REPO_SLUG:-$repo_slug}" == "$repo_slug" ]] || return 1
 	command -v gh >/dev/null 2>&1 || return 1
 	if [[ -n "$work_dir" && -d "$work_dir" ]]; then
 		branch_name=$(git -C "$work_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
@@ -603,8 +636,27 @@ _worker_post_pr_handoff_confirmed() {
 	local handoff_state=""
 	handoff_state=$(_pr_handoff_state_for_branch_or_issue \
 		"$branch_name" "$issue_number" "$repo_slug" "head-only" "$local_head" "1") || return 1
-	[[ "${handoff_state%%|*}" == "ready" ]]
-	return $?
+	_WORKER_POST_PR_HANDOFF_STATE="${handoff_state%%|*}"
+	[[ -n "$_WORKER_POST_PR_HANDOFF_STATE" ]] || _WORKER_POST_PR_HANDOFF_STATE="unknown"
+	case "$_WORKER_POST_PR_HANDOFF_STATE" in
+	ready) return 0 ;;
+	merged)
+		# GH#34931: a worker may merge its own PR before emitting POST_PR_HANDOFF.
+		# Reopened/open issues remain merged checkpoints, never completion.
+		local issue_state=""
+		if ! issue_state=$(gh api "repos/${repo_slug}/issues/${issue_number}" \
+			--jq '.state | ascii_downcase' 2>/dev/null); then
+			_WORKER_POST_PR_HANDOFF_STATE="merged_issue_unreadable"
+			return 1
+		fi
+		if [[ "$issue_state" != "closed" ]]; then
+			_WORKER_POST_PR_HANDOFF_STATE="merged_issue_open"
+			return 1
+		fi
+		return 0
+		;;
+	esac
+	return 1
 }
 
 #######################################
@@ -674,6 +726,18 @@ _normalize_worker_exit_code_and_kill_reason() {
 	return 0
 }
 
+# Keep prelaunch stages in the owning shell as well as the optional durable
+# PRRTS trace. Ordinary issue workers do not have an attempt state file.
+_record_run_attempt_stage() {
+	local stage="$1"
+	_WORKER_PRELAUNCH_LAST_STAGE="$stage"
+	case "$stage" in
+	post_*) _WORKER_PRELAUNCH_LAST_COMPLETED_STAGE="$stage" ;;
+	esac
+	print_info "[lifecycle] ${stage} session=${session_key} pid=$$"
+	return 0
+}
+
 # _execute_run_attempt: run one headless invocation and handle the result.
 # Dispatches to OpenCode (default) or Claude CLI (when --runtime claude specified).
 # Args: role session_key work_dir title prompt selected_model variant_override agent_name
@@ -693,16 +757,18 @@ _execute_run_attempt() {
 	local agent_name="$8"
 	shift 8
 	local -a extra_args=("$@")
+	_WORKER_PRELAUNCH_LAST_STAGE=""
+	_WORKER_PRELAUNCH_LAST_COMPLETED_STAGE=""
 	_begin_worker_runtime_run
 	local runtime=""
 	local prompt_arg="$prompt" prompt_file_arg="" claude_stdin_file="" force_file_transport=0
 	local provider="" persisted_session="" metric_work_dir=""
 	local -a cmd=()
 	local prepare_status=0
-	print_info "[lifecycle] pre_attempt_command_prepare session=$session_key pid=$$"
+	_record_run_attempt_stage pre_attempt_command_prepare
 	_prepare_run_attempt_command || prepare_status=$?
 	[[ "$prepare_status" -eq 0 ]] || return "$prepare_status"
-	print_info "[lifecycle] post_attempt_command_prepare session=$session_key pid=$$"
+	_record_run_attempt_stage post_attempt_command_prepare
 
 	# GH#17549: Claim guard — verify a DISPATCH_CLAIM exists for this runner
 	# before launching a worker for an issue. This prevents pulse LLMs from
@@ -713,10 +779,10 @@ _execute_run_attempt() {
 	# The mismatch caused the guard to reject every legitimate dispatch, creating
 	# a claim→reject→release→reclaim loop. dispatch_with_dedup is the authoritative
 	# dedup layer; a second check here adds no safety and causes false rejections.
-	# GH#20542: DISPATCH_REPO_SLUG export moved to _cmd_run_prepare (called
-	# before the EXIT trap is armed) so _release_dispatch_claim always has a
-	# non-empty slug. The role+session_key guard here is no longer needed —
-	# _cmd_run_prepare sets the slug for all roles unconditionally.
+	# GH#20542: DISPATCH_REPO_SLUG export moved to _cmd_run_prepare. Model
+	# selection runs before it, so a selection failure releases the claim
+	# before the export; _release_dispatch_claim then falls back to the
+	# dispatcher-supplied WORKER_REPO_SLUG (GH#35684).
 
 	local output_file="" exit_code_file="" exit_code=0 permission_request_file=""
 	local start_ms=0 end_ms=0 duration_ms=0
@@ -725,27 +791,31 @@ _execute_run_attempt() {
 	local _t3077_watcher_pid="" _normalized_exit_info=""
 	local _run_watchdog_hard_killed=0 _stall_killed_marker="" _rl_fast_sentinel=""
 	prepare_status=0
-	print_info "[lifecycle] pre_attempt_file_create session=$session_key pid=$$"
+	_record_run_attempt_stage pre_attempt_file_create
 	_create_run_attempt_files || prepare_status=$?
 	[[ "$prepare_status" -eq 0 ]] || return "$prepare_status"
-	print_info "[lifecycle] post_attempt_file_create session=$session_key pid=$$"
+	_record_run_attempt_stage post_attempt_file_create
 	prepare_status=0
-	print_info "[lifecycle] pre_attempt_context_configure session=$session_key pid=$$"
+	_record_run_attempt_stage pre_attempt_context_configure
 	_configure_run_attempt_context || prepare_status=$?
 	[[ "$prepare_status" -eq 0 ]] || return "$prepare_status"
-	print_info "[lifecycle] post_attempt_context_configure session=$session_key pid=$$"
+	_record_run_attempt_stage post_attempt_context_configure
+	_record_run_attempt_stage pre_attempt_ownership_verify
 	if [[ "$role" == "worker" ]] && ! _hrw_verify_dispatch_ownership; then
 		_WORKER_PRELAUNCH_FAILURE_REASON="$_HRW_REASON_OWNERSHIP_LOST"
 		print_error "[lifecycle] runtime ownership fence stopped session=${session_key} before model invocation"
 		return 85
 	fi
+	_record_run_attempt_stage post_attempt_ownership_verify
+	_record_run_attempt_stage pre_attempt_observers_start
 	_start_run_attempt_observers
+	_record_run_attempt_stage post_attempt_observers_start
 	_hrw_mark_runtime_launch_started "$session_key" "$runtime"
 	_emit_verbose_checkpoint worker_started \
 		"model=${selected_model} runtime=${runtime} fix_the_fixer=${_T3077_FIX_THE_FIXER:-0}"
 	print_info "[lifecycle] worker_start session=$session_key model=$selected_model runtime=$runtime pid=$$"
 	case "$runtime" in
-	claude) _invoke_claude "$output_file" "$exit_code_file" "$work_dir" "${cmd[@]}" ;;
+	claude) _invoke_claude "$output_file" "$exit_code_file" "$work_dir" "${cmd[@]}" && _capture_claude_stream_evidence "$output_file" ;;
 	*) _invoke_opencode "$output_file" "$exit_code_file" "${cmd[@]}" ;;
 	esac
 	_complete_run_attempt_invocation
@@ -804,6 +874,126 @@ _discover_actual_worktree_dir() {
 }
 
 # =============================================================================
+# OpenCode runtime lockfile drift (GH#32903)
+# =============================================================================
+# OpenCode rewrites tracked .opencode/package-lock.json / .opencode/bun.lock
+# in every checkout to match the runner's @opencode-ai/* versions. That drift
+# is runtime-owned only when stripping @opencode-ai/* versions, specs and
+# integrity hashes makes the worktree file identical to the committed file.
+# Anything else (other packages, added dependencies, staged edits) is treated
+# as a real change and is never restored.
+
+# Normalize @opencode-ai/* versions/specs/integrity in an npm lockfile.
+_opencode_lockfile_normalize_npm() {
+	local file="$1"
+	jq -S '
+		def strip:
+			if type == "object" then
+				with_entries(
+					if (.key | test("^(node_modules/)?@opencode-ai/[^/]+$")) then
+						if (.value | type) == "object" then
+							.value |= del(.version, .resolved, .integrity)
+						else .value = "@opencode-ai-spec" end
+					else . end)
+				| map_values(strip)
+			elif type == "array" then map(strip)
+			else . end;
+		strip' "$file"
+	return $?
+}
+
+# Normalize @opencode-ai/* versions/specs/integrity in a Bun text lockfile.
+_opencode_lockfile_normalize_bun() {
+	local file="$1"
+	sed -E \
+		-e 's#(@opencode-ai/[A-Za-z0-9._-]+)@[^"]*"#\1@V"#g' \
+		-e 's#("@opencode-ai/[A-Za-z0-9._-]+": )"[^"]*"#\1"V"#g' \
+		-e '/^[[:space:]]*"@opencode-ai\/[A-Za-z0-9._-]+": \[/ s#"sha(256|384|512)-[A-Za-z0-9+/=]+"#"H"#g' \
+		"$file"
+	return $?
+}
+
+# Classify one lockfile. Prints: clean | absent | runtime-only | preserved:<reason>
+_opencode_lockfile_drift_classify() {
+	local repo_dir="$1"
+	local rel_path="$2"
+	if ! git -C "$repo_dir" ls-files --error-unmatch -- "$rel_path" >/dev/null 2>&1; then
+		printf 'absent\n'
+		return 0
+	fi
+	if git -C "$repo_dir" diff --quiet -- "$rel_path" &&
+		git -C "$repo_dir" diff --cached --quiet -- "$rel_path"; then
+		printf 'clean\n'
+		return 0
+	fi
+	if ! git -C "$repo_dir" diff --cached --quiet -- "$rel_path"; then
+		printf 'preserved:staged-change\n'
+		return 0
+	fi
+	[[ -f "${repo_dir}/${rel_path}" ]] || {
+		printf 'preserved:deleted\n'
+		return 0
+	}
+	local tmp_dir="" committed="" normalizer="_opencode_lockfile_normalize_bun"
+	[[ "$rel_path" == *.json ]] && normalizer="_opencode_lockfile_normalize_npm"
+	tmp_dir=$(mktemp -d) || return 1
+	committed="${tmp_dir}/committed"
+	local verdict="preserved:non-opencode-change"
+	if git -C "$repo_dir" show ":${rel_path}" >"$committed" 2>/dev/null &&
+		"$normalizer" "$committed" >"${tmp_dir}/a" 2>/dev/null &&
+		"$normalizer" "${repo_dir}/${rel_path}" >"${tmp_dir}/b" 2>/dev/null &&
+		cmp -s "${tmp_dir}/a" "${tmp_dir}/b"; then
+		verdict="runtime-only"
+	fi
+	rm -rf "$tmp_dir"
+	printf '%s\n' "$verdict"
+	return 0
+}
+
+# Usage: opencode-lockfile-drift [--dir PATH] [--restore]
+# Exit: 0 no ambiguous drift remains, 1 a lockfile change was preserved, 2 usage.
+cmd_opencode_lockfile_drift() {
+	local repo_dir="$PWD" restore=0
+	while [[ $# -gt 0 ]]; do
+		local arg="$1"
+		local value="${2:-}"
+		case "$arg" in
+		--dir)
+			[[ -n "$value" ]] || {
+				print_error "--dir requires a path"
+				return 2
+			}
+			repo_dir="$value"
+			shift 2
+			;;
+		--restore)
+			restore=1
+			shift
+			;;
+		*)
+			print_error "Unknown option: $arg"
+			return 2
+			;;
+		esac
+	done
+	repo_dir=$(git -C "$repo_dir" rev-parse --show-toplevel 2>/dev/null) || {
+		print_error "not a git worktree: ${repo_dir}"
+		return 2
+	}
+	local rel_path="" verdict="" status=0
+	for rel_path in .opencode/package-lock.json .opencode/bun.lock; do
+		verdict=$(_opencode_lockfile_drift_classify "$repo_dir" "$rel_path") || return 2
+		if [[ "$verdict" == "runtime-only" && "$restore" -eq 1 ]]; then
+			git -C "$repo_dir" checkout -- "$rel_path" || return 2
+			verdict="restored"
+		fi
+		[[ "$verdict" == preserved:* ]] && status=1
+		printf '%s\t%s\n' "$rel_path" "$verdict"
+	done
+	return "$status"
+}
+
+# =============================================================================
 # Stall cap helper (GH#20681)
 # =============================================================================
 
@@ -815,6 +1005,9 @@ _worker_canary_soft_bypass_authorized() {
 	local role="$1"
 	local authorized_reason="${AIDEVOPS_WORKER_CANARY_SOFT_BYPASS_REASON:-}"
 	[[ "$role" == "$HEADLESS_ROLE_WORKER" ]] || return 1
+	# GH#36698: model_unavailable is soft only at the dispatcher, whose canary
+	# backs off the rejected model before this worker reselects. A worker whose
+	# own canary model is rejected must exit rather than run on that model.
 	case "$authorized_reason" in
 		inconclusive | overload | provider_error | rate_limit | timeout | transient) ;;
 		*) return 1 ;;
@@ -859,11 +1052,13 @@ cmd_run() {
 	local detach=0
 	local private_workload="${AIDEVOPS_PRIVATE_WORKLOAD:-0}"
 	local private_profile_sha256=""
+	local standalone_prompt=0
 	local -a extra_args=()
 
 	_parse_run_args "$@" || return 1
 	_validate_run_args || return 1
 	_validate_private_workload_args || return 1
+	_validate_standalone_prompt_args || return 1
 	_validate_model_replay_args || return 1
 	local _cmd_run_stop=0 _cmd_run_return_status=1
 	_prepare_cmd_run_environment "$@" || return $?
@@ -943,11 +1138,18 @@ headless-runtime-helper.sh - Model-aware headless runtime (OpenCode default, Cla
 Usage:
   headless-runtime-helper.sh select [--role pulse|worker|triage] [--model provider/model]
   headless-runtime-helper.sh canary [--role pulse|worker|triage] [--model provider/model] [--tier simple|standard|thinking]
-  headless-runtime-helper.sh run --role pulse|worker|triage|model-replay --session-key KEY --dir PATH --title TITLE (--prompt TEXT | --prompt-file FILE) [--model provider/model | --initial-model provider/model] [--tier simple|standard|thinking] [--variant NAME] [--agent NAME] [--runtime opencode|claude] [--opencode-arg ARG] [--private-workload --private-profile-sha256 HASH] [--detach]
+  headless-runtime-helper.sh run --role pulse|worker|triage|model-replay --session-key KEY --dir PATH --title TITLE (--prompt TEXT | --prompt-file FILE) [--model provider/model | --initial-model provider/model] [--tier simple|standard|thinking] [--variant NAME] [--agent NAME] [--runtime opencode|claude] [--opencode-arg ARG] [--private-workload --private-profile-sha256 HASH] [--standalone-prompt] [--detach]
   headless-runtime-helper.sh backoff [status|set MODEL-OR-PROVIDER REASON [SECONDS]|clear MODEL-OR-PROVIDER]
   headless-runtime-helper.sh session [status|clear PROVIDER SESSION_KEY]
   headless-runtime-helper.sh metrics [--role pulse|worker|triage] [--hours N] [--model SUBSTRING] [--fast-threshold N]
+  headless-runtime-helper.sh opencode-lockfile-drift [--dir PATH] [--restore]
   headless-runtime-helper.sh help
+
+OpenCode lockfile drift (GH#32903):
+  Classifies tracked .opencode/package-lock.json and .opencode/bun.lock changes.
+  runtime-only = the only difference is @opencode-ai/* versions, specs, or
+  integrity hashes; --restore checks out just those files. Any other change is
+  reported as preserved:<reason>, left untouched, and exits 1.
 
 Runtime selection:
   Default runtime is OpenCode. Use --runtime claude to dispatch via Claude CLI.
@@ -963,20 +1165,36 @@ Private workloads:
   sanitizes activity evidence, and discards the isolated OpenCode session database
   after exit.
 
+Standalone prompts:
+  --standalone-prompt declares a worker prompt that is not issue work, such as a
+  scheduled report or review that mentions an issue number in prose. It skips only
+  prompt-prose issue classification. It requires --role worker and refuses an
+  issue-N session key, an "Issue #N" title, and WORKER_ISSUE_NUMBER or
+  WORKER_WORKTREE_PATH. It never grants issue claim or worktree authority.
+
+Detached logs (GH#34556):
+  --detach writes the worker log to a new private file
+  $AIDEVOPS_WORKSPACE_DIR/tmp/worker-<key>.log.<random> (default workspace
+  ~/.aidevops/.agent-workspace) and prints "Detaching worker (log: <path>)"
+  before spawning. Set AIDEVOPS_WORKSPACE_DIR to a caller-approved directory to
+  relocate it; that is not a broad filesystem grant. An unusable root fails
+  before launch with no host /tmp fallback. system-cleanup.sh ages these files.
+
 Backoff granularity:
-  Rate limits and provider errors are recorded per model (e.g. anthropic/claude-sonnet-4-6).
+  Rate limits and provider errors are recorded per model (e.g. anthropic/claude-sonnet-5-5).
   Auth errors are recorded per provider (e.g. anthropic) since credentials are shared.
   This allows fallback from sonnet to opus when only sonnet is rate-limited.
 
 Dedup guard (GH#6538):
   Each 'run' invocation acquires a PID lock file keyed by --session-key.
   If a live process already holds the lock, the second invocation exits
-  immediately (exit 0) without spawning a worker. Stale locks (dead PIDs)
-  are cleaned up automatically. Lock files: $STATE_DIR/locks/<key>.pid
+  immediately (exit 0) without spawning a worker. Stale locks are reclaimed
+  on same-key acquisition and by bounded Pulse preflight maintenance.
+  Lock files: $STATE_DIR/locks/<key>.pid
 
 Defaults:
   Model list is derived from routing table + auth availability (GH#17769).
-  Fallback: anthropic/claude-sonnet-4-6 if routing resolution fails.
+  Fallback: anthropic/claude-sonnet-5-5 if routing resolution fails.
   AIDEVOPS_HEADLESS_MODELS is deprecated — respected as override for one release cycle.
   AIDEVOPS_HEADLESS_PROVIDER_ALLOWLIST can restrict selection to providers like: openai
   AIDEVOPS_HEADLESS_VARIANT_STANDARD / AIDEVOPS_HEADLESS_VARIANT_THINKING can set tier defaults.
@@ -995,6 +1213,11 @@ EOF
 main() {
 	local command="${1:-help}"
 	shift || true
+	if [[ "$command" == "opencode-lockfile-drift" ]]; then
+		# Pure git/worktree inspection: no runtime state DB side effects.
+		cmd_opencode_lockfile_drift "$@"
+		return $?
+	fi
 	init_state_db
 	case "$command" in
 	select)

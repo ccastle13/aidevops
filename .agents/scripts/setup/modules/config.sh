@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2025-2026 Marcus Quinn
-# Configuration functions: setup_configs, set_permissions, ssh, aidevops-cli, opencode-config, claude-config, validate, extract-prompts, drift-check
+# Configuration functions: setup_configs, set_permissions, ssh, aidevops-cli, opencode-config, claude-config, safety-hooks, validate, extract-prompts, drift-check
 # Part of aidevops setup.sh modularization (t316.3)
 
 # Shell safety baseline
@@ -124,30 +124,13 @@ update_opencode_config() {
 
 	print_info "Updating OpenCode configuration..."
 
-	# Use unified generator (t1665.4) if available, fall back to legacy scripts
+	# Use the unified generator (t1665.4).
 	if [[ -f ".agents/scripts/generate-runtime-config.sh" ]]; then
 		_run_generator ".agents/scripts/generate-runtime-config.sh" \
 			"Generating OpenCode configuration (unified)..." \
 			"OpenCode configuration complete (agents, commands, MCPs, prompts)" \
 			"OpenCode configuration encountered issues" \
 			all --runtime opencode
-	else
-		# Legacy fallback — remove after one release cycle
-		_run_generator ".agents/scripts/generate-opencode-commands.sh" \
-			"Generating OpenCode commands..." \
-			"OpenCode commands configured" \
-			"OpenCode command generation encountered issues"
-
-		_run_generator ".agents/scripts/generate-opencode-agents.sh" \
-			"Generating OpenCode agent configuration..." \
-			"OpenCode agents configured (11 primary in JSON, subagents as markdown)" \
-			"OpenCode agent generation encountered issues"
-
-		_run_generator ".agents/scripts/subagent-index-helper.sh" \
-			"Regenerating subagent index..." \
-			"Subagent index regenerated" \
-			"Subagent index generation encountered issues" \
-			generate
 	fi
 
 	return 0
@@ -162,32 +145,46 @@ update_claude_config() {
 
 	print_info "Updating Claude Code configuration..."
 
-	# Use unified generator (t1665.4) if available, fall back to legacy scripts
+	# Use the unified generator (t1665.4).
 	if [[ -f ".agents/scripts/generate-runtime-config.sh" ]]; then
 		_run_generator ".agents/scripts/generate-runtime-config.sh" \
 			"Generating Claude Code configuration (unified)..." \
 			"Claude Code configuration complete (agents, commands, MCPs, prompts)" \
 			"Claude Code configuration encountered issues" \
 			all --runtime claude-code
-	else
-		# Legacy fallback — remove after one release cycle
-		_run_generator ".agents/scripts/generate-claude-commands.sh" \
-			"Generating Claude Code commands..." \
-			"Claude Code commands configured" \
-			"Claude Code command generation encountered issues"
-
-		_run_generator ".agents/scripts/generate-claude-agents.sh" \
-			"Generating Claude Code agent configuration..." \
-			"Claude Code agents configured (MCPs, settings, commands)" \
-			"Claude Code agent generation encountered issues"
-
-		_run_generator ".agents/scripts/subagent-index-helper.sh" \
-			"Regenerating subagent index..." \
-			"Subagent index regenerated" \
-			"Subagent index generation encountered issues" \
-			generate
 	fi
 
+	return 0
+}
+
+# Install/refresh Claude Code safety hooks in ~/.aidevops/hooks and their
+# settings registrations. Restored after GH#34128: the only real definition
+# lived in tool-beads.sh, which the Beads retirement (#33270) deleted, leaving
+# a no-op placeholder that froze deployed hooks. Prefer the repo helper being
+# installed so hook sources match this setup run; fall back to the deployed copy.
+# Non-critical: failures warn without aborting the rest of setup.
+setup_safety_hooks() {
+	print_info "Setting up Claude Code safety hooks..."
+
+	if ! command -v python3 >/dev/null 2>&1; then
+		print_warning "Python 3 not found - safety hooks require Python 3"
+		return 0
+	fi
+
+	local helper_script="${INSTALL_DIR:-.}/.agents/scripts/install-hooks-helper.sh"
+	if [[ ! -f "$helper_script" ]]; then
+		helper_script="$HOME/.aidevops/agents/scripts/install-hooks-helper.sh"
+	fi
+	if [[ ! -f "$helper_script" ]]; then
+		print_warning "install-hooks-helper.sh not found - skipping safety hooks"
+		return 0
+	fi
+
+	if bash "$helper_script" install; then
+		print_success "Claude Code safety hooks installed"
+	else
+		print_warning "Safety hook installation encountered issues (non-critical); run: install-hooks-helper.sh install"
+	fi
 	return 0
 }
 
@@ -204,6 +201,7 @@ update_runtime_configs() {
 		print_info "Unified generator not found — falling back to per-runtime updates"
 		update_opencode_config
 		update_claude_config
+		update_codex_config || return $?
 		return 0
 	fi
 
@@ -232,12 +230,16 @@ update_runtime_configs() {
 			all --runtime "$runtime" || return $?
 	done
 
+	# The incremental ai-session update uses this path too.
+	update_codex_config || return $?
 	return 0
 }
 
 update_codex_config() {
+	local helper_dir
+	helper_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
 	# Only run if Codex is installed or config dir exists
-	if [[ ! -d "$HOME/.codex" ]] && ! command -v codex >/dev/null 2>&1; then
+	if [[ ! -d "${CODEX_HOME:-$HOME/.codex}" ]] && ! command -v codex >/dev/null 2>&1; then
 		return 0
 	fi
 
@@ -245,74 +247,22 @@ update_codex_config() {
 
 	# Fix broken MCP_DOCKER entry (P0 — OrbStack/Colima don't support docker mcp)
 	if type _fix_codex_docker_mcp &>/dev/null; then
-		_fix_codex_docker_mcp
+		_fix_codex_docker_mcp || return 1
 	fi
 
 	# Deploy aidevops MCP servers to Codex config.toml
-	_deploy_codex_mcps
+	_deploy_codex_mcps || return 1
+	python3 "$helper_dir/codex-setup.py" all || return 1
 
 	print_success "Codex configuration updated"
 	return 0
 }
 
-# Deploy standard aidevops MCP servers to ~/.codex/config.toml
-# Codex uses TOML format: [mcp_servers.NAME] sections
+# Reconcile known defaults and migrations while preserving custom TOML settings.
 _deploy_codex_mcps() {
-	local config="$HOME/.codex/config.toml"
-	mkdir -p "$HOME/.codex"
-
-	# Touch config if it doesn't exist
-	[[ -f "$config" ]] || touch "$config"
-
-	local mcp_count=0
-
-	# Helper: add a TOML MCP section if not already present
-	# Args: $1=name, $2=type (stdio|url), $3=command_or_url, $4=args (optional, comma-separated)
-	_add_codex_mcp() {
-		local name="$1"
-		local mcp_type="$2"
-		local cmd_or_url="$3"
-		local args="${4:-}"
-
-		if grep -q "\\[mcp_servers\\.${name}\\]" "$config" 2>/dev/null; then
-			echo -e "  ${BLUE:-}=${NC:-} $name (already configured)"
-			return 0
-		fi
-
-		{
-			echo ""
-			echo "[mcp_servers.${name}]"
-			if [[ "$mcp_type" == "stdio" ]]; then
-				echo "command = '${cmd_or_url}'"
-				if [[ -n "$args" ]]; then
-					echo "args = [${args}]"
-				fi
-			else
-				echo "type = 'url'"
-				echo "url = '${cmd_or_url}'"
-			fi
-		} >>"$config"
-		((++mcp_count))
-		echo -e "  ${GREEN:-}+${NC:-} $name"
-		return 0
-	}
-
-	# --- context7 (library docs) ---
-	_add_codex_mcp "context7" "stdio" "npx" "'-y', '@upstash/context7-mcp@latest'"
-
-	# --- Playwright MCP ---
-	_add_codex_mcp "playwright" "stdio" "npx" "'-y', '@anthropic-ai/mcp-server-playwright@latest'"
-
-	# --- shadcn UI ---
-	_add_codex_mcp "shadcn" "stdio" "npx" "'shadcn@latest', 'mcp'"
-
-	# --- OpenAPI Search (remote, zero install) ---
-	_add_codex_mcp "openapi-search" "url" "https://openapi-mcp.openapisearch.com/mcp"
-
-	# --- Cloudflare API (remote) ---
-	_add_codex_mcp "cloudflare-api" "url" "https://mcp.cloudflare.com/mcp"
-
-	echo -e "  ${GREEN:-}Done${NC:-} -- $mcp_count new MCP servers added to Codex config"
+	local helper_dir
+	helper_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
+	python3 "$helper_dir/codex-mcp-config.py" || return 1
 	return 0
 }
 
@@ -375,14 +325,19 @@ except (FileNotFoundError, json.JSONDecodeError):
 if "mcpServers" not in cfg or not isinstance(cfg["mcpServers"], dict):
     cfg["mcpServers"] = {}
 
-if name in cfg["mcpServers"]:
+old_playwright = {"command": "npx", "args": ["-y", "@playwright/mcp@0.0.79", "--headless", "--isolated"]}
+existing = cfg["mcpServers"].get(name)
+migrate = name == "playwright" and (
+    existing == old_playwright or existing == dict(old_playwright, env={})
+)
+if name in cfg["mcpServers"] and not migrate:
     print(f"SKIP  = {name} (already configured)")
 else:
     cfg["mcpServers"][name] = json.loads(value_json)
     with open(file_path, 'w') as f:
         json.dump(cfg, f, indent=2)
         f.write('\n')
-    print(f"ADDED + {name}")
+    print(f"MIGRATED + {name}" if migrate else f"ADDED + {name}")
 PYEOF
 		) || true
 		echo "  ${py_output#* }"
@@ -395,8 +350,8 @@ PYEOF
 	# --- context7 (library docs) ---
 	_add_cursor_mcp "context7" '{"command":"npx","args":["-y","@upstash/context7-mcp@latest"]}'
 
-	# --- Playwright MCP ---
-	_add_cursor_mcp "playwright" '{"command":"npx","args":["-y","@anthropic-ai/mcp-server-playwright@latest"]}'
+	# --- Playwright MCP (GH#34111: private artifact cwd via launcher) ---
+	_add_cursor_mcp "playwright" "$(printf '{"command":"bash","args":["%s","playwright","npx","-y","@playwright/mcp@0.0.79","--headless","--isolated"]}' "$HOME/.aidevops/agents/scripts/browser-mcp-launcher.sh")"
 
 	# --- shadcn UI ---
 	_add_cursor_mcp "shadcn" '{"command":"npx","args":["shadcn@latest","mcp"]}'

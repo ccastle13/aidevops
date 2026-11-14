@@ -41,13 +41,14 @@
 
 set -euo pipefail
 
+: "${AIDEVOPS_PULSE_MERGE_DIRTY_QUEUE_ENABLED:=1}"
+export AIDEVOPS_PULSE_MERGE_DIRTY_QUEUE_ENABLED
+
 # PATH normalisation for launchd/cron environments where PATH is minimal.
-_aidevops_path_prefix="/opt/homebrew/bin:/usr/local/bin:/bin:/usr/bin"
-if [[ "$(uname -s 2>/dev/null || true)" != "Darwin" && -d "/home/linuxbrew/.linuxbrew/bin" ]]; then
-	_aidevops_path_prefix="/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin:/bin:/usr/bin"
-fi
-export PATH="${_aidevops_path_prefix}:${PATH}"
-unset _aidevops_path_prefix
+AIDEVOPS_PATH_PROFILE=daemon _aidevops_self="${BASH_SOURCE[0]:-$0}"
+[[ "$_aidevops_self" == */* ]] || _aidevops_self="./${_aidevops_self}"
+# shellcheck source=runtime-env.sh
+[[ ! -f "${_aidevops_self%/*}/runtime-env.sh" ]] || source "${_aidevops_self%/*}/runtime-env.sh"
 
 # SCRIPT_DIR resolution — uses BASH_SOURCE[0]:-$0 for zsh portability (GH#3931).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -279,6 +280,12 @@ _pmr_graphql_budget_allows_run() {
 # succeeds; unlike a known floor, it is logged as an availability/evidence fault.
 _pmr_rest_core_progress_allows_run() {
 	local progress_rc=0
+	# Merge housekeeping is optional; dispatch and active workers retain their
+	# existing critical/progress admission paths below this independent reserve.
+	if declare -F gh_budget_worker_reserve_allows >/dev/null 2>&1 && ! gh_budget_worker_reserve_allows; then
+		_pmr_log WARN "Worker REST reserve reached; deferring optional merge routine"
+		return 1
+	fi
 	if declare -F pulse_rest_core_priority_allows_next >/dev/null 2>&1; then
 		pulse_rest_core_priority_allows_next progress "merge_routine_start" || progress_rc=$?
 	elif declare -F pulse_rest_core_priority_allows >/dev/null 2>&1; then
@@ -307,6 +314,13 @@ _pmr_rest_core_progress_allows_run() {
 
 _pmr_require_gh_auth() {
 	local token=""
+	# GH#37232: never let `gh auth token` open a macOS keychain dialog from launchd.
+	# shellcheck source=./background-keychain-helper.sh
+	source "${SCRIPT_DIR}/background-keychain-helper.sh"
+	if ! background_keychain_gh_ready "pulse-merge-routine"; then
+		_pmr_log WARN "macOS keychain locked or gh item missing; skipping merge cycle without prompting (re-check backoff 10m, GH#37232)"
+		return 1
+	fi
 	if ! token=$(gh auth token 2>/dev/null) || [[ -z "$token" ]]; then
 		_pmr_log ERROR "GitHub authentication unavailable; aborting merge routine before API access to prevent unauthenticated requests"
 		printf '%s\n' 'pulse-merge-routine: GitHub authentication unavailable; refusing unauthenticated API access' >&2

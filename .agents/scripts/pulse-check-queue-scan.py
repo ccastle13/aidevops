@@ -11,12 +11,16 @@ import os
 import pathlib
 import re
 import shutil
-import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from typing import Any, Optional
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import pulse_check_checkpoints as checkpoint_scan
 import pulse_check_dependencies as dependency_scan
+import pulse_check_progress as progress_scan
 
 AGGREGATE_KEY = "aggregate"
 ERROR_KEY = "error"
@@ -35,7 +39,19 @@ BLOCKING_LABELS = frozenset({
     "hold-for-review",
     "blocked",
     "status:blocked",
+    "status:needs-info",
     "status:in-review",
+    "consolidated",
+    "duplicate",
+})
+EXPLICIT_HOLD_LABELS = frozenset({
+    "needs-maintainer-review",
+    "needs-maintainer-permissions",
+    "no-auto-dispatch",
+    "infrastructure",
+    "hold-for-review",
+    "blocked",
+    "status:blocked",
 })
 PERSISTENT_DASHBOARD_LABELS = frozenset({"persistent", "quality-review"})
 
@@ -50,11 +66,21 @@ def _int_from_env(name: str, default: int) -> int:
 def _empty_aggregate() -> dict[str, int]:
     return {
         "repos": 0,
+        "repos_scanned": 0,
+        "repos_truncated": 0,
+        "dependency_unknown": 0,
         "auto_dispatch_open": 0,
         "available_unassigned": 0,
         "eligible_available_unassigned": 0,
         "excluded_persistent_dashboard": 0,
         "available_old": 0,
+        "no_durable_progress_hour": 0,
+        "no_durable_progress_owned": 0,
+        "no_durable_progress_unowned": 0,
+        "oldest_issue_age_min": 0,
+        "oldest_durable_progress_age_min": 0,
+        "durable_progress_unknown": 0,
+        "external_wait_excluded": 0,
         "oldest_available_age_min": 0,
         "repos_with_available": 0,
         "queued": 0,
@@ -62,6 +88,9 @@ def _empty_aggregate() -> dict[str, int]:
         "assigned_in_flight": 0,
         "blocked_labels": 0,
         "blocked_explicit_hold": 0,
+        "unknown_checkpoint_triage": 0,
+        "oldest_unknown_checkpoint_triage_age_min": 0,
+        "unknown_checkpoint_triage_unreadable": 0,
         "dependency_inconsistent_available": 0,
         "needs_tier": 0,
         "needs_status": 0,
@@ -106,6 +135,27 @@ def _issue_age_minutes(issue: dict[str, Any], now: dt.datetime) -> int:
     return int((now - updated).total_seconds() // 60)
 
 
+def _durable_progress_age(slug: str, issue: dict[str, Any], now: dt.datetime) -> Optional[int]:
+    return progress_scan.durable_progress_age(slug, issue, now, _run_gh_json)
+
+
+def _count_durable_progress(aggregate: dict[str, int], slug: str,
+                             issue: dict[str, Any], now: dt.datetime) -> None:
+    no_progress_before = aggregate["no_durable_progress_hour"]
+    context = progress_scan.ProgressContext(slug, _run_gh_json,
+                                             lambda probe: _dependency_diagnostic(slug, probe),
+                                             PERSISTENT_DASHBOARD_LABELS)
+    progress_scan.count_progress(aggregate, issue, now, context)
+    if aggregate["no_durable_progress_hour"] == no_progress_before:
+        return
+    labels = _issue_labels(issue)
+    owned = bool(issue.get("assignees")) or bool(
+        labels & {"status:claimed", "status:in-progress", "status:in-review", "status:queued"}
+    )
+    key = "no_durable_progress_owned" if owned else "no_durable_progress_unowned"
+    aggregate[key] += 1
+
+
 def _load_repos(repos_json: pathlib.Path) -> tuple[list[dict[str, Any]], str]:
     try:
         data = json.loads(repos_json.read_text(encoding="utf-8"))
@@ -130,7 +180,9 @@ def _load_repos(repos_json: pathlib.Path) -> tuple[list[dict[str, Any]], str]:
     return repos, ""
 
 
+@lru_cache(maxsize=None)
 def _fetch_repo_issues(slug: str, max_issues: int) -> Optional[list[dict[str, Any]]]:
+    """Reuse the same bounded inventory during this report's enrichment pass."""
     issues: Optional[list[dict[str, Any]]] = None
     cmd = [
         "gh", "issue", "list",
@@ -138,27 +190,12 @@ def _fetch_repo_issues(slug: str, max_issues: int) -> Optional[list[dict[str, An
         "--state", "open",
         "--label", "auto-dispatch",
         "--limit", str(max_issues + 1),
-        "--json", "number,title,body,labels,assignees,updatedAt",
+        "--json", "number,title,body,labels,assignees,createdAt,updatedAt",
     ]
     if _valid_repo_slug(slug):
-        try:
-            # Fixed argv, shell=False, validated owner/repo slug.
-            completed = subprocess.run(  # nosec B603
-                cmd,
-                text=True,
-                capture_output=True,
-                timeout=30,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            completed = None
-        if completed is not None and completed.returncode == 0:
-            try:
-                parsed = json.loads(completed.stdout or "[]")
-            except json.JSONDecodeError:
-                parsed = None
-            if isinstance(parsed, list):
-                issues = [issue for issue in parsed if isinstance(issue, dict)]
+        parsed = _run_gh_json(cmd)
+        if isinstance(parsed, list):
+            issues = [issue for issue in parsed if isinstance(issue, dict)]
     return issues
 
 
@@ -187,6 +224,7 @@ def _count_issue(
     labels = _issue_labels(issue)
     assigned = bool(issue.get("assignees"))
     blocked = bool(labels & BLOCKING_LABELS)
+    explicitly_held = bool(labels & EXPLICIT_HOLD_LABELS)
     dependency_inconsistent = bool(issue.get("dependency_inconsistent"))
     has_tier = any(label.startswith("tier:") for label in labels)
     has_status = any(label.startswith("status:") for label in labels)
@@ -200,7 +238,7 @@ def _count_issue(
     aggregate["needs_status"] += int(not has_status)
     aggregate["malformed_metadata"] += int(not has_tier or not has_status)
     aggregate["blocked_labels"] += int(blocked)
-    aggregate["blocked_explicit_hold"] += int(blocked)
+    aggregate["blocked_explicit_hold"] += int(explicitly_held)
     aggregate["dependency_inconsistent_available"] += int(dependency_inconsistent)
     aggregate["parent_task"] += int("parent-task" in labels)
     aggregate["nmr"] += int(is_nmr)
@@ -219,6 +257,8 @@ def _count_issue(
         and not blocked
         and not dependency_inconsistent
     )
+    lifecycle_active = bool(labels & {"status:in-progress", "status:claimed", "status:queued"})
+    available_candidate = available_candidate and not lifecycle_active
     excluded_persistent_dashboard = bool(labels & PERSISTENT_DASHBOARD_LABELS)
     aggregate["excluded_persistent_dashboard"] += int(
         available_candidate and excluded_persistent_dashboard
@@ -244,18 +284,35 @@ def _scan_repo(
     if issues is None:
         aggregate[GH_ERRORS_KEY] += 1
         return
+    aggregate["repos_scanned"] += 1
     if len(issues) > max_issues:
-        aggregate[GH_ERRORS_KEY] += 1
+        aggregate["repos_truncated"] += 1
         issues = issues[:max_issues]
     for issue in issues:
         inconsistent, scan_error = _dependency_diagnostic(slug, issue)
         issue["dependency_inconsistent"] = inconsistent
-        aggregate[GH_ERRORS_KEY] += int(scan_error)
+        # A deadline-limited lookup is missing evidence, not a GitHub failure.
+        within_budget = (
+            dependency_scan.QUERY_DEADLINE is None
+            or time.monotonic() < dependency_scan.QUERY_DEADLINE
+        )
+        aggregate[GH_ERRORS_KEY] += int(scan_error and within_budget)
+        aggregate["dependency_unknown"] += int(scan_error)
     repo_available = sum(
         int(_count_issue(aggregate, issue, now, old_minutes))
         for issue in issues
     )
     aggregate["repos_with_available"] += int(repo_available > 0)
+
+
+def _enrich_repo_history(aggregate: dict[str, int], slug: str,
+                         max_issues: int, now: dt.datetime) -> None:
+    """Collect durable progress before spending budget on advisory checkpoints."""
+    for issue in (_fetch_repo_issues(slug, max_issues) or [])[:max_issues]:
+        if time.monotonic() < dependency_scan.QUERY_DEADLINE:
+            _count_durable_progress(aggregate, slug, issue, now)
+        else:
+            aggregate["durable_progress_unknown"] += 1
 
 
 def main() -> int:
@@ -280,10 +337,33 @@ def main() -> int:
         return 0
 
     now = dt.datetime.now(dt.timezone.utc)
+    budget = max(1, _int_from_env("PULSE_CHECK_QUEUE_BUDGET_SECONDS", 20))
+    dependency_scan.QUERY_DEADLINE = time.monotonic() + budget
+    # Inventory all repositories before spending the remaining budget on
+    # dependency/progress enrichment. Independent reads retain gh admission.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(_fetch_repo_issues,
+                      [str(repo.get("slug") or "") for repo in repos],
+                      [max_issues] * len(repos)))
     for repo in repos:
         _scan_repo(aggregate, repo, max_issues, now, old_minutes)
 
-    _emit(aggregate, scanned_at=now.isoformat())
+    # Optional history must not consume the dependency inventory's budget.
+    for repo in repos:
+        _enrich_repo_history(aggregate, str(repo.get("slug") or ""), max_issues, now)
+
+    # Advisory checkpoint reads must not starve durable progress in any repository.
+    for repo in repos:
+        slug = str(repo.get("slug") or "")
+        context = checkpoint_scan.CheckpointContext(slug, _run_gh_json)
+        checkpoint_scan.enrich_repo(
+            aggregate, (_fetch_repo_issues(slug, max_issues) or [])[:max_issues],
+            now, context, dependency_scan.QUERY_DEADLINE)
+
+    error = "queue_budget_exhausted" if time.monotonic() >= dependency_scan.QUERY_DEADLINE else ""
+    if not error and aggregate["repos_truncated"]:
+        error = "queue_inventory_truncated"
+    _emit(aggregate, error=error, scanned_at=now.isoformat())
     return 0
 
 

@@ -47,6 +47,40 @@ fi
 
 # --- Functions ---
 
+# Git's normal diff inventory omits untracked files until they are staged.
+# Keep this read-only and bounded; Git owns whitespace rules and binary detection.
+_linters_check_untracked_whitespace() {
+	local inventory="" file="" size="" quoted=""
+	local exit_code=0
+	local diff_rc=0
+	local max_bytes=1048576
+	inventory=$(mktemp) || return 1
+	if ! git ls-files --others --exclude-standard -z >"$inventory"; then
+		rm -f "$inventory"
+		return 1
+	fi
+	while IFS= read -r -d '' file; do
+		[[ -f "$file" && ! -L "$file" ]] || continue
+		printf -v quoted '%q' "$file"
+		if ! size=$(wc -c <"$file"); then
+			print_error "Untracked whitespace check: cannot read $quoted"
+			exit_code=1
+			continue
+		fi
+		if [[ "$size" -gt "$max_bytes" ]]; then
+			print_warning "Untracked whitespace check: skipped $quoted (over ${max_bytes} bytes); stage it for Git's cached check"
+			continue
+		fi
+		# --no-index implies --exit-code: 1 is an ordinary addition (including
+		# binary files), while --check reports whitespace errors with bit 2.
+		diff_rc=0
+		git diff --no-index --no-ext-diff --no-textconv --check -- /dev/null "$file" || diff_rc=$?
+		[[ "$diff_rc" -le 1 ]] || exit_code=1
+	done <"$inventory"
+	rm -f "$inventory"
+	return "$exit_code"
+}
+
 check_git_diff_whitespace() {
 	echo -e "${BLUE}Checking Git Diff Whitespace...${NC}"
 
@@ -64,9 +98,10 @@ check_git_diff_whitespace() {
 	fi
 	git diff --check || exit_code=1
 	git diff --cached --check || exit_code=1
+	_linters_check_untracked_whitespace || exit_code=1
 
 	if [[ "$exit_code" -eq 0 ]]; then
-		print_success "git diff --check: no whitespace errors"
+		print_success "git diff --check: no whitespace errors in checked files"
 		return 0
 	fi
 
@@ -84,31 +119,52 @@ check_return_statements() {
 		[[ -f "$file" ]] || continue
 		((++files_checked))
 
-		# Count multi-line functions (exclude one-liners like: func() { echo "x"; })
-		# One-liners don't need explicit return statements
-		local functions_count
-		functions_count=$(safe_grep_count "^[a-zA-Z_][a-zA-Z0-9_]*() {$" "$file")
-
-		# Count all return patterns: return 0, return 1, return $var, return $((expr))
-		local return_statements
-		return_statements=$(grep -cE "return [0-9]+|return \\\$" "$file" 2>/dev/null || echo "0")
-
-		# Also count exit statements at script level (exit 0, exit $?)
-		local exit_statements
-		exit_statements=$(grep -cE "^exit [0-9]+|^exit \\\$" "$file" 2>/dev/null || echo "0")
+		# Count shell functions and terminal statements while ignoring generated
+		# scripts embedded in arbitrary quoted or unquoted heredocs. Treating mock
+		# fixture bodies as the surrounding file inflated the repository baseline.
+		local counts
+		counts=$(awk '
+            function starts_heredoc(line, token) {
+                if (!match(line, /<<-?[[:space:]]*["\047]?[a-zA-Z_][a-zA-Z0-9_]*["\047]?/)) {
+                    return 0
+                }
+                token = substr(line, RSTART, RLENGTH)
+                heredoc_strips_tabs = (token ~ /^<<-/)
+                sub(/^<<-?[[:space:]]*/, "", token)
+                sub(/^["\047]/, "", token)
+                sub(/["\047]$/, "", token)
+                heredoc_delimiter = token
+                in_heredoc = 1
+                return 1
+            }
+            in_heredoc {
+                candidate = $0
+                if (heredoc_strips_tabs) {
+                    sub(/^\t+/, "", candidate)
+                }
+                if (candidate == heredoc_delimiter) {
+                    in_heredoc = 0
+                    heredoc_delimiter = ""
+                }
+                next
+            }
+            starts_heredoc($0) { next }
+            /^[[:space:]]*#/ { next }
+            /^[a-zA-Z_][a-zA-Z0-9_]*\(\)[[:space:]]*\{$/ { functions++ }
+            /return[[:space:]]+([0-9]+|\$)/ { terminals++ }
+            /^exit[[:space:]]+([0-9]+|\$)/ { terminals++ }
+            END { print functions + 0, terminals + 0 }
+        ' "$file")
+		local functions_count="${counts%% *}"
+		local return_statements="${counts#* }"
 
 		# Ensure variables are numeric
 		functions_count=${functions_count//[^0-9]/}
 		return_statements=${return_statements//[^0-9]/}
-		exit_statements=${exit_statements//[^0-9]/}
 		functions_count=${functions_count:-0}
 		return_statements=${return_statements:-0}
-		exit_statements=${exit_statements:-0}
 
-		# Total returns = return statements + exit statements (for main)
-		local total_returns=$((return_statements + exit_statements))
-
-		if [[ $total_returns -lt $functions_count ]]; then
+		if [[ $return_statements -lt $functions_count ]]; then
 			((++violations))
 			print_warning "Missing return statements in $file"
 		fi
@@ -127,34 +183,91 @@ check_return_statements() {
 	return 0
 }
 
+_report_positional_parameters() {
+	local tmp_file="$1"
+	local violations=0
+	if [[ -s "$tmp_file" ]]; then
+		violations=$(wc -l <"$tmp_file")
+		violations=${violations//[^0-9]/}
+		violations=${violations:-0}
+
+		if [[ $violations -gt 0 ]]; then
+			print_warning "Found $violations positional parameter violations:"
+			head -10 "$tmp_file"
+			if [[ $violations -gt 10 ]]; then
+				echo "... and $((violations - 10)) more"
+			fi
+		fi
+	fi
+
+	if [[ $violations -le $MAX_POSITIONAL_ISSUES ]]; then
+		print_success "Positional parameters: $violations violations (within threshold)"
+	else
+		print_error "Positional parameters: $violations violations (exceeds threshold of $MAX_POSITIONAL_ISSUES)"
+		return 1
+	fi
+	return 0
+}
+
 check_positional_parameters() {
 	echo -e "${BLUE}Checking Positional Parameters (S7679)...${NC}"
 
-	local violations=0
-
-	# Find direct usage of positional parameters inside functions (not in local assignments)
-	# Exclude: heredocs (<<), awk scripts, main script body, and local assignments
+	# Find direct positional-parameter use inside functions, excluding generated
+	# heredocs, embedded awk/sed, comments, examples, and local assignments.
 	local tmp_file
 	tmp_file=$(mktemp)
 	_save_cleanup_scope
 	trap '_run_cleanups' RETURN
 	push_cleanup "rm -f '${tmp_file}'"
 
-	# Only check inside function bodies, exclude heredocs, awk/sed patterns, and comments
 	for file in "${ALL_SH_FILES[@]}"; do
 		if [[ -f "$file" ]]; then
-			# Use awk to find $1-$9 usage inside functions, excluding:
-			# - local assignments (local var="$1")
-			# - heredocs (<<EOF ... EOF)
-			# - awk/sed scripts (contain $1, $2 for field references)
-			# - comments (lines starting with #)
-			# - echo/print statements showing usage examples
 			awk '
-            /^[a-zA-Z_][a-zA-Z0-9_]*\(\)[[:space:]]*\{/ { in_func=1; next }
-            in_func && /^\}$/ { in_func=0; next }
-            /<<.*EOF/ || /<<.*"EOF"/ || /<<-.*EOF/ { in_heredoc=1; next }
-            in_heredoc && /^EOF/ { in_heredoc=0; next }
-            in_heredoc { next }
+            function starts_heredoc(line, token) {
+                if (!match(line, /<<-?[[:space:]]*["\047]?[a-zA-Z_][a-zA-Z0-9_]*["\047]?/)) {
+                    return 0
+                }
+                token = substr(line, RSTART, RLENGTH)
+                heredoc_strips_tabs = (token ~ /^<<-/)
+                sub(/^<<-?[[:space:]]*/, "", token)
+                sub(/^["\047]/, "", token)
+                sub(/["\047]$/, "", token)
+                heredoc_delimiter = token
+                in_heredoc = 1
+                return 1
+            }
+            in_heredoc {
+                candidate = $0
+                if (heredoc_strips_tabs) {
+                    sub(/^\t+/, "", candidate)
+                }
+                if (candidate == heredoc_delimiter) {
+                    in_heredoc = 0
+                    heredoc_delimiter = ""
+                }
+                next
+            }
+            starts_heredoc($0) { next }
+            /^[a-zA-Z_][a-zA-Z0-9_]*\(\)[[:space:]]*\{/ { in_func=1; in_arg_case=0; next }
+            in_func && /^\}$/ {
+                if (pending_arg != "") print pending_arg
+                pending_arg=""; in_func=0; in_arg_case=0; next
+            }
+            # Only exempt an option assignment immediately followed by shift:
+            # another use or an unshifted branch remains a direct positional read.
+            in_func && /^[[:space:]]*case[[:space:]]+["\047]?\$[1-9]["\047]?[[:space:]]+in[[:space:]]*$/ { in_arg_case=1; next }
+            in_arg_case && /^[[:space:]]*esac[[:space:]]*$/ {
+                if (pending_arg != "") print pending_arg
+                pending_arg=""; in_arg_case=0; next
+            }
+            in_arg_case && /^[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*=["\047]?\$[1-9]["\047]?[[:space:]]*$/ {
+                if (pending_arg != "") print pending_arg
+                pending_arg=FILENAME ":" NR ": " $0; next
+            }
+            pending_arg != "" {
+                if ($0 !~ /^[[:space:]]*shift[[:space:]]+[1-9][0-9]*[[:space:]]*(;;)?[[:space:]]*$/) print pending_arg
+                pending_arg=""
+            }
             # Track multi-line awk scripts (awk ... single-quote opens, closes on later line)
             /awk[[:space:]]+\047[^\047]*$/ { in_awk=1; next }
             in_awk && /\047/ { in_awk=0; next }
@@ -178,34 +291,15 @@ check_positional_parameters() {
             in_func && /\$[1-9]/ && !/local.*=.*\$[1-9]/ {
                 print FILENAME ":" NR ": " $0
             }
+            END { if (pending_arg != "") print pending_arg }
             ' "$file" >>"$tmp_file"
 		fi
 	done
 
-	if [[ -s "$tmp_file" ]]; then
-		violations=$(wc -l <"$tmp_file")
-		violations=${violations//[^0-9]/}
-		violations=${violations:-0}
-
-		if [[ $violations -gt 0 ]]; then
-			print_warning "Found $violations positional parameter violations:"
-			head -10 "$tmp_file"
-			if [[ $violations -gt 10 ]]; then
-				echo "... and $((violations - 10)) more"
-			fi
-		fi
-	fi
-
+	local rc=0
+	_report_positional_parameters "$tmp_file" || rc=$?
 	rm -f "$tmp_file"
-
-	if [[ $violations -le $MAX_POSITIONAL_ISSUES ]]; then
-		print_success "Positional parameters: $violations violations (within threshold)"
-	else
-		print_error "Positional parameters: $violations violations (exceeds threshold of $MAX_POSITIONAL_ISSUES)"
-		return 1
-	fi
-
-	return 0
+	return "$rc"
 }
 
 check_string_literals() {
@@ -253,7 +347,7 @@ check_string_literals() {
 			local new_strings=$((repeated_strings - baseline_strings))
 			((violations += new_strings))
 			print_error "$file has $new_strings new repeated string literal(s) (baseline: $baseline_strings, current: $repeated_strings)"
-			_linters_show_repeated_literals <"$file"
+			_linters_show_repeated_literals new "$base_content" <"$file"
 		elif ((repeated_strings > 0)); then
 			((debt_files += 1))
 			print_warning "$file has $repeated_strings pre-existing repeated string literal(s) (not blocking)"
@@ -285,8 +379,15 @@ _linters_count_repeated_literals() {
 	return 0
 }
 
+# Prints "  <count>x: <literal>" lines from stdin, with the whole literal text.
+# Modes mirror pre-commit-hook.sh _show_repeated_literals (GH#36999):
+# top (default, first three), all, or new <baseline> — only literals not
+# already repeated >=3x in the baseline, compared on literal text.
 _linters_show_repeated_literals() {
-	grep -v '^[[:space:]]*#' |
+	local mode="${1:-top}"
+	local baseline="${2:-}"
+	local listing
+	listing=$(grep -v '^[[:space:]]*#' |
 		sed -E '
 			s/"\$[A-Za-z_][A-Za-z0-9_]*"//g
 			s/"\$\{[^}]*\}"//g
@@ -296,7 +397,23 @@ _linters_show_repeated_literals() {
 		grep -oE '"[^"]{4,}"' |
 		grep -vE '^"[0-9]+\.?[0-9]*"$' |
 		grep -vE '^"\$' |
-		sort | uniq -c | awk '$1 >= 3 {print "  " $1 "x: " $2}' | head -3
+		sort | uniq -c |
+		awk '$1 >= 3 { n = $1; sub(/^[[:space:]]*[0-9]+[[:space:]]/, ""); print "  " n "x: " $0 }') ||
+		listing="" # grep exits 1 on no match; under pipefail that means none, not an error
+	[[ -n "$listing" ]] || return 0
+	case "$mode" in
+	all) printf '%s\n' "$listing" ;;
+	new)
+		# phase= assignments, not NR==FNR: an empty baseline (new file) must
+		# not make the current listing look like the baseline.
+		awk '
+			phase == "base" { sub(/^ *[0-9]+x: /, ""); seen[$0] = 1; next }
+			{ literal = $0; sub(/^ *[0-9]+x: /, "", literal) }
+			literal != "" && !(literal in seen) { print }
+		' phase=base <(printf '%s\n' "$baseline" | _linters_show_repeated_literals all) phase=cur - <<<"$listing"
+		;;
+	*) head -3 <<<"$listing" ;;
+	esac
 	return 0
 }
 

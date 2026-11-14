@@ -328,6 +328,15 @@ _release_tag_message() {
 	if [[ -n "$source_pr" && -n "$source_merge" ]]; then
 		printf 'Aidevops-Source-PR: %s\n' "$source_pr"
 		printf 'Aidevops-Source-Merge: %s\n' "$source_merge"
+		if [[ -n "${VERSION_MANAGER_SNAPSHOT_BASE:-}" ]]; then
+			[[ "$VERSION_MANAGER_SNAPSHOT_BASE" =~ ^[0-9a-f]{40}$ ]] || return 1
+			printf 'Aidevops-Snapshot-Base: %s\n' "$VERSION_MANAGER_SNAPSHOT_BASE"
+		fi
+		if [[ -n "${VERSION_MANAGER_AGGREGATE_PIN:-}" ]]; then
+			# GH#34710: signed opt-in that this aggregate release may trail main.
+			[[ "$VERSION_MANAGER_AGGREGATE_PIN" == "$source_merge" ]] || return 1
+			printf 'Aidevops-Aggregate-Pin: %s\n' "$VERSION_MANAGER_AGGREGATE_PIN"
+		fi
 		while IFS= read -r aggregated_source; do
 			[[ -n "$aggregated_source" ]] || continue
 			printf 'Aidevops-Aggregated-Source: %s\n' "$aggregated_source"
@@ -342,6 +351,10 @@ create_git_tag() {
 	local tag_name="v$version"
 	local tag_message=""
 
+	# Also guard standalone `tag` and callers that bypass the release command.
+	# shellcheck source=./release-signing-helper.sh
+	source "${SCRIPT_DIR}/release-signing-helper.sh"
+	release_signing_preflight "$REPO_ROOT" || return 1
 	print_info "Creating git tag: $tag_name"
 
 	cd "$REPO_ROOT" || exit 1
@@ -426,9 +439,21 @@ replace_unpublished_aggregate_tag() {
 	tag_ref=$(_version_manager_tag_ref "$tag_name") || return 1
 	[[ "$original_object" =~ ^[0-9a-f]{40}$ ]] || return 1
 	observed_object=$(git rev-parse "$tag_ref" 2>/dev/null) || return 1
-	[[ "$observed_object" == "$original_object" ]] || return 1
-	git verify-tag "$tag_name" >/dev/null 2>&1 || return 1
-	_version_manager_tag_absent_from_all_remotes "$tag_ref" || return 1
+	[[ "$observed_object" == "$original_object" ]] || {
+		print_error "Provisional ${tag_name} moved from its fenced object; refusing replacement"
+		return 1
+	}
+	# GH#34749: the provisional is only deleted and kept for restore, never
+	# trusted or published, so bind it by fenced object identity. A collaborator
+	# host may have signed it with a key this host's allowed signers lack.
+	[[ "$(git cat-file -t "$original_object" 2>/dev/null)" == "tag" ]] || {
+		print_error "Provisional ${tag_name} is not an annotated tag object; refusing replacement"
+		return 1
+	}
+	_version_manager_tag_absent_from_all_remotes "$tag_ref" || {
+		print_error "Provisional ${tag_name} is visible on a remote; refusing replacement"
+		return 1
+	}
 	git update-ref -d "$tag_ref" "$original_object" || return 1
 	if ! create_git_tag "$version"; then
 		_restore_unpublished_release_tag "$tag_name" "$original_object" || true
@@ -612,7 +637,9 @@ _create_hotfix_tag() {
 	# Push the hotfix tag (the release tag is pushed by push_changes;
 	# the hotfix tag needs a separate push since --tags only pushes
 	# tags that point to reachable commits, which this one does).
-	if git push origin "$hotfix_tag" 2>/dev/null; then
+	# GH#34434: post-release runs in a dependency-free tag worktree; skip only
+	# repo-verify (rationale in version-manager-protected-main.sh).
+	if AIDEVOPS_PREPUSH_REPO_VERIFY=0 git push origin "$hotfix_tag" 2>/dev/null; then
 		print_success "Pushed hotfix signal tag: $hotfix_tag"
 	else
 		print_error "Failed to push hotfix signal tag after GitHub release publication"
@@ -648,6 +675,203 @@ validate_release_deployment_readiness() {
 }
 
 _AIDEVOPS_RELEASE_ACTIVE_PRESERVATION_SHA=""
+_AIDEVOPS_RELEASE_SQUASH_RECOVERY_SHA=""
+_AIDEVOPS_RELEASE_INITIAL_ACTIVE_SHA=""
+_AIDEVOPS_RELEASE_PROTECTED_INTEGRATION_SHA=""
+_AIDEVOPS_RELEASE_TRANSITION_LOCK_DIR=""
+
+_acquire_release_runtime_transition_lock() {
+	local lock_dir="${AIDEVOPS_RUNTIME_TRANSITION_LOCK_DIR:-${HOME}/.aidevops/locks/runtime-transition.lock.d}"
+	local waited=0
+	local owner_pid=""
+
+	mkdir -p "${lock_dir%/*}" || return 1
+	while ! mkdir "$lock_dir" 2>/dev/null; do
+		owner_pid=""
+		if [[ -r "$lock_dir/pid" ]]; then
+			IFS= read -r owner_pid <"$lock_dir/pid" || owner_pid=""
+		fi
+		if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
+			rm -f "$lock_dir/pid"
+			rmdir "$lock_dir" 2>/dev/null || true
+			continue
+		fi
+		[[ "$waited" -lt 30 ]] || return 1
+		sleep 1
+		waited=$((waited + 1))
+	done
+	printf '%s\n' "$$" >"$lock_dir/pid" || {
+		rmdir "$lock_dir" 2>/dev/null || true
+		return 1
+	}
+	_AIDEVOPS_RELEASE_TRANSITION_LOCK_DIR="$lock_dir"
+	return 0
+}
+
+_release_runtime_transition_lock() {
+	local lock_dir="$_AIDEVOPS_RELEASE_TRANSITION_LOCK_DIR"
+	local owner_pid=""
+
+	[[ -n "$lock_dir" ]] || return 0
+	if [[ -r "$lock_dir/pid" ]]; then
+		IFS= read -r owner_pid <"$lock_dir/pid" || owner_pid=""
+	fi
+	if [[ "$owner_pid" == "$$" ]]; then
+		rm -f "$lock_dir/pid"
+		rmdir "$lock_dir" 2>/dev/null || true
+	fi
+	_AIDEVOPS_RELEASE_TRANSITION_LOCK_DIR=""
+	return 0
+}
+
+_verify_exact_tag_release_lane() {
+	local sync_repo_root="$1"
+	local release_sha="$2"
+	local source_pr="${AIDEVOPS_RELEASE_LANE_SOURCE_PR:-}"
+	local tag_name="${AIDEVOPS_RELEASE_LANE_TAG:-}"
+	local tag_sha=""
+	local repo_slug=""
+
+	[[ "${AIDEVOPS_RELEASE_SQUASH_RECOVERY:-0}" == "1" ]] || return 1
+	[[ "$source_pr" =~ ^[0-9]+$ && "$tag_name" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+	repo_slug=$(_version_manager_repo_slug) || return 1
+	declare -F release_lane_setup_guard >/dev/null 2>&1 || return 1
+	release_lane_setup_guard "$repo_slug" || return 1
+	jq -e --argjson source_pr "$source_pr" --arg tag_name "$tag_name" '
+		.active == true and .source_pr == $source_pr and .tag == $tag_name
+		and .phase == "exact-tag-deployment" and ((.terminal_receipt // null) == null)
+	' <<<"${_AIDEVOPS_RELEASE_LANE_JSON:-}" >/dev/null || return 1
+	tag_sha=$(git -C "$sync_repo_root" rev-parse "refs/tags/${tag_name}^{commit}" 2>/dev/null) || return 1
+	[[ "$tag_sha" == "$release_sha" ]] || return 1
+	return 0
+}
+
+#aidevops:trust-boundary
+# Print the mainline parent of a two-parent merge whose other parent is exactly
+# release_sha. Fails for octopus/non-merge commits or any other topology.
+_protected_integration_mainline_parent() {
+	local sync_repo_root="$1"
+	local candidate="$2"
+	local release_sha="$3"
+	local parent_line=""
+	local commit_sha=""
+	local parent_one=""
+	local parent_two=""
+	local extra_parent=""
+
+	parent_line=$(git -C "$sync_repo_root" rev-list --parents -n 1 "$candidate" 2>/dev/null) || return 1
+	IFS=' ' read -r commit_sha parent_one parent_two extra_parent <<<"$parent_line"
+	[[ "$commit_sha" == "$candidate" && -n "$parent_one" && -n "$parent_two" && -z "$extra_parent" ]] || return 1
+	if [[ "$parent_two" == "$release_sha" && "$parent_one" != "$release_sha" ]]; then
+		printf '%s\n' "$parent_one"
+		return 0
+	fi
+	if [[ "$parent_one" == "$release_sha" && "$parent_two" != "$release_sha" ]]; then
+		printf '%s\n' "$parent_two"
+		return 0
+	fi
+	return 1
+}
+
+#aidevops:trust-boundary
+# A protected integration is a two-parent merge of the exact signed release
+# commit, reachable from freshly fetched protected main. The active runtime
+# must also be in that main history but not contain the release commit itself.
+# They need not be related until a later protected-main merge (GH#32569).
+# Deferral deploys nothing; converging on protected main cannot downgrade.
+_verify_protected_release_integration() {
+	local sync_repo_root="$1"
+	local release_sha="$2"
+	local active_sha="$3"
+	local protected_main=""
+	local candidate=""
+
+	_verify_exact_tag_release_lane "$sync_repo_root" "$release_sha" || return 1
+	if ! git -C "$sync_repo_root" fetch origin main --quiet; then
+		print_error "Post-release deployment gate cannot refresh protected main for integration verification"
+		return 1
+	fi
+	protected_main=$(git -C "$sync_repo_root" rev-parse "origin/main^{commit}" 2>/dev/null) || return 1
+	git -C "$sync_repo_root" merge-base --is-ancestor "$active_sha" "$protected_main" 2>/dev/null || return 1
+	# A descendant has already incorporated the signed release; it must use
+	# preservation verification, never the stale-runtime deferral.
+	if git -C "$sync_repo_root" merge-base --is-ancestor "$release_sha" "$active_sha" 2>/dev/null; then
+		return 1
+	fi
+	git -C "$sync_repo_root" merge-base --is-ancestor "$release_sha" "$protected_main" 2>/dev/null || return 1
+	while IFS= read -r candidate; do
+		[[ -n "$candidate" ]] || continue
+		_protected_integration_mainline_parent "$sync_repo_root" "$candidate" "$release_sha" >/dev/null || continue
+		git -C "$sync_repo_root" merge-base --is-ancestor "$candidate" "$protected_main" 2>/dev/null || continue
+		_AIDEVOPS_RELEASE_PROTECTED_INTEGRATION_SHA="$candidate"
+		return 0
+	done < <(git -C "$sync_repo_root" rev-list --ancestry-path --merges "${release_sha}..${protected_main}" 2>/dev/null)
+	return 1
+}
+
+_verify_squash_integrated_active_source() {
+	local sync_repo_root="$1"
+	local release_sha="$2"
+	local active_sha="$3"
+	local merge_base=""
+	local path_list=""
+	local changed_path=""
+	local paths_match=1
+	local verify_base="${AIDEVOPS_TEMP_DIR:-${HOME}/.aidevops/.agent-workspace/tmp}"
+
+	_verify_exact_tag_release_lane "$sync_repo_root" "$release_sha" || return 1
+	merge_base=$(git -C "$sync_repo_root" merge-base "$active_sha" "$release_sha" 2>/dev/null) || return 1
+	[[ "$merge_base" != "$active_sha" && "$merge_base" != "$release_sha" ]] || return 1
+	mkdir -p "$verify_base" || return 1
+	path_list=$(mktemp "$verify_base/release-squash-paths.XXXXXX") || return 1
+	if ! git -C "$sync_repo_root" diff --name-only -z --no-renames \
+		"$merge_base" "$active_sha" >"$path_list" 2>/dev/null || [[ ! -s "$path_list" ]]; then
+		rm -f "$path_list"
+		return 1
+	fi
+	while IFS= read -r -d '' changed_path; do
+		[[ -n "$changed_path" ]] || continue
+		if ! git -C "$sync_repo_root" diff --quiet "$active_sha" "$release_sha" -- "$changed_path"; then
+			print_error "Post-release squash recovery rejected active source ${active_sha:0:12}: changed path is not identical in release: $changed_path"
+			paths_match=0
+			break
+		fi
+	done <"$path_list"
+	rm -f "$path_list" || return 1
+	[[ "$paths_match" -eq 1 ]] || return 1
+	_AIDEVOPS_RELEASE_SQUASH_RECOVERY_SHA="$active_sha"
+	return 0
+}
+
+_verify_release_deployment_source_unchanged() {
+	local sync_repo_root="$1"
+	local release_sha="$2"
+	local active_link="$3"
+	local current_sha=""
+	local active_manifest=""
+	local current_active_sha=""
+	local source_status=""
+
+	current_sha=$(git -C "$sync_repo_root" rev-parse HEAD 2>/dev/null) || return 1
+	[[ "$current_sha" == "$release_sha" ]] || return 1
+	source_status=$(git -C "$sync_repo_root" status --porcelain --untracked-files=normal 2>/dev/null) || return 1
+	[[ -z "$source_status" ]] || return 1
+	[[ -n "$_AIDEVOPS_RELEASE_INITIAL_ACTIVE_SHA" ]] || return 0
+	_runtime_bundle_verify_active_link "$active_link" || return 1
+	active_manifest="$_AIDEVOPS_RUNTIME_VERIFY_ACTIVE_ROOT/.bundle-manifest"
+	current_active_sha=$(_runtime_bundle_verify_manifest_value "$active_manifest" git_sha 2>/dev/null) || return 1
+	[[ "$current_active_sha" == "$_AIDEVOPS_RELEASE_INITIAL_ACTIVE_SHA" ]] || return 1
+	return 0
+}
+
+_verify_release_descendant_active_source() {
+	local sync_repo_root="$1"
+	local release_sha="$2"
+	local active_sha="$3"
+	# The validated active bundle contains this exact release commit. Its tree
+	# may include later merges; moving protected main is not a deployment fence.
+	git -C "$sync_repo_root" merge-base --is-ancestor "$release_sha" "$active_sha" 2>/dev/null
+}
 
 _verify_active_release_preservation_merge() {
 	local sync_repo_root="$1"
@@ -658,14 +882,16 @@ _verify_active_release_preservation_merge() {
 	local manifest_status=""
 	local manifest_sha=""
 	local active_sha=""
-	local release_tree=""
-	local active_tree=""
 	local verify_base=""
 	local verify_root=""
 	local verify_repo=""
 	local verify_exit=0
+	local stale_runtime=0
 
 	_AIDEVOPS_RELEASE_ACTIVE_PRESERVATION_SHA=""
+	_AIDEVOPS_RELEASE_SQUASH_RECOVERY_SHA=""
+	_AIDEVOPS_RELEASE_INITIAL_ACTIVE_SHA=""
+	_AIDEVOPS_RELEASE_PROTECTED_INTEGRATION_SHA=""
 	[[ -e "$active_link" || -L "$active_link" ]] || return 0
 	_runtime_bundle_verify_active_link "$active_link" || return 1
 	active_manifest="$_AIDEVOPS_RUNTIME_VERIFY_ACTIVE_ROOT/.bundle-manifest"
@@ -683,26 +909,21 @@ _verify_active_release_preservation_merge() {
 		print_error "Post-release deployment gate rejected the active bundle: manifest git SHA is not the full resolved commit"
 		return 1
 	fi
+	_AIDEVOPS_RELEASE_INITIAL_ACTIVE_SHA="$active_sha"
 	[[ "$active_sha" != "$release_sha" ]] || return 0
 	if git -C "$sync_repo_root" merge-base --is-ancestor "$active_sha" "$release_sha" 2>/dev/null; then
 		return 0
 	fi
 
 	if ! git -C "$sync_repo_root" merge-base --is-ancestor "$release_sha" "$active_sha" 2>/dev/null; then
-		print_error "Post-release deployment gate rejected active source ${active_sha:0:12}: it is not a descendant of release ${release_sha:0:12}"
-		return 1
-	fi
-	release_tree=$(git -C "$sync_repo_root" rev-parse "${release_sha}^{tree}" 2>/dev/null) || {
-		print_error "Post-release deployment gate cannot resolve the release tree"
-		return 1
-	}
-	active_tree=$(git -C "$sync_repo_root" rev-parse "${active_sha}^{tree}" 2>/dev/null) || {
-		print_error "Post-release deployment gate cannot resolve the active bundle tree"
-		return 1
-	}
-	if [[ "$release_tree" != "$active_tree" ]]; then
-		print_error "Post-release deployment gate rejected active descendant ${active_sha:0:12}: its tree differs from release ${release_sha:0:12}"
-		return 1
+		if _verify_protected_release_integration "$sync_repo_root" "$release_sha" "$active_sha"; then
+			stale_runtime=1
+		elif ! _verify_squash_integrated_active_source "$sync_repo_root" "$release_sha" "$active_sha"; then
+			print_error "Post-release deployment gate rejected active source ${active_sha:0:12}: it is neither ancestry-related nor a lane-authorized squash-integrated source"
+			return 1
+		fi
+	else
+		_verify_release_descendant_active_source "$sync_repo_root" "$release_sha" "$active_sha" || return 1
 	fi
 
 	verify_base="${AIDEVOPS_TEMP_DIR:-${HOME}/.aidevops/.agent-workspace/tmp}"
@@ -731,9 +952,58 @@ _verify_active_release_preservation_merge() {
 		return 1
 	fi
 	[[ "$verify_exit" -eq 0 ]] || return 1
+	if [[ "$stale_runtime" -eq 1 ]]; then
+		if [[ -n "$_AIDEVOPS_RELEASE_PROTECTED_INTEGRATION_SHA" ]]; then
+			print_info "Post-release deployment deferred: protected integration ${_AIDEVOPS_RELEASE_PROTECTED_INTEGRATION_SHA:0:12} is verified, but active runtime ${active_sha:0:12} does not include the release tag"
+		fi
+		return 76
+	fi
 
+	if [[ -n "$_AIDEVOPS_RELEASE_SQUASH_RECOVERY_SHA" ]]; then
+		return 0
+	fi
 	_AIDEVOPS_RELEASE_ACTIVE_PRESERVATION_SHA="$active_sha"
 	return 2
+}
+
+# Verify the active runtime after exact-tag deployment. A concurrent auto-update
+# can activate a newer, validated descendant after deployment; accept only the
+# fully materialized preservation result, never an unverified exact-tag bundle
+# or a stale/unrelated runtime. Returns 0 converged, 2 preservation no-op
+# (success already reported), 1 not converged.
+_verify_post_deploy_runtime_convergence() {
+	local sync_repo_root="$1"
+	local release_sha="$2"
+	local preservation_exit=0
+	# The exact-tag check is expected to fail whenever a concurrent auto-update
+	# already advanced the active bundle; suppress its error line here so a
+	# successful preservation fallback below does not leave a stray ERROR in
+	# otherwise-successful release logs. The fallback's own internal exact-tag
+	# verification runs un-suppressed (quiet flag cleared before that call), so
+	# a genuine convergence failure still prints its reason.
+	local _AIDEVOPS_RUNTIME_VERIFY_QUIET=1
+	if verify_aidevops_runtime_bundle_convergence \
+		"$sync_repo_root" \
+		"$release_sha" \
+		"$HOME/.aidevops/agents" \
+		"$HOME/.aidevops/.deployed-sha"; then
+		return 0
+	fi
+	_AIDEVOPS_RUNTIME_VERIFY_QUIET=""
+	_verify_active_release_preservation_merge \
+		"$sync_repo_root" \
+		"$release_sha" \
+		"$HOME/.aidevops/agents" \
+		"$HOME/.aidevops/.deployed-sha" || preservation_exit=$?
+	if [[ "$preservation_exit" -eq 2 ]]; then
+		print_success "Post-release aidevops runtime already contains release ${release_sha:0:12} through validated preservation merge ${_AIDEVOPS_RELEASE_ACTIVE_PRESERVATION_SHA:0:12} (verified no-op)"
+		return 2
+	fi
+	if [[ -n "$_AIDEVOPS_RUNTIME_VERIFY_LAST_ERROR" ]]; then
+		print_error "$_AIDEVOPS_RUNTIME_VERIFY_LAST_ERROR"
+	fi
+	print_error "Post-release deployment helper exited successfully, but runtime bundle provenance did not converge"
+	return 1
 }
 
 run_post_release_agent_sync() {
@@ -741,6 +1011,9 @@ run_post_release_agent_sync() {
 	local remote_url
 	local release_sha=""
 	local active_preservation_exit=0
+	local transition_locked=0
+	local inner_transition_lock=""
+	local -a deploy_env=(env -u AIDEVOPS_AGENTS_DIR -u AGENTS_DIR)
 	remote_url=$(git -C "$sync_repo_root" remote get-url origin 2>/dev/null || echo "")
 
 	if [[ "$remote_url" != *"marcusquinn/aidevops"* ]]; then
@@ -777,30 +1050,48 @@ run_post_release_agent_sync() {
 		return 0
 	fi
 	if [[ "$active_preservation_exit" -ne 0 ]]; then
+		if [[ "$active_preservation_exit" -eq 76 ]]; then
+			return 76
+		fi
 		print_error "Post-release deployment gate could not verify the active runtime before deployment"
+		return "$active_preservation_exit"
+	fi
+	if [[ -n "$_AIDEVOPS_RELEASE_SQUASH_RECOVERY_SHA" ]]; then
+		if ! _acquire_release_runtime_transition_lock; then
+			print_error "Post-release squash recovery could not acquire the runtime activation lock"
+			return 1
+		fi
+		transition_locked=1
+		inner_transition_lock="${_AIDEVOPS_RELEASE_TRANSITION_LOCK_DIR}.release-inner.$$"
+		deploy_env+=("AIDEVOPS_RUNTIME_TRANSITION_LOCK_DIR=$inner_transition_lock")
+	fi
+	if ! _verify_release_deployment_source_unchanged \
+		"$sync_repo_root" "$release_sha" "$HOME/.aidevops/agents"; then
+		[[ "$transition_locked" -eq 0 ]] || _release_runtime_transition_lock
+		print_error "Post-release deployment gate rejected a dirty, changed, or concurrently replaced exact-tag source"
 		return 1
 	fi
 	deploy_args+=(--expected-sha "$release_sha")
+	if [[ -n "$_AIDEVOPS_RELEASE_SQUASH_RECOVERY_SHA" ]]; then
+		print_info "Recovering exact-tag deployment after verified squash integration of active source ${_AIDEVOPS_RELEASE_SQUASH_RECOVERY_SHA:0:12}"
+	fi
 
 	print_info "Running post-release aidevops agent sync..."
 	local sync_output=""
 	local sync_exit=0
-	sync_output=$(env -u AIDEVOPS_AGENTS_DIR -u AGENTS_DIR \
+	sync_output=$("${deploy_env[@]}" \
 		AIDEVOPS_DEPLOY_TARGET="$HOME/.aidevops/agents" \
 		bash "$deploy_script" "${deploy_args[@]}" 2>&1) || sync_exit=$?
+	[[ "$transition_locked" -eq 0 ]] || _release_runtime_transition_lock
 
 	if [[ "$sync_exit" -ne 0 && "$sync_exit" -ne 2 ]]; then
 		print_error "Post-release aidevops deployment or CLI convergence failed: $sync_output"
 		return 1
 	fi
-	if ! verify_aidevops_runtime_bundle_convergence \
-		"$sync_repo_root" \
-		"$release_sha" \
-		"$HOME/.aidevops/agents" \
-		"$HOME/.aidevops/.deployed-sha"; then
-		print_error "Post-release deployment helper exited successfully, but runtime bundle provenance did not converge"
-		return 1
-	fi
+	local convergence_exit=0
+	_verify_post_deploy_runtime_convergence "$sync_repo_root" "$release_sha" || convergence_exit=$?
+	[[ "$convergence_exit" -ne 2 ]] || return 0
+	[[ "$convergence_exit" -eq 0 ]] || return 1
 
 	if [[ "$sync_exit" -eq 2 ]]; then
 		print_success "Post-release aidevops runtime was already converged to ${release_sha:0:12} (verified no-op)"
@@ -823,6 +1114,10 @@ run_post_publication_gates() {
 		_create_hotfix_tag "$version" || hotfix_exit=$?
 	fi
 	run_post_release_agent_sync || deployment_exit=$?
+	if [[ "$hotfix_exit" -eq 0 && "$deployment_exit" -eq 76 ]]; then
+		print_info "Published; deployment deferred until the active runtime includes v${version}. Next (same session, do not wait for auto-update): run aidevops update, then aidevops release reconcile <source-PR>."
+		return 76
+	fi
 
 	if [[ "$hotfix_exit" -ne 0 || "$deployment_exit" -ne 0 ]]; then
 		print_error "PARTIAL RELEASE SUCCESS: GitHub release v$version remains published; post-publication gates failed"

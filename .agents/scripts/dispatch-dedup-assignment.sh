@@ -191,13 +191,15 @@ _has_active_claim() {
 #   $3 = (optional) current runner login — if assigned to self, not a dup
 # Returns:
 #   exit 0 if assigned to another login (do NOT dispatch), parent-task labeled,
-#          no-auto-dispatch labeled, cost-budget exceeded, or guard cannot
-#          determine safety (GUARD_UNCERTAIN)
+#          no-auto-dispatch labeled, waiting for contributor information,
+#          cost-budget exceeded, or guard cannot determine safety
+#          (GUARD_UNCERTAIN)
 #   exit 1 if unassigned or assigned only to self (safe to dispatch)
 # Outputs: one of the following signals on stdout when blocking:
 #   PARENT_TASK_BLOCKED (label=<name>)      — unconditional parent-task / meta block
 #   PUBLICATION_PENDING_BLOCKED (label=...) — canonical planning publication has not landed
 #   NO_AUTO_DISPATCH_BLOCKED (label=...)    — unconditional no-auto-dispatch block (t2832)
+#   NEEDS_INFO_BLOCKED (label=...)          — waiting for contributor information
 #   INFRASTRUCTURE_BLOCKED (label=...)      — infrastructure / billing / runner advisory block
 #   COST_BUDGET_EXCEEDED (...)              — token spend circuit breaker
 #   GUARD_UNCERTAIN (reason=...)            — internal error, cannot determine safety
@@ -249,7 +251,7 @@ _is_assigned_check_parent_task() {
 	local _jq_rc=0
 	local parent_task_hit
 	parent_task_hit=$(printf '%s' "$meta_json" |
-		jq -r '(.labels // [])[].name | select(. == "parent-task" or . == "meta")' 2>/dev/null | head -n 1) || _jq_rc=$?
+		jq -r '(.labels // [])[].name | select(. == "parent-task" or . == "meta")' 2>/dev/null | sed -n '1p') || _jq_rc=$?
 	if [[ "$_jq_rc" -ne 0 ]]; then
 		printf 'GUARD_UNCERTAIN (reason=jq-failure call=parent-task-check issue=%s repo=%s)\n' \
 			"$issue_number" "$repo_slug"
@@ -305,7 +307,7 @@ _is_assigned_check_label_block() {
 	local _jq_rc=0
 	local label_hit
 	label_hit=$(printf '%s' "$meta_json" |
-		jq -r --arg label_name "$label_name" '(.labels // [])[].name | select(. == $label_name)' 2>/dev/null | head -n 1) || _jq_rc=$?
+		jq -r --arg label_name "$label_name" '(.labels // [])[].name | select(. == $label_name)' 2>/dev/null | sed -n '1p') || _jq_rc=$?
 	if [[ "$_jq_rc" -ne 0 ]]; then
 		printf 'GUARD_UNCERTAIN (reason=jq-failure call=%s issue=%s repo=%s)\n' \
 			"$check_name" "$issue_number" "$repo_slug"
@@ -359,6 +361,27 @@ _is_assigned_check_no_auto_dispatch() {
 	local repo_slug="${3:-unknown}"
 	_is_assigned_check_label_block "$meta_json" "$issue_number" "$repo_slug" \
 		"no-auto-dispatch" "NO_AUTO_DISPATCH_BLOCKED" "no-auto-dispatch-check"
+}
+
+#######################################
+# is_assigned helper: block worker implementation while contributor evidence
+# requested by triage is still outstanding. Pulse's ancillary reconciliation
+# removes status:needs-info after a contributor reply; until then the issue is
+# not runnable even if stale status:available and auto-dispatch labels remain.
+#
+# Args:
+#   $1 = issue metadata JSON (from `gh issue view --json ...,labels`)
+#   $2 = (optional) issue number — included in GUARD_UNCERTAIN output
+#   $3 = (optional) repo slug — included in GUARD_UNCERTAIN output
+# Returns: exit 0 if status:needs-info is present or jq fails (prints signal),
+#          exit 1 if the label is absent and jq succeeds
+#######################################
+_is_assigned_check_needs_info() {
+	local meta_json="$1"
+	local issue_number="${2:-unknown}"
+	local repo_slug="${3:-unknown}"
+	_is_assigned_check_label_block "$meta_json" "$issue_number" "$repo_slug" \
+		"status:needs-info" "NEEDS_INFO_BLOCKED" "needs-info-check"
 }
 
 _is_assigned_check_maintainer_permissions() {
@@ -448,8 +471,8 @@ _is_assigned_check_hold_for_review() {
 # comment containing the marker:
 #   <!-- dispatch-cooldown-until:<ISO8601-UTC> reason=no_worker_process runner=<login> -->
 #
-# This check fetches the issue's comments, finds the latest unexpired
-# cooldown marker, and short-circuits dispatch with `DISPATCH_COOLDOWN_ACTIVE`.
+# This check fetches the issue's comments, authenticates an exact cooldown
+# marker, and short-circuits dispatch with `DISPATCH_COOLDOWN_ACTIVE`.
 # Closes the rapid-retry loop where a broken runtime burns ~5 worker
 # spawns over 3-4 hours per issue with 95-99s lifespans each, repeating
 # across many issues simultaneously when one runner is unhealthy.
@@ -463,6 +486,12 @@ _is_assigned_check_hold_for_review() {
 # Gating:
 #   - Skipped entirely when DISPATCH_COOLDOWN_AFTER_LAUNCH_FAILURE_SECONDS=0
 #     (saves one gh API call per dispatch decision when the feature is off).
+#   - A marker is accepted only from an OWNER, MEMBER, or COLLABORATOR comment
+#     whose nonempty authenticated `user.login` exactly matches `runner=`.
+#   - The GitHub server `created_at` bounds marker lifetime: it cannot be in
+#     the future, older than the configured cooldown, or claim an `until`
+#     later than `created_at + cooldown`. This prevents a forged or stale
+#     future timestamp from permanently poisoning dispatch.
 #   - Fail-open on gh API or jq error — cooldown is an optimization, not a
 #     security gate, so a flaky API call should not permanently block
 #     dispatch the way GUARD_UNCERTAIN does for label/assignee checks.
@@ -480,43 +509,65 @@ _is_assigned_check_dispatch_cooldown() {
 	[[ "$cooldown_s" =~ ^[0-9]+$ ]] || cooldown_s=1800
 	[[ "$cooldown_s" -gt 0 ]] || return 1
 
-	# Fetch comments across every page. GitHub's issue comments endpoint returns
-	# oldest-first and ignores sort/direction parameters, so select the last
-	# matching marker after pagination to use the newest cooldown. Fail-open on API
-	# error — cooldown is an optimisation, not a guarantee.
+	# Fetch comments across every page. Marker selection below explicitly orders
+	# numeric GitHub comment IDs, rather than relying on endpoint page ordering.
+	# Fail-open on API error — cooldown is an optimisation, not a guarantee.
 	local comments_endpoint
 	comments_endpoint=$(printf 'repos/%s/issues/%s/comments?per_page=100' "$repo_slug" "$issue_number")
 	local comments_json
 	comments_json=$(gh api --paginate --slurp "$comments_endpoint" 2>/dev/null) || return 1
 	[[ -n "$comments_json" ]] || return 1
 
-	# Extract the latest cooldown marker timestamp.
-	# `(.body // "")` guards against null bodies; `match` with "g" emits zero
-	# results on no-match (no error), so empty bodies and unrelated comments
-	# fall through cleanly. Fail-open on jq error.
+	local now_epoch
+	now_epoch=$(date -u +%s 2>/dev/null) || return 1
+	[[ "$now_epoch" =~ ^[0-9]+$ ]] || return 1
+
+	# Only exact marker lines from authenticated repository participants qualify.
+	# Select candidates by numeric ID so equal-second server timestamps still have
+	# deterministic newest-first precedence across paginated API responses.
 	local _jq_rc=0
-	local marker_iso
-	marker_iso=$(printf '%s' "$comments_json" |
-		jq -r '[.[][] | (.body // "") | match("<!-- dispatch-cooldown-until:([^ ]+) reason=no_worker_process"; "g") | .captures[0].string] | last // ""') || _jq_rc=$?
+	local marker_rows
+	marker_rows=$(printf '%s' "$comments_json" |
+		jq -r '
+			[.[][]
+			| select((.id | type) == "number")
+			#aidevops:trust-boundary
+			| select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR")
+			| . as $comment
+			| (($comment.body // "") | capture("(?:^|\\n)<!-- dispatch-cooldown-until:(?<until>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z) reason=no_worker_process runner=(?<runner>[A-Za-z0-9][A-Za-z0-9-]{0,38}) -->(?:\\r?\\n|$)")?) as $marker
+			| select($marker != null)
+			| select(($comment.user.login? // "") | type == "string" and length > 0)
+			| select($comment.user.login == $marker.runner)
+			| select(($comment.created_at? // "") | type == "string" and length > 0)
+			| {id: .id, until: $marker.until, created_at: $comment.created_at}
+			]
+			| sort_by(.id) | reverse[] | [.until, .created_at] | @tsv
+		') || _jq_rc=$?
 	if [[ "$_jq_rc" -ne 0 ]]; then
 		return 1
 	fi
-	[[ -n "$marker_iso" ]] || return 1
+	[[ -n "$marker_rows" ]] || return 1
 
-	# Parse ISO8601 → epoch. GNU date first, BSD date fallback for macOS dev.
-	local until_epoch=""
-	until_epoch=$(date -u -d "$marker_iso" +%s 2>/dev/null) ||
-		until_epoch=$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$marker_iso" +%s 2>/dev/null) ||
-		return 1
-	[[ "$until_epoch" =~ ^[0-9]+$ ]] || return 1
+	local marker_iso="" created_at="" until_epoch="" created_epoch="" max_until_epoch=""
+	while IFS=$'\t' read -r marker_iso created_at; do
+		# Parse the exact UTC format enforced above. GNU date first, BSD fallback.
+		until_epoch=$(date -u -d "$marker_iso" +%s 2>/dev/null) ||
+			until_epoch=$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$marker_iso" +%s 2>/dev/null) ||
+			continue
+		created_epoch=$(date -u -d "$created_at" +%s 2>/dev/null) ||
+			created_epoch=$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$created_at" +%s 2>/dev/null) ||
+			continue
+		[[ "$until_epoch" =~ ^[0-9]+$ && "$created_epoch" =~ ^[0-9]+$ ]] || continue
 
-	local now_epoch
-	now_epoch=$(date -u +%s 2>/dev/null) || return 1
+		# A server-dated marker has at most one configured cooldown interval.
+		[[ "$created_epoch" -le "$now_epoch" ]] || continue
+		[[ $((now_epoch - created_epoch)) -le "$cooldown_s" ]] || continue
+		max_until_epoch=$((created_epoch + cooldown_s))
+		[[ "$until_epoch" -le "$max_until_epoch" && "$until_epoch" -gt "$now_epoch" ]] || continue
 
-	if [[ "$until_epoch" -gt "$now_epoch" ]]; then
 		printf 'DISPATCH_COOLDOWN_ACTIVE (until=%s reason=no_worker_process)\n' "$marker_iso"
 		return 0
-	fi
+	done <<<"$marker_rows"
 	return 1
 }
 
@@ -1057,16 +1108,20 @@ _is_assigned_compute_blocking() {
 #######################################
 # Load issue metadata for assignment checks.
 #
-# Args: $1 = issue number, $2 = repo slug, $3 = gh rc output variable name
-# Outputs: issue metadata JSON on stdout when available
-# Returns: 0 always; caller inspects the named rc variable
+# Args: $1 = issue number, $2 = repo slug
+# Sets: _IS_ASSIGNED_ISSUE_META_JSON, _IS_ASSIGNED_GH_RC,
+#       _IS_ASSIGNED_REPROBE_STATE
+# Returns: 0 always; caller inspects the globals. Globals avoid losing the real
+# gh status through a command-substitution subshell (GH#31996).
 #######################################
 _is_assigned_load_issue_meta() {
 	local issue_number="$1"
 	local repo_slug="$2"
-	local rc_var="$3"
-	local issue_meta_json=""
-	local gh_rc=0
+	local issue_meta_json="" direct_json=""
+	local gh_rc=0 direct_rc=0
+	_IS_ASSIGNED_ISSUE_META_JSON=""
+	_IS_ASSIGNED_GH_RC=0
+	_IS_ASSIGNED_REPROBE_STATE="not-needed"
 
 	if [[ -n "${ISSUE_META_JSON:-}" ]] \
 		&& printf '%s' "$ISSUE_META_JSON" | jq -e '.assignees and .labels' >/dev/null 2>&1; then
@@ -1077,10 +1132,37 @@ _is_assigned_load_issue_meta() {
 		# check (fail-open), which is correct — the primary fix is label sync at creation.
 		issue_meta_json=$(gh_issue_view "$issue_number" --repo "$repo_slug" \
 			--json state,assignees,labels,createdAt 2>/dev/null) || gh_rc=$?
+		if [[ "$gh_rc" -ne 0 || -z "$issue_meta_json" ]]; then
+			# A wrapper/cache/GraphQL-path failure is uncertainty, not stale proof.
+			# Make one bounded, independent REST reprobe now; if it also fails the
+			# caller remains fail-closed and the next Pulse cycle is the backoff/wake
+			# point. A recovered read only restores evidence flow — mutation still
+			# requires _is_stale_assignment's full positive proof below.
+			_IS_ASSIGNED_REPROBE_STATE="attempted"
+			direct_json=$(gh api "repos/${repo_slug}/issues/${issue_number}" 2>/dev/null) || direct_rc=$?
+			if [[ "$direct_rc" -eq 0 && -n "$direct_json" ]]; then
+				issue_meta_json=$(printf '%s' "$direct_json" | jq -c '
+					{
+						state: ((.state // "") | ascii_upcase),
+						assignees: [(.assignees // [])[] | {login: (.login // "")}],
+						labels: [(.labels // [])[] | {name: (.name // "")}],
+						createdAt: (.created_at // "")
+					}
+				' 2>/dev/null) || direct_rc=$?
+			fi
+			if [[ "$direct_rc" -eq 0 && -n "$issue_meta_json" ]]; then
+				gh_rc=0
+				_IS_ASSIGNED_REPROBE_STATE="recovered"
+			else
+				[[ "$direct_rc" -ne 0 ]] || direct_rc=1
+				gh_rc="$direct_rc"
+				issue_meta_json=""
+			fi
+		fi
 	fi
 
-	printf -v "$rc_var" '%s' "$gh_rc"
-	printf '%s' "$issue_meta_json"
+	_IS_ASSIGNED_ISSUE_META_JSON="$issue_meta_json"
+	_IS_ASSIGNED_GH_RC="$gh_rc"
 	return 0
 }
 
@@ -1236,7 +1318,8 @@ _is_assigned_pre_assignee_guard_blocks() {
 	local issue_number="$2"
 	local repo_slug="$3"
 
-	# Parent-task, pending publication, and no-auto-dispatch are unconditional blocks.
+	# Parent-task, pending publication, manual holds, and external-information
+	# waits are unconditional worker-dispatch blocks.
 	if _is_assigned_check_parent_task "$issue_meta_json" "$issue_number" "$repo_slug"; then
 		return 0
 	fi
@@ -1244,6 +1327,9 @@ _is_assigned_pre_assignee_guard_blocks() {
 		return 0
 	fi
 	if _is_assigned_check_no_auto_dispatch "$issue_meta_json" "$issue_number" "$repo_slug"; then
+		return 0
+	fi
+	if _is_assigned_check_needs_info "$issue_meta_json" "$issue_number" "$repo_slug"; then
 		return 0
 	fi
 	if _is_assigned_check_maintainer_permissions "$issue_meta_json" "$issue_number" "$repo_slug"; then
@@ -1286,16 +1372,19 @@ _is_assigned_impl() {
 		return 1
 	fi
 
-	local issue_meta_json gh_rc=0
-	issue_meta_json=$(_is_assigned_load_issue_meta "$issue_number" "$repo_slug" gh_rc)
+	local issue_meta_json="" gh_rc=0 reprobe_state=""
+	_is_assigned_load_issue_meta "$issue_number" "$repo_slug"
+	issue_meta_json="$_IS_ASSIGNED_ISSUE_META_JSON"
+	gh_rc="$_IS_ASSIGNED_GH_RC"
+	reprobe_state="$_IS_ASSIGNED_REPROBE_STATE"
 
 	# t2046: fail-closed on gh API failure. When we cannot fetch issue metadata
 	# (network error, auth failure, rate limit, issue not found), we cannot
 	# determine whether dispatch is safe. Block and emit GUARD_UNCERTAIN so the
 	# pulse skips this cycle rather than dispatching blindly.
 	if [[ "$gh_rc" -ne 0 || -z "$issue_meta_json" ]]; then
-		printf 'GUARD_UNCERTAIN (reason=gh-api-failure issue=%s repo=%s rc=%s)\n' \
-			"$issue_number" "$repo_slug" "$gh_rc"
+		printf 'GUARD_UNCERTAIN (reason=gh-api-failure issue=%s repo=%s rc=%s reprobe=%s wake=next-pulse)\n' \
+			"$issue_number" "$repo_slug" "$gh_rc" "$reprobe_state"
 		return 0
 	fi
 

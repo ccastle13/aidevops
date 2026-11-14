@@ -28,6 +28,7 @@
 # Include guard
 [[ -n "${_WORKTREE_ADD_LIB_LOADED:-}" ]] && return 0
 _WORKTREE_ADD_LIB_LOADED=1
+_WORKTREE_ADD_CGROUP_MANAGER="pulse-cgroup-v1"
 
 # GH#22238: node_modules restore is useful for interactive worktrees but can
 # saturate CPU when many pulse precreations run concurrently. Serialize the
@@ -47,9 +48,27 @@ if [[ -z "${SCRIPT_DIR:-}" ]]; then
 fi
 # shellcheck source=./task-identity-lib.sh
 source "${SCRIPT_DIR}/task-identity-lib.sh"
+# shellcheck source=./scratch-worktree-helper.sh
+source "${SCRIPT_DIR}/scratch-worktree-helper.sh"
 if [[ -f "${SCRIPT_DIR}/full-loop-cleanup-receipt.sh" ]]; then
 	# shellcheck source=./full-loop-cleanup-receipt.sh
 	source "${SCRIPT_DIR}/full-loop-cleanup-receipt.sh"
+fi
+# GH#35602: precreate.* sub-stage timing for dispatcher pre-creation. Records
+# only under an exported dispatch context; otherwise the helpers run plainly.
+# Never replace a recorder the sourcing process already defined.
+if ! declare -F _ds_record >/dev/null 2>&1 && [[ -f "${SCRIPT_DIR}/dispatch-stage-instrument.sh" ]]; then
+	# shellcheck source=./dispatch-stage-instrument.sh
+	source "${SCRIPT_DIR}/dispatch-stage-instrument.sh"
+fi
+if ! declare -F _ds_substage_run >/dev/null 2>&1; then
+	_ds_substage_start() { printf '0'; return 0; }
+	_ds_substage_record() { return 0; }
+	_ds_substage_run() {
+		shift
+		"$@"
+		return $?
+	}
 fi
 
 # --- Worktree Path Utilities ---
@@ -355,9 +374,16 @@ _restore_worktree_node_modules_acquire_lock() {
 			lock_mtime=$(_file_mtime_epoch "$lock_dir")
 			now_epoch=$(date +%s)
 			age_s=$((now_epoch - lock_mtime))
+			# GH#34200: break a stale lock only when its holder is gone. A
+			# policy install can legitimately hold it past 60 s, and the pid
+			# file made the old bare rmdir fail and spin without a timeout.
 			if ((age_s > 60)); then
-				rmdir "$lock_dir" 2>/dev/null || true
-				continue
+				local holder=""
+				holder=$(cat "${lock_dir}/pid" 2>/dev/null || true)
+				if [[ ! "$holder" =~ ^[0-9]+$ ]] || ! kill -0 "$holder" 2>/dev/null; then
+					rm -f "${lock_dir}/pid" 2>/dev/null || true
+					rmdir "$lock_dir" 2>/dev/null && continue
+				fi
 			fi
 		fi
 		if ((elapsed >= timeout_s * 10)); then
@@ -377,17 +403,176 @@ _restore_worktree_node_modules_release_lock() {
 	return 0
 }
 
+# Re-prove the owner generation this provisioner is allowed to write for.
+# Without an expected contract (pulse path) the owner must be this process and
+# carry a complete session/task lease. With one (cmd_add path) the row must be
+# exactly the generation that cmd_add just registered and verified.
+# Args: $1=worktree path, $2=snapshot owner fields (pid|session|batch|task|created),
+#       $3=expected contract from cmd_add or empty.
+_provision_worktree_owner_still_exact() {
+	local wt_path="$1"
+	local snapshot="$2"
+	local expected="$3"
+	local -a fields=()
+	IFS='|' read -r -a fields <<<"${snapshot}|"
+	[[ "${#fields[@]}" -ge 5 ]] || return 1
+	local owner_pid="${fields[0]}"
+	local owner_session="${fields[1]}"
+	local owner_batch="${fields[2]}"
+	local owner_task="${fields[3]}"
+	local owner_created="${fields[4]}"
+	if [[ -z "$expected" ]]; then
+		worktree_has_exact_owner_contract "$wt_path" "$$" "$owner_session" "$owner_task" || return 1
+		return 0
+	fi
+	worktree_has_exact_owner_generation "$wt_path" "$owner_pid" "$owner_session" \
+		"$owner_batch" "$owner_task" "$owner_created" || return 1
+	return 0
+}
+
+# GH#38065: cheap bounded pre-check so a source that can never fit the byte
+# budget is refused without the full validator walk. Returns 0 only when the
+# apparent size clearly (>2x) exceeds the budget; any uncertainty (no timeout
+# tool, no GNU --apparent-size, timeout, error) returns 1 and the validator decides.
+# Args: $1=source node_modules path, $2=max bytes
+_provision_source_clearly_over_budget() {
+	local source_dir="$1"
+	local max_bytes="$2"
+	local timeout_cmd="" size_kb=""
+	[[ -d "$source_dir" && "$max_bytes" =~ ^[0-9]+$ ]] || return 1
+	if command -v timeout >/dev/null 2>&1; then
+		timeout_cmd="timeout"
+	elif command -v gtimeout >/dev/null 2>&1; then
+		timeout_cmd="gtimeout"
+	else
+		return 1
+	fi
+	size_kb=$("$timeout_cmd" 5 du -sk --apparent-size -- "$source_dir" 2>/dev/null | cut -f1) || return 1
+	[[ "$size_kb" =~ ^[0-9]+$ ]] || return 1
+	((size_kb > (max_bytes / 1024) * 2)) || return 1
+	return 0
+}
+
+# Controller-only copy into a newly owned worktree. No resume or permission
+# mutation: a continuation owned by another process (even dead) is left intact.
+# Args: $1=worktree path, $2=canonical repo root, $3=relative package dir,
+#       $4=optional exact registration contract (pid|session|batch|task|created)
+#          that cmd_add created and verified for this new worktree (GH#34224).
+_provision_worktree_node_modules() (
+	local wt_path="$1"
+	local repo_root="$2"
+	local relative="${3:-.}"
+	local expected_contract="${4:-}"
+	local owner="" validator="" before="" after="" stage=""
+	local owner_pid="" owner_session="" owner_batch="" owner_task="" owner_created="" owner_start=""
+	local owner_fields=""
+	local destination="${wt_path}/${relative}/node_modules"
+	local max_bytes="${WORKTREE_NODE_MODULES_RESTORE_MAX_BYTES:-67108864}"
+	# aidevops:trust-boundary -- only the registered current controller may write;
+	# a live/foreign/continuation owner requires the existing ownership handoff.
+	declare -F check_worktree_owner_snapshot >/dev/null 2>&1 || return 1
+	declare -F worktree_has_exact_owner_contract >/dev/null 2>&1 || return 1
+	owner=$(check_worktree_owner_snapshot "$wt_path") || return 1
+	IFS='|' read -r owner_pid owner_session owner_batch owner_task owner_created owner_start <<<"$owner"
+	owner_fields="${owner_pid}|${owner_session}|${owner_batch}|${owner_task}|${owner_created}"
+	if [[ -n "$expected_contract" ]]; then
+		# #aidevops:trust-boundary (GH#34224) -- cmd_add registers the runtime
+		# PID, not $$, as owner. Accept only the exact generation it just
+		# registered and verified (incl. created_at and live process start);
+		# any foreign, replaced, recycled or continuation owner is refused.
+		declare -F worktree_has_exact_owner_generation >/dev/null 2>&1 || return 1
+		if [[ "$owner_fields" != "$expected_contract" || -z "$owner_start" || -z "$owner_created" ]] ||
+			! _provision_worktree_owner_still_exact "$wt_path" "$owner_fields" "$expected_contract"; then
+			printf 'dependency-provision-rejected reason=owner-contract-changed\n' >&2
+			return 1
+		fi
+	else
+		if [[ "$owner_pid" != "$$" || -z "$owner_start" || -z "$owner_created" ]]; then
+			# GH#34199: name the refusal (fixed, path-free) so readiness reports it.
+			printf 'dependency-provision-rejected reason=controller-not-owner\n' >&2
+			return 1
+		fi
+		_provision_worktree_owner_still_exact "$wt_path" "$owner_fields" "" || return 1
+	fi
+	[[ ! -e "$destination" && ! -L "$destination" ]] || return 1
+	validator="$(dirname "${BASH_SOURCE[0]}")/worktree-dependency-provision.py"
+	if _provision_source_clearly_over_budget "${repo_root}/${relative}/node_modules" "$max_bytes"; then
+		printf 'dependency-provision-rejected reason=source-exceeds-budget\n' >&2
+		return 1
+	fi
+	before=$(python3 "$validator" "$repo_root" "$wt_path" "$relative" --max-bytes "$max_bytes") || return 1
+	stage=$(mktemp -d "${wt_path}/.aidevops-deps-XXXXXXXX") || return 1
+	trap 'rm -rf -- "$stage"' EXIT
+	mkdir -m 700 "${stage}/node_modules" || return 1
+	# Keep the existing restore lifecycle/locks, but enforce limits during copying:
+	# whole-directory fast_cp can exceed the budget if the source changes mid-copy.
+	after=$(python3 "$validator" "$repo_root" "$wt_path" "$relative" --copy-to "${stage}/node_modules" --max-bytes "$max_bytes") || return 1
+	[[ "$before" == "$after" ]] || return 1
+	after=$(python3 "$validator" "$repo_root" "$wt_path" "$relative" --snapshot "${stage}/node_modules" --max-bytes "$max_bytes") || return 1
+	[[ "$before" == "$after" ]] || return 1
+	if [[ "$(check_worktree_owner_snapshot "$wt_path")" != "$owner" ]] ||
+		! _provision_worktree_owner_still_exact "$wt_path" "$owner_fields" "$expected_contract"; then
+		[[ -z "$expected_contract" ]] ||
+			printf 'dependency-provision-rejected reason=owner-contract-changed\n' >&2
+		return 1
+	fi
+	[[ ! -e "$destination" && ! -L "$destination" ]] || return 1
+	python3 "$validator" "$repo_root" "$wt_path" "$relative" --publish "${stage}/node_modules" --max-bytes "$max_bytes" >/dev/null || return 1
+	printf 'Dependency snapshot provisioned (sha256 bytes entries): %s\n' "$after"
+	return 0
+)
+
+# GH#34199: persist the root restore outcome for the JavaScript readiness
+# probe so a skipped or refused restore is reported, not silently successful.
+_restore_worktree_node_modules_record() {
+	local wt_path="$1"
+	local outcome="$2"
+	local reason="${3:-}"
+	local helper="${SCRIPT_DIR}/worktree-js-readiness-helper.sh"
+	[[ -x "$helper" ]] || return 0
+	"$helper" record-restore "$wt_path" "$outcome" "$reason" >/dev/null 2>&1 || true
+	return 0
+}
+
+# Provision one package directory. Validator stderr is still shown; only the
+# fixed, path-free rejection code is retained for the root package record.
+_restore_worktree_node_modules_one() {
+	local wt_path="$1"
+	local repo_root="$2"
+	local rel="$3"
+	local owner_contract="${4:-}"
+	local err="" rc=0 reason="provision-refused"
+	{ err=$(_provision_worktree_node_modules "$wt_path" "$repo_root" "${rel#/}" "$owner_contract" 2>&1 1>&3 3>&-) || rc=$?; } 3>&1
+	if [[ "$rc" -eq 0 ]]; then
+		[[ -n "$rel" ]] || _restore_worktree_node_modules_record "$wt_path" provisioned
+		return 0
+	fi
+	[[ -z "$err" ]] || printf '%s\n' "$err" >&2
+	if [[ "$err" =~ dependency-provision-rejected\ reason=([a-z0-9-]+) ]]; then
+		reason="${BASH_REMATCH[1]}"
+	fi
+	[[ -n "$rel" ]] || _restore_worktree_node_modules_record "$wt_path" rejected "$reason"
+	return 1
+}
+
+# Args: $1=worktree path, $2=canonical repo root, $3=optional exact owner
+#       registration contract created by cmd_add (see _provision_*).
 _restore_worktree_node_modules() {
 	local wt_path="$1"
 	local repo_root="$2"
+	local owner_contract="${3:-}"
 
 	[[ -n "$repo_root" && -d "$wt_path" ]] || return 0
 	[[ "$WORKTREE_NODE_MODULES_RESTORE_ENABLED" == "1" ]] || return 0
 
 	local _lock_dir=""
 	_lock_dir=$(_restore_worktree_node_modules_lock_dir)
-	if ! _restore_worktree_node_modules_acquire_lock "$_lock_dir"; then
+	# One bounded re-attempt after the existing wait; contention is then
+	# recorded so readiness reports preparing:lock-contention, not success.
+	if ! _restore_worktree_node_modules_acquire_lock "$_lock_dir" &&
+		! _restore_worktree_node_modules_acquire_lock "$_lock_dir"; then
 		print_warning "Skipping node_modules restore for ${wt_path}: another restore is active"
+		_restore_worktree_node_modules_record "$wt_path" contention
 		return 0
 	fi
 
@@ -404,30 +589,90 @@ _restore_worktree_node_modules() {
 		_rel="${_pdir#"$wt_path"}"
 		local _src="${repo_root}${_rel}/node_modules"
 		local _dst="${wt_path}${_rel}/node_modules"
-		if [[ -d "$_src" && ! -d "$_dst" ]]; then
-			# t2889: fast_cp uses APFS clonefile / btrfs reflink CoW where
-			# available — sub-second copy on macOS, near-zero disk delta.
-			fast_cp "$_src" "$_dst" 2>/dev/null || true
-			_restored=$((_restored + 1))
+		[[ -d "$_src" && ! -d "$_dst" ]] || continue
+		# Only a package-local package-lock.json or pnpm-lock.yaml can pass the
+		# validator; skip guaranteed rejections instead of holding the lock.
+		if [[ -f "${_pdir}/package-lock.json" || -f "${_pdir}/pnpm-lock.yaml" ]]; then
+			if _restore_worktree_node_modules_one "$wt_path" "$repo_root" "$_rel" "$owner_contract"; then
+				_restored=$((_restored + 1))
+			fi
+		elif [[ -z "$_rel" ]]; then
+			_restore_worktree_node_modules_record "$wt_path" rejected unsupported-lockfile
 		fi
 	done < <(find "$wt_path" -maxdepth 3 -name "package.json" -not -path "*/node_modules/*" 2>/dev/null)
 	_restore_worktree_node_modules_release_lock "$_lock_dir"
 	return 0
 }
 
+# GH#34199: report whether the declared JavaScript verification tools can
+# start in the new worktree. Read-only and bounded; never changes the exit
+# status of worktree creation.
+_print_worktree_js_readiness() {
+	local wt_path="$1"
+	local helper="${SCRIPT_DIR}/worktree-js-readiness-helper.sh"
+	local report="" line=""
+	[[ -x "$helper" && -d "$wt_path" ]] || return 0
+	report=$("$helper" report "$wt_path" 2>/dev/null) || return 0
+	while IFS= read -r line; do
+		[[ -n "$line" ]] || continue
+		if [[ "$line" == "JS_TOOL_READINESS=ready"* ]]; then
+			print_info "$line"
+		else
+			print_warning "$line"
+		fi
+	done <<<"$report"
+	return 0
+}
+
+_worktree_is_aidevops_js_repo() {
+	local wt_path="$1"
+	[[ -f "${wt_path}/package.json" && -f "${wt_path}/bun.lock" ]] || return 1
+	[[ -f "${wt_path}/aidevops.sh" && -d "${wt_path}/.agents/scripts" ]] || return 1
+	grep -Eq '"name"[[:space:]]*:[[:space:]]*"aidevops"' "${wt_path}/package.json" 2>/dev/null || return 1
+	return 0
+}
+
+# GH#34200: aidevops keeps its built-in policy below. Every other project
+# installs only under an owner-recorded, lockfile/runtime-bound
+# js_dependency_policy (worktree-js-readiness-helper.sh prepare), serialized
+# under the restore lock. Never changes the exit status of worktree creation.
+_bootstrap_worktree_js_deps() {
+	local wt_path="$1"
+	local helper="${SCRIPT_DIR}/worktree-js-readiness-helper.sh"
+	local lock_dir="" output="" line="" rc=0
+
+	# Defer installs/lifecycle scripts until the worker has entered its cgroup.
+	[[ "${AIDEVOPS_WORKTREE_MANAGER:-}" != "$_WORKTREE_ADD_CGROUP_MANAGER" ]] || return 0
+	[[ "$AIDEVOPS_WORKTREE_JS_BOOTSTRAP_ENABLED" == "1" ]] || return 0
+	if _worktree_is_aidevops_js_repo "$wt_path"; then
+		_bootstrap_aidevops_worktree_js_deps "$wt_path"
+		return 0
+	fi
+	[[ -x "$helper" && -f "${wt_path}/package.json" ]] || return 0
+	"$helper" prepare "$wt_path" >/dev/null 2>&1 || rc=$?
+	[[ "$rc" -eq 3 ]] || return 0
+	lock_dir=$(_restore_worktree_node_modules_lock_dir)
+	if ! _restore_worktree_node_modules_acquire_lock "$lock_dir"; then
+		print_warning "Skipping approved dependency install for ${wt_path}: another restore is active"
+		_restore_worktree_node_modules_record "$wt_path" contention
+		return 0
+	fi
+	output=$("$helper" prepare "$wt_path" --lock-held) || true
+	_restore_worktree_node_modules_release_lock "$lock_dir"
+	while IFS= read -r line; do
+		[[ -z "$line" ]] || print_info "$line"
+	done <<<"$output"
+	return 0
+}
+
 # Install the aidevops repository's locked JavaScript dependencies when the
-# canonical checkout could not provide node_modules. Keep this deliberately
-# repo-specific: worktree-helper.sh also creates worktrees for user projects,
-# whose package lifecycle scripts must never run implicitly.
+# canonical checkout could not provide node_modules (built-in policy).
 _bootstrap_aidevops_worktree_js_deps() {
 	local wt_path="$1"
-	local package_file="${wt_path}/package.json"
 	local bun_bin=""
 
 	[[ "$AIDEVOPS_WORKTREE_JS_BOOTSTRAP_ENABLED" == "1" ]] || return 0
-	[[ -f "$package_file" && -f "${wt_path}/bun.lock" ]] || return 0
-	[[ -f "${wt_path}/aidevops.sh" && -d "${wt_path}/.agents/scripts" ]] || return 0
-	grep -Eq '"name"[[:space:]]*:[[:space:]]*"aidevops"' "$package_file" 2>/dev/null || return 0
+	_worktree_is_aidevops_js_repo "$wt_path" || return 0
 	[[ ! -x "${wt_path}/node_modules/.bin/tsc" ]] || return 0
 
 	bun_bin=$(command -v bun 2>/dev/null || true)
@@ -472,7 +717,7 @@ _apply_worktree_exclusions() {
 	fi
 	[[ -n "$helper" ]] || return 0
 
-	"$helper" apply "$wt_path" >/dev/null 2>&1 || true
+	_ds_substage_run precreate.exclusions "$helper" apply "$wt_path" >/dev/null 2>&1 || true
 	return 0
 }
 
@@ -879,8 +1124,41 @@ _worktree_is_ssh_auth_failure() {
 }
 
 #######################################
-# Refresh one origin branch, retrying eligible GitHub SSH auth failures via gh.
-# The retry rewrites the URL only for this command and never mutates the remote.
+# Detect a rejected update of a remote-tracking ref that another process
+# changed while this fetch was running (GH#38060). Concurrent fetches of one
+# ref lose this way in all but one process; a repeat fetch then succeeds.
+# Arguments:
+#   $1 - captured git stderr
+# Returns: 0 for a concurrent ref-update rejection, 1 otherwise
+#######################################
+_worktree_is_ref_update_race() {
+	local stderr_text="$1"
+	case "$stderr_text" in
+	*"incorrect old value provided"*) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+#######################################
+# Run one plain fetch of an origin branch into its remote-tracking ref.
+# Arguments:
+#   $1 - clean linked/bootstrap worktree path
+#   $2 - target branch
+# Returns: git fetch exit code
+#######################################
+_worktree_fetch_origin_branch_once() {
+	local fetch_cwd="$1"
+	local target_branch="$2"
+	GIT_TERMINAL_PROMPT=0 git -C "$fetch_cwd" fetch --quiet --no-tags origin \
+		"+refs/heads/${target_branch}:refs/remotes/origin/${target_branch}"
+	return $?
+}
+
+#######################################
+# Refresh one origin branch. A fetch that lost a concurrent update of the ref
+# is repeated at most twice; only a fetch that succeeds proves a fresh base.
+# Eligible GitHub SSH auth failures are retried via gh: that retry rewrites the
+# URL only for this command and never mutates the remote.
 # Arguments:
 #   $1 - clean linked/bootstrap worktree path
 #   $2 - target branch
@@ -893,14 +1171,30 @@ _worktree_fetch_origin_branch() {
 	local fetch_stderr=""
 	local fetch_rc=1
 	local rewrite_from=""
+	local race_retries=0
+	local retry_start=""
 
 	remote_url=$(git -C "$fetch_cwd" remote get-url origin 2>/dev/null || true)
-	if fetch_stderr=$(GIT_TERMINAL_PROMPT=0 git -C "$fetch_cwd" fetch --quiet --no-tags origin \
-		"+refs/heads/${target_branch}:refs/remotes/origin/${target_branch}" 2>&1); then
+	if fetch_stderr=$(_worktree_fetch_origin_branch_once "$fetch_cwd" "$target_branch" 2>&1); then
 		return 0
 	else
 		fetch_rc=$?
 	fi
+
+	# GH#38060: each repeat is recorded as precreate.base_fetch_retry under a
+	# dispatch context, so recovered races stay countable in the stage log.
+	while [[ "$race_retries" -lt 2 ]] && _worktree_is_ref_update_race "$fetch_stderr"; do
+		race_retries=$((race_retries + 1))
+		[[ "$race_retries" -eq 1 ]] || sleep 1
+		retry_start=$(_ds_substage_start)
+		if fetch_stderr=$(_worktree_fetch_origin_branch_once "$fetch_cwd" "$target_branch" 2>&1); then
+			fetch_rc=0
+		else
+			fetch_rc=$?
+		fi
+		_ds_substage_record precreate.base_fetch_retry "$retry_start"
+		[[ "$fetch_rc" -ne 0 ]] || return 0
+	done
 
 	if _worktree_is_github_ssh_remote "$remote_url" &&
 		_worktree_is_ssh_auth_failure "$fetch_stderr" &&
@@ -924,10 +1218,10 @@ _worktree_fetch_origin_branch() {
 }
 
 # Refresh an origin branch from linked-worktree context so the canonical Git
-# guard remains intact. If no linked worktree exists yet, create a short-lived
-# detached bootstrap worktree from HEAD, fetch from there, then remove it from
-# that linked context. HEAD remains available when the remote-tracking ref has
-# not been created locally yet.
+# guard remains intact. If no linked worktree exists yet, create an owned,
+# locked scratch worktree from HEAD (scratch-worktree-helper.sh, GH#35024),
+# fetch from there, then remove it only while the lock is still ours. HEAD
+# remains available when the remote-tracking ref has not been created locally.
 # Args: branch name
 #######################################
 _worktree_refresh_origin_branch() {
@@ -948,7 +1242,8 @@ _worktree_refresh_origin_branch() {
 			[[ -n "$worktree_path" && "$worktree_path" != "$current_root" && -d "$worktree_path" ]] || continue
 			# `rev-parse HEAD` does not read the index. Probe with status so a
 			# truncated/corrupt sibling index cannot poison fresh-base fetches.
-			if ! GIT_OPTIONAL_LOCKS=0 git -C "$worktree_path" status --porcelain --untracked-files=no >/dev/null 2>&1; then
+			if ! GIT_OPTIONAL_LOCKS=0 _ds_substage_run precreate.sibling_status \
+				git -C "$worktree_path" status --porcelain --untracked-files=no >/dev/null 2>&1; then
 				if declare -F log_worktree_removal_event >/dev/null 2>&1; then
 					log_worktree_removal_event "${_WTAR_SKIPPED:-skipped}" "${_WTAR_WH_CALLER:-worktree-helper.sh}" \
 						"$worktree_path" "unreadable-git-state" "skipped" \
@@ -963,20 +1258,18 @@ _worktree_refresh_origin_branch() {
 
 	if [[ -z "$fetch_cwd" ]]; then
 		local base_dir="${AIDEVOPS_WORKTREE_BASE_DIR:-${HOME}/Git/_worktrees}"
-		local repo_name=""
-		repo_name=$(basename "$current_root")
-		mkdir -p "$base_dir" || return 1
-		bootstrap_path="${base_dir}/.${repo_name}-fetch-$$"
-		if ! git worktree add -q --detach "$bootstrap_path" HEAD; then
+		if ! _ds_substage_run precreate.scratch_add scratch_worktree_add "$current_root" "$base_dir" fetch HEAD; then
+			print_warning "Could not create an owned scratch worktree for the fresh-base fetch."
 			return 1
 		fi
+		bootstrap_path="$SCRATCH_WORKTREE_PATH"
 		fetch_cwd="$bootstrap_path"
 	fi
 
 	local fetch_rc=0
-	_worktree_fetch_origin_branch "$fetch_cwd" "$branch" || fetch_rc=$?
+	_ds_substage_run precreate.base_fetch _worktree_fetch_origin_branch "$fetch_cwd" "$branch" || fetch_rc=$?
 	if [[ -n "$bootstrap_path" ]]; then
-		git -C "$fetch_cwd" worktree remove --force "$bootstrap_path" >/dev/null 2>&1 || true
+		scratch_worktree_remove "$bootstrap_path" "${_WTAR_WH_CALLER:-worktree-helper.sh}" || true
 	fi
 	return "$fetch_rc"
 }
@@ -1067,15 +1360,33 @@ _cmd_add_create_worktree() {
 	local _branch="$1"
 	local _path="$2"
 	local _explicit_base="$3"
+	local AIDEVOPS_WORKTREE_CREATE_TASK="${4:-}"
+	# shellcheck source=shared-worktree-create.sh
+	source "${SCRIPT_DIR}/shared-worktree-create.sh" || return 1
 
 	if branch_exists "$_branch"; then
 		echo -e "${BLUE}Creating worktree for existing branch '$_branch'...${NC}"
-		git worktree add "$_path" "$_branch"
+		worktree_create_registered . "$_path" "$_branch" || return 1
 		return 0
 	fi
 
 	# Branch doesn't exist locally — check for stale remote ref (t1060)
-	handle_stale_remote_branch "$_branch" || return 1
+	_ds_substage_run precreate.stale_remote_check handle_stale_remote_branch "$_branch" || return 1
+
+	# GH#33194: an unmerged remote branch (e.g. an open PR head) must be
+	# checked out directly rather than diverging from origin/<default>.
+	# An explicit --base REF always overrides this.
+	if [[ -z "$_explicit_base" ]]; then
+		local _unmerged_remote_ref=""
+		_unmerged_remote_ref=$(_ds_substage_run precreate.unmerged_remote_check \
+			_unmerged_remote_branch_ref "$_branch" 2>/dev/null || true)
+		if [[ -n "$_unmerged_remote_ref" ]]; then
+			echo -e "${BLUE}Creating worktree with new branch '$_branch' on unmerged remote '$_unmerged_remote_ref'...${NC}"
+			worktree_create_registered . "$_path" "$_unmerged_remote_ref" -b "$_branch" || return 1
+			git -C "$_path" branch --set-upstream-to="$_unmerged_remote_ref" "$_branch" 2>/dev/null || true
+			return 0
+		fi
+	fi
 
 	# t2802: explicitly base new branches on origin/<default> (or --base REF)
 	# to prevent scope-leak PRs when canonical HEAD is stale. Canonical
@@ -1084,7 +1395,7 @@ _cmd_add_create_worktree() {
 	_base_ref=$(_resolve_worktree_base_ref "$_explicit_base") || return 1
 	if [[ -n "$_base_ref" ]]; then
 		echo -e "${BLUE}Creating worktree with new branch '$_branch' based on '$_base_ref'...${NC}"
-		git worktree add -b "$_branch" "$_path" "$_base_ref"
+		worktree_create_registered . "$_path" "$_base_ref" -b "$_branch" || return 1
 		return 0
 	fi
 
@@ -1109,7 +1420,12 @@ _cmd_add_reconcile_cleanup_generation() {
 	local reconcile_status=0
 
 	declare -F full_loop_supersede_cleaned_receipts_for_recreated_worktree >/dev/null 2>&1 || return 0
-	head_sha=$(git -C "$path" rev-parse --verify HEAD 2>/dev/null) || return 1
+	head_sha=$(git -C "$path" rev-parse --verify HEAD 2>/dev/null) || {
+		print_warning "Cleanup-receipt reconciliation refused: could not resolve HEAD of the new worktree at ${path}."
+		printf 'AIDEVOPS_WORKTREE_LIFECYCLE_DISPOSITION=RECONCILIATION_FAILED branch=%s head=unknown reason=head_unresolved\n' \
+			"$branch" >&2
+		return 1
+	}
 	if receipt_path=$(full_loop_supersede_cleaned_receipts_for_recreated_worktree \
 		"$path" "$branch" "$head_sha" "$owner_pid" "$owner_session"); then
 		prior_pr=$(jq -r '.pr_number // empty' "$receipt_path" 2>/dev/null || true)
@@ -1121,9 +1437,9 @@ _cmd_add_reconcile_cleanup_generation() {
 		reconcile_status=$?
 	fi
 	[[ "$reconcile_status" -eq 2 ]] && return 0
-	print_warning "Worktree creation cannot continue because cleanup-receipt generation reconciliation failed."
-	printf 'AIDEVOPS_WORKTREE_LIFECYCLE_DISPOSITION=RECONCILIATION_FAILED branch=%s head=%s\n' \
-		"$branch" "$head_sha" >&2
+	print_warning "Worktree creation cannot continue because cleanup-receipt generation reconciliation failed (status ${reconcile_status}; reason printed above)."
+	printf 'AIDEVOPS_WORKTREE_LIFECYCLE_DISPOSITION=RECONCILIATION_FAILED branch=%s head=%s status=%s\n' \
+		"$branch" "$head_sha" "$reconcile_status" >&2
 	return 1
 }
 
@@ -1172,6 +1488,14 @@ _cmd_add_use_existing_worktree() {
 		_ADD_COLLISION_PATH="$existing_path"
 		_cmd_add_emit_collision concurrent_worktree "$branch" inspect_existing_task_worktree "$existing_path"
 		return 2
+	fi
+	# A previous creation may have retained this tree after enrollment failed.
+	# Retry before offering reuse; return 2 so cmd_add cannot fall through to creation.
+	# The canonical checkout has a .git directory and is not enrolled.
+	if [[ ! -d "${existing_path}/.git" || -L "${existing_path}/.git" ]]; then
+		# shellcheck source=shared-worktree-create.sh
+		source "${SCRIPT_DIR}/shared-worktree-create.sh" || return 2
+		_worktree_enroll_generation "$existing_path" || return 2
 	fi
 	echo -e "${YELLOW}Worktree already exists for branch '$branch'${NC}"
 	echo -e "Path: ${BOLD}$existing_path${NC}"
@@ -1236,6 +1560,9 @@ _cmd_add_verify_created_generation() {
 	local registered_created_at=""
 	local repository_root=""
 
+	# GH#34224: only a contract registered and verified by this call may be
+	# handed to dependency provisioning; never inherit a stale/env value.
+	_ADD_PROVISION_OWNER_CONTRACT=""
 	_cmd_add_verify_collision_tip "$branch" "$path" || return 1
 	owner_pid=$(_resolve_worktree_owner_pid "") || return 1
 	register_worktree "$path" "$branch" --task "$explicit_issue" || registration_status=$?
@@ -1252,6 +1579,7 @@ _cmd_add_verify_created_generation() {
 		registered_task registered_created_at <<<"$registration_contract"
 
 	if _cmd_add_reconcile_cleanup_generation "$branch" "$path" "$owner_pid" "$owner_session"; then
+		_ADD_PROVISION_OWNER_CONTRACT="${registered_owner_pid}|${registered_owner_session}|${registered_owner_batch}|${registered_task}|${registered_created_at}"
 		return 0
 	fi
 	repository_root=$(get_repo_root) || return 1
@@ -1262,6 +1590,90 @@ _cmd_add_verify_created_generation() {
 		return 1
 	fi
 	return 1
+}
+
+# GH#35781: managed enrollment failed after the generation was created and its
+# exact owner contract verified. Remove only that generation through the same
+# owner-contract compensation; never leave an unenrolled orphan for reuse.
+_cmd_add_rollback_unenrolled_generation() {
+	local branch="$1"
+	local path="$2"
+	local owner_pid owner_session owner_batch task created_at
+	local repository_root=""
+	printf 'AIDEVOPS_WORKTREE_LIFECYCLE_DISPOSITION=MANAGED_ENROLL_FAILED branch=%s\n' "$branch" >&2
+	IFS='|' read -r owner_pid owner_session owner_batch task created_at <<<"${_ADD_PROVISION_OWNER_CONTRACT:-}"
+	repository_root=$(get_repo_root) || repository_root=""
+	if [[ -z "$repository_root" ]] || ! remove_worktree_if_owner_contract "$path" "$repository_root" "$branch" \
+		"$owner_pid" "$owner_session" "$owner_batch" "$task" "$created_at"; then
+		print_warning "Rollback preserved the unenrolled worktree because its exact ownership contract changed or safe removal failed: $path"
+		return 1
+	fi
+	print_warning "Managed enrollment failed; removed the newly created worktree: $path"
+	return 0
+}
+
+# Canonicalize, register and (for managed creation) enroll a newly created
+# worktree. Sets _ADD_CANONICAL_PATH on success.
+# GH#35781: git porcelain, the owner registry and managed enrollment all key a
+# generation by its physical path. A worktree base reached through a symlinked
+# parent must use that one canonical form from here on.
+_cmd_add_register_created_generation() {
+	local branch="$1"
+	local path="$2"
+	local explicit_issue="$3"
+	local canonical_path=""
+	_ADD_CANONICAL_PATH=""
+	canonical_path=$(cd "$path" 2>/dev/null && pwd -P) || canonical_path=""
+	if [[ -z "$canonical_path" ]]; then
+		print_warning "Created worktree path cannot be resolved to a canonical path: $path"
+		return 1
+	fi
+	# Register ownership before retiring historical cleanup receipts. The
+	# transaction helper verifies the exact row and compensates on failure.
+	_ds_substage_run precreate.verify_generation _cmd_add_verify_created_generation "$branch" "$canonical_path" "$explicit_issue" || return 1
+	if [[ "${AIDEVOPS_WORKTREE_MANAGER:-}" == "$_WORKTREE_ADD_CGROUP_MANAGER" ]]; then
+		# Enroll only after native creation succeeds, before any worker launch.
+		if ! WORKTREE_REGISTRY_DB="${WORKTREE_REGISTRY_DB:-}" _ds_substage_run precreate.managed_enroll \
+			python3 "${SCRIPT_DIR}/worktree-managed-lifetime.py" enroll "$canonical_path"; then
+			_cmd_add_rollback_unenrolled_generation "$branch" "$canonical_path" || true
+			return 1
+		fi
+	fi
+	_ADD_CANONICAL_PATH="$canonical_path"
+	return 0
+}
+
+# Restore/bootstrap worktree-local JavaScript dependencies and report readiness.
+# GH#34224: pass the exact owner contract this add just registered so the
+# controller-owned snapshot can run for a runtime-owned (interactive) row.
+_cmd_add_prepare_worktree_deps() {
+	local path="$1"
+	local repo_root="" common_dir="" stage_t0=""
+	stage_t0=$(_ds_substage_start)
+	repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || repo_root=""
+	# Snapshot validation requires the canonical checkout, not the linked caller.
+	common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common_dir=""
+	if [[ "${common_dir##*/}" == ".git" ]]; then
+		repo_root="${common_dir%/.git}"
+	fi
+	_restore_worktree_node_modules "$path" "$repo_root" "${_ADD_PROVISION_OWNER_CONTRACT:-}"
+	_ADD_PROVISION_OWNER_CONTRACT=""
+	_bootstrap_worktree_js_deps "$path"
+	_print_worktree_js_readiness "$path"
+	_ds_substage_record precreate.helper_deps "$stage_t0"
+	return 0
+}
+
+_cmd_add_preview_routes() {
+	local branch="$1"
+	# Managed creation must not start preview services outside its lifetime cgroup.
+	[[ "${AIDEVOPS_WORKTREE_MANAGER:-}" != "$_WORKTREE_ADD_CGROUP_MANAGER" ]] || return 0
+	local stage_t0=""
+	stage_t0=$(_ds_substage_start)
+	localdev_auto_branch "$branch"
+	preview_proxy_auto_allocate "$branch"
+	_ds_substage_record precreate.preview_routes "$stage_t0"
+	return 0
 }
 
 # --- cmd_add ---
@@ -1319,7 +1731,7 @@ cmd_add() {
 	fi
 
 	local capacity_rc=0
-	aidevops_worktree_capacity_check "$path" || capacity_rc=$?
+	_ds_substage_run precreate.capacity_check aidevops_worktree_capacity_check "$path" || capacity_rc=$?
 	if [[ "$capacity_rc" -ne 0 ]]; then
 		echo -e "${RED}Error: Refusing to create a worktree because filesystem capacity is unsafe.${NC}" >&2
 		echo "Capacity reason: ${AIDEVOPS_DISK_CAPACITY_REASON}; available=${AIDEVOPS_DISK_CAPACITY_AVAILABLE_KB}KB (${AIDEVOPS_DISK_CAPACITY_AVAILABLE_PERCENT}%); minimum=${AIDEVOPS_MIN_WORKTREE_FREE_KB:-5242880}KB and ${AIDEVOPS_MIN_WORKTREE_FREE_PERCENT:-5}%." >&2
@@ -1328,16 +1740,12 @@ cmd_add() {
 	fi
 
 	# Create worktree (existing branch → simple checkout; new branch → base-ref dance).
-	_cmd_add_create_worktree "$branch" "$path" "$explicit_base" || return 1
-	# Register ownership before retiring historical cleanup receipts. The
-	# transaction helper verifies the exact row and compensates on failure.
-	_cmd_add_verify_created_generation "$branch" "$path" "$explicit_issue" || return 1
+	_ds_substage_run precreate.create_worktree _cmd_add_create_worktree "$branch" "$path" "$explicit_base" "$explicit_issue" || return 1
+	_cmd_add_register_created_generation "$branch" "$path" "$explicit_issue" || return 1
+	path="$_ADD_CANONICAL_PATH"
 
 	# Restore gitignored dependencies (node_modules) from canonical repo.
-	local _repo_root=""
-	_repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || _repo_root=""
-	_restore_worktree_node_modules "$path" "$_repo_root"
-	_bootstrap_aidevops_worktree_js_deps "$path"
+	_cmd_add_prepare_worktree_deps "$path"
 
 	# t2885: exclude the new worktree from macOS Spotlight + Time Machine.
 	# Worktrees are ephemeral — persistent state lives on the git remote.
@@ -1358,11 +1766,7 @@ cmd_add() {
 	_ADD_COLLISION_PATH="$path"
 	_cmd_add_print_collision_provenance
 
-	# Localdev integration (t1224.8): auto-create branch subdomain route
-	localdev_auto_branch "$branch"
-
-	# Preview proxy integration (GH#21560): allocate port + register proxy route
-	preview_proxy_auto_allocate "$branch"
+	_cmd_add_preview_routes "$branch"
 
 	return 0
 }

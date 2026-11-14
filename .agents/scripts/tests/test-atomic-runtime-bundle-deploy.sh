@@ -126,6 +126,7 @@ write_fake_plugin_dependencies() {
 	printf 'export const fixture = true;\n' >"$plugin_dir/node_modules/@bufbuild/protobuf/index.mjs"
 	printf '{"name":"@opencode-ai/plugin","type":"module","exports":"./index.mjs"}\n' >"$plugin_dir/node_modules/@opencode-ai/plugin/package.json"
 	printf 'export const tool = Object.assign((definition) => definition, { schema: {} });\n' >"$plugin_dir/node_modules/@opencode-ai/plugin/index.mjs"
+	printf 'export default { id: "aidevops", setup: async () => {} };\n' >"$plugin_dir/v2.mjs"
 	return 0
 }
 
@@ -192,6 +193,7 @@ test_manifest_value_reads_unterminated_final_line() {
 test_initial_activation_and_manifest() {
 	local target_dir="$HOME/.aidevops/agents"
 	local active_root=""
+	local AIDEVOPS_WORKSPACE_DIR=""
 	mkdir -p "$target_dir/scripts" "$target_dir/custom"
 	printf '1.0.0\n' >"$target_dir/VERSION"
 	printf 'old\n' >"$target_dir/scripts/helper.sh"
@@ -199,6 +201,18 @@ test_initial_activation_and_manifest() {
 
 	write_fake_revision "2.0.0" "new"
 	stage_revision "$target_dir"
+	[[ -d "$HOME/.aidevops/.agent-workspace" ]] || fail "fresh deployment prepares the framework workspace"
+	assert_eq "$(cd "$HOME/.aidevops/.agent-workspace" && pwd -P)" "$AIDEVOPS_WORKSPACE_DIR" \
+		"fresh deployment exposes a canonical workspace before activation"
+	[[ ! -e "$AIDEVOPS_WORKSPACE_DIR/worker-lifecycle" ]] || fail "setup leaves lifecycle initialization to the worker"
+	python3 -E -s -B "$REPO_ROOT/.agents/worker-lifecycle/worker-launch.py" --initialize \
+		--state-dir "$AIDEVOPS_WORKSPACE_DIR/worker-lifecycle" --worktree "$FAKE_REPO" -- "$BASH" -c 'exit 0'
+	local registry_status=""
+	registry_status=$(PYTHONPATH="$REPO_ROOT/.agents/worker-lifecycle" python3 -B -m worker_lifecycle.registry \
+		--state-dir "$AIDEVOPS_WORKSPACE_DIR/worker-lifecycle" status)
+	jq -e '.runs == {"bound":1} and .bindings == 1 and .events == 2 and .cleanup_authorized == false' \
+		<<<"$registry_status" >/dev/null || fail "first worker records its run and binding after fresh deployment"
+	pass "first worker registers after fresh deployment without manual parent creation"
 	_runtime_bundle_activate "$target_dir" "$_AIDEVOPS_STAGED_BUNDLE_DIR"
 	active_root=$(_runtime_bundle_resolve_root "$target_dir")
 
@@ -211,8 +225,30 @@ test_initial_activation_and_manifest() {
 	assert_file_contains "$active_root/.bundle-manifest" '^status=validated$' "validated manifest is inside the active bundle"
 	assert_file_contains "$active_root/.bundle-manifest" '^cli_compatibility=2.0.0$' "manifest binds CLI compatibility"
 	assert_eq "preserved" "$(tr -d '[:space:]' <"$active_root/custom/user.txt")" "user custom content survives bundle migration"
+	assert_eq "$HOME/.aidevops/user-agents/custom" "$(readlink "$active_root/custom")" "custom lives in stable user state, not the bundle"
 	[[ -L "$HOME/.aidevops/previous-runtime-bundle" ]] || fail "previous validated bundle is retained"
 	pass "previous validated bundle is retained"
+	return 0
+}
+
+test_disabled_lifecycle_allows_unavailable_workspace() {
+	local target_dir="$HOME/.aidevops/agents"
+	local active_before=""
+	local AIDEVOPS_WORKSPACE_DIR="$TEST_ROOT/workspace-parent-file/child"
+	local AIDEVOPS_LIFECYCLE_DISABLED=0
+	printf 'not a directory\n' >"$TEST_ROOT/workspace-parent-file"
+	active_before=$(_runtime_bundle_resolve_root "$target_dir")
+	write_fake_revision "2.0.0" "new"
+	if stage_revision "$target_dir"; then
+		fail "enabled lifecycle unexpectedly staged with an unavailable workspace"
+	fi
+	assert_eq "$active_before" "$(_runtime_bundle_resolve_root "$target_dir")" \
+		"enabled lifecycle workspace failure preserves the active bundle"
+	AIDEVOPS_LIFECYCLE_DISABLED=1
+	stage_revision "$target_dir"
+	_runtime_bundle_activate "$target_dir" "$_AIDEVOPS_STAGED_BUNDLE_DIR"
+	[[ "$(_runtime_bundle_resolve_root "$target_dir")" != "$active_before" ]] || fail "disabled lifecycle blocked activation"
+	pass "disabled lifecycle permits activation despite unavailable workspace"
 	return 0
 }
 
@@ -465,6 +501,12 @@ test_plugin_dependency_smoke_check() {
 		fail "missing @opencode-ai/plugin unexpectedly passed the import smoke check"
 	fi
 	pass "missing @opencode-ai/plugin fails the import smoke check"
+	write_fake_plugin_dependencies
+	rm -f "$plugin_dir/v2.mjs"
+	if _verify_opencode_plugin_deps "$plugin_dir" >/dev/null 2>&1; then
+		fail "missing native V2 descriptor unexpectedly passed the import smoke check"
+	fi
+	pass "missing native V2 descriptor fails the import smoke check"
 	return 0
 }
 
@@ -590,6 +632,80 @@ test_plist_override_survives_two_bundle_activations() {
 	return 0
 }
 
+stage_and_activate_revision() {
+	local target_dir="$1"
+	local version="$2"
+	write_fake_revision "$version" "user-state-$version"
+	write_fake_plugin_manifest
+	MOCK_PLUGIN_VERIFY_MODE="available"
+	stage_revision "$target_dir"
+	_runtime_bundle_activate "$target_dir" "$_AIDEVOPS_STAGED_BUNDLE_DIR"
+	return 0
+}
+
+# GH#34088: emulate a pre-fix bundle whose real custom/ package holds absolute
+# current/previous/entry links into that bundle, then promote twice, prune the
+# original bundle and roll the active link back.
+test_custom_package_links_survive_promotion_prune_and_rollback() {
+	local saved_home="$HOME"
+	HOME="$TEST_ROOT/home-gh34088"
+	mkdir -p "$HOME/.aidevops"
+	local target_dir="$HOME/.aidevops/agents"
+	local user_root="$HOME/.aidevops/user-agents"
+	local bundles_dir="" legacy_root="" second_root="" pkg="" venv_pip=""
+
+	stage_and_activate_revision "$target_dir" "20.0.0"
+	legacy_root=$(_runtime_bundle_resolve_root "$target_dir")
+	bundles_dir=$(cd "$HOME/.aidevops/runtime-bundles" && pwd -P)
+	rm -rf "${legacy_root:?}/custom" "${legacy_root:?}/draft" "$user_root"
+	pkg="$legacy_root/custom/pkg"
+	mkdir -p "$pkg/versions/1.0/bin" "$pkg/versions/2.0/bin" "$pkg/venv/bin" "$legacy_root/custom/bin" "$legacy_root/draft"
+	printf '#!/usr/bin/env bash\nprintf "v1\\n"\n' >"$pkg/versions/1.0/bin/tool"
+	printf '#!/usr/bin/env bash\nprintf "v2\\n"\n' >"$pkg/versions/2.0/bin/tool"
+	chmod +x "$pkg/versions/1.0/bin/tool" "$pkg/versions/2.0/bin/tool"
+	ln -s "$pkg/versions/2.0" "$pkg/current"
+	ln -s "$pkg/versions/1.0" "$pkg/previous"
+	ln -s "$bundles_dir/older-bundle/agents/custom/pkg/versions/1.0" "$pkg/older"
+	ln -s "versions/1.0" "$pkg/relative"
+	ln -s "/usr/bin" "$pkg/external"
+	ln -s "$pkg/current/bin/tool" "$legacy_root/custom/bin/pkg"
+	printf 'home = %s/venv/bin\n' "$pkg" >"$pkg/venv/pyvenv.cfg"
+	printf '#!%s/venv/bin/python\n' "$pkg" >"$pkg/venv/bin/pip"
+	venv_pip=$(cat "$pkg/venv/bin/pip")
+	printf 'draft note\n' >"$legacy_root/draft/note.md"
+
+	stage_and_activate_revision "$target_dir" "21.0.0"
+	second_root=$(_runtime_bundle_resolve_root "$target_dir")
+	[[ -L "$second_root/custom" && -L "$second_root/draft" ]] || fail "promoted bundle exposes custom/draft as links"
+	pass "promoted bundle exposes custom/draft as links to stable user state"
+	assert_eq "$user_root/custom" "$(readlink "$second_root/custom")" "bundle custom link targets the stable root"
+	assert_eq "$user_root/custom/pkg/versions/2.0" "$(readlink "$user_root/custom/pkg/current")" "absolute current pointer is rebased to the stable root"
+	assert_eq "$user_root/custom/pkg/versions/1.0" "$(readlink "$user_root/custom/pkg/previous")" "absolute previous pointer is rebased to the stable root"
+	assert_eq "$user_root/custom/pkg/versions/1.0" "$(readlink "$user_root/custom/pkg/older")" "pointer into an older bundle is rebased"
+	assert_eq "versions/1.0" "$(readlink "$user_root/custom/pkg/relative")" "relative pointer is preserved"
+	assert_eq "/usr/bin" "$(readlink "$user_root/custom/pkg/external")" "unrelated absolute pointer is preserved"
+	assert_eq "$venv_pip" "$(cat "$user_root/custom/pkg/venv/bin/pip")" "Python environment shebang is reported, never rewritten"
+	assert_eq "v2" "$("$target_dir/custom/bin/pkg")" "stable entry runs through the documented path"
+	[[ -d "$legacy_root/custom/pkg" ]] || fail "legacy in-bundle copy is retained until pruning"
+	pass "legacy in-bundle copy is retained until pruning"
+
+	printf 'kept\n' >"$target_dir/custom/after-migration.txt"
+	AIDEVOPS_RUNTIME_BUNDLE_RETENTION_SECONDS=0 stage_and_activate_revision "$target_dir" "22.0.0"
+	[[ ! -d "${legacy_root%/agents}" ]] || fail "original bundle is pruned"
+	pass "original pre-migration bundle is pruned"
+	assert_eq "v2" "$("$target_dir/custom/bin/pkg")" "stable entry survives pruning of the original bundle"
+	assert_eq "kept" "$(tr -d '[:space:]' <"$target_dir/custom/after-migration.txt")" "post-migration writes survive the next promotion"
+	assert_eq "draft note" "$(cat "$target_dir/draft/note.md")" "draft content migrates to stable state"
+
+	_runtime_bundle_switch_link "$target_dir" "$second_root"
+	assert_eq "$second_root" "$(_runtime_bundle_resolve_root "$target_dir")" "active link rolls back to the previous bundle"
+	assert_eq "v2" "$("$target_dir/custom/bin/pkg")" "rollback keeps the shared stable custom state"
+	assert_eq "kept" "$(tr -d '[:space:]' <"$target_dir/custom/after-migration.txt")" "rollback does not restore an older custom copy"
+
+	HOME="$saved_home"
+	return 0
+}
+
 test_serialized_older_version_refuses_global_activation() {
 	local target_dir="$HOME/.aidevops/agents"
 	local stale_bundle=""
@@ -663,6 +779,7 @@ main() {
 
 	test_manifest_value_reads_unterminated_final_line
 	test_initial_activation_and_manifest
+	test_disabled_lifecycle_allows_unavailable_workspace
 	test_interrupted_staging_preserves_active
 	test_failed_activation_rolls_back
 	test_process_pin_survives_activation
@@ -680,6 +797,7 @@ main() {
 	test_missing_dependency_lock_preserves_active_bundle
 	test_dependency_install_failure_preserves_active_bundle
 	test_plist_override_survives_two_bundle_activations
+	test_custom_package_links_survive_promotion_prune_and_rollback
 	test_serialized_older_version_refuses_global_activation
 	test_same_version_ancestor_refuses_global_activation
 

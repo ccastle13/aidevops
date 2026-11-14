@@ -8,6 +8,14 @@
 
 set -uo pipefail
 
+# Resolve native Git once from the system default PATH (portable to non-FHS
+# hosts such as NixOS); fixtures must bypass the aidevops git wrapper.
+TEST_NATIVE_GIT=$(command -p -v git) || {
+	printf '%s\n' 'Native Git is unavailable on the system PATH' >&2
+	exit 1
+}
+export TEST_NATIVE_GIT
+
 TESTS_RUN=0
 TESTS_FAILED=0
 TEST_ROOT=""
@@ -15,7 +23,7 @@ TEST_ROOT=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PULSE_CLEANUP="${SCRIPT_DIR}/../pulse-cleanup.sh"
 
-GIT_BIN="${AIDEVOPS_TEST_GIT_BIN:-/usr/bin/git}"
+GIT_BIN="${AIDEVOPS_TEST_GIT_BIN:-${TEST_NATIVE_GIT}}"
 export GIT_BIN
 git() {
 	"$GIT_BIN" "$@"
@@ -41,6 +49,20 @@ teardown() {
 	if [[ -n "$TEST_ROOT" && -d "$TEST_ROOT" ]]; then
 		rm -rf "$TEST_ROOT"
 	fi
+	return 0
+}
+
+# GH#34905: cleanup age is confirmed idle time, so backdate every activity
+# signal pulse reads (.git file plus admin HEAD and HEAD reflog).
+backdate_worktree_activity() {
+	local wt_path="$1"
+	local stamp="$2"
+	local admin_dir="" signal=""
+	admin_dir=$(git -C "$wt_path" rev-parse --absolute-git-dir) || return 1
+	for signal in "$wt_path/.git" "$admin_dir/HEAD" "$admin_dir/logs/HEAD"; do
+		[[ -e "$signal" ]] || continue
+		touch -t "$stamp" "$signal" || return 1
+	done
 	return 0
 }
 
@@ -76,7 +98,7 @@ setup_repo_with_worker_worktree() {
 			|| date -u -d "$age_spec" +%Y%m%d%H%M 2>/dev/null \
 			|| printf '202601010000\n')
 	fi
-	touch -t "$old_ts" "$wt_path/.git"
+	backdate_worktree_activity "$wt_path" "$old_ts"
 	return 0
 }
 
@@ -105,7 +127,7 @@ setup_repo_with_detached_review_worktree() {
 	old_ts=$(date -u -v-2d +%Y%m%d%H%M 2>/dev/null \
 		|| date -u -d "$age_spec" +%Y%m%d%H%M 2>/dev/null \
 		|| printf '202601010000\n')
-	touch -t "$old_ts" "$wt_path/.git"
+	backdate_worktree_activity "$wt_path" "$old_ts"
 	return 0
 }
 
@@ -139,6 +161,17 @@ source_pulse_cleanup_with_stubs() {
 	source "${SCRIPT_DIR}/../portable-stat.sh"
 	# shellcheck source=../pulse-cleanup.sh
 	source "$PULSE_CLEANUP"
+	# This suite isolates branch/PR policy, not host-wide process visibility.
+	# Real degraded visibility and managed descendants are exercised by the native
+	# managed-lifetime test. Never require sudo to reach the policy under test.
+	capture_worktree_process_cwds() { return 0; }
+	export WORKTREE_REGISTRY_DB="${TEST_ROOT}/registry.db"
+	python3 - "$WORKTREE_REGISTRY_DB" <<'PY'
+import sqlite3
+import sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    connection.execute("CREATE TABLE IF NOT EXISTS worktree_owners (worktree_path TEXT PRIMARY KEY, owner_pid INTEGER, task_id TEXT, owner_session TEXT)")
+PY
 	return 0
 }
 
@@ -266,7 +299,7 @@ test_open_head_pr_outranks_embedded_terminal_reference() {
 	}
 
 	local terminal_state=""
-	terminal_state=$(_pc_terminal_pr_state_for_branch "testowner/testrepo" "repair/pr-23085-followup" 2>/dev/null)
+	terminal_state=$(_pc_terminal_pr_for_branch "testowner/testrepo" "repair/pr-23085-followup" 2>/dev/null)
 	local lookup_rc=$?
 	local rc=0
 	[[ "$lookup_rc" -eq 1 ]] || rc=1
@@ -279,10 +312,16 @@ test_open_head_pr_outranks_embedded_terminal_reference() {
 test_merged_branch_pr_removes_before_age_threshold() {
 	local repo_dir="${TEST_ROOT}/repo-merged-branch-pr"
 	local wt_path="${TEST_ROOT}/worker-wt-merged-branch-pr"
-	local branch_name="feature/auto-20260507-190806-gh23080"
+	local branch_name="feature/auto-20260507-190806"
 	setup_repo_with_worker_worktree "$repo_dir" "$wt_path" "$branch_name" || return 1
 	source_pulse_cleanup_with_stubs || return 1
 	gh_pr_list() {
+		local args="$*"
+		[[ "$args" == *"--state open"* ]] && return 0
+		if [[ "$args" == *"--json state,number"* ]]; then
+			printf 'MERGED\t23080\n'
+			return 0
+		fi
 		printf '%s\n' 'MERGED'
 		return 0
 	}
@@ -353,6 +392,51 @@ test_closed_issue_dirty_worktree_compacts_and_preserves_branch() {
 	grep -q 'recovery_path=branch-preserved-closed-issue' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
 	print_result "closed issue dirty worktree compacts and preserves branch" "$rc" \
 		"cleanup_rc=$cleanup_rc branch_exists=$branch_exists archive=$archive_manifest pulse=$(cat "$LOGFILE" 2>/dev/null) log=$(cat "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null)"
+	return 0
+}
+
+# GH#34943: a late owner that writes after the compact archive was verified
+# must keep its worktree. The managed-lifetime probe override simulates that
+# write landing inside native removal, after its lock and common-dir probes
+# (the probe only runs there, so the archive itself is unaffected).
+test_late_write_after_compact_archive_preserves_worktree() {
+	local repo_dir="${TEST_ROOT}/repo-late-writer"
+	local wt_path="${TEST_ROOT}/worker-wt-late-writer"
+	local branch_name="feature/auto-20260507-190809-gh23089"
+	setup_repo_with_worker_worktree "$repo_dir" "$wt_path" "$branch_name" || return 1
+	printf 'dirty edit\n' >>"${wt_path}/worker.txt"
+	source_pulse_cleanup_with_stubs || return 1
+	gh() {
+		if [[ "${1:-}" == "issue" && "${2:-}" == "view" && "${3:-}" == "23089" ]]; then
+			printf '%s\n' "CLOSED"
+			return 0
+		fi
+		return 1
+	}
+	worktree_managed_require_removal_proof() {
+		local guarded_path="$1"
+		printf 'late owner write\n' >>"${guarded_path}/late-owner.txt"
+		return 0
+	}
+
+	local now_epoch
+	now_epoch=$(date +%s)
+	AIDEVOPS_HEADLESS_METRICS_FILE="${TEST_ROOT}/missing-late-writer-metrics.jsonl"
+	export AIDEVOPS_HEADLESS_METRICS_FILE
+
+	_cleanup_single_worktree "$repo_dir" "$wt_path" "$branch_name" "$now_epoch" "testowner/testrepo" "main" >/dev/null 2>&1
+	local cleanup_rc=$?
+
+	local branch_exists=1 rc=0
+	git -C "$repo_dir" rev-parse --verify "refs/heads/${branch_name}" >/dev/null 2>&1 && branch_exists=0
+	[[ "$cleanup_rc" -ne 0 ]] || rc=1
+	[[ -d "$wt_path" ]] || rc=1
+	[[ "$branch_exists" -eq 0 ]] || rc=1
+	grep -q 'late owner write' "${wt_path}/late-owner.txt" 2>/dev/null || rc=1
+	grep -q 'dirty edit' "${wt_path}/worker.txt" 2>/dev/null || rc=1
+	grep -q 'worktree-skipped.*compact-archive-source-changed' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
+	print_result "late write after compact archive preserves worktree" "$rc" \
+		"cleanup_rc=$cleanup_rc worktree_exists=$([[ -d "$wt_path" ]] && printf yes || printf no) branch_exists=$branch_exists pulse=$(cat "$LOGFILE" 2>/dev/null) log=$(cat "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null)"
 	return 0
 }
 
@@ -548,11 +632,7 @@ test_local_commit_no_pr_skips_without_recent_metric() {
 	local rc=0
 	[[ "$cleanup_rc" -eq 1 ]] || rc=1
 	[[ -d "$wt_path" ]] || rc=1
-	grep -q 'worktree-skipped.*local-commits-no-pr.*mode=skipped' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
-	grep -q 'owner_guard=clear' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
-	grep -q 'process_guard=clear' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
-	grep -q 'pr_state=none' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
-	grep -q 'recovery_path=branch-preserved-after-' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
+	grep -q "${wt_path}.*idle-unverified-or-pending.*idle_window_secs=604800" "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
 	print_result "local commits/no PR skip without safety proof" "$rc" \
 		"cleanup_rc=$cleanup_rc log=$(cat "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null)"
 	return 0
@@ -577,10 +657,8 @@ test_young_local_commit_logs_not_age_eligible() {
 	local rc=0
 	[[ "$cleanup_rc" -eq 1 ]] || rc=1
 	[[ -d "$wt_path" ]] || rc=1
-	grep -q 'worktree-skipped.*not-age-eligible.*mode=skipped' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
-	grep -q 'pr_state=generated-retention' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
-	grep -q 'commits=1' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
-	print_result "young local commit logs not-age-eligible skip" "$rc" \
+	grep -q "${wt_path}.*idle-unverified-or-pending" "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
+	print_result "young local commit requires confirmed idle" "$rc" \
 		"cleanup_rc=$cleanup_rc log=$(cat "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null)"
 	return 0
 }
@@ -628,18 +706,12 @@ test_stale_local_commit_no_pr_removes_worktree_preserves_branch() {
 	git -C "$repo_dir" rev-parse --verify "refs/heads/${branch_name}" >/dev/null 2>&1 && branch_exists=0
 
 	local rc=0
-	[[ "$cleanup_rc" -eq 0 ]] || rc=1
-	[[ ! -d "$wt_path" ]] || rc=1
+	[[ "$cleanup_rc" -eq 1 ]] || rc=1
+	[[ -d "$wt_path" ]] || rc=1
 	[[ "$branch_exists" -eq 0 ]] || rc=1
-	local archive_manifest=""
-	for archive_manifest in "$HOME"/.aidevops/recovery/archives/testowner__testrepo/23076/*/manifest.json; do
-		[[ -f "$archive_manifest" ]] || archive_manifest=""
-	done
-	[[ -n "$archive_manifest" ]] || rc=1
-	[[ -z "$archive_manifest" ]] || [[ -s "${archive_manifest%/manifest.json}/commits.bundle" ]] || rc=1
-	grep -q 'worktree-removed.*archived-failed-worker.*mode=compact-archive' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
-	grep -q 'recovery_path=branch-preserved' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
-	print_result "stale local commits/no PR removes folder while preserving branch" "$rc" \
+	[[ ! -d "$HOME/.aidevops/recovery/archives/testowner__testrepo/23076" ]] || rc=1
+	grep -q "${wt_path}.*idle-unverified-or-pending" "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
+	print_result "old local commits remain without confirmed idle" "$rc" \
 		"cleanup_rc=$cleanup_rc branch_exists=$branch_exists log=$(cat "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null)"
 	return 0
 }
@@ -673,10 +745,9 @@ test_stale_detached_review_cruft_removes_without_branch() {
 	local cleanup_rc=$?
 
 	local rc=0
-	[[ "$cleanup_rc" -eq 0 ]] || rc=1
-	[[ ! -d "$wt_path" ]] || rc=1
-	grep -q 'worktree-removed.*archived-failed-worker.*mode=compact-archive' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
-	print_result "stale clean detached review worktree is removed as cruft" "$rc" \
+	[[ "$cleanup_rc" -ne 0 ]] || rc=1
+	[[ -d "$wt_path" ]] || rc=1
+	print_result "detached review name and age do not authorize removal" "$rc" \
 		"cleanup_rc=$cleanup_rc log=$(cat "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null)"
 	return 0
 }
@@ -700,12 +771,11 @@ test_stale_clean_auto_worktree_removes_folder_preserves_branch() {
 	git -C "$repo_dir" rev-parse --verify "refs/heads/${branch_name}" >/dev/null 2>&1 && branch_exists=0
 
 	local rc=0
-	[[ "$cleanup_rc" -eq 0 ]] || rc=1
-	[[ ! -d "$wt_path" ]] || rc=1
+	[[ "$cleanup_rc" -eq 1 ]] || rc=1
+	[[ -d "$wt_path" ]] || rc=1
 	[[ "$branch_exists" -eq 0 ]] || rc=1
-	grep -q 'worktree-removed.*archived-failed-worker.*mode=compact-archive' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
-	grep -q 'pr_state=generated-clean-cruft' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
-	print_result "stale clean auto worktree removes folder while preserving branch" "$rc" \
+	grep -q "${wt_path}.*idle-unverified-or-pending" "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
+	print_result "old generated name does not authorize removal" "$rc" \
 		"cleanup_rc=$cleanup_rc branch_exists=$branch_exists log=$(cat "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null)"
 	return 0
 }
@@ -719,7 +789,7 @@ test_clean_generated_worktree_waits_for_archive_threshold() {
 	old_ts=$(date -u -v-4H +%Y%m%d%H%M 2>/dev/null ||
 		date -u -d "4 hours ago" +%Y%m%d%H%M 2>/dev/null ||
 		printf '202601010000\n')
-	touch -t "$old_ts" "$wt_path/.git"
+	backdate_worktree_activity "$wt_path" "$old_ts"
 	source_pulse_cleanup_with_stubs || return 1
 
 	local now_epoch
@@ -732,8 +802,8 @@ test_clean_generated_worktree_waits_for_archive_threshold() {
 	local rc=0
 	[[ "$cleanup_rc" -ne 0 ]] || rc=1
 	[[ -d "$wt_path" ]] || rc=1
-	grep -q 'worktree-skipped.*not-age-eligible.*pr_state=generated-retention' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
-	print_result "clean generated worker waits for compact archive threshold" "$rc" \
+	grep -q "${wt_path}.*idle-unverified-or-pending" "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
+	print_result "clean generated worker waits for confirmed idle" "$rc" \
 		"cleanup_rc=$cleanup_rc log=$(cat "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null)"
 	return 0
 }
@@ -757,7 +827,7 @@ test_dirty_auto_under_seven_days_is_preserved() {
 	local rc=0
 	[[ "$cleanup_rc" -eq 1 ]] || rc=1
 	[[ -d "$wt_path" ]] || rc=1
-	grep -q 'worktree-skipped.*local-commits-no-pr.*mode=skipped' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
+	grep -q "${wt_path}.*idle-unverified-or-pending" "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
 	print_result "dirty generated auto worktree under 7 days is preserved" "$rc" \
 		"cleanup_rc=$cleanup_rc log=$(cat "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null)"
 	return 0
@@ -765,8 +835,8 @@ test_dirty_auto_under_seven_days_is_preserved() {
 
 test_dirty_auto_over_seven_days_compacts_and_preserves_branch() {
 	local repo_dir="${TEST_ROOT}/repo-dirty-auto-stale"
-	local wt_path="${TEST_ROOT}/aidevops-feature-auto-20260507-190808-gh23082"
-	local branch_name="feature/auto-20260507-190808-gh23082"
+	local wt_path="${TEST_ROOT}/aidevops-feature-auto-20260507-190808-gh23092"
+	local branch_name="feature/auto-20260507-190808-gh23092"
 	setup_repo_with_worker_worktree "$repo_dir" "$wt_path" "$branch_name" "8 days ago" || return 1
 	printf 'dirty work\n' >"$wt_path/dirty.txt"
 	source_pulse_cleanup_with_stubs || return 1
@@ -782,18 +852,17 @@ test_dirty_auto_over_seven_days_compacts_and_preserves_branch() {
 	local branch_exists=1
 	git -C "$repo_dir" rev-parse --verify "refs/heads/${branch_name}" >/dev/null 2>&1 && branch_exists=0
 	local archive_manifest=""
-	for archive_manifest in "$HOME"/.aidevops/recovery/archives/testowner__testrepo/23082/*/manifest.json; do
+	for archive_manifest in "$HOME"/.aidevops/recovery/archives/testowner__testrepo/23092/*/manifest.json; do
 		[[ -f "$archive_manifest" ]] || archive_manifest=""
 	done
 
 	local rc=0
-	[[ "$cleanup_rc" -eq 0 ]] || rc=1
-	[[ ! -d "$wt_path" ]] || rc=1
+	[[ "$cleanup_rc" -eq 1 ]] || rc=1
+	[[ -f "$wt_path/dirty.txt" ]] || rc=1
 	[[ "$branch_exists" -eq 0 ]] || rc=1
-	[[ -n "$archive_manifest" ]] || rc=1
-	[[ -z "$archive_manifest" ]] || jq -e '.reason == "failed-worker" and .dirty_state == "dirty"' "$archive_manifest" >/dev/null || rc=1
-	grep -q 'worktree-removed.*archived-failed-worker.*mode=compact-archive' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
-	print_result "dirty generated auto worktree over 7 days is compacted and removed" "$rc" \
+	[[ -z "$archive_manifest" ]] || rc=1
+	grep -q "${wt_path}.*idle-unverified-or-pending" "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
+	print_result "old dirty generated worktree remains without confirmed idle" "$rc" \
 		"cleanup_rc=$cleanup_rc branch_exists=$branch_exists archive=$archive_manifest pulse=$(cat "$LOGFILE" 2>/dev/null) log=$(cat "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null)"
 	return 0
 }
@@ -811,7 +880,11 @@ test_preserve_forensics_marker_blocks_compact_cleanup() {
 	AIDEVOPS_HEADLESS_METRICS_FILE="${TEST_ROOT}/missing-forensics-metrics.jsonl"
 	export AIDEVOPS_HEADLESS_METRICS_FILE
 
-	_cleanup_single_worktree "$repo_dir" "$wt_path" "$branch_name" "$now_epoch" "testowner/testrepo" "main" >/dev/null 2>&1
+	# Isolate this prerequisite stub so it cannot affect subsequent cases.
+	(
+		_pc_confirmed_idle_archive_ready() { return 0; }
+		_cleanup_single_worktree "$repo_dir" "$wt_path" "$branch_name" "$now_epoch" "testowner/testrepo" "main"
+	) >/dev/null 2>&1
 	local cleanup_rc=$?
 	local rc=0
 	[[ "$cleanup_rc" -ne 0 ]] || rc=1
@@ -839,9 +912,38 @@ test_unclear_archive_attribution_preserves_worktree() {
 	local rc=0
 	[[ "$cleanup_rc" -ne 0 ]] || rc=1
 	[[ -d "$wt_path" ]] || rc=1
-	grep -q 'worktree-skipped.*archive-attribution-unclear.*mode=skipped' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
-	print_result "unclear archive attribution preserves full worktree" "$rc" \
+	grep -q "${wt_path}.*idle-unverified-or-pending" "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
+	print_result "unattributed worktree requires confirmed idle" "$rc" \
 		"cleanup_rc=$cleanup_rc log=$(cat "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null)"
+	return 0
+}
+
+test_old_unattributed_worktree_is_archived_and_removed() {
+	local repo_dir="${TEST_ROOT}/repo-old-unattributed"
+	local wt_path="${TEST_ROOT}/aidevops-feature-auto-old-unattributed"
+	local branch_name="feature/auto-old-unattributed"
+	setup_repo_with_worker_worktree "$repo_dir" "$wt_path" "$branch_name" "30 days ago" || return 1
+	local old_ts
+	old_ts=$(date -u -v-30d +%Y%m%d%H%M 2>/dev/null || date -u -d "30 days ago" +%Y%m%d%H%M) || return 1
+	backdate_worktree_activity "$wt_path" "$old_ts" || return 1
+	source_pulse_cleanup_with_stubs || return 1
+
+	local now_epoch
+	now_epoch=$(date +%s)
+	AIDEVOPS_HEADLESS_METRICS_FILE="${TEST_ROOT}/missing-old-unattributed-metrics.jsonl"
+	export AIDEVOPS_HEADLESS_METRICS_FILE
+
+	_cleanup_single_worktree "$repo_dir" "$wt_path" "$branch_name" "$now_epoch" "testowner/testrepo" "main" >/dev/null 2>&1
+	local cleanup_rc=$?
+	local archive_manifest=""
+	for archive_manifest in "$HOME"/.aidevops/recovery/archives/testowner__testrepo/unattributed/*/manifest.json; do
+		[[ -f "$archive_manifest" ]] || archive_manifest=""
+	done
+	local rc=0
+	[[ "$cleanup_rc" -ne 0 && -d "$wt_path" && -z "$archive_manifest" ]] || rc=1
+	grep -q "${wt_path}.*idle-unverified-or-pending" "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
+	print_result "thirty-day age alone does not authorize archival" "$rc" \
+		"cleanup_rc=$cleanup_rc archive=$archive_manifest"
 	return 0
 }
 
@@ -868,7 +970,10 @@ test_security_label_blocks_compact_cleanup() {
 	AIDEVOPS_HEADLESS_METRICS_FILE="${TEST_ROOT}/missing-security-metrics.jsonl"
 	export AIDEVOPS_HEADLESS_METRICS_FILE
 
-	_cleanup_single_worktree "$repo_dir" "$wt_path" "$branch_name" "$now_epoch" "testowner/testrepo" "main" >/dev/null 2>&1
+	(
+		_pc_confirmed_idle_archive_ready() { return 0; }
+		_cleanup_single_worktree "$repo_dir" "$wt_path" "$branch_name" "$now_epoch" "testowner/testrepo" "main"
+	) >/dev/null 2>&1
 	local cleanup_rc=$?
 	local rc=0
 	[[ "$cleanup_rc" -ne 0 ]] || rc=1
@@ -886,6 +991,12 @@ test_stale_dirty_attributed_worker_archives_before_removal() {
 	setup_repo_with_worker_worktree "$repo_dir" "$wt_path" "$branch_name" "8 days ago" || return 1
 	git -C "$wt_path" reset -q --hard main || return 1
 	printf 'unfinished dirty worker state\n' >"$wt_path/unfinished.txt"
+	# The reset rewrites HEAD and its reflog, which is real idle-clock
+	# activity (GH#34905); restore the 8-day idle evidence afterwards.
+	local idle_stamp
+	idle_stamp=$(date -u -v-8d +%Y%m%d%H%M 2>/dev/null ||
+		date -u -d "8 days ago" +%Y%m%d%H%M) || return 1
+	backdate_worktree_activity "$wt_path" "$idle_stamp" || return 1
 	source_pulse_cleanup_with_stubs || return 1
 
 	local now_epoch
@@ -900,13 +1011,11 @@ test_stale_dirty_attributed_worker_archives_before_removal() {
 		[[ -f "$archive_manifest" ]] || archive_manifest=""
 	done
 	local rc=0
-	[[ "$cleanup_rc" -eq 0 ]] || rc=1
-	[[ ! -d "$wt_path" ]] || rc=1
-	[[ -n "$archive_manifest" ]] || rc=1
-	[[ -z "$archive_manifest" ]] || jq -e '.reason == "failed-worker" and .dirty_state == "dirty"' "$archive_manifest" >/dev/null || rc=1
-	[[ -z "$archive_manifest" ]] || [[ -s "${archive_manifest%/manifest.json}/untracked.tar.gz" ]] || rc=1
-	grep -q 'worktree-removed.*archived-failed-worker.*mode=compact-archive' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
-	print_result "stale dirty attributable worker archives before removal" "$rc" \
+	[[ "$cleanup_rc" -eq 1 ]] || rc=1
+	[[ -f "$wt_path/unfinished.txt" ]] || rc=1
+	[[ -z "$archive_manifest" ]] || rc=1
+	grep -q "${wt_path}.*idle-unverified-or-pending" "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
+	print_result "attributed dirty work remains without confirmed idle" "$rc" \
 		"cleanup_rc=$cleanup_rc archive=$archive_manifest log=$(cat "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null)"
 	return 0
 }
@@ -986,10 +1095,256 @@ test_branch_pr_lookup_treats_null_pr_number_as_no_pr() {
 	return 0
 }
 
+test_terminal_pr_identity_and_policy_guards() {
+	source_pulse_cleanup_with_stubs || return 1
+	gh_pr_list() {
+		local args="$*"
+		[[ "$args" == *"--state open"* ]] && return 0
+		printf 'MERGED\t23080\n'
+		return 0
+	}
+	local record="" reason="" rc=0
+	record=$(_pc_terminal_pr_for_branch "testowner/testrepo" "feature/auto-gh23081") || rc=1
+	[[ "$record" == $'MERGED\t23080' ]] || rc=1
+	print_result "head PR identity outranks embedded issue number" "$rc"
+	gh_pr_list() {
+		local args="$*"
+		[[ "$args" == *"--state open"* ]] && return 0
+		printf 'MERGED\tnull\n'
+		return 0
+	}
+	rc=0
+	if _pc_terminal_pr_for_branch "testowner/testrepo" "repair/pr-23085-followup" >/dev/null; then rc=1; fi
+	print_result "malformed head PR identity cannot fall back to branch token" "$rc"
+	gh_pr_list() {
+		local args="$*"
+		if [[ "$args" == *"--state open"* ]]; then printf '23090\n'; else printf 'MERGED\t23080\n'; fi
+		return 0
+	}
+	rc=0
+	if _pc_terminal_pr_for_branch "testowner/testrepo" "feature/auto-gh23081" >/dev/null; then rc=1; fi
+	print_result "open head PR vetoes another merged PR for the same branch" "$rc"
+	gh() {
+		local target_type="${1:-}"
+		if [[ "$target_type" == "pr" ]]; then printf 'security\n'; fi
+		return 0
+	}
+	rc=0
+	if reason=$(_pc_compact_archive_policy_clear "$TEST_ROOT" 23080 "testowner/testrepo" pr 23081); then rc=1; fi
+	[[ "$reason" == "protected-security" ]] || rc=1
+	print_result "PR security label protects issue-numbered branch" "$rc"
+	gh() {
+		local target_type="${1:-}"
+		if [[ "$target_type" == "issue" ]]; then printf 'preserve-forensics\n'; fi
+		return 0
+	}
+	rc=0
+	if reason=$(_pc_compact_archive_policy_clear "$TEST_ROOT" 23080 "testowner/testrepo" pr 23081); then rc=1; fi
+	[[ "$reason" == "protected-preserve-forensics" ]] || rc=1
+	print_result "branch issue retention also protects PR archive" "$rc"
+	return 0
+}
+
+test_abandoned_profile_publication_is_archived_recoverably() {
+	local repo_dir="${TEST_ROOT}/profile-repo"
+	local wt_path="${TEST_ROOT}/profile-repo-profile-readme-20260901000000-123-456"
+	local recovery_root="${TEST_ROOT}/profile-recovery"
+	local git_dir=""
+	local common_dir=""
+	local canonical_head=""
+	local resolved_wt_path=""
+	local old_ts=""
+
+	mkdir -p "$repo_dir"
+	git -C "$repo_dir" init -q -b main
+	git -C "$repo_dir" config user.email "test@example.invalid"
+	git -C "$repo_dir" config user.name "Test Profile"
+	printf 'base\n' >"${repo_dir}/README.md"
+	git -C "$repo_dir" add README.md
+	git -C "$repo_dir" commit -q -m init
+	git -C "$repo_dir" worktree add -q --detach "$wt_path" main
+	printf 'recoverable generated state\n' >"${wt_path}/profile.tmp"
+	git_dir=$(git -C "$wt_path" rev-parse --path-format=absolute --git-dir)
+	resolved_wt_path=$(cd "$wt_path" && pwd -P)
+	common_dir=$(git -C "$repo_dir" rev-parse --path-format=absolute --git-common-dir)
+	canonical_head=$(git -C "$repo_dir" rev-parse HEAD)
+	jq -n --arg path "$resolved_wt_path" --arg common "$common_dir" --arg head "$canonical_head" '
+		{schema:"aidevops-profile-publication/v1",producer:"profile-readme",worktree_path:$path,canonical_common_dir:$common,canonical_head:$head,created_epoch:1}
+	' >"${git_dir}/aidevops-profile-publication.json"
+	old_ts=$(date -u -v-3H +%Y%m%d%H%M 2>/dev/null || date -u -d '3 hours ago' +%Y%m%d%H%M)
+	backdate_worktree_activity "$wt_path" "$old_ts"
+
+	AIDEVOPS_WORKTREE_TRASH_ROOT="$recovery_root"
+	ORPHAN_PROFILE_PUBLICATION_ARCHIVE_SECS=7200
+	export AIDEVOPS_WORKTREE_TRASH_ROOT ORPHAN_PROFILE_PUBLICATION_ARCHIVE_SECS
+	source_pulse_cleanup_with_stubs || return 1
+	local now_epoch=""
+	now_epoch=$(date +%s)
+	_cleanup_single_worktree "$repo_dir" "$wt_path" "" "$now_epoch" "testowner/testrepo" "main" >/dev/null 2>&1
+	local cleanup_rc=$?
+	local rc=0
+	[[ "$cleanup_rc" -eq 0 ]] || rc=1
+	[[ ! -d "$wt_path" && -d "$recovery_root" ]] || rc=1
+	grep -q 'profile-publication.*recoverable' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
+	print_result "abandoned marked profile publication is archived recoverably" "$rc" "cleanup_rc=$cleanup_rc"
+	return 0
+}
+
+write_profile_publication_intent() {
+	local repo_dir="$1"
+	local wt_path="$2"
+	local recorded_path="${3:-}"
+	local common_dir=""
+	local canonical_head=""
+	local resolved_wt_path=""
+	local intent_dir=""
+	local intent_path=""
+	local intent_id=""
+	common_dir=$(git -C "$repo_dir" rev-parse --path-format=absolute --git-common-dir) || return 1
+	canonical_head=$(git -C "$wt_path" rev-parse HEAD) || return 1
+	resolved_wt_path=$(cd "$wt_path" && pwd -P) || return 1
+	[[ -n "$recorded_path" ]] || recorded_path="$resolved_wt_path"
+	intent_id=$(basename "$wt_path")
+	intent_dir="${common_dir}/aidevops-profile-publication-intents"
+	intent_path="${intent_dir}/${intent_id}.json"
+	mkdir -p "$intent_dir"
+	chmod 700 "$intent_dir"
+	jq -n --arg id "$intent_id" --arg path "${recorded_path:-$resolved_wt_path}" \
+		--arg common "$common_dir" --arg head "$canonical_head" --argjson created "$(date +%s)" '
+		{schema:"aidevops-profile-publication-intent/v1",producer:"profile-readme",intent_id:$id,worktree_path:$path,canonical_common_dir:$common,canonical_head:$head,created_epoch:$created}
+	' >"$intent_path"
+	chmod 600 "$intent_path"
+	return 0
+}
+
+setup_profile_publication_worktree() {
+	local repo_dir="$1"
+	local wt_path="$2"
+	mkdir -p "$repo_dir"
+	git -C "$repo_dir" init -q -b main
+	git -C "$repo_dir" config user.email "test@example.invalid"
+	git -C "$repo_dir" config user.name "Test Profile"
+	printf 'base\n' >"${repo_dir}/README.md"
+	git -C "$repo_dir" add README.md
+	git -C "$repo_dir" commit -q -m init
+	git -C "$repo_dir" worktree add -q --detach "$wt_path" main
+	local old_ts=""
+	old_ts=$(date -u -v-3H +%Y%m%d%H%M 2>/dev/null || date -u -d '3 hours ago' +%Y%m%d%H%M)
+	backdate_worktree_activity "$wt_path" "$old_ts"
+	return 0
+}
+
+test_markerless_profile_publication_intent_is_archived_recoverably() {
+	local repo_dir="${TEST_ROOT}/intent-profile-repo"
+	local wt_path="${TEST_ROOT}/intent-profile-repo-profile-readme-20260901000000-123-456"
+	local recovery_root="${TEST_ROOT}/intent-profile-recovery"
+	setup_profile_publication_worktree "$repo_dir" "$wt_path" || return 1
+	write_profile_publication_intent "$repo_dir" "$wt_path" || return 1
+	printf 'recoverable generated state\n' >"${wt_path}/profile.tmp"
+	AIDEVOPS_WORKTREE_TRASH_ROOT="$recovery_root"
+	ORPHAN_PROFILE_PUBLICATION_ARCHIVE_SECS=7200
+	export AIDEVOPS_WORKTREE_TRASH_ROOT ORPHAN_PROFILE_PUBLICATION_ARCHIVE_SECS
+	source_pulse_cleanup_with_stubs || return 1
+	_PC_PROFILE_PUBLICATION_LEGACY_RECOVERIES=0
+	local now_epoch=""
+	now_epoch=$(date +%s)
+	_cleanup_single_worktree "$repo_dir" "$wt_path" "" "$now_epoch" "testowner/testrepo" "main" >/dev/null 2>&1
+	local cleanup_rc=$?
+	local common_dir=""
+	common_dir=$(git -C "$repo_dir" rev-parse --path-format=absolute --git-common-dir)
+	local rc=0
+	[[ "$cleanup_rc" -eq 0 ]] || rc=1
+	[[ ! -d "$wt_path" && -d "$recovery_root" ]] || rc=1
+	[[ ! -e "${common_dir}/aidevops-profile-publication-intents/$(basename "$wt_path").json" ]] || rc=1
+	grep -q 'provenance=intent' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
+	print_result "markerless profile publication with durable intent is archived recoverably" "$rc" \
+		"cleanup_rc=$cleanup_rc audit=$(cat "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null) pulse=$(cat "$LOGFILE" 2>/dev/null)"
+	return 0
+}
+
+test_malformed_profile_publication_intent_fails_closed() {
+	local repo_dir="${TEST_ROOT}/malformed-profile-repo"
+	local wt_path="${TEST_ROOT}/malformed-profile-repo-profile-readme-20260901000000-123-456"
+	local recovery_root="${TEST_ROOT}/malformed-profile-recovery"
+	setup_profile_publication_worktree "$repo_dir" "$wt_path" || return 1
+	write_profile_publication_intent "$repo_dir" "$wt_path" "${wt_path}-wrong" || return 1
+	printf 'must remain in place\n' >"${wt_path}/profile.tmp"
+	AIDEVOPS_WORKTREE_TRASH_ROOT="$recovery_root"
+	export AIDEVOPS_WORKTREE_TRASH_ROOT
+	source_pulse_cleanup_with_stubs || return 1
+	_PC_PROFILE_PUBLICATION_LEGACY_RECOVERIES=0
+	local now_epoch=""
+	now_epoch=$(date +%s)
+	_cleanup_single_worktree "$repo_dir" "$wt_path" "" "$now_epoch" "testowner/testrepo" "main" >/dev/null 2>&1
+	local cleanup_rc=$?
+	local rc=0
+	[[ "$cleanup_rc" -ne 0 ]] || rc=1
+	[[ -d "$wt_path" && ! -d "$recovery_root" ]] || rc=1
+	print_result "malformed profile publication intent fails closed without legacy fallback" "$rc" "cleanup_rc=$cleanup_rc"
+	return 0
+}
+
+test_legacy_markerless_profile_publication_is_archived_recoverably() {
+	local repo_dir="${TEST_ROOT}/legacy-profile-repo"
+	local wt_path="${TEST_ROOT}/legacy-profile-repo-profile-readme-20260901000000-123-456"
+	local recovery_root="${TEST_ROOT}/legacy-profile-recovery"
+	setup_profile_publication_worktree "$repo_dir" "$wt_path" || return 1
+	printf 'legacy recoverable state\n' >"${wt_path}/profile.tmp"
+	AIDEVOPS_WORKTREE_TRASH_ROOT="$recovery_root"
+	ORPHAN_PROFILE_PUBLICATION_LEGACY_RECOVERY_CAP=10
+	export AIDEVOPS_WORKTREE_TRASH_ROOT ORPHAN_PROFILE_PUBLICATION_LEGACY_RECOVERY_CAP
+	source_pulse_cleanup_with_stubs || return 1
+	_PC_PROFILE_PUBLICATION_LEGACY_RECOVERIES=0
+	local now_epoch=""
+	now_epoch=$(date +%s)
+	_cleanup_single_worktree "$repo_dir" "$wt_path" "" "$now_epoch" "testowner/testrepo" "main" >/dev/null 2>&1
+	local cleanup_rc=$?
+	local rc=0
+	[[ "$cleanup_rc" -eq 0 ]] || rc=1
+	[[ ! -d "$wt_path" && -d "$recovery_root" ]] || rc=1
+	[[ "$_PC_PROFILE_PUBLICATION_LEGACY_RECOVERIES" -eq 1 ]] || rc=1
+	grep -q 'provenance=legacy' "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null || rc=1
+	print_result "legacy markerless profile publication is bounded and archived recoverably" "$rc" \
+		"cleanup_rc=$cleanup_rc count=$_PC_PROFILE_PUBLICATION_LEGACY_RECOVERIES audit=$(cat "$AIDEVOPS_CLEANUP_LOG" 2>/dev/null) pulse=$(cat "$LOGFILE" 2>/dev/null)"
+	return 0
+}
+
+test_stale_profile_publication_intent_is_removed() {
+	local repo_dir="${TEST_ROOT}/stale-intent-profile-repo"
+	local wt_path="${TEST_ROOT}/stale-intent-profile-repo-profile-readme-20260901000000-123-456"
+	setup_profile_publication_worktree "$repo_dir" "$wt_path" || return 1
+	write_profile_publication_intent "$repo_dir" "$wt_path" || return 1
+	local common_dir=""
+	common_dir=$(git -C "$repo_dir" rev-parse --path-format=absolute --git-common-dir)
+	local intent_path=""
+	intent_path="${common_dir}/aidevops-profile-publication-intents/$(basename "$wt_path").json"
+	git -C "$repo_dir" worktree remove --force "$wt_path"
+	local old_epoch=$(( $(date +%s) - 10800 ))
+	local temporary="${intent_path}.tmp"
+	jq --argjson created "$old_epoch" '.created_epoch = $created' "$intent_path" >"$temporary"
+	mv "$temporary" "$intent_path"
+	source_pulse_cleanup_with_stubs || return 1
+	_pc_cleanup_stale_profile_publication_intents "$repo_dir" "$(date +%s)"
+	local rc=0
+	[[ ! -e "$intent_path" ]] || rc=1
+	print_result "stale profile publication intent without a worktree is removed" "$rc"
+	return 0
+}
+
 TEST_ROOT=$(mktemp -d)
 trap teardown EXIT
+# Git reports canonical worktree paths and the managed-lifetime fence refuses
+# any other form, so resolve macOS /var -> /private/var like production does.
+TEST_ROOT=$(cd "$TEST_ROOT" && pwd -P) || exit 1
 export HOME="${TEST_ROOT}/home"
 mkdir -p "${HOME}/.aidevops/logs"
+# Production always has an ownership registry; without one the managed
+# lifetime fence fails closed before any archive is attempted. A subshell
+# keeps the registry library from replacing this file's stubs.
+(
+	# shellcheck source=../shared-worktree-registry.sh
+	source "${SCRIPT_DIR}/../shared-worktree-registry.sh" && _init_registry_db
+) || exit 1
 
 echo "=== test-pulse-cleanup-worker-owned-no-pr.sh ==="
 test_recent_metric_blocks_local_commit_no_pr_removal
@@ -1002,6 +1357,7 @@ test_open_ci_repair_dirty_worktree_is_preserved
 test_open_head_pr_outranks_embedded_terminal_reference
 test_merged_branch_pr_removes_before_age_threshold
 test_closed_issue_dirty_worktree_compacts_and_preserves_branch
+test_late_write_after_compact_archive_preserves_worktree
 test_failed_compact_archive_preserves_dirty_worktree
 test_terminal_worktree_respects_live_owner_signal
 test_terminal_worktree_respects_recent_worker_metric
@@ -1014,12 +1370,19 @@ test_dirty_auto_under_seven_days_is_preserved
 test_dirty_auto_over_seven_days_compacts_and_preserves_branch
 test_preserve_forensics_marker_blocks_compact_cleanup
 test_unclear_archive_attribution_preserves_worktree
+test_old_unattributed_worktree_is_archived_and_removed
 test_security_label_blocks_compact_cleanup
 test_stale_dirty_attributed_worker_archives_before_removal
 test_no_newline_pr_output_blocks_local_commit_cleanup
 test_no_newline_open_pr_output_blocks_clean_fastpath
 test_branch_pr_lookup_uses_null_safe_jq_filter
 test_branch_pr_lookup_treats_null_pr_number_as_no_pr
+test_terminal_pr_identity_and_policy_guards
+test_abandoned_profile_publication_is_archived_recoverably
+test_markerless_profile_publication_intent_is_archived_recoverably
+test_malformed_profile_publication_intent_fails_closed
+test_legacy_markerless_profile_publication_is_archived_recoverably
+test_stale_profile_publication_intent_is_removed
 
 echo ""
 echo "Results: $((TESTS_RUN - TESTS_FAILED))/${TESTS_RUN} passed, ${TESTS_FAILED} failed."

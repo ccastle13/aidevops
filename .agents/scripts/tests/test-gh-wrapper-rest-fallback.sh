@@ -148,6 +148,10 @@ _stub_jq_filter_arg() {
 }
 _stub_gh_api_collaborator_permission() {
 	local status="${STUB_COLLAB_STATUS:-200}"
+	if [[ "${STUB_COLLAB_APP_FAIL:-0}" == "1" && "${GH_TOKEN:-}" == "cached-app-token" ]]; then
+		printf 'HTTP/2.0 403 Forbidden\n\n{"message":"Forbidden"}\n'
+		return 1
+	fi
 	if [[ "${STUB_COLLAB_FAIL:-0}" == "1" ]]; then
 		printf 'HTTP/2.0 %s Forbidden\n\n{"message":"Forbidden"}\n' "$status"
 		return 1
@@ -377,7 +381,10 @@ set_origin_label() {
 	local repo_slug="$2"
 	local origin_name="$3"
 	printf 'set-origin %s %s %s\n' "$pr_number" "$repo_slug" "$origin_name" >>"$GH_CALLS"
-	[[ "${STUB_SET_ORIGIN_FAIL:-0}" != "1" ]] || return 1
+	if [[ "${STUB_SET_ORIGIN_FAIL:-0}" == "1" ]]; then
+		printf 'GraphQL: API rate limit exceeded for test identity\n' >&2
+		return 1
+	fi
 	STUB_CREATE_ORIGIN_FIXTURE=$(jq -cn --arg name "origin:${origin_name}" '{labels: [{name: $name}]}') || return 1
 	export STUB_CREATE_ORIGIN_FIXTURE
 	return 0
@@ -700,6 +707,44 @@ else
 		"mutations=${mutation_count}; GH_CALLS=$(cat "$GH_CALLS")"
 fi
 unset STUB_ISSUE_VIEW_FIXTURE
+
+# =============================================================================
+# Test 8i: healthy-budget native label failure reconciles an absent removal as
+# a validated REST no-op instead of surfacing a false validation failure.
+# =============================================================================
+: >"$GH_CALLS"
+: >"$GH_INFO_OUTPUT"
+export STUB_PRIMARY_FAIL=1
+export STUB_RATE_LIMIT_REMAINING=5000
+export STUB_ISSUE_VIEW_FIXTURE='{"labels":[{"name":"no-auto-dispatch"}],"assignees":[]}'
+label_reconcile_rc=0
+gh_issue_edit_safe 51 --repo "owner/repo" \
+	--add-label "no-auto-dispatch" --remove-label "auto-dispatch" >/dev/null 2>&1 || label_reconcile_rc=$?
+if [[ "$label_reconcile_rc" -eq 0 ]] &&
+	grep -qE '^issue edit 51' "$GH_CALLS" 2>/dev/null &&
+	grep -q 'reconciling failed issue-label edit through validated REST deltas' "$GH_INFO_OUTPUT" 2>/dev/null &&
+	! grep -qE '^api -X (PATCH|POST|DELETE).*/repos/owner/repo/issues/51' "$GH_CALLS" 2>/dev/null; then
+	pass "gh_issue_edit_safe reconciles an already-converged label edit at healthy budget"
+else
+	fail "gh_issue_edit_safe reconciles an already-converged label edit at healthy budget" \
+		"rc=${label_reconcile_rc}; GH_CALLS=$(cat "$GH_CALLS"); INFO=$(cat "$GH_INFO_OUTPUT")"
+fi
+
+# Scalar failures must retain the native error and must not broaden into REST
+# writes merely because label reconciliation exists for delta-bearing edits.
+: >"$GH_CALLS"
+: >"$GH_INFO_OUTPUT"
+scalar_reconcile_rc=0
+gh_issue_edit_safe 52 --repo "owner/repo" --title "Native failure" >/dev/null 2>&1 || scalar_reconcile_rc=$?
+if [[ "$scalar_reconcile_rc" -ne 0 ]] &&
+	! grep -q 'reconciling failed issue-label edit' "$GH_INFO_OUTPUT" 2>/dev/null &&
+	! grep -qE '^api -X PATCH.*/repos/owner/repo/issues/52' "$GH_CALLS" 2>/dev/null; then
+	pass "gh_issue_edit_safe does not broaden healthy-budget scalar failures into REST writes"
+else
+	fail "gh_issue_edit_safe does not broaden healthy-budget scalar failures into REST writes" \
+		"rc=${scalar_reconcile_rc}; GH_CALLS=$(cat "$GH_CALLS"); INFO=$(cat "$GH_INFO_OUTPUT")"
+fi
+unset STUB_PRIMARY_FAIL STUB_ISSUE_VIEW_FIXTURE
 
 # =============================================================================
 # Test 9: gh_issue_comment → falls back to REST when primary fails AND exhausted
@@ -1045,10 +1090,13 @@ origin_partial_output=$(gh_create_pr \
 	--base "main" \
 	--body "origin partial body" 2>"$origin_partial_stderr") || origin_partial_rc=$?
 origin_partial_create_count=$(grep -cE '^pr create' "$GH_CALLS" 2>/dev/null || true)
-if [[ "$origin_partial_rc" -eq 78 \
-	&& "$origin_partial_output" == "https://github.com/owner/repo/pull/9100" \
-	&& "$origin_partial_create_count" -eq 1 ]] \
-	&& grep -q 'durable PR #9100 exists but exact origin:interactive provenance is unverified; not retrying creation' \
+if [[ "$origin_partial_rc" -eq 78 &&
+	"$origin_partial_output" == "https://github.com/owner/repo/pull/9100" &&
+	"$origin_partial_create_count" -eq 1 ]] &&
+	grep -q 'origin label reconciliation failed: GitHub API rate limited the label write' \
+		"$origin_partial_stderr" 2>/dev/null &&
+	! grep -q 'test identity' "$origin_partial_stderr" 2>/dev/null &&
+	grep -q 'durable PR #9100 exists but exact origin:interactive provenance is unverified; not retrying creation' \
 		"$origin_partial_stderr" 2>/dev/null; then
 	pass "gh_create_pr preserves URL and returns typed partial success"
 else
@@ -2154,6 +2202,51 @@ else
 	fail "collaborator permission lookup uses GitHub App REST route when available" \
 		"perm=${collab_perm} GH_CALLS=$(cat "$GH_CALLS") | TOKENS=$(cat "$GH_APP_TOKEN_CALLS")"
 fi
+
+: >"$GH_CALLS"
+: >"$GH_APP_TOKEN_CALLS"
+export STUB_COLLAB_PERMISSION=admin
+export STUB_COLLAB_APP_FAIL=1
+collab_perm=""
+_gh_collaborator_permission_lookup "owner/repo" "testuser" collab_perm 2>/dev/null || true
+if [[ "$collab_perm" == "admin" && "${AIDEVOPS_GH_COLLAB_PERMISSION_REASON:-}" == "gh-fallback-ok" ]] &&
+	grep -q 'cached-app-token' "$GH_APP_TOKEN_CALLS" 2>/dev/null &&
+	[[ "$(grep -cE '^api -i /repos/owner/repo/collaborators/testuser/permission' "$GH_CALLS")" -eq 2 ]]; then
+	pass "collaborator permission retries with gh auth after GitHub App denial"
+else
+	fail "collaborator permission retries with gh auth after GitHub App denial" \
+		"perm=${collab_perm} reason=${AIDEVOPS_GH_COLLAB_PERMISSION_REASON:-unset} GH_CALLS=$(cat "$GH_CALLS") | TOKENS=$(cat "$GH_APP_TOKEN_CALLS")"
+fi
+unset STUB_COLLAB_APP_FAIL
+
+: >"$GH_CALLS"
+: >"$GH_APP_TOKEN_CALLS"
+export STUB_COLLAB_STATUS=404
+collab_perm=""
+_gh_collaborator_permission_lookup "owner/repo" "outsider" collab_perm 2>/dev/null || true
+if [[ "$collab_perm" == "none" && "${AIDEVOPS_GH_COLLAB_PERMISSION_HTTP:-}" == "404" ]] &&
+	[[ "$(grep -cE '^api -i /repos/owner/repo/collaborators/outsider/permission' "$GH_CALLS")" -eq 1 ]]; then
+	pass "GitHub App 404 remains a confirmed non-collaborator verdict"
+else
+	fail "GitHub App 404 remains a confirmed non-collaborator verdict" \
+		"perm=${collab_perm} http=${AIDEVOPS_GH_COLLAB_PERMISSION_HTTP:-unset} GH_CALLS=$(cat "$GH_CALLS")"
+fi
+unset STUB_COLLAB_STATUS
+
+: >"$GH_CALLS"
+: >"$GH_APP_TOKEN_CALLS"
+export STUB_COLLAB_APP_FAIL=1
+export STUB_COLLAB_FAIL=1
+if ! _gh_collaborator_permission_lookup "owner/repo" "testuser" >/dev/null 2>&1 &&
+	[[ "${AIDEVOPS_GH_COLLAB_PERMISSION_REASON:-}" == "app-and-gh-api-failure" ]] &&
+	[[ "$(grep -cE '^api -i /repos/owner/repo/collaborators/testuser/permission' "$GH_CALLS")" -eq 2 ]]; then
+	pass "collaborator permission fails closed when App and gh auth both fail"
+else
+	fail "collaborator permission fails closed when App and gh auth both fail" \
+		"http=${AIDEVOPS_GH_COLLAB_PERMISSION_HTTP:-unset} reason=${AIDEVOPS_GH_COLLAB_PERMISSION_REASON:-unset} GH_CALLS=$(cat "$GH_CALLS")"
+fi
+unset STUB_COLLAB_APP_FAIL STUB_COLLAB_FAIL
+export STUB_COLLAB_PERMISSION=write
 
 unset AIDEVOPS_GITHUB_APP_ENABLED AIDEVOPS_GITHUB_APP_ID AIDEVOPS_GITHUB_APP_INSTALLATION_ID AIDEVOPS_GITHUB_APP_REST_FIRST
 

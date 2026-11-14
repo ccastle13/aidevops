@@ -110,7 +110,13 @@ jobs:
       - name: Extract CHANGELOG section
         run: |
           VERSION="${RELEASE_TAG#v}"
-          BODY=$(awk "/^## \[$VERSION\]/,/^## \[/" CHANGELOG.md | sed '$d')
+          BODY=$(awk -v version="$VERSION" '
+            /^## \[[0-9]+\.[0-9]+\.[0-9]+[^]]*\]/ {
+              if (found) exit
+              if ($2 == "[" version "]") found = 1
+            }
+            found { print }
+          ' CHANGELOG.md)
           PREV_TAG=$(git describe --tags --abbrev=0 "$RELEASE_TAG^" 2>/dev/null || true)
           if [[ -n "$PREV_TAG" ]]; then
             EXTRA=$(git log --oneline --max-count=10 --invert-grep \
@@ -128,7 +134,7 @@ jobs:
           printf '%s\n' "$BODY" > "$RUNNER_TEMP/release-notes.md"
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           # Node 24 ships npm 11.5+ which natively supports OIDC Trusted Publishers.
           node-version: '24'
@@ -193,6 +199,13 @@ jobs:
           [[ "$RELEASE_RC" -eq 0 ]] || exit "$RELEASE_RC"
           echo "deferred=false" >> "$GITHUB_OUTPUT"
 
+      # A successful step here is the durable jobs-API evidence that reconciliation
+      # reads to report the deferral and allow a bounded recovery retry (GH#35565).
+      - name: Record deferred GitHub release
+        if: steps.github-release.outputs.deferred == 'true'
+        run: |
+          echo "::warning::GitHub release for $RELEASE_TAG is deferred until the installation API rate limit resets; aidevops release reconcile <PR> dispatches a bounded same-tag recovery after the grace"
+
       - name: Check npm publication state
         id: npm-state
         env:
@@ -201,24 +214,28 @@ jobs:
           EXPECTED_SHASUM: ${{ steps.npm-package.outputs.shasum }}
         run: |
           VIEW_OUTPUT=""
-          if VIEW_OUTPUT=$(npm view "aidevops@${RELEASE_VERSION}" version dist --json 2>&1); then
-            jq -e --arg version "$RELEASE_VERSION" --arg integrity "$EXPECTED_INTEGRITY" \
-              --arg shasum "$EXPECTED_SHASUM" '
-                .version == $version
-                and .dist.integrity == $integrity
-                and .dist.shasum == $shasum
-              ' <<<"$VIEW_OUTPUT" >/dev/null || {
-              echo "::error::Existing npm package does not match the verified tag artifact"
+          for attempt in {1..12}; do
+            if VIEW_OUTPUT=$(npm view "aidevops@${RELEASE_VERSION}" version dist --json 2>&1); then
+              jq -e --arg version "$RELEASE_VERSION" --arg integrity "$EXPECTED_INTEGRITY" \
+                --arg shasum "$EXPECTED_SHASUM" '
+                  .version == $version
+                  and .dist.integrity == $integrity
+                  and .dist.shasum == $shasum
+                ' <<<"$VIEW_OUTPUT" >/dev/null || {
+                echo "::error::Existing npm package does not match the verified tag artifact"
+                exit 1
+              }
+              echo "published=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if ! grep -qE 'E404|No match found' <<<"$VIEW_OUTPUT"; then
+              echo "::error::Unable to determine npm publication state"
+              printf '%s\n' "$VIEW_OUTPUT" >&2
               exit 1
-            }
-            echo "published=true" >> "$GITHUB_OUTPUT"
-          elif grep -qE 'E404|No match found' <<<"$VIEW_OUTPUT"; then
-            echo "published=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "::error::Unable to determine npm publication state"
-            printf '%s\n' "$VIEW_OUTPUT" >&2
-            exit 1
-          fi
+            fi
+            sleep 5
+          done
+          echo "published=false" >> "$GITHUB_OUTPUT"
 
       # No token needed: npm verifies this workflow and environment through OIDC.
       - name: Publish to npm
@@ -234,20 +251,34 @@ jobs:
           EXPECTED_SHASUM: ${{ steps.npm-package.outputs.shasum }}
         run: |
           PUBLISHED_METADATA=""
-          for attempt in {1..12}; do
-            if PUBLISHED_METADATA=$(npm view "aidevops@${RELEASE_VERSION}" version dist --json 2>/dev/null) \
-              && jq -e --arg version "$RELEASE_VERSION" --arg integrity "$EXPECTED_INTEGRITY" \
-                --arg shasum "$EXPECTED_SHASUM" '
-                  .version == $version
-                  and .dist.integrity == $integrity
-                  and .dist.shasum == $shasum
-                  and .dist.attestations.provenance.predicateType == "https://slsa.dev/provenance/v1"
-                  and ((.dist.attestations.url // "") | type == "string" and length > 0)
-                ' <<<"$PUBLISHED_METADATA" >/dev/null; then
+          # Allow up to 15 minutes for npm's asynchronous publication processing.
+          RETRY_DELAYS=(5 5 10 10 15 15 30 30 45 45 60 60 90 120 120 120 120)
+          for attempt in {1..18}; do
+            VIEW_OUTPUT=""
+            if ! VIEW_OUTPUT=$(npm view "aidevops@${RELEASE_VERSION}" version dist --json 2>&1); then
+              if ! grep -qE 'E404|No match found' <<<"$VIEW_OUTPUT"; then
+                echo "::error::Unable to determine npm publication metadata"
+                printf '%s\n' "$VIEW_OUTPUT" >&2
+                exit 1
+              fi
+            elif ! jq -e --arg version "$RELEASE_VERSION" --arg integrity "$EXPECTED_INTEGRITY" \
+              --arg shasum "$EXPECTED_SHASUM" '
+                .version == $version
+                and .dist.integrity == $integrity
+                and .dist.shasum == $shasum
+              ' <<<"$VIEW_OUTPUT" >/dev/null; then
+              echo "::error::npm metadata does not match the verified package identity"
+              exit 1
+            elif jq -e '
+              .dist.attestations.provenance.predicateType == "https://slsa.dev/provenance/v1"
+              and ((.dist.attestations.url // "") | type == "string" and length > 0)
+            ' <<<"$VIEW_OUTPUT" >/dev/null; then
+              PUBLISHED_METADATA="$VIEW_OUTPUT"
               break
             fi
-            PUBLISHED_METADATA=""
-            sleep 5
+            if [[ "$attempt" -lt 18 ]]; then
+              sleep "${RETRY_DELAYS[$((attempt - 1))]}"
+            fi
           done
           [[ -n "$PUBLISHED_METADATA" ]] || {
             echo "::error::npm did not converge to the exact package identity for $RELEASE_VERSION"
@@ -262,7 +293,25 @@ jobs:
           trap cleanup_audit EXIT
           npm install --prefix "$AUDIT_DIR" --ignore-scripts --no-audit --no-fund --save-exact \
             "aidevops@${RELEASE_VERSION}" >/dev/null
-          AUDIT_JSON=$(npm --prefix "$AUDIT_DIR" audit signatures --json --include-attestations)
+          ATTESTATION_RETRY_DELAYS=(15 30 45 90 120)
+          AUDIT_JSON=""
+          for attempt in {1..6}; do
+            if AUDIT_JSON=$(npm --prefix "$AUDIT_DIR" audit signatures --json --include-attestations 2>&1); then
+              break
+            fi
+            if [[ "$AUDIT_JSON" != *E404* || "$AUDIT_JSON" != *"404 Not Found"* || \
+              "$AUDIT_JSON" != *"/-/npm/v1/attestations/aidevops@${RELEASE_VERSION}"* ]]; then
+              echo "::error::Unable to audit npm provenance signatures"
+              printf '%s\n' "$AUDIT_JSON" >&2
+              exit 1
+            fi
+            if [[ "$attempt" -eq 6 ]]; then
+              echo "::error::npm attestation bundle did not propagate for $RELEASE_VERSION"
+              printf '%s\n' "$AUDIT_JSON" >&2
+              exit 1
+            fi
+            sleep "${ATTESTATION_RETRY_DELAYS[$((attempt - 1))]}"
+          done
           jq -e --arg version "$RELEASE_VERSION" '
             (.invalid | type == "array" and length == 0)
             and (.missing | type == "array" and length == 0)
@@ -328,12 +377,35 @@ jobs:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           CURRENT="$RUNNER_TEMP/aidevops.rb"
+          TAP_ERROR_FILE="$RUNNER_TEMP/tap-state.err"
           TAP_JSON=""
-          if ! TAP_JSON=$(gh api \
-            repos/marcusquinn/homebrew-tap/contents/Formula/aidevops.rb 2>&1); then
-            echo "::error::Unable to determine Homebrew tap publication state"
+          for attempt in {1..3}; do
+            if TAP_JSON=$(gh api \
+              repos/marcusquinn/homebrew-tap/contents/Formula/aidevops.rb 2> "$TAP_ERROR_FILE"); then
+              break
+            fi
+            # Emit only an allowlisted class from the first stderr line, never raw
+            # API text (which can contain credentials, headers or workflow commands).
+            TAP_ERROR=""
+            IFS= read -r TAP_ERROR < "$TAP_ERROR_FILE" || true
+            ERROR_CLASS="API request failed"
+            if [[ "$TAP_ERROR" =~ HTTP\ ([0-9]{3}) ]]; then
+              ERROR_CLASS="HTTP ${BASH_REMATCH[1]}"
+            fi
+            if grep -qiE 'API rate limit exceeded|secondary rate limit' "$TAP_ERROR_FILE" ||
+              { grep -qiE 'HTTP (403|429)' "$TAP_ERROR_FILE" &&
+                grep -qiE 'rate[- ]limit' "$TAP_ERROR_FILE"; }; then
+              echo "::warning::Homebrew tap check: rate limit ($ERROR_CLASS), attempt $attempt/3"
+              if [[ "$attempt" -lt 3 ]]; then
+                sleep 60
+                continue
+              fi
+              echo "::error::Homebrew tap check rate limit persisted after 3 attempts; retry same-tag release reconcile after reset"
+            else
+              echo "::error::Unable to determine Homebrew tap publication state: $ERROR_CLASS"
+            fi
             exit 1
-          fi
+          done
           if ! jq -er '.content' <<<"$TAP_JSON" | base64 --decode > "$CURRENT"; then
             echo "::error::Homebrew tap returned malformed formula content"
             exit 1
@@ -363,37 +435,98 @@ jobs:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           CURRENT="$RUNNER_TEMP/aidevops-verified.rb"
+          TAP_ERROR_FILE="$RUNNER_TEMP/tap-verify.err"
+          RATE_FAILURES=0
           for attempt in {1..12}; do
-            if gh api repos/marcusquinn/homebrew-tap/contents/Formula/aidevops.rb \
-              --jq '.content' | base64 --decode > "$CURRENT" \
-              && cmp -s homebrew/aidevops.rb "$CURRENT"; then
+            if ! TAP_CONTENT=$(gh api repos/marcusquinn/homebrew-tap/contents/Formula/aidevops.rb \
+              --jq '.content' 2> "$TAP_ERROR_FILE"); then
+              # Keep diagnostics bounded and secret-free, as in the state check.
+              TAP_ERROR=""
+              IFS= read -r TAP_ERROR < "$TAP_ERROR_FILE" || true
+              ERROR_CLASS="API request failed"
+              if [[ "$TAP_ERROR" =~ HTTP\ ([0-9]{3}) ]]; then
+                ERROR_CLASS="HTTP ${BASH_REMATCH[1]}"
+              fi
+              if grep -qiE 'API rate limit exceeded|secondary rate limit' "$TAP_ERROR_FILE" ||
+                { grep -qiE 'HTTP (403|429)' "$TAP_ERROR_FILE" &&
+                  grep -qiE 'rate[- ]limit' "$TAP_ERROR_FILE"; }; then
+                RATE_FAILURES=$((RATE_FAILURES + 1))
+                echo "::warning::Homebrew tap verification: rate limit ($ERROR_CLASS), retry $RATE_FAILURES/3, attempt $attempt/12"
+                if [[ "$RATE_FAILURES" -lt 3 && "$attempt" -lt 12 ]]; then
+                  sleep 60
+                  continue
+                fi
+                echo "::error::Homebrew tap verification rate limit retry budget exhausted; retry same-tag release reconcile after reset"
+              else
+                echo "::error::Unable to verify Homebrew tap publication state: $ERROR_CLASS"
+              fi
+              exit 1
+            fi
+            if [[ -z "$TAP_CONTENT" ]]; then
+              echo "::error::Homebrew tap returned empty formula content"
+              exit 1
+            fi
+            if ! base64 --decode <<<"$TAP_CONTENT" > "$CURRENT"; then
+              echo "::error::Homebrew tap returned malformed formula content"
+              exit 1
+            fi
+            if cmp -s homebrew/aidevops.rb "$CURRENT"; then
+              echo "Homebrew tap verified for $RELEASE_TAG (attempt $attempt/12)"
               exit 0
             fi
-            sleep 5
+            echo "::warning::Homebrew tap formula mismatch, attempt $attempt/12"
+            if [[ "$attempt" -lt 12 ]]; then
+              sleep 5
+            fi
           done
           echo "::error::Homebrew tap did not converge to $RELEASE_TAG"
           exit 1
 
       - name: Queue exact-tag postflight
+        id: postflight-queue
         if: steps.github-release.outputs.deferred != 'true'
         env:
           SYNC_TOKEN: ${{ secrets.SYNC_PAT }}
           JOB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           #aidevops:trust-boundary
+          PAT_ERR="$RUNNER_TEMP/postflight-pat.err"
+          JOB_ERR="$RUNNER_TEMP/postflight-job.err"
+          : > "$PAT_ERR"
+          : > "$JOB_ERR"
           if [[ -n "$SYNC_TOKEN" ]] && GH_TOKEN="$SYNC_TOKEN" gh workflow run postflight.yml \
               --repo "$GITHUB_REPOSITORY" \
               --ref main \
-              --field "tag=$RELEASE_TAG"; then
-            :
+              --field "tag=$RELEASE_TAG" 2> "$PAT_ERR"; then
+            echo "postflight_deferred=false" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::SYNC_PAT could not dispatch postflight; retrying with the job token"
-            GH_TOKEN="$JOB_TOKEN" gh workflow run postflight.yml \
-              --repo "$GITHUB_REPOSITORY" \
-              --ref main \
-              --field "tag=$RELEASE_TAG"
+            if grep -qiE 'Resource not accessible by personal access token' "$PAT_ERR"; then
+              echo "::warning::SYNC_PAT lacks permission to dispatch postflight; grant the fine-grained token repository permission 'Actions: Read and write' on $GITHUB_REPOSITORY. Retrying with the job token"
+            else
+              echo "::warning::SYNC_PAT could not dispatch postflight; retrying with the job token"
+            fi
+            if GH_TOKEN="$JOB_TOKEN" gh workflow run postflight.yml \
+                --repo "$GITHUB_REPOSITORY" \
+                --ref main \
+                --field "tag=$RELEASE_TAG" 2> "$JOB_ERR"; then
+              echo "postflight_deferred=false" >> "$GITHUB_OUTPUT"
+            elif grep -qiE 'API rate limit exceeded for installation' "$JOB_ERR"; then
+              # Only installation-quota exhaustion defers; earlier verification already succeeded.
+              echo "postflight_deferred=true" >> "$GITHUB_OUTPUT"
+              echo "- Postflight for $RELEASE_TAG deferred by installation API rate limit; run 'aidevops release reconcile <PR>' to queue it without republishing" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            else
+              cat "$JOB_ERR" >&2
+              exit 1
+            fi
           fi
           echo "Queued Postflight Verification for $RELEASE_TAG"
+
+      # A successful step here is the durable jobs-API evidence that reconciliation reads.
+      - name: Record deferred postflight
+        if: steps.postflight-queue.outputs.postflight_deferred == 'true'
+        run: |
+          echo "::warning::Postflight queue for $RELEASE_TAG is deferred until the installation API rate limit resets; run aidevops release reconcile <PR> to queue it without republishing"
 
       - name: Publication summary
         env:

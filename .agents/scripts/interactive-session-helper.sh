@@ -6,7 +6,7 @@
 # Purpose: provide a mandatory, AI-driven acquire/release primitive for
 # interactive GitHub issue ownership. When an interactive session engages
 # with an issue in a maintainer-managed repo, this helper applies
-# `status:in-review` + self-assignment so the pulse's dispatch-dedup guard
+# `status:claimed` + self-assignment so the pulse's dispatch-dedup guard
 # (`dispatch-dedup-helper.sh is-assigned`) will not dispatch a parallel worker.
 # External non-maintainer repos skip these state/comment routines entirely.
 #
@@ -19,17 +19,17 @@
 #   a pulse bug), use `lockdown` instead — it applies `no-auto-dispatch` +
 #   `status:in-review` + self-assignment + conversation lock + audit comment.
 #
-# Why reuse status:in-review rather than a new label:
+# Why use status:claimed rather than a new label:
 #   - `_has_active_claim` in dispatch-dedup-helper.sh already treats it as an
 #     active claim that blocks dispatch.
 #   - `_normalize_stale_should_skip_reset` in pulse-issue-reconcile.sh already
 #     skips it during stale-recovery (only queued/in-progress get reset).
-#   - `ISSUE_STATUS_LABEL_PRECEDENCE` in shared-constants.sh already ranks it
-#     second after `done` for label-invariant reconciliation.
+#   - `ISSUE_STATUS_LABEL_PRECEDENCE` in shared-constants.sh already includes
+#     it in label-invariant reconciliation.
 #   - `.github/workflows/issue-sync.yml` already clears it on PR-close cleanup.
 # All the gating infrastructure is in place. The only gap this helper closes
-# is timing: today the label lands at PR open (via `full-loop-helper.sh
-# commit-and-pr`); we need it to land at interactive session engage.
+# is timing: the claim must land at interactive session engage without making
+# active implementation indistinguishable from a review-ready PR.
 #
 # AI-driven contract:
 #   The primary enforcement layer is an `AGENTS.md` rule telling the
@@ -58,6 +58,9 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/shared-constants.sh"
+# shellcheck source=./issue-open-pr-guard.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/issue-open-pr-guard.sh"
 
 set -euo pipefail
 
@@ -117,10 +120,14 @@ _isc_stamp_path() {
 _isc_current_user() {
 	local login=""
 	login=$(gh api user --jq '.login' 2>/dev/null) || login=""
-	# Reject JSON null / empty / literal "null"
-	if [[ -z "$login" || "$login" == "null" ]]; then
-		printf ''
-		return 0
+	# REST core and GraphQL have separate quotas. Identity must always come
+	# from the authenticated credential, never from caller/environment input.
+	if [[ "$login" == "null" || ! "$login" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]]; then
+		login=$(gh api graphql -f 'query=query { viewer { login } }' \
+			--jq '.data.viewer.login // empty' 2>/dev/null) || login=""
+	fi
+	if [[ "$login" == "null" || ! "$login" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]]; then
+		login=""
 	fi
 	printf '%s' "$login"
 	return 0
@@ -130,7 +137,8 @@ _isc_current_user() {
 # issue-state routines in this repo. External upstream repos do not run our
 # pulse, so posting claim/status/lockdown lifecycle markers there is noise.
 #
-# Returns 0 for maintainer-equivalent access, 1 otherwise. Lookup failures are
+# Returns 0 for maintainer-equivalent access, 1 otherwise, 75 for deferred reads.
+# Lookup failures are
 # treated as NOT authorized: skipping a claim is safer than publicly applying
 # internal aidevops workflow state to an upstream project we cannot verify.
 _isc_can_manage_issue_state() {
@@ -150,7 +158,10 @@ _isc_can_manage_issue_state() {
 	# #aidevops:trust-boundary — managed-repo claim/state writes require a
 	# confirmed collaborator permission; lookup failures fail closed without
 	# being treated as confirmed non-collaborators.
-	_gh_collaborator_permission_lookup "$slug" "$user" permission || return 1
+	local permission_rc=0
+	_gh_collaborator_permission_lookup "$slug" "$user" permission || permission_rc=$?
+	[[ "$permission_rc" -ne 75 ]] || return 75
+	[[ "$permission_rc" -eq 0 ]] || return 1
 	case "$permission" in
 		admin | maintain | write)
 			return 0
@@ -201,14 +212,66 @@ _isc_read_claim_metadata() {
 	return 0
 }
 
+# Validate a supplied existing worktree before claim writes. Empty/nonexistent
+# paths retain the established deferred-worktree claim contract.
+_isc_validate_worktree_origin() {
+	local slug="$1" worktree="$2" origin=""
+	[[ -n "$worktree" && -d "$worktree" ]] || return 0
+	origin=$(git -C "$worktree" remote get-url origin 2>/dev/null) || origin=""
+	origin=${origin%.git}
+	case "$origin" in
+	"https://github.com/${slug}" | "git@github.com:${slug}" | "ssh://git@github.com/${slug}" | "ssh://git@github.com:22/${slug}") return 0 ;;
+	*)
+		_isc_err "claim: supplied worktree origin does not match the target; no claim written"
+		return 1
+		;;
+	esac
+}
+
+# Normalize only the preserved PR in the verified implementing worktree. The
+# original signed body/comments remain the immutable creation audit trail.
+_isc_normalize_owned_pr() {
+	local issue="$1" slug="$2" worktree="$3" user="$4"
+	local branch="" prs="" pr="" metadata=""
+	[[ -n "$worktree" && -d "$worktree" ]] || return 0
+	_isc_validate_worktree_origin "$slug" "$worktree" || return 1
+	branch=$(git -C "$worktree" symbolic-ref --short HEAD 2>/dev/null) || return 1
+	#aidevops:trust-boundary — independently verify authority and current sole
+	# ownership; a stale PR origin label never substitutes for either check.
+	_isc_can_manage_issue_state "$slug" "$user" || return 1
+	metadata=$(_isc_read_claim_metadata "$issue" "$slug") || return 1
+	jq -e --arg user "$user" '
+		.state == "OPEN" and ([.assignees[].login] == [$user])
+	' <<<"$metadata" >/dev/null || return 1
+	prs=$(gh pr list --repo "$slug" --head "$branch" --state open \
+		--json number,isCrossRepository,closingIssuesReferences 2>/dev/null) || return 1
+	# PRs that do not close this issue belong to other work, e.g. a stamp
+	# written from another task's worktree (GH#35951). Never edit or block on
+	# them; only PRs that claim this issue continue to the strict checks.
+	prs=$(jq -c --argjson issue "$issue" '
+		[.[] | select(any(.closingIssuesReferences[]?; .number == $issue))]
+	' <<<"$prs") || return 1
+	[[ "$(jq 'length' <<<"$prs")" == 0 ]] && return 0
+	jq -e '([.labels[].name] | index("status:in-review") != null)' \
+		<<<"$metadata" >/dev/null || return 1
+	pr=$(jq -er --argjson issue "$issue" '
+		select(length == 1) | .[0] | select(.isCrossRepository == false) |
+		select([.closingIssuesReferences[].number] == [$issue]) | .number
+	' <<<"$prs") || return 1
+	[[ "$(_isc_read_claim_metadata "$issue" "$slug")" == "$metadata" ]] || return 1
+	gh pr edit "$pr" --repo "$slug" --add-label origin:interactive \
+		--remove-label origin:worker --remove-label origin:worker-takeover >/dev/null || return 1
+	return 0
+}
+
 # Compatibility label probe used by release paths and focused regression tests.
 # Claim acquisition intentionally uses the richer ownership metadata above.
-_isc_has_in_review() {
+_isc_has_claimed() {
 	local issue="$1"
 	local slug="$2"
 	local json=""
 	json=$(gh issue view "$issue" --repo "$slug" --json labels 2>/dev/null) || return 2
-	printf '%s' "$json" | jq -e '(.labels // []) | any(.name == "status:in-review")' >/dev/null 2>&1
+	printf '%s' "$json" | jq -e '(.labels // []) | any(.name == "status:claimed")' >/dev/null 2>&1
 	return $?
 }
 
@@ -433,6 +496,12 @@ main() {
 	case "$cmd" in
 	claim)
 		_isc_cmd_claim "$@" || rc=$?
+		if [[ "$rc" -eq 0 ]]; then
+			# Includes idempotent claims; start-helper uses this same entrypoint.
+			# shellcheck source=./pulse-repo-dormancy.sh
+			source "${SCRIPT_DIR}/pulse-repo-dormancy.sh"
+			pulse_repo_wake "${2:-}" interactive_claim || true
+		fi
 		;;
 	lockdown)
 		_isc_cmd_lockdown "$@" || rc=$?

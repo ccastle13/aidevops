@@ -39,6 +39,18 @@ if sqlite3 "$AIDEVOPS_OBS_DB_OVERRIDE" "SELECT payload_json FROM runtime_events;
 fi
 node "$RUNTIME_EVENTS" verify | jq -e '.ok == true' >/dev/null
 
+objective_payload='{"objective_version":1,"objective_id":"objective:cli","run_id":"run:cli","allocation":"unique","boundary":"request:1-request:2","contribution_id":"contribution:cli","request_ids":["request:1"]}'
+node "$RUNTIME_EVENTS" emit objective.session.attached --session session:cli --subject contribution:cli \
+	--payload "$objective_payload" >/dev/null
+objective_json="$(node "$RUNTIME_EVENTS" query --objective objective:cli --session session:cli --limit 10)"
+[[ "$(printf '%s' "$objective_json" | jq 'length')" -eq 1 ]]
+[[ "$(printf '%s' "$objective_json" | jq -r '.[0].event_type')" == "objective.session.attached" ]]
+if node "$RUNTIME_EVENTS" emit objective.outcome --subject objective:cli \
+	--payload '{"objective_version":1,"objective_id":"objective:cli","run_id":"run:cli","outcome":"verified"}' >/dev/null; then
+	printf 'FAIL runtime events accepted unverifiable objective evidence\n' >&2
+	exit 1
+fi
+
 unset _PULSE_DISPATCH_WORKER_LAUNCH_LOADED 2>/dev/null || true
 unset _WORKER_LIFECYCLE_COMMON_LOADED 2>/dev/null || true
 # shellcheck source=../worker-lifecycle-common.sh
@@ -119,10 +131,16 @@ assert "worker.exited" not in handler
 assert "_hrff_finalize_exit_trap" in handler
 finalizer = failure[failure.index("_hrff_finalize_exit_trap()") : failure.index("_exit_trap_handler()")]
 assert finalizer.index("_push_wip_commits_on_exit") < finalizer.index("_emit_worker_runtime_event")
-assert finalizer.index('reason="worker_complete"') < finalizer.index("_emit_worker_runtime_event")
+assert finalizer.index("_escalate_worker_pr_checkpoint") < finalizer.index("_emit_worker_runtime_event")
+assert 'reason="${_HRW_RECOVERY_CLASSIFICATION:-worker_draft_checkpoint_escalation_failed}"' in finalizer
+assert 'if [[ "$reason" == "worker_complete" ]]; then' in finalizer
+assert '_emit_worker_runtime_event "worker.completed" "recovered" "$reason"' in finalizer
+assert 'elif [[ "$reason" == "$checkpoint_reason" ]]; then' in finalizer
+assert '_emit_worker_runtime_event "worker.deferred" "checkpointed" "$reason"' in finalizer
+assert '_emit_worker_runtime_event "worker.failed" "failed" "$reason"' in finalizer
 
 worker = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
-finish = worker[worker.index("_cmd_run_finish()") : worker.index("_cmd_run_prepare()")]
+finish = worker[worker.index("_cmd_run_finish() {") :].split("\n}\n", 1)[0]
 assert finish.index("_hrw_finish_failed_run") < finish.index("_emit_worker_runtime_event")
 assert "_HRW_FINAL_RUNTIME_EVENT" in finish
 PY

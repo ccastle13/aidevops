@@ -24,6 +24,29 @@ get_version() {
 	aidevops_find_version
 }
 
+_detect_opencode_cli_version() {
+	# OpenCode V1 and V2 can be installed side by side; under the V2 profile the
+	# plain `opencode` on PATH may be V1, so prefer the isolated V2 CLI first.
+	local cli
+	local version=""
+	local -a candidates=(opencode)
+	if [[ "${AIDEVOPS_OPENCODE_PROFILE:-}" == "v2" ]]; then
+		candidates=(
+			"${AIDEVOPS_OPENCODE_V2_ROOT:-$HOME/.aidevops/runtimes/opencode-v2}/runtime/node_modules/.bin/opencode2"
+			opencode2
+			opencode
+		)
+	fi
+	for cli in "${candidates[@]}"; do
+		version=$("$cli" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+		if [[ -n "$version" ]]; then
+			printf '%s\n' "$version"
+			return 0
+		fi
+	done
+	return 0
+}
+
 detect_app() {
 	# Detect which AI coding assistant is running this script
 	# Returns: "AppName|version" or "AppName" or "unknown"
@@ -33,7 +56,7 @@ detect_app() {
 	if [[ "${OPENCODE:-}" == "1" ]]; then
 		app_name="OpenCode"
 		# Try multiple version detection methods (install path varies: bun, npm, homebrew)
-		app_version=$(opencode --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+		app_version=$(_detect_opencode_cli_version)
 		if [[ -z "$app_version" ]]; then
 			app_version=$(npm list -g opencode-ai --json 2>/dev/null | jq -r '.dependencies["opencode-ai"].version // empty' 2>/dev/null || echo "")
 		fi
@@ -76,7 +99,7 @@ detect_app() {
 		*opencode*)
 			app_name="OpenCode"
 			# Try CLI first, then npm global package.json
-			app_version=$(opencode --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+			app_version=$(_detect_opencode_cli_version)
 			if [[ -z "$app_version" ]]; then
 				app_version=$(npm list -g opencode-ai --json 2>/dev/null | jq -r '.dependencies["opencode-ai"].version // empty' 2>/dev/null || echo "")
 			fi
@@ -257,7 +280,12 @@ _get_runtime_hint() {
 	local runtime_hint=""
 	case "$app_name" in
 	OpenCode)
-		runtime_hint="You are running in OpenCode. Global config: ~/.config/opencode/opencode.json"
+		if [[ "${AIDEVOPS_OPENCODE_PROFILE:-}" == "v2" ]]; then
+			local v2_config="${OPENCODE_CONFIG:-~/.aidevops/runtimes/opencode-v2/config/opencode/opencode.json}"
+			runtime_hint="You are running in OpenCode V2. Global config: ${v2_config/#$HOME/~}"
+		else
+			runtime_hint="You are running in OpenCode. Global config: ~/.config/opencode/opencode.json"
+		fi
 		;;
 	"Claude Code")
 		runtime_hint="You are running in Claude Code. Global config: ~/.config/Claude/Claude.json"
@@ -396,6 +424,8 @@ _check_advisories() {
 			continue
 		fi
 		local first_line
+		# Display only the human summary; optional # check: metadata is never
+		# displayed or executed here. Probes belong to aidevops security.
 		first_line=$(head -1 "$advisory_file" | sed 's/^[[:space:]]*//')
 		if [[ -n "$first_line" ]]; then
 			local entry
@@ -435,8 +465,10 @@ _check_contribution_watch() {
 	local cw_count
 	cw_count=$(jq -r --arg user "$cw_username" '
 		[.items | to_entries[] |
+		 select((.value.last_any_comment // "") != "") |
 		 select(.value.last_any_comment > (.value.last_our_comment // "")) |
-		 select(.value.last_notified == "" or .value.last_any_comment > .value.last_notified)
+		 select((.value.state // "") != "closed" or .value.last_any_comment > (.value.closed_at // "")) |
+		 select(.value.last_any_comment > (.value.last_seen // ""))
 		] | length
 	' "$cw_state" 2>/dev/null) || cw_count=0
 
@@ -446,6 +478,21 @@ _check_contribution_watch() {
 
 	echo "$contribution_watch"
 	return 0
+}
+
+# -----------------------------------------------------------------------------
+# _in_isolated_runtime_session: true inside a pinned Buzz/team-interface runtime.
+# Those sessions export per-process XDG_CONFIG_HOME/XDG_DATA_HOME that point at
+# an immutable runtime anchor or session shard. A background setup.sh inherits
+# them and rewrites the anchor's opencode.json (plugin entry → live deploy), so
+# the anchor fails content verification on its next start. The host's own
+# auto-update daemon redeploys from a clean environment instead.
+# -----------------------------------------------------------------------------
+_in_isolated_runtime_session() {
+	if [[ -n "${AIDEVOPS_REMOTE_RUNTIME_ANCHOR:-}" || "${AIDEVOPS_REMOTE_INTERFACE:-}" == "1" || -n "${AIDEVOPS_TEAM_INTERFACE_OVERLAY:-}" ]]; then
+		return 0
+	fi
+	return 1
 }
 
 # -----------------------------------------------------------------------------
@@ -464,6 +511,11 @@ _hotfix_auto_apply() {
 	local framework_repo="${AIDEVOPS_FRAMEWORK_REPO:-$HOME/Git/aidevops}"
 	local setup_script="${framework_repo}/setup.sh"
 
+	if _in_isolated_runtime_session; then
+		echo "Hotfix v${hotfix_version} available — deferred to the host auto-update (isolated runtime session)"
+		return 0
+	fi
+
 	echo "Hotfix v${hotfix_version} available — auto-applying (auto_hotfix_accept=true)..."
 
 	if [[ ! -d "$framework_repo/.git" ]]; then
@@ -480,6 +532,10 @@ _hotfix_auto_apply() {
 	fi
 
 	(
+		# GH#33046: the greeting runs this check inside whatever OpenCode
+		# process started the session, including another tool's sandboxed
+		# child. Its per-process config must never become setup's write target.
+		unset OPENCODE_CONFIG OPENCODE_CONFIG_DIR
 		cd "$framework_repo" || exit 1
 		git pull --ff-only origin main >/dev/null 2>&1
 		if [[ -x "$setup_script" ]]; then
@@ -640,7 +696,7 @@ _check_script_drift() {
 	local has_code_drift=0
 	while IFS= read -r filepath; do
 		case "$filepath" in
-		.agents/scripts/* | .agents/agents/* | .agents/workflows/* | .agents/prompts/* | .agents/hooks/* | setup.sh | aidevops.sh | VERSION)
+		.agents/scripts/* | .agents/agents/* | .agents/workflows/* | .agents/prompts/* | .agents/hooks/* | .agents/worker-lifecycle/* | setup.sh | aidevops.sh | VERSION)
 			has_code_drift=1
 			break
 			;;
@@ -652,7 +708,13 @@ _check_script_drift() {
 		return 0
 	fi
 
-	# Framework code drift detected.
+	# Framework code drift detected. Pinned runtimes must not redeploy: their
+	# inherited per-process config paths would become setup's write target.
+	if _in_isolated_runtime_session; then
+		echo ""
+		return 0
+	fi
+
 	# setup.sh --stage ai-session applies changed deploy stages first; the setup
 	# mode falls back to full non-interactive setup when it cannot prove safety.
 	local setup_script="$framework_repo/setup.sh"
@@ -664,7 +726,11 @@ _check_script_drift() {
 	echo "Script drift detected (${deployed_sha:0:7}→${current_sha:0:7}). Redeploying in background..."
 	# t2729 (Option B): redirect at subshell level so the background process
 	# never holds the parent's stdout FD open for synchronous callers.
-	(bash "$setup_script" --stage ai-session || bash "$setup_script" --non-interactive) >/dev/null 2>&1 &
+	# GH#33046: never pass an inherited per-process OpenCode config to setup.
+	(
+		unset OPENCODE_CONFIG OPENCODE_CONFIG_DIR
+		bash "$setup_script" --stage ai-session || bash "$setup_script" --non-interactive
+	) >/dev/null 2>&1 &
 
 	return 0
 }
@@ -865,10 +931,20 @@ _check_signing() {
 		return 0
 	fi
 
-	local signing_format
-	signing_format=$(git config --global gpg.format 2>/dev/null || echo "")
-	local signing_enabled
-	signing_enabled=$(git config --global commit.gpgsign 2>/dev/null || echo "")
+	# GH#33066: exit 1 means unset; any other failure (for example a command
+	# guard block) is unknown state and must not produce a false setup nag.
+	local signing_format="" signing_enabled="" read_rc=0
+	signing_format=$(git config --global --get gpg.format 2>/dev/null) || read_rc=$?
+	[[ "$read_rc" -le 1 ]] || {
+		echo ""
+		return 0
+	}
+	read_rc=0
+	signing_enabled=$(git config --global --get commit.gpgsign 2>/dev/null) || read_rc=$?
+	[[ "$read_rc" -le 1 ]] || {
+		echo ""
+		return 0
+	}
 
 	if [[ "$signing_format" != "ssh" || "$signing_enabled" != "true" ]]; then
 		echo "Commit signing not configured. Run: aidevops signing setup"

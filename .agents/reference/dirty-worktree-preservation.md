@@ -36,6 +36,16 @@ Use `verify` and `matches` before any explicit `clean` operation.
 
 ## Audited mirror synchronization
 
+The scheduled `repo-sync-helper.sh check` remains **read-only by default**.
+For a registered clean default-branch checkout, it reports
+`CONVERGENCE_ELIGIBLE` only when the exact remote tip is already present in
+the local object store and `HEAD` is its ancestor. It never fetches or merges
+canonical refs: a missing remote object leaves ancestry unverified, not
+implicitly eligible. Dirty (including untracked), diverged, detached and
+non-default-branch checkouts are not convergence-eligible. The operator uses
+the audited `sync-mirror` route below for a confirmed eligible mirror, rather
+than bypassing its backup, identity and compare-and-swap guards with `git merge`.
+
 An explicit request to synchronize the canonical mirror authorizes this route:
 
 ```bash
@@ -55,7 +65,77 @@ cannot select the target. Under the canonical recovery lock it:
 3. removes only structurally canonical ownership rows without signalling PIDs;
 4. preserves divergent/local-only commits at an audited recovery ref;
 5. compare-and-swaps the local ref and updates the worktree to the pinned tip;
-6. verifies branch, HEAD, remote ref, worktree cleanliness, and the audit chain.
+6. verifies branch, HEAD, remote ref, worktree cleanliness, and the audit chain;
+7. reinstates preserved untracked files on top of the new tip without
+   overwriting anything.
+
+`fast-forward-current` uses the same preservation and reinstatement for
+untracked-only state; tracked or staged changes still block it. Reinstatement
+never overwrites or writes through links: a path that now exists, or sits under
+a new non-directory or symlinked directory, stays in the backup and is reported as an
+`UNTRACKED_LEFT_IN_BACKUP=` line next to `UNTRACKED_RESTORED=<n>`. The backup is
+acknowledged (so retention can prune it) only when every untracked path was
+reinstated and it held no tracked edits, or on the routine-update route. Tracked
+and staged edits remain only in the backup.
+
+`RESTORE_COMMAND` is a full pre-operation rollback: it restores the captured
+HEAD, index, worktree and untracked state, so it also undoes the
+synchronization. Use it to roll back, not to recover a file. It accepts a
+checkout whose only state is untracked files reinstated, byte-identical, from
+the same backup, and refuses if any backed-up path now differs, including a
+path the new tip ignores.
+
+### Incoming project-config untracking (GH#35659)
+
+When the pinned tip removes the index entry for `.aidevops.json` and adds an
+explicit, non-negated root ignore rule for it (the supported migration), a
+plain worktree update would silently delete the local file. Before any backup,
+clean or ref change, `sync-mirror`, `fast-forward-current`, `restore-default`
+and `fast-forward-local` copy the local file into a private directory under the
+recovery root (`PROJECT_CONFIG_PRESERVED_DIR=`), record it in the audit entry,
+and after the verified update reinstate its exact bytes, mode and mtime as
+ignored local state (`PROJECT_CONFIG_REINSTATED=.aidevops.json`). Reinstatement
+never overwrites or follows links; anything in the way leaves the copy in place
+(`PROJECT_CONFIG_LEFT_IN_BACKUP=`). A symlinked, non-regular or foreign-owned
+config is refused before anything changes. `fast-forward-local` also refuses a
+locally edited config, which its three-way re-apply cannot keep. A deletion
+without the ignore rule is intentional and is not reinstated; an already-absent
+config stays absent. Explicit restores still use
+`project-config-restore-helper.sh`.
+
+A clean canonical checkout whose resolved default branch is still unborn is a
+supported bootstrap input for `sync-mirror` and `fast-forward-current` (an
+unborn branch is an ancestor of every tip, so full-loop's post-merge
+fast-forward initializes it; GH#36289). The helper requires symbolic
+`HEAD` to name that exact branch, an absent local ref, and a completely empty
+index and worktree. It records `local_state=unborn`, creates the local ref with
+zero-object compare-and-swap semantics, and materializes only the pinned remote
+tree. Other recovery operations, detached or mismatched `HEAD`, dirty state,
+branch occupancy, identity ambiguity, and ref drift remain blocked. A failure
+after ref creation deletes that ref only when it still points to the pinned tip
+and verifies the original clean unborn state before returning.
+
+### Local-only repositories (no `origin`)
+
+Repos registered with `"local_only": true` have no remote, so `sync-mirror`
+cannot pin a tip. When the user has authorized making a reviewed linked-worktree
+branch live, use the remote-less route:
+
+```bash
+.agents/scripts/canonical-recovery-helper.sh fast-forward-local \
+  --repo /path/to/canonical-checkout --from-branch feature/branch \
+  --task t123 --confirm FAST_FORWARD_LOCAL_CANONICAL
+```
+
+It refuses any repository that has a remote (use `sync-mirror`), any branch not
+checked out in a linked worktree, and any branch that is not a pure fast-forward
+of the canonical default branch. Under the recovery lock it verifies the audit
+chain, records the authorization with `--task` in place of `--issue`, backs up
+and verifies dirty state, cleans it, compare-and-swaps the local ref, updates the
+worktree, then re-applies the preserved tracked edits with a three-way merge and
+restores untracked files. On a merge conflict it leaves the default ref at the new
+tip with a clean worktree, prints `CONFLICT_PATH=` lines, and keeps the edits in
+the printed backup ID (`RESTORE_COMMAND` restores the pre-run state).
 
 Clean records an in-progress transition before its first worktree mutation. Any
 reset, removal, hook, final-status, or evidence-finalization failure immediately
@@ -186,6 +266,27 @@ Restore preserved state only to a clean checkout on the recorded branch:
   --confirm RESTORE_DIRTY_WORKTREE_BACKUP
 ```
 
+## Worktree cleanup archives
+
+Closed-issue worktree cleanup preserves a dirty linked worktree with the same
+non-mutating `backup` command (operation ID `worktree-cleanup`) before native
+`git worktree remove --force`; the backup ID is recorded as `dirty_backup=` in
+the cleanup audit log. Cleanup refuses locked or unreadable worktrees before
+archiving, and an unchanged worktree whose removal is refused reuses its
+verified backup on later runs, so archives never accumulate (GH#34572). To
+restore, re-create the worktree at its recorded path on the preserved branch,
+then run `restore` with the logged backup ID.
+
+Before GH#34572, cleanup wrote `aidevops worktree cleanup archive` entries to
+`git stash` and could repeat them every run. Report, then drop, only exact
+duplicates (same base, worktree, index, and untracked trees as a newer kept
+archive); distinct archives and other stashes are never touched:
+
+```bash
+.agents/scripts/stash-audit-helper.sh dedupe-archives --repo /path/to/repo
+.agents/scripts/stash-audit-helper.sh dedupe-archives --repo /path/to/repo --apply
+```
+
 ## Backup retention
 
 Backups live under:
@@ -206,3 +307,40 @@ Manual prune:
   --backup <backup-id> --confirm ACKNOWLEDGE_DIRTY_WORKTREE_BACKUP
 .agents/scripts/dirty-worktree-backup-helper.sh prune --force
 ```
+
+Targeted removal of one acknowledged/restored backup (refuses `open` backups
+and `.keep` markers; `--dry-run` prints `Would remove` without mutation):
+
+```bash
+.agents/scripts/dirty-worktree-backup-helper.sh delete --dry-run \
+  --backup <backup-id> --confirm DELETE_DIRTY_WORKTREE_BACKUP
+.agents/scripts/dirty-worktree-backup-helper.sh delete \
+  --backup <backup-id> --confirm DELETE_DIRTY_WORKTREE_BACKUP
+```
+
+## Removing a dirty linked worktree
+
+`worktree-helper.sh remove <path>` refuses a worktree with uncommitted changes
+before any recovery archive or producer reservation is created, and names
+`--force`. Use `remove <path> --force` to archive the changes and remove it.
+
+If an earlier attempt was interrupted after the archive was reserved, and the
+tree was then cleaned or edited, a retry reports
+`producer:source-drift; existing archive retained`. The reservation pins the
+recorded source state. Recover by restoring that state, then forcing removal:
+
+```bash
+git -C <worktree> apply <archive>/diff.patch   # plus any recorded untracked files
+worktree-helper.sh remove <worktree> --force   # reuses the existing archive
+```
+
+The archive lives under the recovery root's `.producer-archives/`. Alternatively
+review the archive and retire the reservation through the recovery lifecycle
+helpers; never delete the archive by hand.
+
+Compact retention (`worktree-archive-helper.sh prune`) expires a producer
+archive only after its source and Git registration are gone: an empty delta
+at the next apply pass, any other archive 30 days after capture
+(`AIDEVOPS_WORKTREE_PRODUCER_ARCHIVE_TTL_DAYS`). It also retires the matching
+`.producer-transactions/<id>/` journal. Create `<archive>/.keep` to retain one
+indefinitely. Details: `scripts/worktree-archive-helper.md` "Retention".

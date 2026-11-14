@@ -451,33 +451,76 @@ _full_loop_receipt_reclaim_stale_ownerless_lock() {
 	return 0
 }
 
+# Real PID of the current (sub)shell. $$ is the top-level shell inside $(...),
+# which hides dead subshell holders; `sh -c 'echo $PPID'` is portable to Bash 3.2.
+_full_loop_receipt_self_pid() {
+	sh -c 'echo "$PPID"'
+	return 0
+}
+
+_full_loop_receipt_pid_start() {
+	local pid="$1"
+	local start=""
+	start=$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null) || start=""
+	start="${start//[[:space:]]/_}"
+	printf '%s\n' "$start"
+	return 0
+}
+
+# Succeeds when the recorded owner ("pid[ start]") is still the live process.
+_full_loop_receipt_owner_alive() {
+	local pid="$1"
+	local recorded_start="$2"
+	local current_start=""
+	kill -0 "$pid" 2>/dev/null || return 1
+	[[ -n "$recorded_start" ]] || return 0
+	current_start=$(_full_loop_receipt_pid_start "$pid")
+	[[ -z "$current_start" || "$current_start" == "$recorded_start" ]]
+}
+
 _full_loop_receipt_lock_acquire() {
+	local owner_start=""
+	local holder_age=0
+	local holder_mtime=""
+	local self_pid=""
 	local receipt_dir=""
 	local lock_dir=""
 	local owner_pid=""
 	local ownerless_lock_minimum_age="${AIDEVOPS_FULL_LOOP_RECEIPT_LOCK_OWNERLESS_GRACE_SECONDS:-5}"
 	local attempt=0
-	[[ "$ownerless_lock_minimum_age" =~ ^[1-9][0-9]*$ ]] || return 1
-	receipt_dir=$(_full_loop_cleanup_receipt_dir) || return 1
-	mkdir -p "$receipt_dir" || return 1
+	_FULL_LOOP_RECEIPT_LOCK_FAILURE="receipt-lock-timeout"
+	[[ "$ownerless_lock_minimum_age" =~ ^[1-9][0-9]*$ ]] || { _FULL_LOOP_RECEIPT_LOCK_FAILURE="receipt-lock-config-invalid"; return 1; }
+	receipt_dir=$(_full_loop_cleanup_receipt_dir) || { _FULL_LOOP_RECEIPT_LOCK_FAILURE="receipt-dir-unavailable"; return 1; }
+	mkdir -p "$receipt_dir" || { _FULL_LOOP_RECEIPT_LOCK_FAILURE="receipt-dir-unavailable"; return 1; }
 	lock_dir="${receipt_dir}/.mutation.lock.d"
 	while [[ "$attempt" -lt 200 ]]; do
 		if mkdir "$lock_dir" 2>/dev/null; then
-			printf '%s\n' "$$" >"${lock_dir}/owner" || {
+			# Redirect straight to the owner file: a $(...) here would make sh's
+			# parent a throwaway subshell instead of the real holder.
+			_full_loop_receipt_self_pid >"${lock_dir}/owner" || true
+			IFS= read -r self_pid <"${lock_dir}/owner" || self_pid=""
+			[[ "$self_pid" =~ ^[0-9]+$ ]] || self_pid="$$"
+			printf '%s %s\n' "$self_pid" "$(_full_loop_receipt_pid_start "$self_pid")" >"${lock_dir}/owner" || {
+				# ENOSPC can leave an empty owner file. rmdir alone cannot remove
+				# that file, permanently blocking subsequent cleanup leases.
+				rm -f "${lock_dir}/owner" 2>/dev/null || true
 				rmdir "$lock_dir" 2>/dev/null || true
+				_FULL_LOOP_RECEIPT_LOCK_FAILURE="receipt-lock-owner-write-failed"
 				return 1
 			}
 			_FULL_LOOP_RECEIPT_LOCK="$lock_dir"
 			if declare -F _full_loop_recover_recreated_receipt_transactions >/dev/null 2>&1 &&
 				! _full_loop_recover_recreated_receipt_transactions "$receipt_dir"; then
 				_full_loop_receipt_lock_release
+				_FULL_LOOP_RECEIPT_LOCK_FAILURE="receipt-recovery-failed"
 				return 1
 			fi
 			return 0
 		fi
 		owner_pid=""
-		[[ -f "${lock_dir}/owner" ]] && IFS= read -r owner_pid <"${lock_dir}/owner" || true
-		if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
+		owner_start=""
+		[[ -f "${lock_dir}/owner" ]] && IFS=' ' read -r owner_pid owner_start <"${lock_dir}/owner" || true
+		if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! _full_loop_receipt_owner_alive "$owner_pid" "$owner_start"; then
 			rm -f "${lock_dir}/owner" 2>/dev/null || true
 			rmdir "$lock_dir" 2>/dev/null || true
 			continue
@@ -488,6 +531,14 @@ _full_loop_receipt_lock_acquire() {
 		sleep 0.05
 		attempt=$((attempt + 1))
 	done
+	if [[ "$owner_pid" =~ ^[0-9]+$ ]]; then
+		holder_mtime=$(_file_mtime_epoch "$lock_dir" 2>/dev/null) || holder_mtime=""
+		if [[ "$holder_mtime" =~ ^[0-9]+$ ]]; then
+			holder_age=$(($(date '+%s') - holder_mtime))
+			[[ "$holder_age" -lt 0 ]] && holder_age=0
+		fi
+		_FULL_LOOP_RECEIPT_LOCK_FAILURE="receipt-lock-timeout (holder ${owner_pid}, held ${holder_age}s)"
+	fi
 	return 1
 }
 
@@ -497,6 +548,21 @@ _full_loop_receipt_lock_release() {
 	rmdir "$_FULL_LOOP_RECEIPT_LOCK" 2>/dev/null || true
 	_FULL_LOOP_RECEIPT_LOCK=""
 	return 0
+}
+
+# Stable reason code for the last deferred-cleanup receipt failure (GH#34468).
+# File scope (t18681): these must exist before the first lock release, because
+# a fresh process can fail before it ever holds the receipt lock.
+_FULL_LOOP_CLEANUP_FAILURE_REASON=""
+_FULL_LOOP_RECEIPT_LOCK_FAILURE=""
+_FULL_LOOP_REASON_WRITE_FAILED="receipt-write-failed"
+
+# Record a stable failure reason (global + stderr) and return 1.
+_full_loop_cleanup_fail() {
+	local reason="$1"
+	_FULL_LOOP_CLEANUP_FAILURE_REASON="$reason"
+	printf 'cleanup-receipt-failure: %s\n' "$reason" >&2
+	return 1
 }
 
 _full_loop_cleanup_deferred_matches() {
@@ -547,17 +613,20 @@ full_loop_write_cleanup_deferred() {
 	local now=""
 	local temp_path=""
 
-	[[ -n "$worktree" && -n "$branch" && "$owner_pid" =~ ^[0-9]+$ ]] || return 1
-	[[ "$executor_completion_state" == "$_FULL_LOOP_EXECUTOR_FINALIZATION_PENDING" || "$executor_completion_state" == "$_FULL_LOOP_EXECUTOR_COMPLETE" ]] || return 1
-	command -v jq >/dev/null 2>&1 || return 1
-	receipt_path=$(_full_loop_cleanup_receipt_path "$repo" "$pr_number") || return 1
-	_full_loop_receipt_lock_acquire || return 1
+	_FULL_LOOP_CLEANUP_FAILURE_REASON=""
+	[[ -n "$worktree" && -n "$branch" && "$owner_pid" =~ ^[0-9]+$ ]] || { _full_loop_cleanup_fail "invalid-receipt-arguments"; return 1; }
+	[[ "$executor_completion_state" == "$_FULL_LOOP_EXECUTOR_FINALIZATION_PENDING" || "$executor_completion_state" == "$_FULL_LOOP_EXECUTOR_COMPLETE" ]] || { _full_loop_cleanup_fail "invalid-completion-state"; return 1; }
+	command -v jq >/dev/null 2>&1 || { _full_loop_cleanup_fail "jq-unavailable"; return 1; }
+	receipt_path=$(_full_loop_cleanup_receipt_path "$repo" "$pr_number") || { _full_loop_cleanup_fail "receipt-path-unavailable"; return 1; }
+	_full_loop_receipt_lock_acquire || { _full_loop_cleanup_fail "${_FULL_LOOP_RECEIPT_LOCK_FAILURE:-receipt-lock-timeout}"; return 1; }
 	kill -0 "$owner_pid" 2>/dev/null || {
 		_full_loop_receipt_lock_release
+		_full_loop_cleanup_fail "owner-not-live"
 		return 1
 	}
 	owner_identity=$(_full_loop_process_identity "$owner_pid") || {
 		_full_loop_receipt_lock_release
+		_full_loop_cleanup_fail "owner-identity-unavailable"
 		return 1
 	}
 	if [[ -f "$receipt_path" ]]; then
@@ -568,10 +637,13 @@ full_loop_write_cleanup_deferred() {
 			return 0
 		fi
 		_full_loop_receipt_lock_release
+		_full_loop_cleanup_fail "receipt-mismatch"
 		return 1
 	fi
-	now=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || {
+	# Admission events retain microseconds; do not backdate a same-second receipt.
+	now=$(python3 -E -s -B -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"))') || {
 		_full_loop_receipt_lock_release
+		_full_loop_cleanup_fail "$_FULL_LOOP_REASON_WRITE_FAILED"
 		return 1
 	}
 	temp_path="${receipt_path}.tmp.$$"
@@ -588,12 +660,15 @@ full_loop_write_cleanup_deferred() {
 		  owner:{pid:$owner_pid,process_identity:$owner_identity,session:$owner_session},
 		  cleanup_lease:{state:$cleanup_lease_pending,pid:null,acquired_at:null},created_at:$now,updated_at:$now,cleaned_at:null}' \
 		>"$temp_path" || {
+		rm -f "$temp_path"
 		_full_loop_receipt_lock_release
+		_full_loop_cleanup_fail "$_FULL_LOOP_REASON_WRITE_FAILED"
 		return 1
 	}
 	mv "$temp_path" "$receipt_path" || {
 		rm -f "$temp_path"
 		_full_loop_receipt_lock_release
+		_full_loop_cleanup_fail "$_FULL_LOOP_REASON_WRITE_FAILED"
 		return 1
 	}
 	_full_loop_receipt_lock_release
@@ -620,7 +695,7 @@ _full_loop_cleanup_receipt_for_worktree_unlocked_fallback() {
 			.worktree == $worktree
 			and ((.receipt_disposition.state // "") != $superseded)
 		' "$receipt_path" >/dev/null 2>&1; then
-			candidate_created_at=$(jq -r '.created_at // empty' "$receipt_path" 2>/dev/null || true)
+			candidate_created_at=$(jq -r '(.created_at // "") | rtrimstr("Z")' "$receipt_path" 2>/dev/null || true)
 			candidate_is_migrated=0
 			jq -e --arg string_type "$_FULL_LOOP_RECEIPT_JSON_STRING_TYPE" \
 				'.migration.from_repository | type == $string_type and length > 0' \
@@ -662,7 +737,7 @@ _full_loop_cleanup_receipt_for_worktree_unlocked() {
 			| select((.receipt_disposition.state // "") != $superseded)
 			| {
 				path: input_filename,
-				created_at: (.created_at // ""),
+				created_at: ((.created_at // "") | rtrimstr("Z")),
 				is_migrated: (
 					if (((.migration.from_repository? // null) | type) == $string_type
 						and ((.migration.from_repository? // "") | length) > 0)
@@ -713,10 +788,21 @@ _full_loop_valid_receipt_file_count() {
 	for receipt_path in "$receipt_dir"/*.json; do
 		[[ -f "$receipt_path" ]] || continue
 		[[ ! -L "$receipt_path" ]] || return 1
-		_full_loop_receipt_file_is_json_object "$receipt_path" || return 1
 		receipt_file_count=$((receipt_file_count + 1))
 	done
-	printf '%s\n' "$receipt_file_count"
+	if [[ "$receipt_file_count" -eq 0 ]]; then
+		printf '0\n'
+		return 0
+	fi
+	# Validate the entire set with one process, still failing closed on malformed
+	# JSON, non-objects and empty files rather than skipping lifecycle evidence.
+	jq -ne --argjson count "$receipt_file_count" '
+		reduce inputs as $receipt ({files: {}, valid: true};
+			.files[input_filename] = true
+			| .valid = (.valid and ($receipt | type == ({} | type))))
+		| if (.files | length) == $count and .valid
+		then $count else error("invalid receipt set") end
+	' "$receipt_dir"/*.json 2>/dev/null || return 1
 	return 0
 }
 
@@ -741,23 +827,13 @@ _full_loop_recreated_worktree_identity_matches() {
 _full_loop_active_recreated_receipts_are_cleaned() {
 	local receipt_dir="$1"
 	local worktree="$2"
-	local receipt_path=""
-	local state=""
-	local matching_count=0
 
-	for receipt_path in "$receipt_dir"/*.json; do
-		[[ -f "$receipt_path" ]] || continue
-		if ! jq -e --arg worktree "$worktree" --arg superseded "$_FULL_LOOP_RECEIPT_PATH_RECREATED" '
-			.worktree == $worktree
-			and ((.receipt_disposition.state // "") != $superseded)
-		' "$receipt_path" >/dev/null 2>&1; then
-			continue
-		fi
-		state=$(jq -r '.resource_cleanup_state // empty' "$receipt_path" 2>/dev/null) || return 1
-		[[ "$state" == "$_FULL_LOOP_CLEANUP_CLEANED" ]] || return 1
-		matching_count=$((matching_count + 1))
-	done
-	[[ "$matching_count" -gt 0 ]] || return 1
+	jq -es --arg worktree "$worktree" --arg superseded "$_FULL_LOOP_RECEIPT_PATH_RECREATED" \
+		--arg cleaned "$_FULL_LOOP_CLEANUP_CLEANED" '
+		[.[] | select(.worktree == $worktree
+			and ((.receipt_disposition.state // "") != $superseded))]
+		| length > 0 and all(.[]; .resource_cleanup_state == $cleaned)
+	' "$receipt_dir"/*.json >/dev/null 2>&1 || return 1
 	return 0
 }
 
@@ -843,22 +919,27 @@ _full_loop_prepare_recreated_receipt_transaction() {
 	local generation_id="${head_sha}:${owner_pid}:${now}"
 	local transaction_dir=""
 	local receipt_path=""
+	local receipt_json=""
+	local matching_paths=""
 	local matching_count=0
 
+	# Select in bulk too: scanning each unrelated receipt here would restore the
+	# same lock-time bottleneck whenever an old path actually needs superseding.
+	# Keep filenames JSON-encoded until each selected entry is decoded.
+	matching_paths=$(jq -nc --arg worktree "$worktree" --arg cleaned "$_FULL_LOOP_CLEANUP_CLEANED" \
+		--arg superseded "$_FULL_LOOP_RECEIPT_PATH_RECREATED" '
+		inputs | select(.worktree == $worktree
+			and .resource_cleanup_state == $cleaned
+			and ((.receipt_disposition.state // "") != $superseded))
+		| input_filename
+	' "$receipt_dir"/*.json) || return 1
 	transaction_dir=$(_full_loop_initialize_recreated_receipt_transaction "$receipt_dir") || return 1
-	for receipt_path in "$receipt_dir"/*.json; do
-		[[ -f "$receipt_path" ]] || continue
-		if [[ -L "$receipt_path" ]]; then
+	while IFS= read -r receipt_json; do
+		[[ -n "$receipt_json" ]] || continue
+		receipt_path=$(jq -r '.' <<<"$receipt_json") || return 1
+		if [[ ! -f "$receipt_path" || -L "$receipt_path" ]]; then
 			_full_loop_remove_recreated_receipt_transaction "$receipt_dir" "$transaction_dir" >/dev/null 2>&1 || true
 			return 1
-		fi
-		if ! jq -e --arg worktree "$worktree" --arg cleaned "$_FULL_LOOP_CLEANUP_CLEANED" \
-			--arg superseded "$_FULL_LOOP_RECEIPT_PATH_RECREATED" '
-			.worktree == $worktree
-			and .resource_cleanup_state == $cleaned
-			and ((.receipt_disposition.state // "") != $superseded)
-		' "$receipt_path" >/dev/null 2>&1; then
-			continue
 		fi
 		if ! _full_loop_stage_recreated_receipt_file "$receipt_path" "$transaction_dir" \
 			"$worktree" "$branch" "$head_sha" "$owner_pid" "$owner_session" "$now" "$generation_id"; then
@@ -866,7 +947,7 @@ _full_loop_prepare_recreated_receipt_transaction() {
 			return 1
 		fi
 		matching_count=$((matching_count + 1))
-	done
+	done <<<"$matching_paths"
 	if [[ "$matching_count" -eq 0 ]] ||
 		! _full_loop_validate_recreated_receipt_transaction "$receipt_dir" "$transaction_dir"; then
 		_full_loop_remove_recreated_receipt_transaction "$receipt_dir" "$transaction_dir" >/dev/null 2>&1 || true
@@ -946,6 +1027,15 @@ _full_loop_supersede_recreated_receipt_files() {
 	return 0
 }
 
+# Print an actionable refusal reason on stderr. Callers capture stdout, so the
+# reason still reaches the operator (GH#34002).
+_full_loop_supersede_reason() {
+	local reason="$1"
+
+	printf 'Cleanup-receipt reconciliation refused: %s\n' "$reason" >&2
+	return 0
+}
+
 # Preserve terminal cleanup history while retiring it as active lifecycle
 # evidence when a manual add creates a new worktree generation at the same path.
 # Every unsuperseded receipt for the path must already be CLEANED; an active
@@ -964,15 +1054,31 @@ full_loop_supersede_cleaned_receipts_for_recreated_worktree() {
 	local now=""
 	local receipt_file_count=0
 
-	[[ -d "$worktree" && ! -L "$worktree" && -n "$branch" ]] || return 1
-	[[ "$head_sha" =~ ^[0-9a-fA-F]{40,64}$ && "$owner_pid" =~ ^[0-9]+$ ]] || return 1
-	receipt_dir=$(_full_loop_cleanup_receipt_dir) || return 1
+	if [[ ! -d "$worktree" || -L "$worktree" || -z "$branch" ]]; then
+		_full_loop_supersede_reason "worktree path is missing, a symlink, or branch is empty: ${worktree}"
+		return 1
+	fi
+	if [[ ! "$head_sha" =~ ^[0-9a-fA-F]{40,64}$ || ! "$owner_pid" =~ ^[0-9]+$ ]]; then
+		_full_loop_supersede_reason "head SHA or owner PID is not valid"
+		return 1
+	fi
+	receipt_dir=$(_full_loop_cleanup_receipt_dir) || {
+		_full_loop_supersede_reason "cleanup receipt directory could not be resolved"
+		return 1
+	}
 	[[ -d "$receipt_dir" ]] || return 2
-	command -v git >/dev/null 2>&1 || return 1
-	command -v jq >/dev/null 2>&1 || return 1
-	_full_loop_recreated_worktree_identity_matches "$worktree" "$branch" "$head_sha" || return 1
-	_full_loop_receipt_lock_acquire || return 1
+	command -v git >/dev/null 2>&1 || { _full_loop_supersede_reason "git is not available"; return 1; }
+	command -v jq >/dev/null 2>&1 || { _full_loop_supersede_reason "jq is not available"; return 1; }
+	_full_loop_recreated_worktree_identity_matches "$worktree" "$branch" "$head_sha" || {
+		_full_loop_supersede_reason "worktree root, branch or HEAD does not match the new generation (${worktree})"
+		return 1
+	}
+	_full_loop_receipt_lock_acquire || {
+		_full_loop_supersede_reason "could not acquire the receipt lock for ${receipt_dir}"
+		return 1
+	}
 	receipt_file_count=$(_full_loop_valid_receipt_file_count "$receipt_dir") || {
+		_full_loop_supersede_reason "a receipt in ${receipt_dir} is a symlink or not a JSON object"
 		_full_loop_receipt_lock_release
 		return 1
 	}
@@ -984,18 +1090,25 @@ full_loop_supersede_cleaned_receipts_for_recreated_worktree() {
 		_full_loop_receipt_lock_release
 		return 2
 	}
-	if ! _full_loop_recreated_worktree_identity_matches "$worktree" "$branch" "$head_sha" ||
-		! _full_loop_active_recreated_receipts_are_cleaned "$receipt_dir" "$worktree"; then
+	if ! _full_loop_recreated_worktree_identity_matches "$worktree" "$branch" "$head_sha"; then
+		_full_loop_supersede_reason "worktree identity changed while the receipt lock was held"
+		_full_loop_receipt_lock_release
+		return 1
+	fi
+	if ! _full_loop_active_recreated_receipts_are_cleaned "$receipt_dir" "$worktree"; then
+		_full_loop_supersede_reason "a receipt for ${worktree} is not CLEANED (active or deferred lifecycle, e.g. ${selected_path}); finish or clean it first"
 		_full_loop_receipt_lock_release
 		return 1
 	fi
 
 	now=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || {
+		_full_loop_supersede_reason "could not read the clock"
 		_full_loop_receipt_lock_release
 		return 1
 	}
 	if ! _full_loop_supersede_recreated_receipt_files "$receipt_dir" "$worktree" "$branch" \
 		"$head_sha" "$owner_pid" "$owner_session" "$now"; then
+		_full_loop_supersede_reason "receipt supersede transaction failed in ${receipt_dir}; changes were rolled back"
 		_full_loop_receipt_lock_release
 		return 1
 	fi
@@ -1020,6 +1133,96 @@ full_loop_cleanup_owner_alive() {
 	kill -0 "$owner_pid" 2>/dev/null || return 1
 	observed_identity=$(_full_loop_process_identity "$owner_pid") || return 1
 	[[ "$observed_identity" == "$expected_identity" ]] || return 1
+	return 0
+}
+
+# GH#32528: An interactive runtime hosts many sequential full-loops and can
+# live for days, so owner liveness alone kept every merged worktree it touched.
+# The deferral protects a runtime that may still use the worktree right after
+# merge; once WORKTREE_DEFERRED_OWNER_MAX_HOURS (default 4, matching
+# WORKTREE_CLEAN_GRACE_HOURS) has passed since the deferral was recorded, the
+# lease expires. Downstream cwd, dirty-content, open-PR and merge-proof guards
+# still decide removal. Missing or malformed timestamps fail closed.
+full_loop_cleanup_owner_lease_aged() {
+	local receipt_path="$1"
+	local max_hours="${WORKTREE_DEFERRED_OWNER_MAX_HOURS:-4}"
+	local age_seconds=""
+
+	[[ "$max_hours" =~ ^[0-9]+$ && "$max_hours" -gt 0 ]] || max_hours=4
+	[[ -f "$receipt_path" ]] || return 1
+	age_seconds=$(jq -r '
+		(.created_at // .updated_at // "") as $stamp
+		| if ($stamp | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,6})?Z$"))
+		  then ($stamp | capture("^(?<whole>[^.Z]+)([.](?<fraction>[0-9]+))?Z$")) as $parts
+		    | (now - (($parts.whole + "Z" | fromdateiso8601)
+		      + ("0." + ($parts.fraction // "0") | tonumber))) | floor
+		  else empty end
+	' "$receipt_path" 2>/dev/null) || return 1
+	[[ "$age_seconds" =~ ^[0-9]+$ ]] || return 1
+	[[ "$age_seconds" -ge $((max_hours * 3600)) ]] || return 1
+	return 0
+}
+
+# GH#37448: one OpenCode app PID serves every session, so a live owner PID
+# cannot show whether the session that ran `complete` still needs its tree.
+# That session records its explicit end on its own receipt. Only the exact
+# receipt owner (PID, process identity and a declared, non-fallback session)
+# can record it; any mismatch leaves the receipt unchanged.
+# Args: repo, PR number, owner PID, owner session
+# Returns: 0 when recorded (or already recorded), 1 otherwise.
+full_loop_mark_cleanup_owner_relinquished() {
+	local repo="$1"
+	local pr_number="$2"
+	local owner_pid="$3"
+	local owner_session="$4"
+	local receipt_path="" owner_identity="" now=""
+
+	[[ "$pr_number" =~ ^[0-9]+$ && "$owner_pid" =~ ^[0-9]+$ && -n "$owner_session" ]] || return 1
+	[[ "$owner_session" != "$_FULL_LOOP_OWNER_SESSION_FALLBACK" ]] || return 1
+	receipt_path=$(_full_loop_cleanup_receipt_path "$repo" "$pr_number") || return 1
+	[[ -f "$receipt_path" ]] || return 1
+	owner_identity=$(_full_loop_process_identity "$owner_pid") || return 1
+	now=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || return 1
+	_full_loop_receipt_lock_acquire || return 1
+	if ! jq -e --arg repo "$repo" --argjson pr "$pr_number" --argjson pid "$owner_pid" \
+		--arg identity "$owner_identity" --arg session "$owner_session" '
+		.repository == $repo and .pr_number == $pr and .owner.pid == $pid
+		and .owner.process_identity == $identity and .owner.session == $session
+	' "$receipt_path" >/dev/null 2>&1; then
+		_full_loop_receipt_lock_release
+		return 1
+	fi
+	if full_loop_cleanup_owner_relinquished "$receipt_path"; then
+		_full_loop_receipt_lock_release
+		return 0
+	fi
+	if ! jq --arg now "$now" '
+		.owner_relinquished = {pid: .owner.pid, process_identity: .owner.process_identity,
+			session: .owner.session, at: $now}
+		| .updated_at = $now
+	' "$receipt_path" >"${receipt_path}.tmp.$$" || ! mv "${receipt_path}.tmp.$$" "$receipt_path"; then
+		rm -f "${receipt_path}.tmp.$$" 2>/dev/null || true
+		_full_loop_receipt_lock_release
+		return 1
+	fi
+	_full_loop_receipt_lock_release
+	return 0
+}
+
+# Succeeds only when the receipt carries a relinquish record that names its
+# own owner exactly. Missing, partial or mismatched records fail closed.
+full_loop_cleanup_owner_relinquished() {
+	local receipt_path="$1"
+	[[ -f "$receipt_path" ]] || return 1
+	# Type selectors yield nothing on a wrong type, so jq -e fails closed.
+	jq -e --arg fallback "$_FULL_LOOP_OWNER_SESSION_FALLBACK" '
+		(.owner_relinquished | objects) as $record
+		| (.owner.process_identity | strings) as $identity
+		| (.owner.session | strings) as $session
+		| ($identity | length) > 0 and ($session | length) > 0 and $session != $fallback
+		and (.owner.pid | numbers) == $record.pid
+		and $record.process_identity == $identity and $record.session == $session
+	' "$receipt_path" >/dev/null 2>&1 || return 1
 	return 0
 }
 
@@ -1453,9 +1656,9 @@ full_loop_mark_cleanup_receipt_cleaned() {
 	local worktree="$2"
 	local cleanup_log="${3:-${AIDEVOPS_CLEANUP_LOG:-${HOME}/.aidevops/logs/cleanup_worktrees.log}}"
 
-	[[ -f "$receipt_path" && -n "$worktree" && ! -e "$worktree" && -f "$cleanup_log" ]] || return 1
-	grep -Fq "worktree-removed: ${worktree} —" "$cleanup_log" || return 1
-	jq -e --arg worktree "$worktree" '.worktree == $worktree' "$receipt_path" >/dev/null 2>&1 || return 1
+	# shellcheck source=./full-loop-cleanup-evidence.sh
+	source "${BASH_SOURCE[0]%/*}/full-loop-cleanup-evidence.sh" || return 1
+	full_loop_verify_cleanup_evidence "$receipt_path" "$worktree" "$cleanup_log" || return 1
 	full_loop_transition_cleanup_receipt "$receipt_path" "$_FULL_LOOP_CLEANUP_CLEANED"
 	return $?
 }

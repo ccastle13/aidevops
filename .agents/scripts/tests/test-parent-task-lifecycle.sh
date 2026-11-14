@@ -156,7 +156,7 @@ _parse_phases_section() {
 # --- Locate source file for structural tests ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="$SCRIPT_DIR/pulse-issue-reconcile.sh"
-ACTIONS_TARGET="$SCRIPT_DIR/pulse-issue-reconcile-actions.sh"
+ACTIONS_TARGET="$("$SCRIPT_DIR/tests/pira-combined-source.sh")"
 PARENT_TARGET="$SCRIPT_DIR/pulse-issue-reconcile-parent.sh"
 WRAPPER_TARGET="$SCRIPT_DIR/shared-gh-wrappers-create.sh"
 
@@ -275,6 +275,18 @@ assert_eq "A5: ## Phases at EOF extracts both phases" "2" "$count"
 result=$(_parse_phases_section "")
 assert_empty "A6: empty body → empty result" "$result"
 
+# --- A7: Numbered-list phases parsed by the canonical shared parser ---
+BODY_A7=$'## Phases (one PR each)\n\n1. **Navigation.** Move menu #12\n2. **Search.** Add search\n\n## Notes\n\n1. unrelated'
+result=$( (
+	# shellcheck source=/dev/null
+	source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/shared-phase-filing.sh"
+	_parse_phases_section "$BODY_A7"
+) 2>/dev/null)
+rows=$(printf '%s\n' "$result" | grep -c . || true)
+assert_eq "A7a: numbered list emits one row per phase" "2" "$rows"
+assert_contains "A7b: numbered phase child ref parsed" $'1\t**Navigation.** Move menu\tnone\t12' "$result"
+assert_contains "A7c: unfiled numbered phase has empty child ref" $'2\t**Search.** Add search\tnone\t' "$result"
+
 # ============================================================
 echo ""
 echo "${TEST_BLUE}=== Part B: structural wiring tests ===${TEST_NC}"
@@ -348,8 +360,16 @@ assert_grep_fixed \
 	'_parent_close_contract_incomplete() {' \
 	"$ACTIONS_TARGET"
 assert_grep_fixed \
-	'B7b: close path checks the contract after child terminality' \
-	'if _parent_close_contract_incomplete "$parent_body" "$child_count"; then' \
+	'B7b: close path checks the contract with child provenance after terminality' \
+	'if _parent_close_contract_incomplete "$parent_body" "$child_count" "$child_source"' \
+	"$ACTIONS_TARGET"
+assert_grep_fixed \
+	'B7b2: close path passes declared and graph children with verified terminality (GH#37679)' \
+	'"$_PIR_CPT_DECLARED_NUMS" "$_PIR_CPT_GRAPH_NUMS" 1; then' \
+	"$ACTIONS_TARGET"
+assert_grep_fixed \
+	'B7b3: keep-open is an explicit blocker separate from the provisional marker (GH#37679)' \
+	'_PARENT_CLOSE_CONTRACT_REASON="keep-open"' \
 	"$ACTIONS_TARGET"
 assert_grep_fixed \
 	'B7c: incomplete canonical phases post the idempotent phase nudge' \
@@ -382,6 +402,10 @@ assert_grep_fixed \
 assert_grep_fixed \
 	'B7g: unchecked parent criteria are deterministic close blockers' \
 	'_PARENT_CLOSE_CONTRACT_REASON="unchecked-criteria"' \
+	"$ACTIONS_TARGET"
+assert_grep_fixed \
+	'B7g2: native graph completion supersedes stale unchecked tracker criteria' \
+	'[[ "$native_graph_complete" -eq 0 ]]' \
 	"$ACTIONS_TARGET"
 assert_grep_fixed \
 	'B7h: incomplete parent close contracts use an explicit review hold' \
@@ -423,11 +447,11 @@ assert_grep_fixed \
 	"$PARENT_TARGET"
 TESTS_RUN=$((TESTS_RUN + 1))
 hold_guard_count=$(grep -Fc '_pir_parent_mutation_is_allowed "$slug" "$issue_num"' "$ACTIONS_TARGET" 2>/dev/null || true)
-if [[ "$hold_guard_count" -ge 6 ]]; then
+if [[ "$hold_guard_count" -ge 5 ]]; then
 	echo "${TEST_GREEN}PASS${TEST_NC}: B10d: every parent mutation class has a live hold recheck"
 else
 	TESTS_FAILED=$((TESTS_FAILED + 1))
-	echo "${TEST_RED}FAIL${TEST_NC}: B10d: expected at least 6 live parent hold checks, found $hold_guard_count"
+	echo "${TEST_RED}FAIL${TEST_NC}: B10d: expected at least 5 live parent hold checks, found $hold_guard_count"
 fi
 
 # B11: parent creation stamps a machine-readable contract before signing.

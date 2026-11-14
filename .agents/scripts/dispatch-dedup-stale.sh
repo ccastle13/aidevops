@@ -21,7 +21,7 @@
 # 28 min of dispatch capacity per crash.
 #######################################
 STALE_ASSIGNMENT_THRESHOLD_SECONDS="${STALE_ASSIGNMENT_THRESHOLD_SECONDS:-${DISPATCH_COMMENT_MAX_AGE:-600}}"
-_DDS_NMR_LABEL="needs-maintainer-review"
+# Stale-recovery escalation applies a structural block, never NMR.
 _DDS_STRUCTURAL_BLOCK_LABEL="status:blocked"
 _DDS_STATUS_BLOCKED="blocked"
 _DDS_KIND_DRAFT="draft_checkpoint"
@@ -31,6 +31,16 @@ _DDS_KIND_LINKED_AMBIGUOUS="linked_ambiguous"
 _DDS_CLOSING_REFERENCE_PAGE_SIZE=100
 STALE_RECOVERY_OPEN_PR_SCAN_LIMIT="${STALE_RECOVERY_OPEN_PR_SCAN_LIMIT:-1000}"
 
+# GH#34008: share the exact orphan-recovery `For #N` draft linkage rule with
+# the continuation target predicates instead of re-deriving it here.
+_DDS_SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
+[[ "$_DDS_SCRIPT_DIR" == "${BASH_SOURCE[0]}" ]] && _DDS_SCRIPT_DIR="."
+# shellcheck source=pr-checkpoint-target-lib.sh
+source "${_DDS_SCRIPT_DIR}/pr-checkpoint-target-lib.sh"
+# shellcheck source=dispatch-claim-trust.sh
+source "${_DDS_SCRIPT_DIR}/dispatch-claim-trust.sh"
+unset _DDS_SCRIPT_DIR
+
 #######################################
 # t2132: Separate threshold for interactive claims.
 # Interactive sessions routinely go 30-60+ minutes between actions on an issue
@@ -39,6 +49,10 @@ STALE_RECOVERY_OPEN_PR_SCAN_LIMIT="${STALE_RECOVERY_OPEN_PR_SCAN_LIMIT:-1000}"
 # Default: 7200s (2 hours).
 #######################################
 INTERACTIVE_STALE_THRESHOLD_SECONDS="${INTERACTIVE_STALE_THRESHOLD_SECONDS:-7200}"
+# A verified, exclusively owned interactive claim can remain locally active
+# without GitHub writes for hours (GH#33234). Other assignments retain their
+# existing thresholds, including the 600s headless worker lease.
+INTERACTIVE_CLAIM_STALE_THRESHOLD_SECONDS="${INTERACTIVE_CLAIM_STALE_THRESHOLD_SECONDS:-21600}"
 
 #######################################
 # Convert ISO 8601 timestamp to epoch seconds
@@ -81,7 +95,7 @@ _stale_recovery_load_threshold() {
 }
 
 #######################################
-# Count prior non-reset stale-recovery-tick comments on an issue
+# Count stale-recovery ticks since the latest maintainer release on an issue
 # (cross-runner counter). Fails open: returns 0 on gh failure.
 # Args: $1 = issue number, $2 = repo slug
 # Output: integer count on stdout
@@ -115,7 +129,7 @@ _stale_recovery_fetch_comments_pages() {
 }
 
 #######################################
-# Count non-reset stale recovery ticks from a slurped comments JSON document.
+# Count stale recovery ticks after the latest trusted release marker.
 # Args: $1 = slurped comments pages JSON
 # Output: integer tick count
 #######################################
@@ -123,10 +137,21 @@ _stale_recovery_count_ticks_from_pages() {
 	local comments_pages="$1"
 	local prior_ticks
 	prior_ticks=$(printf '%s' "$comments_pages" | jq \
-		'[
-			.[] | .[]?
-			| select(.body | (test("<!-- stale-recovery-tick:[1-9]") and (test("reset") | not)))
-		] | length' \
+		--arg release_marker '<!-- stale-recovery-release:verified -->' \
+		'([.[] | .[]?] | sort_by(.created_at, .id))
+		| reduce .[] as $comment (0;
+			if (($comment.body // "")
+				| contains($release_marker))
+				and (($comment.author_association // "")
+				| IN(
+					"OWNER",
+					"MEMBER"
+				)) then 0
+			elif (($comment.body // "")
+				| test("<!-- stale-recovery-tick:[1-9]"))
+				and ((($comment.body // "")
+				| contains("reset")) | not) then . + 1
+			else . end)' \
 		2>/dev/null) || prior_ticks=0
 	[[ "$prior_ticks" =~ ^[0-9]+$ ]] || prior_ticks=0
 	printf '%s' "$prior_ticks"
@@ -154,19 +179,27 @@ _stale_recovery_final_evidence_recheck() {
 	local issue_number="$1"
 	local repo_slug="$2"
 	local expected_dispatch_ts="$3"
+	local recheck_branches="${4:-false}"
 	local pages="" latest_dispatch_ts="" now_epoch=""
 	pages=$(_stale_recovery_fetch_comments_pages "$issue_number" "$repo_slug")
 	[[ -n "$pages" ]] || return 1
 	latest_dispatch_ts=$(_stale_recovery_latest_dispatch_ts_from_pages "$pages")
 	[[ "$latest_dispatch_ts" == "$expected_dispatch_ts" ]] || return 1
 	now_epoch=$(date +%s)
-	local comments="" claims="" parsed=""
+	local comments="" claims="" parsed="" permission_trusted_authors=""
 	comments=$(printf '%s' "$pages" | jq -c '[.[] | .[]?]' 2>/dev/null) || return 1
+	permission_trusted_authors=$(_claim_permission_trusted_authors "$comments" "$repo_slug") || return 1
 	claims=$(printf '%s' "$comments" | jq -c '[.[] | select((.body // "") | contains("DISPATCH_CLAIM nonce="))]' 2>/dev/null) || return 1
 	parsed=$(printf '%s\n%s\n' "$claims" "$comments" | jq -nc --argjson now "$now_epoch" --argjson max_age 2147483647 \
 		--argjson include_terminal false \
+		--argjson permission_trusted_authors "$permission_trusted_authors" \
 		-f "${SCRIPT_DIR}/dispatch-lease-claims.jq" 2>/dev/null) || return 1
 	if printf '%s' "$parsed" | jq -e 'any(.lease_phase == "ready")' >/dev/null 2>&1; then
+		return 1
+	fi
+	# Re-read remote tips immediately before takeover, including pushes that
+	# arrived after the initial age check. Unknown branch evidence protects ownership.
+	if [[ "$recheck_branches" == "true" ]] && _stale_assignment_has_recent_branch_activity "$issue_number" "$repo_slug" "$now_epoch" "${_STALE_CONTEXT_THRESHOLD:-$STALE_ASSIGNMENT_THRESHOLD_SECONDS}" "$comments"; then
 		return 1
 	fi
 	# PID exit is deliberately absent: remote completion requires durable evidence.
@@ -201,6 +234,9 @@ _stale_recovery_has_terminal_evidence_since() {
 # Classify every open PR whose authoritative GitHub closing metadata includes
 # this same-repository stale issue. A PR is exact only when that issue is its
 # sole closing identity; all multi-issue linkage remains durable but ambiguous.
+# A non-closing checkpoint draft (_pr_checkpoint_nonclosing_draft_links_issue:
+# an orphan-recovery `For #N` draft, GH#34008, or a worker `For #N`/`Ref #N`
+# draft) is also exact.
 # Args: $1=issue number, $2=repo slug, $3=open PR list JSON
 # Output: matching "PR number|exact|ambiguous" rows, one per line
 #######################################
@@ -228,16 +264,22 @@ _stale_recovery_linked_pr_rows() {
 				(.repository.name | type) == "string" and
 				(.repository.owner.login | type) == "string"))
 	' >/dev/null 2>&1 || return 1
+	# GH#34008: an orphan-recovery `For #N` draft has no closing identity by
+	# design, nor does a worker For/Ref checkpoint draft; the shared exact rule
+	# links both so the checkpoint is preserved for continuation, not reset.
 	printf '%s' "$open_pr_json" | jq -r --argjson issue "$issue_number" \
-		--arg owner "$repo_owner" --arg name "$repo_name" '
+		--arg owner "$repo_owner" --arg name "$repo_name" "${_PR_CHECKPOINT_FOR_LINK_JQ_DEFS}"'
 		def matches_target:
 			.number == $issue and
 			((.repository.name | ascii_downcase) == ($name | ascii_downcase)) and
 			((.repository.owner.login | ascii_downcase) == ($owner | ascii_downcase));
 		.[] |
 		(.closingIssuesReferences | map(select(matches_target))) as $matches |
-		select(($matches | length) > 0) |
-		"\(.number)|\(if ((.closingIssuesReferences | length) == 1 and ($matches | length) == 1) then "exact" else "ambiguous" end)"
+		if ($matches | length) > 0 then
+			"\(.number)|\(if ((.closingIssuesReferences | length) == 1 and ($matches | length) == 1) then "exact" else "ambiguous" end)"
+		elif checkpoint_draft_links($issue) then
+			"\(.number)|exact"
+		else empty end
 	' 2>/dev/null || return 1
 	return 0
 }
@@ -256,7 +298,7 @@ _stale_recovery_find_open_pr() {
 	[[ "$_scan_limit" =~ ^[1-9][0-9]*$ ]] || _scan_limit=1000
 	_open_pr_json=$(gh pr list --repo "$repo_slug" --state open \
 		--limit "$_scan_limit" \
-		--json number,closingIssuesReferences,isDraft,labels,statusCheckRollup 2>/dev/null) || return 1
+		--json number,closingIssuesReferences,isDraft,isCrossRepository,labels,body,statusCheckRollup 2>/dev/null) || return 1
 	_open_pr_count=$(printf '%s' "$_open_pr_json" | jq -er 'length' 2>/dev/null) || return 1
 	# Reaching the bound means authoritative linkage may exist outside this page.
 	[[ "$_open_pr_count" -lt "$_scan_limit" ]] || return 1
@@ -419,7 +461,7 @@ _stale_recovery_escalate_pr_checkpoint() {
 	fi
 
 	gh_issue_comment "$issue_number" --repo "$repo_slug" \
-		--body "<!-- ops:start — workers: skip this comment, it is audit trail not implementation context -->
+		--body "$(aidevops_ops_marker stale-pr-checkpoint)"$'\n'"<!-- ops:start — workers: skip this comment, it is audit trail not implementation context -->
 <!-- stale-pr-checkpoint:escalated pr=${pr_number} kind=${checkpoint_kind} -->
 **PR checkpoint requires structural repair**
 
@@ -509,7 +551,7 @@ _stale_recovery_escalate() {
 
 	# Post escalation comment explaining the suspension
 	gh_issue_comment "$issue_number" --repo "$repo_slug" \
-		--body "<!-- ops:start — workers: skip this comment, it is audit trail not implementation context -->
+		--body "$(aidevops_ops_marker stale-recovery-escalated)"$'\n'"<!-- ops:start — workers: skip this comment, it is audit trail not implementation context -->
 <!-- stale-recovery-tick:escalated (threshold=${_threshold}) -->
 **Stale recovery threshold reached** (t2008)
 
@@ -519,7 +561,7 @@ Previously assigned to: ${stale_assignees}
 Reason for latest stale: ${reason}
 Recovery count: ${_prior_ticks} (threshold: ${_threshold})
 
-Marked \`status:blocked\`. Investigate why workers keep failing (wrong brief, unimplementable scope, missing dependency, etc.), then return the issue to \`status:available\` when the structural blocker is resolved.
+Marked \`status:blocked\`. Review worker logs, salvageable branches and linked PRs first. Once the root cause is addressed and no worker owns the issue, a maintainer can run \`dispatch-dedup-helper.sh release-stale-recovery ${issue_number} ${repo_slug} 'reviewed reason'\`. The command records an audit marker and restores dispatch eligibility; it does not clear independent security/review holds or replace cryptographic approval.
 
 _This escalation is the \"no-progress fail-safe\" from t2008 (paired with t1986 parent-task guard and t2007 cost circuit breaker)._
 <!-- ops:end -->" \
@@ -562,6 +604,33 @@ _stale_recovery_has_unresolved_blocked_by() {
 		return 0
 	fi
 	return 1
+}
+
+# Preserve the assignment and labels when an unresolved input circuit exists;
+# the recovery owner alone projects a revision/retry rearm with its receipt.
+_stale_recovery_has_input_circuit() {
+	local issue_number="$1" repo_slug="$2" pages="${3:-}" issue_json="" comments="" rc=0
+	# The recovery scan already fetched all comment pages. An explicit valid
+	# snapshot without any circuit needs no further circuit-specific reads.
+	if [[ -n "$pages" ]] && jq -e 'arrays | all(.[]; arrays | true) and
+		(all(.[][]; ((.body // "") | contains("aidevops:terminal-blocker-circuit revision=")) | not))' <<<"$pages" >/dev/null 2>&1; then
+		return 1
+	fi
+	# shellcheck source=terminal-blocker-circuit.sh
+	source "${SCRIPT_DIR}/terminal-blocker-circuit.sh" || return 0
+	comments=$(terminal_blocker_fetch_trusted_comments "$issue_number" "$repo_slug") || return 0
+	if ! jq -e 'any(.[]; (.body // "") | contains("aidevops:terminal-blocker-circuit revision="))' <<<"$comments" >/dev/null 2>&1; then
+		return 1
+	fi
+	issue_json=$(gh api "repos/${repo_slug}/issues/${issue_number}" --jq '{title: (.title // ""), body: (.body // ""), labels: (.labels // [])}' 2>/dev/null) || return 0
+	# A blocked-to-available transition belongs to rearm, which records the
+	# receipt; stale recovery must not silently release even a rearmed hold.
+	if jq -e 'any(.labels[]?; .name == "status:blocked")' <<<"$issue_json" >/dev/null 2>&1; then
+		return 0
+	fi
+	terminal_blocker_input_circuit_active "$comments" "$issue_json" "$repo_slug" "$issue_number" "" || rc=$?
+	[[ "$rc" -eq 1 ]] && return 1
+	return 0
 }
 
 #######################################
@@ -619,7 +688,7 @@ _stale_recovery_apply_blocked_by_hold() {
 	local _now_ts=""
 	_now_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 	gh_issue_comment "$issue_number" --repo "$repo_slug" \
-		--body "<!-- ops:start — workers: skip this comment, it is audit trail not implementation context -->
+		--body "$(aidevops_ops_marker stale-recovery-tick)"$'\n'"<!-- ops:start — workers: skip this comment, it is audit trail not implementation context -->
 <!-- WORKER_SUPERSEDED runners=${stale_assignees} ts=${_now_ts} -->
 <!-- stale-recovery-blocked-by-unresolved -->
 **Stale assignment recovered, but re-dispatch remains blocked** (GH#23932)
@@ -666,6 +735,7 @@ _stale_recovery_apply() {
 	local expected_dispatch_ts="${5:-}"
 	local recovery_tick="${6:-}"
 	local recovery_threshold="${7:-}"
+	local recovery_pages="${8:-}"
 
 	local saved_ifs="${IFS:-}"
 	local -a assignee_arr=()
@@ -677,11 +747,15 @@ _stale_recovery_apply() {
 	for assignee in "${assignee_arr[@]}"; do
 		[[ -n "$assignee" ]] && _recov_extra+=(--remove-assignee "$assignee")
 	done
+	if _stale_recovery_has_input_circuit "$issue_number" "$repo_slug" "$recovery_pages"; then
+		printf 'STALE_CIRCUIT_HOLD: issue #%s in %s — preserving status and assignment\n' "$issue_number" "$repo_slug"
+		return 0
+	fi
 	if _stale_recovery_has_unresolved_blocked_by "$issue_number" "$repo_slug"; then
 		_stale_recovery_apply_blocked_by_hold "$issue_number" "$repo_slug" "$stale_assignees" "$reason" "$expected_dispatch_ts" "${_recov_extra[@]}"
 		return 0
 	fi
-	if ! _stale_recovery_final_evidence_recheck "$issue_number" "$repo_slug" "$expected_dispatch_ts"; then
+	if ! _stale_recovery_final_evidence_recheck "$issue_number" "$repo_slug" "$expected_dispatch_ts" true; then
 		printf 'STALE_RECHECK_BLOCKED: issue #%s in %s — evidence changed before takeover\n' "$issue_number" "$repo_slug"
 		return 0
 	fi
@@ -697,7 +771,7 @@ _stale_recovery_apply() {
 	local _now_ts
 	_now_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 	gh_issue_comment "$issue_number" --repo "$repo_slug" \
-		--body "<!-- ops:start — workers: skip this comment, it is audit trail not implementation context -->
+		--body "$(aidevops_ops_marker stale-recovery-tick)"$'\n'"<!-- ops:start — workers: skip this comment, it is audit trail not implementation context -->
 <!-- WORKER_SUPERSEDED runners=${stale_assignees} ts=${_now_ts} -->
 <!-- stale-recovery-tick:${recovery_tick:-1} -->
 **Stale assignment recovered** (GH#15060)
@@ -706,6 +780,9 @@ Previously assigned to: ${stale_assignees}
 Reason: ${reason}
 Threshold: ${STALE_ASSIGNMENT_THRESHOLD_SECONDS}s
 Global recovery attempt: ${recovery_tick:-1}/${recovery_threshold:-unknown}
+Last pushed issue branch: ${_STALE_BRANCH_CHECKPOINT:-none found}
+
+Resume from that remote branch when present; inspect and reuse its commits before starting new work.
 
 The assigned runner had no active worker process and produced no progress within the threshold. Unassigned and relabeled \`status:available\` for re-dispatch.
 
@@ -801,7 +878,7 @@ _recover_stale_assignment() {
 	fi
 	# ── End stale-recovery escalation check ──────────────────────────────
 
-	_stale_recovery_apply "$issue_number" "$repo_slug" "$stale_assignees" "$reason" "$_latest_dispatch_ts" "$_next_tick" "$_threshold" || return 1
+	_stale_recovery_apply "$issue_number" "$repo_slug" "$stale_assignees" "$reason" "$_latest_dispatch_ts" "$_next_tick" "$_threshold" "$_comments_pages" || return 1
 	return 0
 }
 
@@ -872,10 +949,36 @@ _stale_assignment_has_live_interactive_claim() {
 		return 1
 	fi
 
+	printf '%s' "$issue_meta_json" | jq -e --arg claimant "$claim_author" \
+		--arg in_progress 'status:in-progress' '
+		(.state | ascii_downcase) == "open" and
+		([.labels[]?.name] | any(. == "status:claimed" or
+			. == $in_progress or . == "status:in-review")) and
+		([.assignees[]?.login] | index($claimant) != null)
+	' >/dev/null 2>&1 || return 1
+	return 0
+}
+
+# The audit marker alone is not ownership: require a matching comment author,
+# status:claimed and the claimant as the sole assignee. A released claim loses
+# that status/assignment. Keep the interactive threshold even after the claim
+# ages out; the normal activity check then recovers a genuinely quiet session
+# at the interactive threshold, never at the worker threshold.
+_stale_assignment_has_owned_interactive_claim() {
+	local issue_meta_json="$1"
+	local comments_json="$2"
+	local claim_record="" claim_author=""
+	claim_record=$(printf '%s' "$comments_json" | jq -r '
+		[.[] | select((.body_start // "") | contains("aidevops-interactive-claim/v1"))
+		| select(. as $comment | ($comment.body_start // "") | contains("Interactive session claimed by @" + ($comment.author // "")))]
+		| first | if . == null then empty else .author end
+	' 2>/dev/null) || return 1
+	[[ -n "$claim_record" ]] || return 1
+	claim_author="$claim_record"
 	printf '%s' "$issue_meta_json" | jq -e --arg claimant "$claim_author" '
 		(.state | ascii_downcase) == "open" and
-		([.labels[]?.name] | index("status:in-review") != null) and
-		([.assignees[]?.login] | index($claimant) != null)
+		([.labels[]?.name] | index("status:claimed") != null) and
+		([.assignees[]?.login] == [$claimant])
 	' >/dev/null 2>&1 || return 1
 	return 0
 }
@@ -898,7 +1001,10 @@ _resolve_stale_threshold() {
 	local created_at=''
 	local updated_at=''
 
-	if printf '%s' "$_issue_meta_json" | jq -e '.labels | map(.name) | index("origin:interactive")' >/dev/null 2>&1 ||
+	if _stale_assignment_has_owned_interactive_claim "$_issue_meta_json" "$comments_json"; then
+		is_interactive='true'
+		threshold="$INTERACTIVE_CLAIM_STALE_THRESHOLD_SECONDS"
+	elif printf '%s' "$_issue_meta_json" | jq -e '.labels | map(.name) | index("origin:interactive")' >/dev/null 2>&1 ||
 		_stale_assignment_has_live_interactive_claim "$_issue_meta_json" "$comments_json" "$now_epoch"; then
 		is_interactive='true'
 		threshold="$INTERACTIVE_STALE_THRESHOLD_SECONDS"
@@ -958,7 +1064,7 @@ _stale_assignment_fetch_comments_json() {
 	comments_pages=$(gh api "repos/${repo_slug}/issues/${issue_number}/comments" \
 		--paginate --slurp 2>/dev/null) || return 1
 	comments_json=$(printf '%s' "$comments_pages" | jq \
-		'[.[] | .[]? | {created_at: .created_at, author: .user.login, body_start: ((.body // "")[:200])}] | sort_by(.created_at) | reverse' \
+		'[.[] | .[]? | {created_at: .created_at, author: .user.login, author_association: .author_association, body: .body, body_start: ((.body // "")[:200])}] | sort_by(.created_at) | reverse' \
 		2>/dev/null) || return 1
 	printf '%s' "$comments_json"
 	return 0
@@ -1049,6 +1155,48 @@ _stale_assignment_has_recent_open_pr_activity() {
 	return 1
 }
 
+# GH#33383: remote issue branches are progress even before a PR exists.
+# Returns 0 for recent OR indeterminate evidence (protect ownership), 1 only
+# after all matching remote tips are known to be old. Committer time is a proxy
+# for push time; GitHub's refs API does not expose an actual pushed-at timestamp.
+# Also leaves the newest old tip in _STALE_BRANCH_CHECKPOINT for salvage.
+_stale_assignment_has_recent_branch_activity() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local now_epoch="$3"
+	local effective_threshold="$4"
+	local comments_json="${5:-[]}"
+	local refs="" rows="" named_branch=""
+	local branch="" sha="" commit_ts="" commit_epoch="" newest_epoch=0
+	_STALE_BRANCH_CHECKPOINT=""
+	# Only the latest trusted dispatch comment can name a nonstandard branch.
+	named_branch=$(printf '%s' "$comments_json" | jq -r '
+		[.[] | select(.author_association | IN("OWNER", "MEMBER", "COLLABORATOR"))
+		| select((.body // empty) | test("Dispatching worker|DISPATCH_CLAIM|Worker \\(PID"; "i"))]
+		| sort_by(.created_at) | last | (.body // empty)
+		| [scan("(?:branch=|\\*\\*Branch\\*\\*:[ \\t]*`?)([A-Za-z0-9_./-]+)") | .[0]] | first // empty
+	' 2>/dev/null) || return 0
+	refs=$(gh api --paginate --slurp "repos/${repo_slug}/git/matching-refs/heads/" 2>/dev/null) || return 0
+	rows=$(printf '%s' "$refs" | jq -r --arg issue "$issue_number" --arg named "$named_branch" '
+		.[] | .[] | (.ref | ltrimstr("refs/heads/")) as $branch
+		| select(($branch | test("gh" + $issue + "([^0-9]|$)")) or ($named != "" and $branch == $named))
+		| [$branch, .object.sha] | @tsv
+	' 2>/dev/null) || return 0
+	while IFS=$'\t' read -r branch sha; do
+		[[ -n "$branch" ]] || continue
+		[[ "$sha" =~ ^[a-fA-F0-9]{40,64}$ ]] || return 0
+		commit_ts=$(gh api "repos/${repo_slug}/git/commits/${sha}" --jq '.committer.date // empty' 2>/dev/null) || return 0
+		commit_epoch=$(_ts_to_epoch "$commit_ts")
+		[[ "$commit_epoch" -gt 0 ]] || return 0
+		if [[ "$commit_epoch" -gt "$newest_epoch" ]]; then
+			newest_epoch="$commit_epoch"
+			_STALE_BRANCH_CHECKPOINT="${branch} (commit ${sha}, committed ${commit_ts})"
+		fi
+		[[ $((now_epoch - commit_epoch)) -lt "$effective_threshold" ]] && return 0
+	done <<<"$rows"
+	return 1
+}
+
 _stale_assignment_load_threshold_context() {
 	local issue_number="$1"
 	local repo_slug="$2"
@@ -1078,15 +1226,10 @@ _is_stale_assignment() {
 	local blocking_assignees="$3"
 	local now_epoch
 	now_epoch=$(date +%s)
+	_STALE_BRANCH_CHECKPOINT=""
 
-	# Fetch issue comments to find the most recent dispatch claim and
-	# overall activity timestamp. Use --paginate --slurp so gh combines all
-	# pages before jq sorts them; `gh api --paginate --jq ...` applies jq per
-	# page, which can leave page-1 timestamps ahead of newer activity on long
-	# issue threads and trigger false stale recovery (GH#3894 / t2769 incident).
-	#
-	# GH#18816: fail-CLOSED on API failure. A transient gh error is NOT evidence
-	# that the assignment is stale — block this pulse cycle and retry next cycle.
+	# GH#3894/t2769: slurp all comment pages before sorting, not per-page --jq.
+	# GH#18816: API failure is not staleness; protect ownership this pulse cycle.
 	local comments_json
 	if _interactive_claim_fence_blocks_dispatch "$issue_number" "$repo_slug" || ! comments_json=$(_stale_assignment_fetch_comments_json "$issue_number" "$repo_slug"); then
 		# Cannot fetch comments — cannot determine staleness. Fail-CLOSED:
@@ -1107,11 +1250,8 @@ _is_stale_assignment() {
 	# t2153 age-floor guard: issue cannot be stale before it could signal.
 	_issue_too_young_for_staleness "$issue_created_at" "$effective_threshold" "$now_epoch" && return 1
 
-	# t2132 Fix D: Find the most recent dispatch/claim comment.
-	# Matches worker dispatch patterns AND interactive session claim pattern.
-	# Previously only matched "Dispatching worker|DISPATCH_CLAIM|Worker (PID",
-	# which missed the interactive claim comment posted by
-	# interactive-session-helper.sh ("Interactive session claimed").
+	# t2132 Fix D: include both worker dispatch and "Interactive session claimed"
+	# comments from interactive-session-helper.sh when finding the latest claim.
 	local last_dispatch_ts=""
 	last_dispatch_ts=$(_stale_assignment_latest_dispatch_ts "$comments_json")
 
@@ -1134,6 +1274,9 @@ _is_stale_assignment() {
 			return 1
 		fi
 		# No dispatch comment AND no recent activity — stale
+		if _stale_assignment_has_recent_branch_activity "$issue_number" "$repo_slug" "$now_epoch" "$effective_threshold" "$comments_json"; then
+			return 1
+		fi
 		_recover_stale_assignment "$issue_number" "$repo_slug" "$blocking_assignees" \
 			"no dispatch claim comment found, no recent activity (threshold=${effective_threshold}s, interactive=${is_interactive})" || return 1
 		return 0
@@ -1165,6 +1308,9 @@ _is_stale_assignment() {
 	# dispatch checks do not burn PR-list API budget; branch pushes and draft PR
 	# updates are better liveness signals than synthetic issue heartbeats.
 	if _stale_assignment_has_recent_open_pr_activity "$issue_number" "$repo_slug" "$now_epoch" "$effective_threshold"; then
+		return 1
+	fi
+	if _stale_assignment_has_recent_branch_activity "$issue_number" "$repo_slug" "$now_epoch" "$effective_threshold" "$comments_json"; then
 		return 1
 	fi
 

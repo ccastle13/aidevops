@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2025-2026 Marcus Quinn
 #
-# Regression coverage for existence-aware origin:* and solved:* provisioning.
+# Regression coverage for existence-aware managed-label provisioning.
 
 set -uo pipefail
 
@@ -49,6 +49,7 @@ source "${SCRIPTS_DIR}/shared-gh-wrappers.sh"
 
 TEST_LABEL_SNAPSHOT=""
 TEST_INVENTORY_RC=0
+TEST_WRITE_RC=0
 _gh_with_timeout() {
 	local op_class="$1"
 	shift
@@ -57,6 +58,7 @@ _gh_with_timeout() {
 		[[ "$TEST_INVENTORY_RC" -eq 0 ]] || return "$TEST_INVENTORY_RC"
 		printf '%s\n' "$TEST_LABEL_SNAPSHOT"
 	fi
+	[[ "$op_class" != "write" ]] || return "$TEST_WRITE_RC"
 	return 0
 }
 
@@ -84,6 +86,44 @@ assert_count "missing solved label is created once" 1 'gh label create solved:in
 assert_count "present origin labels are not recreated" 0 'gh label create origin:worker --repo'
 assert_count "present solved labels are not recreated" 0 'gh label create solved:worker --repo'
 
+# Reminder provisioning is opt-in and caches only successful repository checks.
+: >"$CALL_LOG"
+_CONTINUATION_REMINDER_LABEL_ENSURED=""
+TEST_LABEL_SNAPSHOT=$'origin:interactive\ncontinuation-reminder'
+ensure_continuation_reminder_label_exists owner/repo
+assert_count "present reminder label needs inventory only" 1 'read route=managed-label-inventory-rest'
+assert_count "present reminder label causes no write" 0 'write route=managed-label-create-rest'
+ensure_continuation_reminder_label_exists owner/repo
+assert_count "reminder label is cached per repo" 1 'read route=managed-label-inventory-rest'
+
+: >"$CALL_LOG"
+_CONTINUATION_REMINDER_LABEL_ENSURED=""
+TEST_LABEL_SNAPSHOT='origin:interactive'
+ensure_continuation_reminder_label_exists owner/repo
+assert_count "missing reminder label is created once" 1 'gh label create continuation-reminder --repo owner/repo'
+ensure_continuation_reminder_label_exists owner/repo
+assert_count "created reminder label is cached" 1 'gh label create continuation-reminder --repo owner/repo'
+
+: >"$CALL_LOG"
+_CONTINUATION_REMINDER_LABEL_ENSURED=""
+_gh_ci_ensure_requested_reminder_label owner/repo --label bug
+assert_count "ordinary issues skip reminder inventory" 0 'read route=managed-label-inventory-rest'
+_gh_ci_ensure_requested_reminder_label owner/repo --label 'bug,continuation-reminder'
+assert_count "comma-separated reminder request provisions label" 1 'gh label create continuation-reminder --repo owner/repo'
+
+: >"$CALL_LOG"
+_CONTINUATION_REMINDER_LABEL_ENSURED=""
+TEST_WRITE_RC=1
+if _gh_ci_ensure_requested_reminder_label owner/repo --label=continuation-reminder 2>/dev/null; then
+	fail "failed reminder creation stops issue path" "expected non-zero status"
+else
+	pass "failed reminder creation stops issue path"
+fi
+assert_count "failed reminder creation attempted once" 1 'gh label create continuation-reminder --repo owner/repo'
+TEST_WRITE_RC=0
+ensure_continuation_reminder_label_exists owner/repo
+assert_count "failed reminder creation is not cached" 2 'gh label create continuation-reminder --repo owner/repo'
+
 # Tracking creation reuses the canonical origin set and adds its own labels.
 : >"$CALL_LOG"
 TEST_LABEL_SNAPSHOT=$'origin:worker\norigin:interactive\norigin:worker-takeover'
@@ -92,6 +132,39 @@ managed_labels_ensure_tracking_set owner/repo \
 assert_count "tracking set provisions status label" 1 'gh label create status:in-review '
 assert_count "tracking set provisions bug label" 1 'gh label create bug '
 assert_count "tracking set reuses present origins" 0 'gh label create origin:'
+
+# Approval transitions provision every label before posting signed evidence.
+: >"$CALL_LOG"
+TEST_LABEL_SNAPSHOT='needs-maintainer-review'
+managed_labels_ensure_approval_set owner/repo issue \
+	_gh_managed_label_names_snapshot _gh_managed_label_create_runner
+assert_count "issue approval creates missing dispatch label" 1 'gh label create auto-dispatch '
+assert_count "issue approval creates missing dispatch mutex label" 1 'gh label create no-auto-dispatch '
+assert_count "issue approval reuses present review label" 0 'gh label create needs-maintainer-review '
+
+: >"$CALL_LOG"
+TEST_LABEL_SNAPSHOT=$'needs-maintainer-review\nauto-dispatch\nno-auto-dispatch'
+managed_labels_ensure_approval_set owner/repo issue \
+	_gh_managed_label_names_snapshot _gh_managed_label_create_runner
+assert_count "converged issue approval performs zero creates" 0 'write route=managed-label-create-rest gh label create'
+
+: >"$CALL_LOG"
+TEST_LABEL_SNAPSHOT=""
+managed_labels_ensure_approval_set owner/repo pr \
+	_gh_managed_label_names_snapshot _gh_managed_label_create_runner
+assert_count "PR approval creates only the review label" 1 'gh label create needs-maintainer-review '
+assert_count "PR approval does not create dispatch label" 0 'gh label create auto-dispatch '
+assert_count "PR approval does not create dispatch mutex label" 0 'gh label create no-auto-dispatch '
+
+# GH#36292: release requests provision their hold and approval-only labels.
+: >"$CALL_LOG"
+TEST_LABEL_SNAPSHOT='release-approval-required'
+managed_labels_ensure_release_approval_set owner/repo \
+	_gh_managed_label_names_snapshot _gh_managed_label_create_runner
+assert_count "release approval creates missing hold label" 1 'gh label create hold-for-review '
+assert_count "release approval creates missing dispatch mutex label" 1 'gh label create no-auto-dispatch '
+assert_count "release approval reuses present request label" 0 'gh label create release-approval-required '
+assert_count "release approval never creates the dispatch label" 0 'gh label create auto-dispatch '
 
 # Failed inventory is fail-closed: do not fan out speculative writes or cache.
 : >"$CALL_LOG"
@@ -107,6 +180,12 @@ if ensure_solved_labels_exist owner/repo; then
 	fail "solved inventory failure propagates" "expected non-zero status"
 else
 	pass "solved inventory failure propagates"
+fi
+_CONTINUATION_REMINDER_LABEL_ENSURED=""
+if ensure_continuation_reminder_label_exists owner/repo; then
+	fail "reminder inventory failure propagates" "expected non-zero status"
+else
+	pass "reminder inventory failure propagates"
 fi
 assert_count "failed inventory performs zero creates" 0 'write route=managed-label-create-rest gh label create'
 

@@ -372,6 +372,25 @@ writes only the body, verifies the hold and metadata remained unchanged, checks
 the post-write body hash, and requires tamper-evident audit receipts. Ordinary,
 bulk, pulse, decomposition, and dispatch paths remain fail-closed.
 
+For generated auto-dispatch issues without a task ID, use
+`issue-sync-helper.sh refresh-body <issue> --repo <owner/repo> --body-file <path>`
+instead. It requires admin/maintain authority, an open unclaimed issue outside
+queued/in-progress/in-review states, and preserves the existing signature footer
+and complete pulse feedback blocks. `--dry-run` displays a diff and exits 2.
+Unlike `sync-body`, it takes the regenerated brief file as its source and does
+not require a TODO mapping or `no-auto-dispatch` hold.
+
+GH#37294: the coordinator mapping stays authoritative when a TODO.md row is
+renamed after its issue was bound, so the TODO `ref:GH#` backfill is refused.
+`sync-body` and `enrich` print the TODO ref, the coordinator owner of the
+issue, and the issue's title/body task IDs. A maintainer repairs the rename with
+`issue-sync-helper.sh rebind-task tNEW --from tOLD --repo <owner/repo>
+[--dry-run]`. It requires one live `tNEW` row carrying that `ref:GH#`, no live
+`tOLD` row, and `tOLD` owning the issue, and it adds an audited coordinator
+alias. Then `enrich tNEW` regenerates the title, `Task ID`, and `Blocked by`.
+Bounded push-run enrich processes tasks whose TODO row or brief changed in the
+push (`AIDEVOPS_ENRICH_CHANGED_SINCE`) before the TODO-ordered backlog.
+
 ### 4.6 Simultaneous DISPATCH_CLAIM Race (fixed t2422)
 
 **Pattern:** Two runners pass Layers 1–6 together and post `DISPATCH_CLAIM`

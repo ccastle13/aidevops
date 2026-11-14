@@ -17,6 +17,9 @@
 #   - _dedup_layer3_title_match
 #   - _dedup_layer4_pr_evidence
 #   - _dedup_layer5_dispatch_comment
+#   - _dispatch_blocked_checkpoint_attention
+#   - _dispatch_stalled_checkpoint_continuation
+#   - _dispatch_stalled_checkpoint_signal
 #   - _dispatch_interactive_hold_gate
 #   - _dedup_layer6_assignee_and_stale
 #   - _dedup_layer7_claim_lock
@@ -39,8 +42,8 @@ _PULSE_DISPATCH_DEDUP_LAYERS_LOADED=1
 # Returns one of:
 #   "partial"  — open PR or remote branch references this issue
 #                (worker reached at least the worktree/PR stage)
-#   "no_work"  — no PR, no branch (worker died before producing any
-#                durable artifact — transient/infrastructure failure)
+#   "no_work"  — successful lookups found no PR or branch
+#   "unknown"  — lookup failed or returned invalid data; not failure evidence
 #
 # Arguments:
 #   $1 - issue_number
@@ -52,11 +55,11 @@ _classify_stale_recovery_crash_type() {
 	local repo_slug="$2"
 
 	[[ "$issue_number" =~ ^[0-9]+$ ]] || {
-		printf 'no_work'
+		printf 'unknown'
 		return 0
 	}
 	[[ -n "$repo_slug" ]] || {
-		printf 'no_work'
+		printf 'unknown'
 		return 0
 	}
 
@@ -65,9 +68,10 @@ _classify_stale_recovery_crash_type() {
 	local _open_pr_count
 	_open_pr_count=$(gh_pr_list --repo "$repo_slug" --state open \
 		--search "#${issue_number} in:body" --limit 1 \
-		--json number --jq 'length' 2>/dev/null) || _open_pr_count=0
-	[[ "$_open_pr_count" =~ ^[0-9]+$ ]] || _open_pr_count=0
-	if [[ "$_open_pr_count" -gt 0 ]]; then
+		--json number --jq 'length' 2>/dev/null) || _open_pr_count=""
+	local lookup_unknown=0
+	[[ "$_open_pr_count" =~ ^[0-9]+$ ]] || lookup_unknown=1
+	if [[ "$_open_pr_count" =~ ^[0-9]+$ && "$_open_pr_count" -gt 0 ]]; then
 		printf 'partial'
 		return 0
 	fi
@@ -76,13 +80,23 @@ _classify_stale_recovery_crash_type() {
 	# number. Workers create branches like `bugfix/t1992-...`,
 	# `feature/auto-...-issue-18418`, or contain `gh-18418`. If we find
 	# anything, the worker reached the worktree-creation stage.
-	local _branch_count
-	_branch_count=$(gh api "repos/${repo_slug}/branches" --paginate \
-		--jq "[.[] | select(.name | test(\"(t|gh-?)${issue_number}([^0-9]|\$)\"))] | length" \
-		2>/dev/null) || _branch_count=0
-	[[ "$_branch_count" =~ ^[0-9]+$ ]] || _branch_count=0
-	if [[ "$_branch_count" -gt 0 ]]; then
+	local branches_json="" _branch_count=""
+	branches_json=$(gh api "repos/${repo_slug}/branches" --paginate --slurp \
+		2>/dev/null) || lookup_unknown=1
+	# Count once across all pages. Per-page --jq yields "0\n1", which the
+	# old numeric guard silently coerced to zero and fed into the no_work breaker.
+	_branch_count=$(printf '%s' "$branches_json" | jq -er --arg issue "$issue_number" '
+		if type == "array" and length > 0 and all(.[]; type == "array") then
+			[.[][] | if (.name | type) == "string" then . else error("invalid branch") end
+			| select(.name | test("(t|gh-?|issue-)" + $issue + "([^0-9]|$)"))] | length
+		else error("invalid branch pages") end
+	' 2>/dev/null) || lookup_unknown=1
+	if [[ "$_branch_count" =~ ^[0-9]+$ && "$_branch_count" -gt 0 ]]; then
 		printf 'partial'
+		return 0
+	fi
+	if [[ "$lookup_unknown" -eq 1 ]]; then
+		printf 'unknown'
 		return 0
 	fi
 
@@ -147,6 +161,79 @@ _stale_recovery_has_worker_evidence() {
 #   0 - duplicate detected (do NOT dispatch)
 #   1 - no duplicate (safe to dispatch)
 #######################################
+#######################################
+# Block all but one runnable issue for an authoritative Dependabot PR target.
+# Intake creation is locally serialized, but separate Pulse hosts can still
+# create issues concurrently. Elect an existing live owner first, otherwise the
+# lowest issue number. Unknown repository reads fail closed.
+# GH#32979: a consolidation-task child inlines its parent's body verbatim, so
+# it carries the parent's intake marker without being an intake. It rewrites
+# the parent issue and never works the Dependabot PR; gating it on the parent's
+# target ownership deadlocked both (the parent waits for the consolidation).
+# Arguments: issue_number, repo_slug, issue_body, [issue_meta_json]
+# Exit: 0 = blocked, 1 = current issue owns the target or is not an intake
+# Sets _DEDUP_DEPENDABOT_BLOCK on block: owned | repo_mismatch |
+#   lookup_unavailable | invalid_evidence (empty when not blocked).
+#######################################
+_DEDUP_DEPENDABOT_BLOCK=""
+_dedup_dependabot_intake_target() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local issue_body="$3"
+	local issue_meta_json="${4:-}"
+	local target_repo=""
+	local target_pr=""
+	local marker=""
+	local issues_json=""
+	local owner_issue=""
+
+	_DEDUP_DEPENDABOT_BLOCK=""
+	if [[ -n "$issue_meta_json" ]] && printf '%s' "$issue_meta_json" |
+		jq -e '[.labels[]?.name] | index("consolidation-task") != null' >/dev/null 2>&1; then
+		return 1
+	fi
+	if [[ "$issue_body" =~ aidevops:dependabot-pr-intake[[:space:]]repo=([^[:space:]]+)[[:space:]]pr=([0-9]+) ]]; then
+		target_repo="${BASH_REMATCH[1]}"
+		target_pr="${BASH_REMATCH[2]}"
+	else
+		return 1
+	fi
+	[[ "$target_repo" == "$repo_slug" ]] || {
+		echo "[pulse-wrapper] Dedup: Dependabot intake #${issue_number} target repository mismatch; blocking dispatch" >>"$LOGFILE"
+		_DEDUP_DEPENDABOT_BLOCK="repo_mismatch"
+		return 0
+	}
+	marker="<!-- aidevops:dependabot-pr-intake repo=${target_repo} pr=${target_pr} -->"
+	issues_json=$(gh_issue_list --repo "$repo_slug" --state open --label dependencies \
+		--limit 501 --json number,body,labels,assignees 2>/dev/null) || {
+		echo "[pulse-wrapper] Dedup: authoritative Dependabot intake lookup unavailable for #${issue_number}; blocking dispatch" >>"$LOGFILE"
+		_DEDUP_DEPENDABOT_BLOCK="lookup_unavailable"
+		return 0
+	}
+	owner_issue=$(printf '%s' "$issues_json" | jq -er --arg marker "$marker" '
+		if length >= 501 then error("intake lookup truncated") else [.[]
+			| ([.labels[]?.name // ""] | unique) as $labels
+			| select(($labels | index("origin:worker")) != null)
+			| select(($labels | index("dependencies")) != null)
+			| select((.body // "") | contains($marker))] as $matches
+		| if ($matches | length) == 0 then error("missing current intake") else
+			([$matches[]
+				| select(((.assignees // []) | length) > 0 or
+					([.labels[]?.name // ""] | any(. == "status:in-progress" or . == "status:in-review")))
+				| .number] | min) // ([$matches[].number] | min)
+		end end' 2>/dev/null) || {
+		echo "[pulse-wrapper] Dedup: invalid Dependabot intake evidence for #${issue_number}; blocking dispatch" >>"$LOGFILE"
+		_DEDUP_DEPENDABOT_BLOCK="invalid_evidence"
+		return 0
+	}
+	if [[ "$owner_issue" != "$issue_number" ]]; then
+		echo "[pulse-wrapper] Dedup: Dependabot PR #${target_pr} intake #${issue_number} blocked by target owner #${owner_issue}" >>"$LOGFILE"
+		_DEDUP_DEPENDABOT_BLOCK="owned"
+		return 0
+	fi
+	return 1
+}
+
 #######################################
 # Layer 1 (GH#6696): in-flight dispatch ledger check.
 # Catches workers in the 10-15 min gap between dispatch and PR creation.
@@ -215,17 +302,33 @@ _dedup_layer4_pr_evidence() {
 	if [[ -x "$dedup_helper" ]]; then
 		dedup_helper_output=$("$dedup_helper" has-open-pr "$issue_number" "$repo_slug" "$issue_title" 2>>"$LOGFILE") || dedup_helper_rc=$?
 		if [[ "$dedup_helper_output" == *"PR_LOOKUP_RESULT=uncertain"* ]]; then
-			echo "[pulse-wrapper] Dedup: ${dedup_helper_output}" >>"$LOGFILE"
+			echo "[pulse-wrapper] Dedup: ${dedup_helper_output} issue=#${issue_number} repo=${repo_slug}" >>"$LOGFILE"
 			printf 'pr_lookup_uncertain\n'
 			return 0
 		fi
 		if [[ "$dedup_helper_rc" -eq 0 ]]; then
+			# Recover an exact approved draft before treating existing PR evidence
+			# as terminal. Failure still blocks replacement implementation workers.
+			if _dispatch_revised_checkpoint "$issue_number" "$repo_slug" "${self_login:-}"; then
+				return 0
+			fi
 			if [[ -n "$dedup_helper_output" ]]; then
-				echo "[pulse-wrapper] Dedup: ${dedup_helper_output}" >>"$LOGFILE"
+				echo "[pulse-wrapper] Dedup: ${dedup_helper_output} issue=#${issue_number} repo=${repo_slug}" >>"$LOGFILE"
 			else
 				echo "[pulse-wrapper] Dedup: PR evidence already exists for #${issue_number} in ${repo_slug}" >>"$LOGFILE"
 			fi
 			if [[ "$dedup_helper_output" == WORKER_DRAFT_CHECKPOINT:* ]]; then
+				if _dispatch_stalled_checkpoint_continuation "$issue_number" "$repo_slug" \
+					"$dedup_helper_output" "${self_login:-}"; then
+					# The continuation helper verifies released/expired ownership;
+					# preserve that distinction through the outer dedup classifier.
+					# GH#37779: name a re-arm block or terminal action in the signal.
+					printf 'stale_draft_checkpoint: %s%s\n' \
+						"${_DEDUP_STALLED_CHECKPOINT_SIGNAL:+${_DEDUP_STALLED_CHECKPOINT_SIGNAL} }" "$dedup_helper_output"
+					return 0
+				fi
+				printf '%s\n' "$dedup_helper_output"
+				_dispatch_blocked_checkpoint_attention "$issue_number" "$repo_slug" "$dedup_helper_output"
 				return 2
 			fi
 			return 0
@@ -320,6 +423,126 @@ _dispatch_stale_pr_checkpoint_continuation() {
 # Args: issue number, repo slug, issue title, authenticated login, issue JSON
 # Exit: 0=routed/deduplicated, 1=not a machine checkpoint, 2=verified candidate blocked
 #######################################
+_dispatch_revised_checkpoint() {
+	local issue="$1" repo="$2" login="$3" path=""
+	local attempt_log=""
+	[[ -n "$login" ]] || return 1
+	if declare -F has_worker_for_repo_issue >/dev/null 2>&1 && has_worker_for_repo_issue "$issue" "$repo"; then
+		return 1
+	fi
+	declare -F _pulse_merge_repo_path_for_slug >/dev/null 2>&1 || return 1
+	path=$(_pulse_merge_repo_path_for_slug "$repo" 2>/dev/null) || return 1
+	[[ -d "$path" ]] || return 1
+	if ! declare -F _hrw_create_detached_log >/dev/null 2>&1; then
+		# shellcheck source=./headless-runtime-worker-prepare.sh
+		source "${BASH_SOURCE[0]%/*}/headless-runtime-worker-prepare.sh"
+	fi
+	attempt_log=$(_hrw_create_detached_log "pr-checkpoint-continuation-${repo}-${issue}") || return 2
+	printf '[pulse-wrapper] revision dispatch issue=%s repo=%s attempt_log=%s\n' "$issue" "$repo" "$attempt_log" >>"$LOGFILE"
+	local -x AIDEVOPS_WORKER_ATTEMPT_LOG="$attempt_log"
+	"${SCRIPT_DIR}/pr-checkpoint-continuation-helper.sh" dispatch-approved \
+		"$repo" "$path" "$issue" "$login" >>"$attempt_log" 2>&1
+	return $?
+}
+
+#######################################
+# GH#33132: a worker that released as `blocked` after opening a draft leaves
+# the objective held here by WORKER_DRAFT_CHECKPOINT with no approval prompt.
+# Ask the continuation helper for one deduplicated attention record per PR
+# head and blocked release. Best-effort: it never dispatches, relabels or
+# reassigns, and the draft remains a hard duplicate-dispatch block.
+# Arguments: issue_number, repo_slug, WORKER_DRAFT_CHECKPOINT output
+#######################################
+_dispatch_blocked_checkpoint_attention() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local checkpoint_output="$3"
+	local pr_number=""
+	[[ "$checkpoint_output" =~ WORKER_DRAFT_CHECKPOINT:[[:space:]]draft[[:space:]]PR[[:space:]]#([0-9]+) ]] || return 0
+	pr_number="${BASH_REMATCH[1]}"
+	"${SCRIPT_DIR}/pr-checkpoint-continuation-helper.sh" blocked-attention \
+		"$repo_slug" "$issue_number" "$pr_number" >>"$LOGFILE" 2>&1 || true
+	return 0
+}
+
+#######################################
+# GH#33654: a worker killed by a stall/timeout after opening its draft releases
+# the issue unassigned, so stale-assignment recovery never emits
+# STALE_PR_CONTINUATION and the blocked-release attention path skips it. Ask
+# the continuation helper to verify the stall release and launch the bounded
+# exact-head continuation (or record attention once a continuation of the same
+# head also stalled). The draft stays a hard duplicate-dispatch block.
+# Arguments: issue_number, repo_slug, WORKER_DRAFT_CHECKPOINT output, login
+# Exit: 0 when routed/deduplicated/attention recorded, 1 when not applicable
+#######################################
+_dispatch_stalled_checkpoint_continuation() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local checkpoint_output="$3"
+	local self_login="$4"
+	local pr_number="" repo_path=""
+	_DEDUP_STALLED_CHECKPOINT_SIGNAL=""
+	[[ -n "$self_login" ]] || return 1
+	[[ "$checkpoint_output" =~ WORKER_DRAFT_CHECKPOINT:[[:space:]]draft[[:space:]]PR[[:space:]]#([0-9]+) ]] || return 1
+	pr_number="${BASH_REMATCH[1]}"
+	if declare -F has_worker_for_repo_issue >/dev/null 2>&1 && has_worker_for_repo_issue "$issue_number" "$repo_slug"; then
+		return 1
+	fi
+	declare -F _pulse_merge_repo_path_for_slug >/dev/null 2>&1 || return 1
+	repo_path=$(_pulse_merge_repo_path_for_slug "$repo_slug" 2>/dev/null) || return 1
+	[[ -n "$repo_path" && -d "$repo_path" ]] || return 1
+	# GH#37779: keep the helper output in a file, never a pipe: a detached
+	# continuation worker may inherit the descriptor. The output names the
+	# re-arm block or terminal action so the dispatch signal can carry it.
+	local output_file="" helper_rc=0 helper_output=""
+	output_file=$(mktemp "${TMPDIR:-/tmp}/pcc-dispatch-stalled.XXXXXX") || output_file=""
+	if [[ -z "$output_file" ]]; then
+		"${SCRIPT_DIR}/pr-checkpoint-continuation-helper.sh" dispatch-stalled \
+			"$repo_slug" "$repo_path" "$issue_number" "$pr_number" "$self_login" >>"$LOGFILE" 2>&1 || helper_rc=$?
+	else
+		"${SCRIPT_DIR}/pr-checkpoint-continuation-helper.sh" dispatch-stalled \
+			"$repo_slug" "$repo_path" "$issue_number" "$pr_number" "$self_login" >"$output_file" 2>&1 || helper_rc=$?
+		helper_output=$(<"$output_file") || helper_output=""
+		rm -f "$output_file"
+		[[ -z "$helper_output" ]] || printf '%s\n' "$helper_output" >>"$LOGFILE"
+		_DEDUP_STALLED_CHECKPOINT_SIGNAL=$(_dispatch_stalled_checkpoint_signal "$helper_output")
+	fi
+	if [[ "$helper_rc" -eq 0 ]]; then
+		echo "[pulse-wrapper] Dedup: routed stall-released worker draft PR #${pr_number} for issue #${issue_number} in ${repo_slug} (GH#33654)${_DEDUP_STALLED_CHECKPOINT_SIGNAL:+ ${_DEDUP_STALLED_CHECKPOINT_SIGNAL}}" >>"$LOGFILE"
+		return 0
+	fi
+	return 1
+}
+
+#######################################
+# GH#37779: summarise why a routed stalled checkpoint is still held, so the
+# DISPATCH_BLOCK_REASON signal distinguishes the per-PR fuse, a pending
+# all-runners-tried window and a terminal action from a silent hold.
+# Arguments: dispatch-stalled helper output
+# Output: terminal_action=<action> | terminal_deferred=<reason> |
+#         rearm_blocked=<reason> | empty
+#######################################
+_dispatch_stalled_checkpoint_signal() {
+	local output="$1"
+	local line="" rearm="" terminal=""
+	local action_re='^STALLED_CHECKPOINT_TERMINAL_ACTION: .* action=([a-z_]+)'
+	local held_re='^STALLED_CHECKPOINT_TERMINAL_(DEFERRED|SKIPPED): .* reason=([a-z_]+)'
+	local rearm_re='^STALLED_CHECKPOINT_REARM_BLOCKED: .* reason=([a-z_]+)( window=([0-9]+s|unknowns))?'
+	while IFS= read -r line; do
+		if [[ "$line" =~ $action_re ]]; then
+			terminal="terminal_action=${BASH_REMATCH[1]}"
+		elif [[ "$line" =~ $held_re ]]; then
+			terminal="terminal_skipped=${BASH_REMATCH[2]}"
+			[[ "${BASH_REMATCH[1]}" != DEFERRED ]] || terminal="terminal_deferred=${BASH_REMATCH[2]}"
+		elif [[ "$line" =~ $rearm_re ]]; then
+			rearm="rearm_blocked=${BASH_REMATCH[1]}${BASH_REMATCH[3]:+:${BASH_REMATCH[3]}}"
+		fi
+	done <<<"$output"
+	# A terminal outcome is the more specific signal for the same sweep.
+	[[ -z "${terminal:-$rearm}" ]] || printf '%s\n' "${terminal:-$rearm}"
+	return 0
+}
+
 _dispatch_interactive_worker_checkpoint_continuation() {
 	local issue_number="$1"
 	local repo_slug="$2"
@@ -332,6 +555,9 @@ _dispatch_interactive_worker_checkpoint_continuation() {
 	local pr_number=""
 	local continuation_signal=""
 
+	if _dispatch_revised_checkpoint "$issue_number" "$repo_slug" "$self_login"; then
+		return 0
+	fi
 	printf '%s' "$issue_meta_json" | jq -e '
 		([.labels[]?.name]) as $labels |
 		((.state // "") | ascii_upcase) == "OPEN" and
@@ -460,6 +686,10 @@ _dedup_layer6_assignee_and_stale() {
 			# instead of a bare "Reason: stale_timeout" with no signal.
 			local _stale_crash_type
 			_stale_crash_type=$(_classify_stale_recovery_crash_type "$issue_number" "$repo_slug")
+			if [[ "$_stale_crash_type" != "no_work" && "$_stale_crash_type" != "partial" ]]; then
+				echo "[pulse-wrapper] Dedup: stale recovery crash evidence unavailable for #${issue_number} in ${repo_slug} — skipping fast-fail record" >>"$LOGFILE"
+				return 1
+			fi
 			echo "[pulse-wrapper] Dedup: stale recovery detected for #${issue_number} in ${repo_slug} crash_type=${_stale_crash_type} — recording fast-fail (t1927/t2042)" >>"$LOGFILE"
 			fast_fail_record "$issue_number" "$repo_slug" "stale_timeout" "" "$_stale_crash_type" || true
 		fi
@@ -490,6 +720,7 @@ _dedup_layer7_claim_lock() {
 	local repo_slug="$2"
 	local self_login="$3"
 	local dedup_helper="${SCRIPT_DIR}/dispatch-dedup-helper.sh"
+	local claim_helper="${SCRIPT_DIR}/dispatch-claim-helper.sh"
 	# GH#15317: reset the dynamically-scoped _claim_comment_id unconditionally
 	# so the dispatch_with_dedup caller always sees a fresh value. Do NOT
 	# declare local here — see function header.
@@ -497,26 +728,32 @@ _dedup_layer7_claim_lock() {
 	_claim_lease_token=""
 	_claim_lease_device=""
 	if [[ -x "$dedup_helper" ]] && [[ "$issue_number" =~ ^[0-9]+$ ]]; then
+		if [[ ! -x "$claim_helper" ]]; then
+			echo "[pulse-wrapper] Dedup: claim helper unavailable — blocking dispatch (fail-closed)" >>"$LOGFILE"
+			return 0
+		fi
 		# GH#17590: Pre-check for existing claims BEFORE posting our own.
 		# Without this, two runners both post claims within seconds, then
 		# the consensus window resolves the race — but the losing claim
 		# comment is left on the issue, wasting a GitHub API call and
 		# cluttering the issue. The pre-check is cheap (read-only) and
 		# catches the common case where another runner already claimed.
-		local _precheck_output="" _precheck_exit=0
-		_precheck_output=$("$dedup_helper" check-claim "$issue_number" "$repo_slug") || _precheck_exit=$?
-		if [[ "$_precheck_exit" -eq 0 ]]; then
-			# Active claim exists from another runner — skip claim entirely
-			echo "[pulse-wrapper] Dedup: pre-check found active claim on #${issue_number} in ${repo_slug} — skipping (${_precheck_output})" >>"$LOGFILE"
-			return 0
-		fi
-		if [[ "$_precheck_exit" -eq 2 ]]; then
-			echo "[pulse-wrapper] Dedup: claim pre-check error for #${issue_number} in ${repo_slug} — blocking dispatch for this cycle (fail-closed)" >>"$LOGFILE"
-			return 0
-		fi
-		# No active claim found (exit 1) — proceed to claim.
+		# Private, attempt-local snapshot is only for takeover annotation. The
+		# post-consensus claim read must always fetch the live GitHub timeline.
+		# GH#33202: these must stay in this function; set -u aborts dispatch
+		# when they are declared anywhere else.
+		local claim_snapshot=""
+		claim_snapshot=$(umask 077; mktemp "${AIDEVOPS_TEMP_DIR:-${HOME}/.aidevops/.agent-workspace/tmp}/dispatch-claim.XXXXXX") || claim_snapshot=""
+		local _claim_started_ns=""
+		_claim_started_ns=$(_ds_now_ns)
+		# Bypass the CLI forwarding wrapper, not its assignment guard: cmd_claim
+		# runs the same recovery-enabled guard before publishing the claim.
+		# One process retains the precheck snapshot and sources libraries once.
 		local claim_exit=0 claim_output=""
-		claim_output=$("$dedup_helper" claim "$issue_number" "$repo_slug" "$self_login" 2>>"$LOGFILE") || claim_exit=$?
+		# shellcheck disable=SC2094 # LOGFILE is an output-only diagnostic sink, not an input.
+		claim_output=$(AIDEVOPS_DISPATCH_CLAIM_CALL_LOG="$LOGFILE" DISPATCH_CLAIM_SNAPSHOT_FILE="$claim_snapshot" "$claim_helper" check-and-claim "$issue_number" "$repo_slug" "$self_login" 2>>"$LOGFILE") || claim_exit=$?
+		[[ -z "$claim_snapshot" ]] || rm -f "$claim_snapshot"
+		_ds_record "$issue_number" "$repo_slug" "claim_consensus" "$_claim_started_ns"
 		echo "$claim_output" >>"$LOGFILE"
 		if [[ "$claim_exit" -eq 1 ]]; then
 			echo "[pulse-wrapper] Dedup: claim lost for #${issue_number} in ${repo_slug} — another runner claimed first (GH#11086)" >>"$LOGFILE"

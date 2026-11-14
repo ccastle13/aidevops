@@ -8,7 +8,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit
-CORE_SCRIPT="${SCRIPT_DIR}/../pulse-dispatch-core.sh"
+CORE_SCRIPT="${SCRIPT_DIR}/../pulse-dispatch-commit-gates.sh"
+ORCHESTRATOR_SCRIPT="${SCRIPT_DIR}/../pulse-dispatch-core.sh"
 
 readonly TEST_RED='\033[0;31m'
 readonly TEST_GREEN='\033[0;32m'
@@ -213,10 +214,48 @@ test_read_collaborator_without_approval_blocks() {
 test_collaborator_permission_lookup_failure_blocks() {
 	setup_case "COLLABORATOR" "User" "" 2
 	if _check_external_issue_author_gate 23 "owner/repo"; then
-		print_result "collaborator permission lookup failure blocks" 0
+		if grep -q -- '--add-label needs-maintainer-review' "$GH_CALLS_FILE"; then
+			print_result "collaborator permission lookup failure blocks without NMR" 1 "Unexpected label mutation"
+		else
+			print_result "collaborator permission lookup failure blocks without NMR" 0
+		fi
 	else
-		print_result "collaborator permission lookup failure blocks" 1 "Expected gate to fail closed"
+		print_result "collaborator permission lookup failure blocks without NMR" 1 "Expected gate to fail closed"
 	fi
+	cleanup_case
+	return 0
+}
+
+# GH#34644: private org members (including org admins) are reported as
+# CONTRIBUTOR; the shared authority helper resolves them via permission lookup.
+test_write_authorized_contributor_allows_dispatch() {
+	setup_case "CONTRIBUTOR" "User" "" 0
+	if _check_external_issue_author_gate 34644 "owner/repo"; then
+		print_result "write-authorized CONTRIBUTOR author bypasses external gate" 1 "Expected gate to allow dispatch"
+	elif grep -q -- '--add-label' "$GH_CALLS_FILE"; then
+		print_result "write-authorized CONTRIBUTOR author bypasses external gate" 1 "Unexpected label mutation"
+	else
+		print_result "write-authorized CONTRIBUTOR author bypasses external gate" 0
+	fi
+	cleanup_case
+	return 0
+}
+
+test_nmr_label_failure_is_logged() {
+	setup_case "CONTRIBUTOR" "User" "" 1
+	gh_issue_edit_safe() {
+		printf 'gh_issue_edit_safe %s\n' "$*" >>"$GH_CALLS_FILE"
+		return 1
+	}
+	if _check_external_issue_author_gate 34645 "owner/repo" && grep -q 'failed to apply needs-maintainer-review' "$LOGFILE"; then
+		print_result "failed NMR label write keeps block and is logged" 0
+	else
+		print_result "failed NMR label write keeps block and is logged" 1 "Expected block plus label-failure log"
+	fi
+	gh_issue_edit_safe() {
+		printf 'gh_issue_edit_safe %s\n' "$*" >>"$GH_CALLS_FILE"
+		return 0
+	}
 	cleanup_case
 	return 0
 }
@@ -239,13 +278,13 @@ test_external_origin_bot_without_approval_blocks() {
 test_bot_with_null_labels_fails_closed() {
 	setup_case "NONE" "Bot" "" 0 false null
 	if _check_external_issue_author_gate 25 "owner/repo"; then
-		if grep -q -- '--add-label needs-maintainer-review' "$GH_CALLS_FILE"; then
-			print_result "bot with null labels fails closed and applies NMR" 0
+		if ! grep -q -- '--add-label needs-maintainer-review' "$GH_CALLS_FILE"; then
+			print_result "bot with null labels defers without NMR" 0
 		else
-			print_result "bot with null labels fails closed and applies NMR" 1 "NMR label was not applied"
+			print_result "bot with null labels defers without NMR" 1 "Unexpected label mutation"
 		fi
 	else
-		print_result "bot with null labels fails closed and applies NMR" 1 "Expected gate to block"
+		print_result "bot with null labels defers without NMR" 1 "Expected gate to block"
 	fi
 	cleanup_case
 	return 0
@@ -254,13 +293,13 @@ test_bot_with_null_labels_fails_closed() {
 test_bot_with_missing_labels_fails_closed() {
 	setup_case "NONE" "Bot" "" 0 false missing
 	if _check_external_issue_author_gate 26 "owner/repo"; then
-		if grep -q -- '--add-label needs-maintainer-review' "$GH_CALLS_FILE"; then
-			print_result "bot with missing labels fails closed and applies NMR" 0
+		if ! grep -q -- '--add-label needs-maintainer-review' "$GH_CALLS_FILE"; then
+			print_result "bot with missing labels defers without NMR" 0
 		else
-			print_result "bot with missing labels fails closed and applies NMR" 1 "NMR label was not applied"
+			print_result "bot with missing labels defers without NMR" 1 "Unexpected label mutation"
 		fi
 	else
-		print_result "bot with missing labels fails closed and applies NMR" 1 "Expected gate to block"
+		print_result "bot with missing labels defers without NMR" 1 "Expected gate to block"
 	fi
 	cleanup_case
 	return 0
@@ -269,13 +308,13 @@ test_bot_with_missing_labels_fails_closed() {
 test_bot_with_empty_label_name_fails_closed() {
 	setup_case "NONE" "Bot" "" 0 false empty-name
 	if _check_external_issue_author_gate 27 "owner/repo"; then
-		if grep -q -- '--add-label needs-maintainer-review' "$GH_CALLS_FILE"; then
-			print_result "bot with empty label name fails closed and applies NMR" 0
+		if ! grep -q -- '--add-label needs-maintainer-review' "$GH_CALLS_FILE"; then
+			print_result "bot with empty label name defers without NMR" 0
 		else
-			print_result "bot with empty label name fails closed and applies NMR" 1 "NMR label was not applied"
+			print_result "bot with empty label name defers without NMR" 1 "Unexpected label mutation"
 		fi
 	else
-		print_result "bot with empty label name fails closed and applies NMR" 1 "Expected gate to block"
+		print_result "bot with empty label name defers without NMR" 1 "Expected gate to block"
 	fi
 	cleanup_case
 	return 0
@@ -314,16 +353,91 @@ test_author_lookup_failure_fails_closed() {
 	setup_case "" "" ""
 	rm -f "${TEST_ROOT}/issue-meta.json"
 	if _check_external_issue_author_gate 4 "owner/repo"; then
-		if grep -q -- '--add-label needs-maintainer-review' "$GH_CALLS_FILE"; then
-			print_result "author lookup failure fails closed with NMR" 0
+		if ! grep -q -- '--add-label needs-maintainer-review' "$GH_CALLS_FILE"; then
+			print_result "author lookup failure defers without NMR" 0
 			cleanup_case
 			return 0
 		fi
-		print_result "author lookup failure fails closed with NMR" 1 "NMR label was not applied"
+		print_result "author lookup failure defers without NMR" 1 "Unexpected label mutation"
 		cleanup_case
 		return 0
 	fi
-	print_result "author lookup failure fails closed with NMR" 1 "Expected gate to block on lookup failure"
+	print_result "author lookup failure defers without NMR" 1 "Expected gate to block on lookup failure"
+	cleanup_case
+	return 0
+}
+
+test_dedup_author_gate_integration() {
+	local caller_src
+	# The orchestrator delegates to four extracted gates. Include their actual
+	# implementations so this isolated integration check exercises the caller chain.
+	caller_src=$(awk '/^_dispatch_dedup_capacity_gates\(\) \{/,/^}$/ { print } /^_dispatch_dedup_state_label_gates\(\) \{/,/^}$/ { print } /^_dispatch_dedup_dependency_gates\(\) \{/,/^}$/ { print } /^_dispatch_dedup_scope_gates\(\) \{/,/^}$/ { print } /^_dispatch_dedup_check_layers\(\) \{/,/^}$/ { print }' "$ORCHESTRATOR_SCRIPT")
+	eval "$caller_src"
+	# Isolate unrelated pre-dispatch dependencies; exercise the actual caller,
+	# author gate, JSON validation and GitHub mock together without network I/O.
+	_ds_now_ns() { printf '0\n'; }
+	_ds_record() { return 0; }
+	_ds_stage_start() { return 0; }
+	_PULSE_DISPATCH_DEDUP_LABEL_CHECK_STAGE="dedup.label_checks"
+	_PULSE_DISPATCH_OPEN_STATE="OPEN"
+	_dispatch_interactive_hold_gate() { return 1; }
+	aidevops_worktree_capacity_check() { return 0; }
+	_dispatch_worktree_capacity_gate() { return 0; }
+	_has_publication_pending_label() { return 1; }
+	_has_consolidated_label() { return 1; }
+	_check_nmr_approval_gate() { return 1; }
+	is_blocked_by_unresolved() { return 1; }
+	local consolidation_calls_file=""
+	consolidation_calls_file=$(mktemp 2>/dev/null || mktemp -t aidevops-gh32729)
+	# GH#32729: costly scope gates must not run for a candidate the read-only
+	# dedup layers already rejected.
+	_issue_needs_consolidation() {
+		printf '%s\n' "$1" >>"$consolidation_calls_file"
+		return 1
+	}
+	_issue_targets_large_files() { return 1; }
+	_dedup_dependabot_intake_target() { return 1; }
+	_footprint_check_overlap() { return 0; }
+	check_dispatch_dedup() { return "$mock_dedup_rc"; }
+	local mock_dedup_rc=0 rc=0
+	local meta='{"state":"OPEN","title":"Fixture","labels":[],"body":""}'
+	setup_case "CONTRIBUTOR" "User" ""
+	_dispatch_dedup_check_layers 31404 owner/repo Fixture Fixture runner "$TEST_ROOT" "$meta" || rc=$?
+	if [[ "$rc" -eq 1 && ! -s "$GH_CALLS_FILE" ]]; then
+		print_result "active claim skips author metadata lookup and mutation" 0
+	else
+		print_result "active claim skips author metadata lookup and mutation" 1 "rc=$rc"
+	fi
+	if [[ ! -s "$consolidation_calls_file" ]]; then
+		print_result "active claim skips costly consolidation gate" 0
+	else
+		print_result "active claim skips costly consolidation gate" 1 "consolidation ran before dedup rejected the candidate"
+	fi
+	# A successful API with empty output must defer, not allow dispatch.
+	mock_dedup_rc=1
+	: >"${TEST_ROOT}/issue-meta.json"
+	rc=0
+	_dispatch_dedup_check_layers 31404 owner/repo Fixture Fixture runner "$TEST_ROOT" "$meta" || rc=$?
+	if [[ "$rc" -eq 1 ]] && ! grep -q -- '--add-label' "$GH_CALLS_FILE" && grep -q 'metadata fetch failed' "$LOGFILE"; then
+		print_result "empty metadata skips dispatch without labels and logs retry" 0
+	else
+		print_result "empty metadata skips dispatch without labels and logs retry" 1 "rc=$rc"
+	fi
+	cleanup_case
+	setup_case "NONE" "Bot" "" 0
+	rc=0
+	_dispatch_dedup_check_layers 31404 owner/repo Fixture Fixture runner "$TEST_ROOT" "$meta" || rc=$?
+	if [[ "$rc" -eq 0 ]] && ! grep -q -- '--add-label' "$GH_CALLS_FILE"; then
+		print_result "trusted bot dispatch resumes when metadata recovers" 0
+	else
+		print_result "trusted bot dispatch resumes when metadata recovers" 1 "rc=$rc"
+	fi
+	if grep -qx '31404' "$consolidation_calls_file"; then
+		print_result "unclaimed candidate still runs consolidation gate" 0
+	else
+		print_result "unclaimed candidate still runs consolidation gate" 1 "consolidation gate was skipped"
+	fi
+	rm -f "$consolidation_calls_file"
 	cleanup_case
 	return 0
 }
@@ -339,6 +453,8 @@ main() {
 	test_collaborator_author_allows_dispatch
 	test_read_collaborator_without_approval_blocks
 	test_collaborator_permission_lookup_failure_blocks
+	test_write_authorized_contributor_allows_dispatch
+	test_nmr_label_failure_is_logged
 	test_external_origin_bot_without_approval_blocks
 	test_bot_with_null_labels_fails_closed
 	test_bot_with_missing_labels_fails_closed
@@ -346,6 +462,7 @@ main() {
 	test_external_author_with_crypto_approval_allows_dispatch
 	test_external_author_with_unverifiable_approval_blocks_without_reapplying_nmr
 	test_author_lookup_failure_fails_closed
+	test_dedup_author_gate_integration
 
 	printf '\nRan %s tests, %s failed.\n' "$TESTS_RUN" "$TESTS_FAILED"
 	if [[ "$TESTS_FAILED" -gt 0 ]]; then

@@ -4,6 +4,14 @@
 
 set -uo pipefail
 
+# Resolve native Git once from the system default PATH (portable to non-FHS
+# hosts such as NixOS); fixtures must bypass the aidevops git wrapper.
+TEST_NATIVE_GIT=$(command -p -v git) || {
+	printf '%s\n' 'Native Git is unavailable on the system PATH' >&2
+	exit 1
+}
+export TEST_NATIVE_GIT
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || exit 1
 HELPER="${SCRIPT_DIR}/command-policy-helper.py"
 POLICY="${SCRIPT_DIR}/../configs/command-policy.json"
@@ -15,7 +23,7 @@ trap 'rm -rf "$TEST_ROOT"' EXIT
 # Fixture construction must bypass the deployed guard shim. Policy assertions
 # still invoke canonical-git-command-guard.py through the helper under test.
 git() {
-	/usr/bin/git "$@"
+	"$TEST_NATIVE_GIT" "$@"
 	return $?
 }
 
@@ -470,6 +478,34 @@ PY
 	return 0
 }
 
+test_workspace_repository_creation() {
+	local workspace="${TEST_ROOT}/create-projects"
+	local repo="${workspace}/repo-a"
+	local outside="${TEST_ROOT}/create-outside"
+	local sibling="${workspace}-sibling"
+	local escape="${workspace}/escape"
+	local allowed='"decision": "allow"'
+
+	mkdir -p "$repo" "$outside" "$sibling"
+	ln -s "$outside" "$escape"
+
+	assert_authorized_decision "workspace session creates a remote-only repository without authorization" "" "gh repo create owner/new-repo --public --add-readme --license mit --description 'New package'" 0 "$allowed" "$repo" "$workspace"
+	assert_authorized_decision "workspace root itself creates a repository without authorization" "" "gh repo create new-repo --private" 0 "$allowed" "$workspace" "$workspace"
+	assert_authorized_decision "workspace session uses the repository new alias without authorization" "" "gh repo new owner/new-alias --private" 0 "$allowed" "$repo" "$workspace"
+	assert_authorized_decision "creation outside the workspace still needs authorization" "" "gh repo create owner/new-repo --public" 20 "github.account-mutation" "$outside" "$workspace"
+	assert_authorized_decision "sibling-prefix directory is outside the workspace" "" "gh repo create owner/new-repo --public" 20 "github.account-mutation" "$sibling" "$workspace"
+	assert_authorized_decision "symlink escape is outside the workspace" "" "gh repo create owner/new-repo --public" 20 "github.account-mutation" "$escape" "$workspace"
+	assert_authorized_decision "local source creation still needs authorization" "" "gh repo create owner/new-repo --public --source=." 20 "github.account-mutation" "$repo" "$workspace"
+	assert_authorized_decision "clone-capable creation still needs authorization" "" "gh repo create owner/new-repo --public --clone" 20 "github.account-mutation" "$repo" "$workspace"
+	assert_authorized_decision "creation without explicit visibility still needs authorization" "" "gh repo create owner/new-repo --public=false" 20 "github.account-mutation" "$repo" "$workspace"
+	assert_authorized_decision "forks still need authorization inside the workspace" "" "gh repo fork owner/source --clone=false" 20 "github.account-mutation" "$repo" "$workspace"
+	assert_authorized_decision "compound creation still needs authorization" "" "gh repo create owner/new-repo --public && printf done" 20 "github.account-mutation" "$repo" "$workspace"
+	assert_authorized_decision "privileged wrapper creation still needs authorization" "" "sudo -n gh repo create owner/new-repo --public" 20 "github.account-mutation" "$repo" "$workspace"
+	assert_authorized_decision "shell-launched creation still needs authorization" "" "bash -lc 'gh repo create owner/new-repo --public'" 20 "github.account-mutation" "$repo" "$workspace"
+	assert_authorized_decision "disabled workspace root keeps creation authorization-gated" "" "gh repo create owner/new-repo --public" 20 "github.account-mutation" "$repo" ""
+	return 0
+}
+
 test_account_mutation_guard_validation() {
 	local malformed_guard="${TEST_ROOT}/malformed-account-guard.json"
 	local output=""
@@ -532,6 +568,11 @@ test_static_decisions() {
 	assert_argv_decision "treats dash-prefixed operand after separator as deletion target" forbid filesystem.rm-recursive-force 20 "/work" rm -rf -- -rf
 	assert_argv_decision "argv preserves spaces" allow command.default-allow 0 "$TEST_ROOT" printf "%s" "curl https://requestbin.com/a path"
 	assert_argv_decision "rejects temp traversal before exemption" forbid filesystem.rm-recursive-force 20 "$TEST_ROOT" rm -rf "/tmp/../home/example"
+	assert_argv_decision "forbids reordered bare OpenCode long continuation" forbid opencode.bare-continue 20 "$TEST_ROOT" opencode run --format default --continue Continue
+	assert_argv_decision "forbids bare OpenCode short continuation" forbid opencode.bare-continue 20 "$TEST_ROOT" /usr/local/bin/opencode run -c Continue
+	assert_argv_decision "allows explicit OpenCode long session" allow command.default-allow 0 "$TEST_ROOT" opencode run --continue --session ses_example Continue
+	assert_argv_decision "allows explicit OpenCode short session" allow command.default-allow 0 "$TEST_ROOT" opencode run -s ses_example -c Continue
+	assert_argv_decision "does not block unrelated continue flags" allow command.default-allow 0 "$TEST_ROOT" other-tool run --continue Continue
 	local nul_output=""
 	local nul_status=0
 	nul_output="$(python3 "$HELPER" check-command --argv-json '["printf","\u0000"]')" || nul_status=$?
@@ -720,7 +761,14 @@ test_canonical_delegation() {
 	printf '{}\n' >"${repo}/.aidevops.json"
 	git -C "$repo" add README.md .aidevops.json
 	git -C "$repo" commit -q -m seed
-	assert_decision "forbids canonical branch mutation through canonical guard" "git branch -m main renamed" forbid git.canonical-worktree 20 "$repo"
+	# GH#32849 exempts unregistered marker repos under temp roots, so the
+	# canonical case must register the fixture in a test-scoped repos.json.
+	local registry="${TEST_ROOT}/repos.json"
+	local empty_registry="${TEST_ROOT}/repos-empty.json"
+	printf '{"initialized_repos":[{"path":"%s"}]}\n' "$repo" >"$registry"
+	printf '{"initialized_repos":[]}\n' >"$empty_registry"
+	AIDEVOPS_REPOS_FILE="$registry" assert_decision "forbids canonical branch mutation through canonical guard" "git branch -m main renamed" forbid git.canonical-worktree 20 "$repo"
+	AIDEVOPS_REPOS_FILE="$empty_registry" assert_decision "allows unregistered temp marker repo branch mutation" "git branch -m main renamed" allow command.default-allow 0 "$repo"
 	git -C "$repo" worktree add -q -b feature/test "$linked"
 	assert_decision "allows linked-worktree branch creation" "git switch -c feature/child" allow command.default-allow 0 "$linked"
 	assert_decision "forbids generic Git destructive operation in linked worktree" "git reset --hard HEAD" forbid git.reset-destructive 20 "$linked"
@@ -784,6 +832,150 @@ test_worker_network_policy() {
 		pass "worker blocks Tier 5 Git remote alias"
 	else
 		fail "worker blocks Tier 5 Git remote alias" "status=${status} output=${output}"
+	fi
+	return 0
+}
+
+assert_worker_git() {
+	local label="$1"
+	local expected_status="$2"
+	local argv_json="$3"
+	local expected_text="${4:-}"
+	local output=""
+	local status=0
+	output="$(python3 "$HELPER" check-command --worker --worker-id test --cwd "${TEST_ROOT}/linked" --argv-json "$argv_json")" || status=$?
+	if [[ "$status" -eq "$expected_status" && "$output" == *"$expected_text"* ]]; then
+		pass "$label"
+	else
+		fail "$label" "status=${status} output=${output}"
+	fi
+	return 0
+}
+
+test_worker_git_default_remote() {
+	local repo="${TEST_ROOT}/repo"
+	git -C "$repo" remote set-url origin https://github.com/example/repo.git
+	assert_worker_git "worker resolves bare git push to origin" 0 '["git","push"]'
+	assert_worker_git "worker resolves bare git fetch to origin" 0 '["git","fetch"]'
+	assert_worker_git "worker resolves bare git pull to origin" 0 '["git","pull","--rebase"]'
+	assert_worker_git "worker blocks fetch of all remotes" 20 '["git","fetch","--all"]' git-fetch-all-remotes
+	assert_worker_git "worker blocks git clone without repository" 20 '["git","clone"]' git-clone-destination-missing
+	assert_worker_git "worker blocks remote URL config override" 20 '["git","-c","remote.origin.url=https://requestbin.com/x.git","push","origin"]' git-network-config-override
+	assert_worker_git "worker blocks ssh command config override" 20 '["git","-c","core.sshCommand=ssh","push","origin"]' git-network-config-override
+	assert_worker_git "worker blocks git-dir override" 20 '["git","--git-dir=/nonexistent/.git","push","origin"]' git-repository-override
+
+	git -C "$repo" config remote.origin.pushurl https://requestbin.com/example/repo.git
+	assert_worker_git "worker classifies origin push URL for bare git push" 20 '["git","push"]' requestbin.com
+	assert_worker_git "worker classifies push URL for named git push" 20 '["git","push","origin","HEAD"]' requestbin.com
+	assert_worker_git "worker ignores push URL for git fetch" 0 '["git","fetch"]'
+	git -C "$repo" config --unset remote.origin.pushurl
+
+	git -C "$repo" remote add other https://requestbin.com/example/repo.git
+	assert_worker_git "worker classifies every --multiple remote" 20 '["git","fetch","--multiple","origin","other"]' requestbin.com
+	git -C "$repo" config remote.pushDefault other
+	assert_worker_git "worker honours remote.pushDefault for bare push" 20 '["git","push"]' requestbin.com
+	assert_worker_git "worker ignores remote.pushDefault for fetch" 0 '["git","fetch"]'
+	git -C "$repo" config branch.feature/test.remote other
+	assert_worker_git "worker honours branch remote for bare fetch" 20 '["git","fetch"]' requestbin.com
+	git -C "$repo" config branch.feature/test.pushRemote origin
+	assert_worker_git "worker honours branch pushRemote over pushDefault" 0 '["git","push"]'
+	git -C "$repo" config --remove-section branch.feature/test
+	git -C "$repo" config --unset remote.pushDefault
+	git -C "$repo" remote remove other
+	return 0
+}
+
+# GH#34040: a failed or slow default-remote query must not anonymously deny the
+# dispatched origin. Query results are injected so the cases are deterministic.
+test_worker_git_default_remote_query_failures() {
+	local output=""
+	local status=0
+	output="$(PYTHONPATH="$SCRIPT_DIR" python3 - <<'PY'
+import subprocess
+
+import command_policy_git as git_policy
+import command_policy_git_default_remote as default_remote
+import command_policy_git_query as network
+
+
+def fake(responses):
+    def run(cwd, args, ok_codes=(0,)):
+        return responses[args[0]]
+    return run
+
+
+entries = ["branch.feature/a.remote origin", "branch.local.remote .", "branch.feature/b.remote upstream"]
+default_remote._run_git_query_detailed = fake({"config": (entries, ""), "symbolic-ref": (None, "exit-128")})
+assert default_remote._default_git_remote("/x", "push") == (["origin", "upstream"], ""), "branch failure superset"
+default_remote._run_git_query_detailed = fake({"config": (["branch.x.remote -evil"], ""), "symbolic-ref": (None, "timeout")})
+assert default_remote._default_git_remote("/x", "fetch") == ([], "branch-query-timeout"), "unsafe superset"
+default_remote._run_git_query_detailed = fake({"config": (None, "exit-3"), "symbolic-ref": (["refs/heads/a"], "")})
+result = {"destinations": [], "unclassified": []}
+git_policy._analyze_git_remote(["git", "push"], "/x", "push", [], result)
+assert result["unclassified"] == ["git-push-destination-missing(config-query-exit-3)"], result
+
+calls = []
+
+
+def flaky(*args, **kwargs):
+    calls.append(kwargs["timeout"])
+    if len(calls) == 1:
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+    return subprocess.CompletedProcess(args[0], 0, "refs/heads/a\n", "")
+
+
+network.subprocess.run = flaky
+assert network._run_git_query_detailed("/x", ["symbolic-ref", "HEAD"]) == (["refs/heads/a"], ""), "retry"
+assert calls == [10, 10], calls
+print("ok")
+PY
+)" || status=$?
+	if [[ "$status" -eq 0 && "$output" == "ok" ]]; then
+		pass "worker default-remote query failures stay attributable and bounded"
+	else
+		fail "worker default-remote query failures stay attributable and bounded" "status=${status} output=${output}"
+	fi
+	return 0
+}
+
+# GH#33065: workers must not disable or redirect commit signing.
+test_worker_signing_overrides() {
+	local denied="git.worker-signing-override"
+	assert_worker_git "worker blocks -c commit.gpgsign=false" 20 '["git","-c","commit.gpgsign=false","commit","-m","x"]' "$denied"
+	assert_worker_git "worker blocks mixed-case -c commit.gpgSign=0" 20 '["git","-c","commit.gpgSign=0","commit","-m","x"]' "$denied"
+	assert_worker_git "worker blocks -c tag.gpgsign=off" 20 '["git","-c","tag.gpgsign=off","tag","-a","v1","-m","x"]' "$denied"
+	assert_worker_git "worker blocks -c gpg.format override" 20 '["git","-c","gpg.format=openpgp","commit","-m","x"]' "$denied"
+	assert_worker_git "worker blocks -c user.signingkey override" 20 '["git","-c","user.signingkey=/tmp/k.pub","commit","-m","x"]' "$denied"
+	assert_worker_git "worker blocks -c gpg.ssh.program override" 20 '["git","-c","gpg.ssh.program=/usr/bin/true","commit","-m","x"]' "$denied"
+	assert_worker_git "worker blocks --config-env signing toggle" 20 '["git","--config-env=commit.gpgsign=SIGN","commit","-m","x"]' "$denied"
+	assert_worker_git "worker blocks commit --no-gpg-sign" 20 '["git","commit","--no-gpg-sign","-m","x"]' "$denied"
+	assert_worker_git "worker blocks abbreviated --no-gpg" 20 '["git","commit","--no-gpg","-m","x"]' "$denied"
+	local subcommand
+	for subcommand in merge rebase cherry-pick revert am pull; do
+		assert_worker_git "worker blocks ${subcommand} --no-gpg-sign" 20 "[\"git\",\"${subcommand}\",\"--no-gpg-sign\",\"HEAD\"]" "$denied"
+	done
+	assert_worker_git "worker blocks tag --no-sign" 20 '["git","tag","--no-sign","v1"]' "$denied"
+	assert_worker_git "worker blocks git config commit.gpgsign false" 20 '["git","config","commit.gpgsign","false"]' "$denied"
+	assert_worker_git "worker blocks git config --global commit.gpgsign no" 20 '["git","config","--global","commit.gpgsign","no"]' "$denied"
+	assert_worker_git "worker blocks git config set commit.gpgsign false" 20 '["git","config","set","commit.gpgsign","false"]' "$denied"
+	assert_worker_git "worker blocks git config --unset commit.gpgsign" 20 '["git","config","--unset","commit.gpgsign"]' "$denied"
+	assert_worker_git "worker blocks git config user.signingkey write" 20 '["git","config","user.signingkey","/tmp/k.pub"]' "$denied"
+	assert_worker_git "worker blocks git config --remove-section gpg" 20 '["git","config","--remove-section","gpg"]' "$denied"
+
+	assert_worker_git "worker allows commit -S" 0 '["git","commit","-S","-m","x"]'
+	assert_worker_git "worker allows commit --gpg-sign" 0 '["git","commit","--gpg-sign","-m","x"]'
+	assert_worker_git "worker allows -c commit.gpgsign=true" 0 '["git","-c","commit.gpgsign=true","commit","-m","x"]'
+	assert_worker_git "worker allows reading commit.gpgsign" 0 '["git","config","--bool","commit.gpgsign"]'
+	assert_worker_git "worker allows --get user.signingkey" 0 '["git","config","--get","user.signingkey"]'
+	assert_worker_git "worker allows --no-gpg-sign text after separator" 0 '["git","log","--","--no-gpg-sign"]'
+	assert_worker_git "worker allows unrelated -c override" 0 '["git","-c","color.ui=never","status"]'
+
+	local output="" status=0
+	output="$(python3 "$HELPER" check-command --cwd "${TEST_ROOT}/linked" --argv-json '["git","commit","--no-gpg-sign","-m","x"]')" || status=$?
+	if [[ "$status" -eq 0 && "$output" != *"$denied"* ]]; then
+		pass "interactive sessions keep signing overrides available"
+	else
+		fail "interactive sessions keep signing overrides available" "status=${status} output=${output}"
 	fi
 	return 0
 }
@@ -953,7 +1145,196 @@ PY
 	return 0
 }
 
+_ssh_binding_fixture_setup() {
+	cat <<'PY'
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import patch
+
+scripts, root = map(Path, sys.argv[1:])
+sys.path.insert(0, str(scripts))
+from command_policy_dispatch import analyze_network_argv
+from ssh_binding_helper import NAMESPACE, binding_command, grant_path, repository_common_dir
+
+home = root / 'ssh-home'
+home.mkdir()
+os.environ['HOME'] = str(home)
+os.environ['AIDEVOPS_TEMP_DIR'] = str(root / 'ssh-tmp')
+env = dict(os.environ)
+repo = root / 'ssh-repo'
+repo.mkdir()
+subprocess.run([os.environ['TEST_NATIVE_GIT'], 'init', '-q', str(repo)], check=True)
+subprocess.run([os.environ['TEST_NATIVE_GIT'], '-C', str(repo), 'remote', 'add', 'origin',
+                'https://github.com/owner/operations.git'], check=True)
+keys = home / '.aidevops/approval-keys'
+keys.mkdir(parents=True)
+key = root / 'fixture-ssh-signing-key'
+subprocess.run(['/usr/bin/ssh-keygen', '-t', 'ed25519', '-N', '', '-q', '-f', str(key)], check=True)
+(keys / 'approval.pub').write_bytes(Path(str(key) + '.pub').read_bytes())
+argv = ['ssh', '-F', '/dev/null', '-o', 'HostName=ci.example.com', '-o', 'ProxyCommand=none',
+        '-o', 'ProxyJump=none', '-o', 'ClearAllForwardings=yes', '-o', 'PermitLocalCommand=no',
+        '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-l', 'deploy', '-p', '22', 'ci-alias', 'id']
+count = 0
+
+def check(name, condition):
+    global count
+    assert condition, name
+    count += 1
+    print('PASS SSH', name)
+
+def sign(command, **changes):
+    path = grant_path('owner/operations', command)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    grant = {'schema': NAMESPACE, 'repository': 'owner/operations', 'common_dir': repository_common_dir(str(repo)), 'argv': command,
+             'binding': binding_command(command), 'issued_at': now.isoformat(),
+             'expires_at': (now + timedelta(hours=4)).isoformat()}
+    grant.update(changes)
+    path.write_text(json.dumps(grant))
+    Path(str(path) + '.sig').unlink(missing_ok=True)
+    subprocess.run(['/usr/bin/ssh-keygen', '-Y', 'sign', '-f', str(key), '-n', NAMESPACE, str(path)],
+                   check=True, capture_output=True)
+    return path
+
+def network(command):
+    return analyze_network_argv(command, str(repo))
+
+def worker(command):
+    return subprocess.run(['python3', str(scripts / 'command-policy-helper.py'), 'check-command',
+                           '--worker', '--cwd', str(repo), '--argv-json', json.dumps(command)],
+                          env=env, capture_output=True, text=True)
+
+def preflight(command, class_map=False):
+    issue = {'body': 'requires-ssh: ' + json.dumps(command), 'labels': []}
+    config = repo / '.aidevops.json'
+    if class_map:
+        config.write_text(json.dumps({'dispatch_class_requirements': {'operations': {'ssh_commands': [command]}}}))
+        issue = {'labels': ['dispatch-class:operations'], 'body': ''}
+    else:
+        config.unlink(missing_ok=True)
+    return subprocess.run(['bash', '-c', 'source "$1/runner-capability-helper.sh"; runner_capability_check "$2" "$3"',
+                           'fixture', str(scripts), str(repo), json.dumps(issue)],
+                           env=env, capture_output=True, text=True)
+PY
+	return 0
+}
+
+_ssh_binding_fixture_cases() {
+	cat <<'PY'
+with patch('socket.socket', side_effect=AssertionError('network access forbidden')):
+    check('unknown alias remains unclassified', bool(network(['ssh', 'ci-alias', 'id'])['unclassified']))
+    check('unsigned pinned command denied', bool(network(argv)['unclassified']))
+    denied = preflight(argv)
+    check('preflight missing authorization names recovery', denied.returncode != 0 and
+          'ssh_network_requirement_unmet recovery=reference/ssh-bindings.md' in denied.stdout)
+    cli = subprocess.run(['python3', str(scripts / 'ssh_binding_helper.py'), 'prepare', '--cwd', str(repo),
+                          '--argv-json', json.dumps(argv)], env=env, capture_output=True, text=True)
+    check('preparation writes unsigned request only', cli.returncode == 0 and bool(network(argv)['unclassified']))
+    cli = subprocess.run(['python3', str(scripts / 'ssh_binding_helper.py'), 'prepare', '--cwd', str(repo),
+                          '--argv-json', json.dumps(argv)], env=env, capture_output=True, text=True)
+    check('preparation never overwrites', cli.returncode != 0)
+    path = sign(argv)
+    result = network(argv)
+    check('exact owner binding resolves endpoint and port', result['destinations'] == ['ci.example.com'] and
+          result['endpoints'][0]['port'] == 22 and not result['unclassified'])
+    accepted = worker(argv)
+    check('normal worker policy accepts signed command', accepted.returncode == 0)
+    check('declared preflight authorizes without executing SSH', preflight(argv).returncode == 0)
+    check('dispatch class preflight authorizes', preflight(argv, True).returncode == 0)
+    for suffix in [['-J', 'jump.example.com', 'id'], ['-L', '8080:ci.example.com:22', 'id'], ['-N']]:
+        check('post-target options denied ' + suffix[0], bool(network(argv[:-1] + suffix)['unclassified']))
+    for label, position, replacement in [('command', -1, 'uname'), ('alias', -2, 'other-alias'),
+                                          ('port', -3, '2222'), ('account', -5, 'root'),
+                                          ('endpoint', 4, 'HostName=other.example.com')]:
+        changed = argv.copy()
+        changed[position] = replacement
+        check(label + ' mismatch denied', bool(network(changed)['unclassified']))
+    for option in [['-J', 'jump.example.com'], ['-D', '8080'], ['-L', '8080:ci.example.com:22'],
+                   ['-R', '8080:ci.example.com:22'], ['-W', 'ci.example.com:22'],
+                   ['-F', '/etc/ssh/ssh_config'], ['-o', 'ProxyCommand=arbitrary'],
+                   ['-o', 'LocalCommand=id'], ['-o', 'HostName=ci.example.com'], ['-p', '22']]:
+        check('ambiguous option denied ' + option[0] + ' ' + option[1],
+              bool(network(argv[:1] + option + argv[1:])['unclassified']))
+    path = sign(argv, expires_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat())
+    check('expired signed grant denied', bool(network(argv)['unclassified']) and preflight(argv).returncode != 0)
+    sign(argv, expires_at=(datetime.now(timezone.utc) + timedelta(hours=5)).isoformat())
+    check('overlong signed grant denied', bool(network(argv)['unclassified']))
+    sign(argv, repository='owner/other')
+    check('wrong repository in signed payload denied', bool(network(argv)['unclassified']))
+    sign(argv, common_dir=str(root / 'other-repo/.git'))
+    check('spoofed repository origin cannot reuse grant', bool(network(argv)['unclassified']))
+    sign(argv, issued_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())
+    check('future approval denied', bool(network(argv)['unclassified']))
+    port_one = argv.copy()
+    port_one[-3] = '1'
+    sign(port_one, binding=dict(binding_command(port_one), port=True))
+    check('boolean port cannot equal integer one', bool(network(port_one)['unclassified']))
+    sign(argv, binding=dict(binding_command(argv), port=22.0))
+    check('float port cannot equal integer port', bool(network(argv)['unclassified']))
+    path = sign(argv)
+    raw = path.read_text()
+    path.write_text(raw + ' ')
+    check('tampered grant denied', bool(network(argv)['unclassified']))
+    path.write_text(raw)
+    copy = root / 'grant-copy.json'
+    copy.write_text(raw)
+    path.unlink()
+    path.symlink_to(copy)
+    check('symlink grant denied without following it', bool(network(argv)['unclassified']))
+    path.unlink()
+    path.write_text(raw)
+    signature = Path(str(path) + '.sig')
+    saved = signature.read_bytes()
+    signature.write_text('not a signature')
+    check('forged signature denied', bool(network(argv)['unclassified']))
+    signature.write_bytes(saved)
+    # Tier deny wins even with a valid owner signature; no blanket network grant.
+    blocked = argv.copy()
+    blocked[4] = 'HostName=requestbin.com'
+    sign(blocked)
+    check('tier5 denial wins in worker', worker(blocked).returncode != 0)
+    check('tier5 denial wins in preflight', preflight(blocked).returncode != 0)
+    # A different repository cannot reuse the same signed command.
+    subprocess.run([os.environ['TEST_NATIVE_GIT'], '-C', str(repo), 'remote', 'set-url', 'origin',
+                    'https://github.com/owner/other.git'], check=True)
+    check('different repository cannot reuse grant', bool(network(argv)['unclassified']))
+    # Prove no SSH config/credential file is even opened in the analyzer.
+    original_open = Path.open
+    def guarded_open(path, *args, **kwargs):
+        assert '.ssh' not in path.parts and path != key, path
+        return original_open(path, *args, **kwargs)
+    with patch.object(Path, 'open', guarded_open):
+        check('unknown alias needs no credential/config reads', bool(network(['ssh', 'ci-alias', 'id'])['unclassified']))
+print(f'{count} offline SSH binding fixtures passed')
+PY
+	return 0
+}
+
+test_exact_ssh_bindings() {
+	local status=0
+	python3 - "$SCRIPT_DIR" "$TEST_ROOT" < <(
+		_ssh_binding_fixture_setup
+		_ssh_binding_fixture_cases
+	) || status=$?
+	if [[ "$status" -eq 0 ]]; then
+		pass "exact SSH binding offline security and preclaim fixtures"
+	else
+		fail "exact SSH binding offline security and preclaim fixtures" "status=${status}"
+	fi
+	return 0
+}
+
 main() {
+	test_exact_ssh_bindings
+	# Focused inner loop; the default invocation still runs every existing case.
+	if [[ "${1:-}" == "--ssh-bindings-only" ]]; then
+		[[ "$FAILURES" -eq 0 ]] || return 1
+		return 0
+	fi
 	test_validation
 	test_evaluate_invocations_compatibility
 	test_worker_protocol_bash_examples
@@ -964,9 +1345,13 @@ main() {
 	test_direct_pr_merge_policy
 	test_account_mutation_authorization
 	test_account_mutation_workspace_authorization
+	test_workspace_repository_creation
 	test_account_mutation_guard_validation
 	test_canonical_delegation
 	test_worker_network_policy
+	test_worker_git_default_remote
+	test_worker_git_default_remote_query_failures
+	test_worker_signing_overrides
 	test_policy_fail_closed
 	test_secondary_layers
 	printf '\nTests: %d, Failures: %d\n' "$TESTS" "$FAILURES"

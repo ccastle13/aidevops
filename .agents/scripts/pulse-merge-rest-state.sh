@@ -7,6 +7,9 @@
 [[ -n "${_PULSE_MERGE_REST_STATE_LOADED:-}" ]] && return 0
 _PULSE_MERGE_REST_STATE_LOADED=1
 
+# shellcheck source=./shared-gh-collaborator-permission.sh
+source "${BASH_SOURCE[0]%/*}/shared-gh-collaborator-permission.sh"
+
 _pmrs_gh_call() {
 	local operation="$1"
 	shift
@@ -83,7 +86,8 @@ _pmp_refresh_unknown_mergeable_state_into() {
 	_pmp_normalize_mergeable_state_into refreshed_mergeable "$current_mergeable"
 
 	if [[ "$refreshed_mergeable" == "UNKNOWN" || -z "$refreshed_mergeable" ]]; then
-		refreshed_mergeable=$(AIDEVOPS_GH_REST_FIRST_READS=1 AIDEVOPS_GH_PR_VIEW_CACHE_DISABLE=1 \
+		# STRICT: the REST single-PR read triggers mergeability computation (GH#37368).
+		refreshed_mergeable=$(AIDEVOPS_GH_REST_FIRST_READS=1 AIDEVOPS_GH_REST_FIRST_STRICT=1 AIDEVOPS_GH_PR_VIEW_CACHE_DISABLE=1 \
 			gh_pr_view "$pr_number" --repo "$repo_slug" --json mergeable --jq '.mergeable // ""')
 		refresh_exit=$?
 		[[ $refresh_exit -eq 0 && -n "$refreshed_mergeable" ]] || refreshed_mergeable="UNKNOWN"
@@ -182,6 +186,9 @@ _pmp_rest_reviews_json() {
 
 	max_pages=$(_pmrs_review_max_pages)
 	while [[ "$page" -le "$max_pages" ]]; do
+		if declare -F gh_budget_worker_reserve_allows >/dev/null 2>&1; then
+			gh_budget_worker_reserve_allows || return 1
+		fi
 		endpoint="repos/${repo_slug}/pulls/${pr_number}/reviews?per_page=100&page=${page}"
 		page_json=$(AIDEVOPS_GH_PAGE_NUMBER="$page" \
 			AIDEVOPS_GH_ROUTE_DECISION="pulse-review-explicit-page" \
@@ -211,7 +218,15 @@ _pmp_rest_review_decision_from_reviews() {
 	local reviews_json=""
 
 	reviews_json=$(_pmp_rest_reviews_json "$pr_number" "$repo_slug") || return 1
-	printf '%s' "$reviews_json" | jq -r '
+	printf '%s' "$reviews_json" | _pmp_reduce_reviews_json || return 1
+	return 0
+}
+
+#######################################
+# Reduce a REST-shaped review array (stdin) to the active review state.
+#######################################
+_pmp_reduce_reviews_json() {
+	jq -r '
 		def state_changing: .state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED";
 		if type != "array" then error("expected review array")
 		elif any(.[]?; state_changing and (
@@ -232,6 +247,46 @@ _pmp_rest_review_decision_from_reviews() {
 	return 0
 }
 
+#######################################
+# GraphQL fallback for the review state when REST is at the worker reserve.
+# One bounded history read (GraphQL budget is separate from REST core).
+# Preserve state-changing reviews even after later comments. Pagination metadata
+# makes incomplete history fail closed, independently of gh's internal limits.
+# Args: $1=PR number, $2=repo slug
+# Stdout: CHANGES_REQUESTED | OBSERVED_APPROVED | NONE
+#######################################
+_pmp_graphql_review_decision_from_reviews() {
+	local pr_number="$1"
+	local repo_slug="$2"
+	local pr_json=""
+	local owner="${repo_slug%%/*}" name="${repo_slug#*/}"
+	local mapped=""
+
+	# GraphQL variables must remain literal, not shell-expanded.
+	# shellcheck disable=SC2016
+	pr_json=$(_pmrs_gh_call read gh api graphql -f query='
+		query($owner:String!,$name:String!,$number:Int!) {
+			repository(owner:$owner,name:$name) {
+				pullRequest(number:$number) {
+					reviews(first:100) {
+						pageInfo { hasNextPage }
+						nodes { databaseId author { login } state submittedAt }
+					}
+				}
+			}
+		}' -f owner="$owner" -f name="$name" -F number="$pr_number" 2>/dev/null) || return 1
+	mapped=$(printf '%s' "$pr_json" | jq -ce '
+		if .errors != null then error("GraphQL errors") else
+		.data.repository.pullRequest.reviews
+		| if .pageInfo.hasNextPage != false or (.nodes | type) != "array"
+		  then error("incomplete review history") else .nodes end
+		| map({user: {login: .author.login}, state: .state, submitted_at: .submittedAt, id: .databaseId})
+		end
+	' 2>/dev/null) || return 1
+	printf '%s' "$mapped" | _pmp_reduce_reviews_json || return 1
+	return 0
+}
+
 _pmp_refresh_unknown_review_decision_into() {
 	local dest_var="$1"
 	local pr_number="$2"
@@ -242,7 +297,9 @@ _pmp_refresh_unknown_review_decision_into() {
 	[[ "$dest_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
 	_pmp_normalize_review_decision_into refreshed_review "$current_review"
 	if [[ "$refreshed_review" == "UNKNOWN" ]]; then
-		refreshed_review=$(_pmp_rest_review_decision_from_reviews "$pr_number" "$repo_slug" 2>/dev/null) || refreshed_review="UNKNOWN"
+		refreshed_review=$(_pmp_rest_review_decision_from_reviews "$pr_number" "$repo_slug" 2>/dev/null) ||
+			refreshed_review=$(_pmp_graphql_review_decision_from_reviews "$pr_number" "$repo_slug" 2>/dev/null) ||
+			refreshed_review="UNKNOWN"
 		_pmp_normalize_review_decision_into refreshed_review "$refreshed_review"
 	fi
 	printf -v "$dest_var" '%s' "$refreshed_review"
@@ -288,13 +345,74 @@ _pmp_refresh_native_auto_review_into() {
 # Resolve unknown review states before classification or eligibility decisions.
 # Args: $1=repo slug, $2=PR JSON array
 #######################################
+_pmrs_review_cache() {
+	local action="$1" repo_slug="$2" number="$3" head="$4" updated="$5" decision="${6:-}"
+	local cache_credential=""
+	# This cache is enrichment only. Final native-auto reconciliation deliberately
+	# uses uncached review pages. Missing metadata always forces a fresh read.
+	[[ -n "$head" && -n "$updated" ]] || return 1
+	_gh_active_credential_into cache_credential || return 1
+	PMRS_CACHE_REPO="$repo_slug" PMRS_CACHE_NUMBER="$number" PMRS_CACHE_HEAD="$head" \
+		PMRS_CACHE_UPDATED="$updated" PMRS_CACHE_DECISION="$decision" PMRS_CACHE_TOKEN="$cache_credential" \
+		python3 - "$action" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+import time
+
+root = Path(os.environ.get("AIDEVOPS_PULSE_REVIEW_CACHE_DIR", str(Path.home() / ".aidevops/logs/pulse-review-cache")))
+try:
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    mode = root.lstat()
+    if not stat.S_ISDIR(mode.st_mode) or mode.st_uid != os.getuid() or mode.st_mode & 0o077:
+        sys.exit(1)
+    key = hashlib.sha256(json.dumps([os.environ.get("GH_HOST", "github.com"),
+        os.environ["PMRS_CACHE_TOKEN"],
+        *[os.environ["PMRS_CACHE_" + name] for name in ("REPO", "NUMBER", "HEAD", "UPDATED")]]).encode()).hexdigest()
+    path = root / (key + ".json")
+    allowed = "NONE CHANGES_REQUESTED OBSERVED_APPROVED".split()
+    if sys.argv[1] == "get":
+        mode = path.lstat()
+        if not stat.S_ISREG(mode.st_mode) or mode.st_uid != os.getuid() or mode.st_mode & 0o077:
+            sys.exit(1)
+        row = json.loads(path.read_text())
+        if not 0 <= time.time() - row["at"] < 300 or row["decision"] not in allowed:
+            sys.exit(1)
+        print(row["decision"])
+    else:
+        decision = os.environ["PMRS_CACHE_DECISION"]
+        if decision not in allowed:
+            sys.exit(1)
+        fd, temporary = tempfile.mkstemp(dir=root)
+        with os.fdopen(fd, "w") as stream:
+            json.dump({"at": time.time(), "decision": decision}, stream)
+        os.replace(temporary, path)
+except (OSError, ValueError, KeyError, TypeError):
+    sys.exit(1)
+PY
+	return $?
+}
+
 _pmp_enrich_prs_with_review_decisions() {
 	local repo_slug="$1"
 	local pr_json="$2"
 	local enriched_json="$pr_json"
 	local pr_rows=""
 	local _US=$'\x1f'
-	local index="" number="" review_decision=""
+	local index="" number="" review_decision="" head="" updated=""
+	local enrichment_credential=""
+	# Pin keychain and host-specific auth across cache get, fresh fetch and put.
+	# No credential identity means no cache; existing fresh-read behavior remains.
+	local GH_TOKEN="${GH_TOKEN:-}" GH_ENTERPRISE_TOKEN="${GH_ENTERPRISE_TOKEN:-}"
+	if _gh_active_credential_into enrichment_credential; then
+		GH_TOKEN="$enrichment_credential"
+		GH_ENTERPRISE_TOKEN="$enrichment_credential"
+		export GH_TOKEN GH_ENTERPRISE_TOKEN
+	fi
 
 	if [[ -z "$repo_slug" ]]; then
 		printf '%s' "$pr_json"
@@ -307,18 +425,22 @@ _pmp_enrich_prs_with_review_decisions() {
 			(if ((.value | has("number") | not) or .value.number == null or (.value.number | tostring | length) == 0)
 			 then "" else (.value.number | tostring) end),
 			(if ((.value | has("reviewDecision") | not) or .value.reviewDecision == null or (.value.reviewDecision | tostring | length) == 0)
-			 then "UNKNOWN" else .value.reviewDecision end)
+			 then "UNKNOWN" else .value.reviewDecision end),
+			(.value.headRefOid // ""), (.value.updatedAt // "")
 		] | join("\u001f")
 		end' 2>/dev/null) || {
 		printf '%s' "$pr_json"
 		return 0
 	}
 
-	while IFS="$_US" read -r index number review_decision; do
+	while IFS="$_US" read -r index number review_decision head updated; do
 		[[ -n "$index" ]] || continue
 		_pmp_normalize_review_decision_into review_decision "$review_decision"
 		if [[ "$number" =~ ^[0-9]+$ ]] && _pmp_review_decision_is_unknown "$review_decision"; then
-			_pmp_refresh_unknown_review_decision_into review_decision "$number" "$repo_slug" "$review_decision"
+			if ! review_decision=$(_pmrs_review_cache get "$repo_slug" "$number" "$head" "$updated"); then
+				_pmp_refresh_unknown_review_decision_into review_decision "$number" "$repo_slug" UNKNOWN
+				_pmrs_review_cache put "$repo_slug" "$number" "$head" "$updated" "$review_decision" || true
+			fi
 			enriched_json=$(printf '%s' "$enriched_json" | jq --argjson index "$index" --arg review "$review_decision" '.[$index].reviewDecision = $review' 2>/dev/null) || {
 				printf '%s' "$pr_json"
 				return 0
@@ -344,11 +466,254 @@ _pmp_update_branch_rest() {
 			"$pr_number" "$repo_slug" >&2
 		return 2
 	fi
-	AIDEVOPS_GH_QUOTA_COST=1 \
+	# Every caller shares one head-bound semantic-conflict cooldown (GH#34560).
+	# The helpers live in pulse-merge-process.sh; absent helpers fail open.
+	if declare -F _pmp_update_branch_conflict_cooldown_active >/dev/null 2>&1 &&
+		_pmp_update_branch_conflict_cooldown_active "$pr_number" "$repo_slug" "$expected_head_sha"; then
+		printf 'update-branch skipped: semantic conflict cooldown active for PR #%s head %s (GH#34560)\n' \
+			"$pr_number" "${expected_head_sha:0:12}" >&2
+		return 1
+	fi
+
+	local ub_output=""
+	local ub_rc=0
+	ub_output=$(AIDEVOPS_GH_QUOTA_COST=1 \
 		AIDEVOPS_GH_ROUTE_DECISION="pulse-update-branch-rest" \
 		_pmrs_gh_call write gh api --method PUT "repos/${repo_slug}/pulls/${pr_number}/update-branch" \
-			-f expected_head_sha="$expected_head_sha"
-	return $?
+		-f expected_head_sha="$expected_head_sha" 2>&1) || ub_rc=$?
+	[[ -z "$ub_output" ]] || printf '%s\n' "$ub_output"
+	if [[ "$ub_rc" -ne 0 && "$ub_output" == *"HTTP 422"* ]] &&
+		declare -F _pmp_record_update_branch_conflict_cooldown >/dev/null 2>&1; then
+		_pmp_record_update_branch_conflict_cooldown "$pr_number" "$repo_slug" "$expected_head_sha" || true
+	fi
+	return "$ub_rc"
+}
+
+#######################################
+# Resolve (and opportunistically prune) the per-PR missing-check state file.
+# Lines: "<head_sha> <epoch> <ok|failed|exhausted>".
+# Args: $1=repo slug, $2=PR number
+#######################################
+_pmrs_missing_checks_state_file() {
+	local repo_slug="$1"
+	local pr_number="$2"
+	local state_dir="${AIDEVOPS_PULSE_MISSING_CHECKS_STATE_DIR:-${HOME}/.aidevops/.agent-workspace/pulse-missing-required-checks}"
+	local safe_slug=""
+
+	mkdir -p "$state_dir" 2>/dev/null || return 1
+	find "$state_dir" -type f -mtime +7 -delete 2>/dev/null || true
+	safe_slug=$(printf '%s' "$repo_slug" | tr -c '[:alnum:]._-' '_')
+	printf '%s/%s-%s' "$state_dir" "$safe_slug" "$pr_number"
+	return 0
+}
+
+#######################################
+# True when every non-passing required context is absent from the exact-head
+# rollup and no check is in flight. Reads the globals that
+# _check_required_checks_passing sets in the same shell; unset = unknown.
+#######################################
+_pmrs_missing_checks_applicable() {
+	local nonpass="${_PULSE_REQUIRED_CHECKS_NONPASS_COUNT:-}"
+	local missing="${_PULSE_REQUIRED_CHECKS_MISSING_COUNT:-}"
+	local in_flight="${_PULSE_CHECKS_IN_FLIGHT_COUNT:-}"
+
+	[[ "$nonpass" =~ ^[0-9]+$ && "$missing" =~ ^[0-9]+$ && "$in_flight" =~ ^[0-9]+$ ]] || return 1
+	[[ "$missing" -gt 0 && "$missing" -eq "$nonpass" && "$in_flight" -eq 0 ]] || return 1
+	return 0
+}
+
+#######################################
+# Age of the head commit from its committer timestamp.
+# Args: $1=repo slug, $2=head SHA
+# Stdout: age in seconds
+#######################################
+_pmrs_head_commit_age_seconds() {
+	local repo_slug="$1"
+	local head_sha="$2"
+	local committed_at="" committed_epoch="" now_epoch=""
+
+	committed_at=$(AIDEVOPS_GH_ROUTE_DECISION="pulse-missing-checks-head-age-rest" \
+		_pmrs_gh_call read gh api "repos/${repo_slug}/commits/${head_sha}" \
+		--jq '.commit.committer.date // empty' 2>/dev/null) || return 1
+	[[ -n "$committed_at" ]] || return 1
+	committed_epoch=$(date -u -d "$committed_at" +%s 2>/dev/null \
+		|| TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "$committed_at" +%s 2>/dev/null) || return 1
+	[[ "$committed_epoch" =~ ^[0-9]+$ ]] || return 1
+	now_epoch=$(date -u +%s)
+	printf '%s' "$((now_epoch - committed_epoch))"
+	return 0
+}
+
+#######################################
+# List latest-per-workflow runs at the exact head that ended failure or
+# startup_failure with zero jobs (no check run is ever created for them).
+# Args: $1=repo slug, $2=head SHA
+# Stdout: one "<run id><TAB><workflow name>" line per run; returns 1 when none
+#######################################
+_pmrs_zero_job_runs() {
+	local repo_slug="$1"
+	local head_sha="$2"
+	local runs_json="" candidates="" run_id="" run_name="" total="" found=1
+
+	runs_json=$(AIDEVOPS_GH_ROUTE_DECISION="pulse-zero-job-runs-rest" \
+		_pmrs_gh_call read gh api -X GET "repos/${repo_slug}/actions/runs" \
+		-f head_sha="$head_sha" -f per_page=100 2>/dev/null) || return 1
+	candidates=$(jq -r --arg head "$head_sha" '
+		(.workflow_runs // [])
+		| map(select(.head_sha == $head))
+		| group_by(.workflow_id)
+		| map(max_by(.run_number // 0))
+		| .[]
+		| select(.status == "completed" and (.conclusion == "failure" or .conclusion == "startup_failure"))
+		| [.id, (.name // "workflow")] | @tsv' <<<"$runs_json" 2>/dev/null) || return 1
+	while IFS=$'\t' read -r run_id run_name; do
+		[[ "$run_id" =~ ^[0-9]+$ ]] || continue
+		total=$(AIDEVOPS_GH_ROUTE_DECISION="pulse-zero-job-runs-jobs-rest" \
+			_pmrs_gh_call read gh api -X GET "repos/${repo_slug}/actions/runs/${run_id}/jobs" \
+			-f per_page=1 --jq '.total_count' 2>/dev/null) || continue
+		[[ "$total" == "0" ]] || continue
+		printf '%s\t%s\n' "$run_id" "$run_name"
+		found=0
+	done <<<"$candidates"
+	return "$found"
+}
+
+#######################################
+# Request one rerun of a zero-job run. The reservation is written before the
+# write and survives restarts: a run ID is never replayed, and an ambiguous or
+# failed request escalates once.
+# Args: $1=repo slug, $2=PR number, $3=head SHA, $4=run id
+# Returns: 0=rerun requested, 2=already handled earlier, 1=request failed
+#######################################
+_pmrs_rerun_zero_job_run() {
+	local repo_slug="$1"
+	local pr_number="$2"
+	local head_sha="$3"
+	local run_id="$4"
+	local state_root="${AIDEVOPS_TEMP_DIR:-${HOME:+$HOME/.aidevops/.agent-workspace/tmp}}"
+	local state_dir="${PULSE_MERGE_ZERO_JOB_RERUN_STATE_DIR:-${state_root:+$state_root/pulse-zero-job-reruns}}"
+	local reservation=""
+
+	[[ "$repo_slug" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$pr_number" =~ ^[0-9]+$ ]] || return 1
+	[[ "$head_sha" =~ ^[A-Za-z0-9_-]+$ && "$run_id" =~ ^[0-9]+$ && -n "$state_dir" ]] || return 1
+	mkdir -p "$state_dir" 2>/dev/null || return 1
+	reservation="${state_dir}/${repo_slug//\//-}-${pr_number}-${head_sha}-${run_id}"
+	if ! mkdir "$reservation" 2>/dev/null; then
+		if mkdir "$reservation/escalated" 2>/dev/null; then
+			echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: zero-job run=${run_id} on head ${head_sha:0:12} already had a rerun requested; no further automatic reruns (t18926)" >>"$LOGFILE"
+		fi
+		return 2
+	fi
+	#aidevops:trust-boundary — the run ID comes from an API listing filtered to
+	# the gated head SHA, and the caller already passed pulse write policy.
+	if gh run rerun "$run_id" --repo "$repo_slug" >/dev/null 2>&1; then
+		: >"$reservation/submitted" 2>/dev/null || true
+		echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: requested rerun of zero-job workflow run=${run_id} on head ${head_sha:0:12} (t18926)" >>"$LOGFILE"
+		return 0
+	fi
+	mkdir "$reservation/escalated" 2>/dev/null || true
+	echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: rerun request failed for zero-job workflow run=${run_id} on head ${head_sha:0:12}; no further automatic reruns (t18926)" >>"$LOGFILE"
+	return 1
+}
+
+#######################################
+# Rerun zero-job workflow runs for the gated head before any update-branch.
+# Args: $1=repo slug, $2=PR number, $3=head SHA
+# Returns: 0=zero-job runs exist and were handled (caller must not
+#          update-branch), 1=none exist or reruns are not permitted
+#######################################
+_pmrs_remediate_zero_job_runs() {
+	local repo_slug="$1"
+	local pr_number="$2"
+	local head_sha="$3"
+	local runs="" run_id="" run_name=""
+
+	if declare -F repo_allows_pulse_write_actions >/dev/null 2>&1 &&
+		! repo_allows_pulse_write_actions "$repo_slug"; then
+		return 1
+	fi
+	if declare -F _pmrc_actions_incident_blocks_rerun >/dev/null 2>&1 &&
+		_pmrc_actions_incident_blocks_rerun; then
+		return 1
+	fi
+	runs=$(_pmrs_zero_job_runs "$repo_slug" "$head_sha") || return 1
+	while IFS=$'\t' read -r run_id run_name; do
+		[[ -n "$run_id" ]] || continue
+		_pmrs_rerun_zero_job_run "$repo_slug" "$pr_number" "$head_sha" "$run_id" || true
+	done <<<"$runs"
+	return 0
+}
+
+#######################################
+# Remediate required contexts that will never report on the current head
+# (GH#32951). GitHub can drop a workflow run for a PR event; the required
+# context then stays "expected" forever, native auto-merge can never finish,
+# and re-arming it every cycle only churns writes (other runners may disarm
+# it again). Request one expected-head update-branch to retrigger CI instead.
+# Bounded per head by a cooldown and per PR by an attempt cap so a
+# paths-filtered required workflow that never reports cannot loop.
+#
+# Caller must have passed all merge gates and stopped DRY_RUN, and must call
+# _check_required_checks_passing for the same PR immediately before.
+# Args: $1=PR number, $2=repo slug, $3=gated head SHA
+# Returns: 0=handled (update requested, cooling down, failed, or attempts
+#          exhausted) — caller must not arm native auto-merge;
+#          1=not applicable, head too young, or state unavailable
+#######################################
+_pmp_remediate_missing_required_checks() {
+	local pr_number="$1"
+	local repo_slug="$2"
+	local head_sha="${3:-}"
+	local threshold="${AIDEVOPS_PULSE_MISSING_REQUIRED_CHECK_SECONDS:-1800}"
+	local max_attempts="${AIDEVOPS_PULSE_MISSING_REQUIRED_CHECK_MAX_UPDATES:-2}"
+	local state_file="" now_epoch="" head_entry="" head_epoch="" head_result=""
+	local attempts=0 age="" ub_output="" ub_rc=0
+	local missing="${_PULSE_REQUIRED_CHECKS_MISSING_COUNT:-0}"
+
+	[[ -n "$head_sha" ]] || return 1
+	_pmrs_missing_checks_applicable || return 1
+	[[ "$threshold" =~ ^[0-9]+$ ]] || threshold=1800
+	[[ "$max_attempts" =~ ^[0-9]+$ ]] || max_attempts=2
+	state_file=$(_pmrs_missing_checks_state_file "$repo_slug" "$pr_number") || return 1
+	now_epoch=$(date -u +%s)
+
+	if [[ -f "$state_file" ]]; then
+		head_entry=$(awk -v sha="$head_sha" '$1 == sha { e = $2 " " $3 } END { print e }' "$state_file" 2>/dev/null) || head_entry=""
+		attempts=$(awk '$3 == "ok" { n++ } END { print n + 0 }' "$state_file" 2>/dev/null) || attempts=0
+		[[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
+	fi
+	read -r head_epoch head_result <<<"$head_entry"
+	[[ "$head_result" == "exhausted" ]] && return 0
+	if [[ "$head_epoch" =~ ^[0-9]+$ ]] && ((now_epoch - head_epoch < threshold)); then
+		return 0
+	fi
+
+	age=$(_pmrs_head_commit_age_seconds "$repo_slug" "$head_sha") || return 1
+	[[ "$age" =~ ^[0-9]+$ && "$age" -ge "$threshold" ]] || return 1
+
+	if [[ "$attempts" -ge "$max_attempts" ]]; then
+		printf '%s %s exhausted\n' "$head_sha" "$now_epoch" >>"$state_file"
+		echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: ${missing} required context(s) never reported on head ${head_sha:0:12} after ${attempts} update-branch attempt(s); native auto-merge not re-armed — check required workflow triggers/path filters or re-run CI (GH#32951)" >>"$LOGFILE"
+		return 0
+	fi
+
+	# A zero-job run created no check run; rerunning it needs no new commit and
+	# keeps passing checks, unlike update-branch on an up-to-date head (t18926).
+	if _pmrs_remediate_zero_job_runs "$repo_slug" "$pr_number" "$head_sha"; then
+		printf '%s %s rerun\n' "$head_sha" "$now_epoch" >>"$state_file"
+		return 0
+	fi
+
+	ub_output=$(_pmp_update_branch_rest "$pr_number" "$repo_slug" "$head_sha" 2>&1) || ub_rc=$?
+	if [[ "$ub_rc" -eq 0 ]]; then
+		printf '%s %s ok\n' "$head_sha" "$now_epoch" >>"$state_file"
+		echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: ${missing} required context(s) never reported on head ${head_sha:0:12} (${age}s old, no checks in flight) — update-branch requested to retrigger CI instead of arming native auto-merge (GH#32951)" >>"$LOGFILE"
+		return 0
+	fi
+	printf '%s %s failed\n' "$head_sha" "$now_epoch" >>"$state_file"
+	ub_output=$(printf '%s' "$ub_output" | tr '\n' ' ' | cut -c1-300)
+	echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: ${missing} required context(s) never reported on head ${head_sha:0:12}; update-branch failed, holding native auto-merge for ${threshold}s (GH#32951): ${ub_output}" >>"$LOGFILE"
+	return 0
 }
 
 #######################################

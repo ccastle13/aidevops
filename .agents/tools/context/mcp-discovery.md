@@ -54,8 +54,8 @@ npx mcporter generate-cli --command https://mcp.context7.com/mcp --compile
 
 | MCP | Tokens | Activation | When to enable |
 |-----|--------|------------|----------------|
-| `playwriter` | ~3K | `@playwriter` calls `aidevops_mcp` | Browser automation needed |
-| `playwright` | Varies | `@playwright` calls `aidevops_mcp` | Isolated browser automation needed |
+| `playwright` | Varies | `@playwright` calls `aidevops_mcp` | Default browser automation (Playwright, not Playwriter): headless, headed-hidden or headed |
+| `playwriter` | ~3K | Explicit legacy `@playwriter` request only | Only when the user names Playwriter (not Playwright) |
 | `google-analytics-mcp` | ~800 | Disabled by default | Analytics reporting |
 | `context7` | ~800 | Disabled by default | Library docs lookup |
 
@@ -71,7 +71,7 @@ npx mcporter generate-cli --command https://mcp.context7.com/mcp --compile
 
 ## Architecture
 
-MCP tool definitions consume context tokens (e.g. `context7` ~2K, `repomix` ~5K, `chrome-devtools` ~17K for 50+ tools). Loading all MCPs globally means every conversation pays this cost even when most tools go unused.
+MCP tool definitions consume context tokens (e.g. `context7` ~2K, `chrome-devtools` ~17K for 50+ tools). Loading all MCPs globally means every conversation pays this cost even when most tools go unused.
 
 **Lazy-load pattern** (inspired by [Amp's approach](https://ampcode.com/news/lazy-load-mcp-with-skills)):
 
@@ -113,17 +113,17 @@ Subagents declare MCP requirements via the `mcp:` field:
 
 ```yaml
 ---
-description: Browser automation via Chrome extension
+description: Browser automation via Playwright MCP
 mode: subagent
 tools:
   read: true
   bash: true
 mcp:
-  - playwriter
+  - playwright
 ---
 ```
 
-The `mcp:` field is declarative -- it documents which MCP the subagent requires. Tool permission alone does not connect an OpenCode MCP configured with `enabled: false`. Explicit activation profiles, currently `@playwriter` and `@playwright`, call `aidevops_mcp` before their first MCP operation.
+The `mcp:` field is declarative -- it documents which MCP the subagent requires. Tool permission alone does not connect an OpenCode MCP configured with `enabled: false`. The preferred `@playwright` activation profile calls `aidevops_mcp` before its first MCP operation; `@playwriter` remains explicit legacy compatibility only.
 
 ### Main Agent Pattern
 
@@ -149,19 +149,19 @@ In `opencode.json`, MCP tools are denied globally and granted only to an owning 
     "serper_*": false
   },
   "agent": {
-    "playwriter": {
+    "playwright": {
       "tools": {
         "aidevops_mcp": true
       },
       "permission": {
-        "playwriter_*": "allow"
+        "playwright_*": "allow"
       }
     }
   }
 }
 ```
 
-Invoke `@playwriter` rather than enabling Playwriter globally. Its first step connects only the registry entry named `playwriter`; the next step receives `playwriter_*` tools. If the extension has no approved tab, the agent reports that consent diagnostic instead of misdiagnosing missing tools.
+Select `@playwright` from OpenCode agent autocomplete rather than enabling Playwright globally or pasting a literal `@playwright` string. Its first step connects only the registry entry named `playwright`; the next step receives `playwright_*` tools. A wrong-agent activation request has no MCP lifecycle side effect. Normal headless, headed-hidden and headed work launches a separate isolated browser and prefers Brave when available (`tools/browser/playwright.md` "Window modes"). Extension mode is an interactive-only exception: it requires `PLAYWRIGHT_MCP_EXTENSION=1`, is blocked by headless-runtime markers, and may receive `PLAYWRIGHT_MCP_EXTENSION_TOKEN` through secure injection. A token alone does not change modes. Select `@playwriter` from autocomplete only when the user explicitly requests a legacy Playwriter setup.
 
 ## Future: includeTools Filtering
 

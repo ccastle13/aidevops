@@ -2,13 +2,21 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2025-2026 Marcus Quinn
 #
-# Regression test for GH#23077.
+# Regression tests for GH#23077 and GH#32223.
 #
 # A protected counter branch rejects direct CAS pushes. The allocator must use
 # GitHub's read-only policy API to stop before mutation when available, retain
 # push-time classification as a fallback, and leave the working tree unchanged.
 
 set -u
+
+# Resolve native Git once from the system default PATH (portable to non-FHS
+# hosts such as NixOS); fixtures must bypass the aidevops git wrapper.
+TEST_NATIVE_GIT=$(command -p -v git) || {
+	printf '%s\n' 'Native Git is unavailable on the system PATH' >&2
+	exit 1
+}
+export TEST_NATIVE_GIT
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 1
 CLAIM_SCRIPT="${SCRIPT_DIR}/../claim-task-id.sh"
@@ -35,6 +43,7 @@ fail() {
 
 setup_protected_remote() {
 	local base_dir="$1"
+	local dedicated_state="${2:-valid}"
 	local bare_dir="${base_dir}/remote.git"
 	local seed_dir="${base_dir}/seed"
 	local work_dir="${base_dir}/work"
@@ -49,8 +58,19 @@ setup_protected_remote() {
 	printf '# Tasks\n\n' >"${seed_dir}/TODO.md"
 	git -C "$seed_dir" add .task-counter .gitignore TODO.md >/dev/null 2>&1 || return 1
 	git -C "$seed_dir" commit -m "chore: seed protected counter" >/dev/null 2>&1 || return 1
+	printf '%s\n' 'fixture history' >"${seed_dir}/history.txt"
+	git -C "$seed_dir" add history.txt >/dev/null 2>&1 || return 1
+	git -C "$seed_dir" commit -m "chore: retain parent history" >/dev/null 2>&1 || return 1
 	git -C "$seed_dir" push origin main >/dev/null 2>&1 || return 1
-	git -C "$seed_dir" push origin main:refs/heads/task-id-counter >/dev/null 2>&1 || return 1
+	if [[ "$dedicated_state" != "absent" ]]; then
+		git -C "$seed_dir" push origin main:refs/heads/task-id-counter >/dev/null 2>&1 || return 1
+	fi
+	if [[ "$dedicated_state" == "stale" ]]; then
+		printf '1005\n' >"${seed_dir}/.task-counter"
+		git -C "$seed_dir" add .task-counter >/dev/null 2>&1 || return 1
+		git -C "$seed_dir" commit -m "chore: advance default counter" >/dev/null 2>&1 || return 1
+		git -C "$seed_dir" push origin main >/dev/null 2>&1 || return 1
+	fi
 
 	mkdir -p "${bare_dir}/hooks" || return 1
 	cat >"${bare_dir}/hooks/pre-receive" <<'HOOK'
@@ -298,6 +318,489 @@ test_implicit_dedicated_counter_branch() {
 	return 0
 }
 
+test_linked_worktree_preserves_history() {
+	local parent_tmpdir="$1"
+	local bin_dir="$2"
+	local mode=""
+	local case_dir=""
+	local work_dir=""
+	local name=""
+	local output=""
+	local rc=0
+	local history_count=""
+
+	for mode in explicit implicit; do
+		name="linked worktree ${mode} counter claim preserves shared history"
+		case_dir="${parent_tmpdir}/linked-${mode}"
+		mkdir -p "$case_dir" || { fail "$name" "fixture directory failed"; continue; }
+		work_dir=$(setup_protected_remote "$case_dir") || {
+			fail "$name" "repo setup failed"
+			continue
+		}
+		if [[ "$mode" == "implicit" ]]; then
+			printf '%s\n' '{}' >"${work_dir}/.aidevops.json"
+		fi
+		rc=0
+		output=$(PATH="${bin_dir}:${PATH}" FAKE_GH_POLICY=unavailable \
+			CAS_MAX_RETRIES=5 CAS_WALL_TIMEOUT_S=20 CAS_SSH_FALLBACK_ENABLED=0 "$CLAIM_SCRIPT" \
+			--title "${mode} linked history" --no-issue --repo-path "$work_dir" 2>&1) || rc=$?
+		if [[ "$mode" == "implicit" && $rc -ne 0 ]] || \
+			[[ "$mode" == "explicit" && $rc -ne 4 ]]; then
+			fail "$name" "unexpected claim exit ${rc}: $output"
+			continue
+		fi
+		if [[ "$mode" == "implicit" ]] && ! printf '%s\n' "$output" | grep -Fq \
+			'counter branch auto-selected from validated dedicated branch: task-id-counter'; then
+			fail "$name" "implicit discovery was not exercised: $output"
+			continue
+		fi
+		if [[ "$mode" == "explicit" ]] && ! printf '%s\n' "$output" | grep -Fq \
+			'PROTECTED_COUNTER_BRANCH'; then
+			fail "$name" "explicit main counter fetch was not exercised: $output"
+			continue
+		fi
+		history_count=$(git -C "${case_dir}/seed" rev-list --count origin/main 2>/dev/null) || history_count=0
+		if [[ $(git -C "${case_dir}/seed" rev-parse --is-shallow-repository) != "false" ]] || \
+			((history_count < 2)); then
+			fail "$name" "shared repository became shallow or origin/main lost history (${history_count} commits)"
+			continue
+		fi
+		pass "$name"
+	done
+	return 0
+}
+
+run_canonical_claim() {
+	local work_dir="$1"
+	local bin_dir="$2"
+	local temp_root="$3"
+	shift 3
+	PATH="${bin_dir}:${SCRIPT_DIR}/..:/usr/bin:/bin" \
+		AIDEVOPS_TEMP_DIR="$temp_root" \
+		FAKE_GH_POLICY=classic \
+		CAS_MAX_RETRIES=5 \
+		CAS_WALL_TIMEOUT_S=20 \
+		CAS_SSH_FALLBACK_ENABLED=0 \
+		"$CLAIM_SCRIPT" --no-issue --repo-path "$work_dir" "$@"
+}
+
+assert_canonical_discovery_result() {
+	local state="$1"
+	local name="$2"
+	local case_dir="$3"
+	local output="$4"
+	local rc="$5"
+	local task_id=""
+	local branch_counter=""
+
+	case "$state" in
+	valid)
+		if [[ $rc -ne 0 ]]; then
+			fail "$name" "claim failed with ${rc}: $output"
+			return 1
+		fi
+		task_id=$(printf '%s\n' "$output" | awk -F= '/^task_id=/{print $2; exit}')
+		if [[ "$task_id" != "t1000" ]]; then
+			fail "$name" "expected t1000, got ${task_id:-<empty>}"
+			return 1
+		fi
+		branch_counter=$("$TEST_NATIVE_GIT" --git-dir="${case_dir}/remote.git" \
+			show refs/heads/task-id-counter:.task-counter 2>/dev/null | tr -d '[:space:]')
+		if [[ "$branch_counter" != "1001" ]]; then
+			fail "$name" "expected dedicated counter 1001, got ${branch_counter:-<empty>}"
+			return 1
+		fi
+		;;
+	absent)
+		if [[ $rc -ne 4 ]] || ! printf '%s\n' "$output" | grep -Fq 'Dedicated counter branch task-id-counter not present; using main'; then
+			fail "$name" "expected absent-branch fallback and setup exit 4: rc=${rc}: $output"
+			return 1
+		fi
+		;;
+	stale)
+		if [[ $rc -ne 4 ]] || ! printf '%s\n' "$output" | grep -Fq 'COUNTER_BRANCH_STALE'; then
+			fail "$name" "expected stale-branch fallback and setup exit 4: rc=${rc}: $output"
+			return 1
+		fi
+		;;
+	indeterminate)
+		if [[ $rc -ne 4 ]] || ! printf '%s\n' "$output" | grep -Fq 'AIDEVOPS_TASK_COUNTER_STATUS=setup_error detail=counter_branch_discovery_failed'; then
+			fail "$name" "expected typed discovery failure: rc=${rc}: $output"
+			return 1
+		fi
+		if printf '%s\n' "$output" | grep -Fq 'using main'; then
+			fail "$name" "indeterminate discovery silently fell back to main: $output"
+			return 1
+		fi
+		;;
+	esac
+	return 0
+}
+
+test_canonical_implicit_counter_discovery() {
+	local parent_tmpdir="$1"
+	local bin_dir="$2"
+	local state=""
+	local case_dir=""
+	local work_dir=""
+	local temp_root=""
+	local name=""
+	local output=""
+	local rc=0
+	local before_head=""
+	local before_status=""
+	local after_head=""
+	local after_status=""
+
+	for state in valid absent stale indeterminate; do
+		name="canonical implicit discovery handles ${state} dedicated branch with the real Git shim"
+		case_dir="${parent_tmpdir}/canonical-${state}"
+		mkdir -p "$case_dir" || { fail "$name" "fixture directory failed"; continue; }
+		work_dir=$(setup_protected_remote "$case_dir" "$state") || {
+			fail "$name" "repo setup failed"
+			continue
+		}
+		work_dir="${case_dir}/seed"
+		printf '%s\n' '{}' >"${work_dir}/.aidevops.json"
+		temp_root="${case_dir}/contexts"
+		mkdir -p "$temp_root" || { fail "$name" "context root setup failed"; continue; }
+		if [[ "$state" == "indeterminate" ]]; then
+			mv "${case_dir}/remote.git" "${case_dir}/remote-unavailable.git" || {
+				fail "$name" "could not make remote unavailable"
+				continue
+			}
+		fi
+		before_head=$("$TEST_NATIVE_GIT" -C "$work_dir" rev-parse HEAD 2>/dev/null)
+		before_status=$("$TEST_NATIVE_GIT" -C "$work_dir" status --short 2>/dev/null)
+
+		rc=0
+		output=$(run_canonical_claim "$work_dir" "$bin_dir" "$temp_root" \
+			--title "canonical ${state} discovery" 2>&1) || rc=$?
+		after_head=$("$TEST_NATIVE_GIT" -C "$work_dir" rev-parse HEAD 2>/dev/null)
+		after_status=$("$TEST_NATIVE_GIT" -C "$work_dir" status --short 2>/dev/null)
+		if [[ "$after_head" != "$before_head" || "$after_status" != "$before_status" ]]; then
+			fail "$name" "canonical source repository changed"
+			continue
+		fi
+		if ! printf '%s\n' "$output" | grep -Fq 'Using isolated Git context for canonical counter discovery and CAS'; then
+			fail "$name" "isolated-context evidence missing: $output"
+			continue
+		fi
+		if find "$temp_root" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+			fail "$name" "isolated context was not cleaned up"
+			continue
+		fi
+
+		assert_canonical_discovery_result "$state" "$name" "$case_dir" "$output" "$rc" || continue
+
+		pass "$name"
+	done
+	return 0
+}
+
+test_canonical_context_setup_failure() {
+	local parent_tmpdir="$1"
+	local bin_dir="$2"
+	local name="canonical context setup failure is typed and leaves the source unchanged"
+	local case_dir="${parent_tmpdir}/canonical-context-error"
+	local work_dir=""
+	local temp_root="${case_dir}/blocked-temp-root"
+	local before_head=""
+	local output=""
+	local rc=0
+
+	mkdir -p "$case_dir" || { fail "$name" "fixture directory failed"; return 0; }
+	work_dir=$(setup_protected_remote "$case_dir" valid) || {
+		fail "$name" "repo setup failed"
+		return 0
+	}
+	work_dir="${case_dir}/seed"
+	printf '%s\n' '{}' >"${work_dir}/.aidevops.json"
+	printf '%s\n' 'not a directory' >"$temp_root"
+	before_head=$("$TEST_NATIVE_GIT" -C "$work_dir" rev-parse HEAD 2>/dev/null)
+
+	output=$(run_canonical_claim "$work_dir" "$bin_dir" "$temp_root" \
+		--title "canonical context setup failure" 2>&1) || rc=$?
+	if [[ $rc -ne 4 ]] || ! printf '%s\n' "$output" | grep -Fq \
+		'AIDEVOPS_TASK_COUNTER_STATUS=setup_error detail=counter_git_context_temp_root_failed'; then
+		fail "$name" "expected typed setup failure: rc=${rc}: $output"
+		return 0
+	fi
+	if [[ $("$TEST_NATIVE_GIT" -C "$work_dir" rev-parse HEAD 2>/dev/null) != "$before_head" ]]; then
+		fail "$name" "canonical source HEAD changed"
+		return 0
+	fi
+
+	pass "$name"
+	return 0
+}
+
+# GH#33152: fixture with a `develop` (not `main`) default branch, a stale
+# dedicated task-id-counter branch, and no explicit .aidevops.json
+# default_branch/counter_branch. Exercises remote-detected default branch
+# discovery, the resulting (correct) COUNTER_BRANCH_STALE refusal, the
+# --sync-counter-branch fast-forward catch-up, and a subsequent successful
+# allocation off the synced branch.
+setup_develop_default_remote() {
+	local base_dir="$1"
+	local bare_dir="${base_dir}/remote.git"
+	local seed_dir="${base_dir}/seed"
+	local work_dir="${base_dir}/work"
+
+	git init --bare --initial-branch=develop "$bare_dir" >/dev/null 2>&1 || return 1
+	git clone "$bare_dir" "$seed_dir" >/dev/null 2>&1 || return 1
+	git -C "$seed_dir" config user.email "test@test.local" >/dev/null 2>&1 || return 1
+	git -C "$seed_dir" config user.name "Test" >/dev/null 2>&1 || return 1
+	git -C "$seed_dir" config commit.gpgsign false >/dev/null 2>&1 || true
+	printf '2000\n' >"${seed_dir}/.task-counter"
+	printf '# Tasks\n\n' >"${seed_dir}/TODO.md"
+	git -C "$seed_dir" add .task-counter TODO.md >/dev/null 2>&1 || return 1
+	git -C "$seed_dir" commit -m "chore: seed develop counter" >/dev/null 2>&1 || return 1
+	git -C "$seed_dir" push origin develop >/dev/null 2>&1 || return 1
+	git -C "$seed_dir" push origin develop:refs/heads/task-id-counter >/dev/null 2>&1 || return 1
+
+	# Make the dedicated branch stale relative to develop (M < N) on its own
+	# lineage — sync_counter_branch must fast-forward it, not rebase/rewrite.
+	git -C "$seed_dir" checkout -b task-id-counter-local origin/task-id-counter >/dev/null 2>&1 || return 1
+	printf '1500\n' >"${seed_dir}/.task-counter"
+	git -C "$seed_dir" add .task-counter >/dev/null 2>&1 || return 1
+	git -C "$seed_dir" commit -m "chore: stale dedicated counter" >/dev/null 2>&1 || return 1
+	git -C "$seed_dir" push origin task-id-counter-local:refs/heads/task-id-counter --force >/dev/null 2>&1 || return 1
+	git -C "$seed_dir" checkout develop >/dev/null 2>&1 || return 1
+	git -C "$seed_dir" branch -D task-id-counter-local >/dev/null 2>&1 || true
+
+	git -C "$seed_dir" config "url.file://${bare_dir}.insteadOf" "https://github.com/example/develop-default.git" || return 1
+	git -C "$seed_dir" remote set-url origin "https://github.com/example/develop-default.git" || return 1
+	git -C "$seed_dir" worktree add --detach "$work_dir" develop >/dev/null 2>&1 || return 1
+	printf '%s\n' '{}' >"${work_dir}/.aidevops.json"
+	printf '%s\n' "$work_dir"
+	return 0
+}
+
+# gh stub reporting no branch protection for any branch — this fixture only
+# exercises default-branch detection and the sync action, not the policy
+# preflight already covered by test_protected_counter_branch_preflight.
+setup_open_policy_stub() {
+	local base_dir="$1"
+	local bin_dir="${base_dir}/bin-open"
+
+	mkdir -p "$bin_dir" || return 1
+	cat >"${bin_dir}/gh" <<'STUB'
+#!/usr/bin/env bash
+set -u
+if [[ "$#" -ge 2 && "$1" == "api" ]]; then
+	printf '%s\n' '{}'
+	exit 0
+fi
+exit 1
+STUB
+	chmod +x "${bin_dir}/gh" || return 1
+	printf '%s\n' "$bin_dir"
+	return 0
+}
+
+test_develop_default_branch_sync_and_claim() {
+	local tmpdir="$1"
+	local name_detect="develop-default repo detects remote default branch instead of assuming main"
+	local name_sync="sync-counter-branch fast-forwards a stale dedicated branch to the default-branch counter"
+	local name_claim="claim after sync allocates from the caught-up dedicated counter branch"
+	local case_dir="${tmpdir}/develop-default"
+	local work_dir="" bin_dir="" output="" rc=0 task_id=""
+
+	mkdir -p "$case_dir" || { fail "$name_detect" "fixture directory failed"; return 0; }
+	work_dir=$(setup_develop_default_remote "$case_dir") || {
+		fail "$name_detect" "repo setup failed"
+		return 0
+	}
+	bin_dir=$(setup_open_policy_stub "$case_dir") || {
+		fail "$name_detect" "policy stub setup failed"
+		return 0
+	}
+
+	rc=0
+	output=$(PATH="${bin_dir}:${PATH}" CAS_MAX_RETRIES=5 CAS_WALL_TIMEOUT_S=20 CAS_SSH_FALLBACK_ENABLED=0 \
+		"$CLAIM_SCRIPT" --title "develop default discovery" --no-issue --dry-run --repo-path "$work_dir" 2>&1) || rc=$?
+
+	if ! printf '%s\n' "$output" | grep -Fq 'Default branch detected from origin: develop'; then
+		fail "$name_detect" "missing remote default-branch detection evidence: $output"
+		return 0
+	fi
+	if printf '%s\n' "$output" | grep -Eq 'refs/heads/main[^-]|/main:'; then
+		fail "$name_detect" "helper referenced a main branch that does not exist in this fixture: $output"
+		return 0
+	fi
+	if [[ $rc -ne 0 ]] || ! printf '%s\n' "$output" | grep -q 'COUNTER_BRANCH_STALE'; then
+		fail "$name_detect" "expected a correctly-classified stale refusal against develop: rc=${rc}: $output"
+		return 0
+	fi
+	pass "$name_detect"
+
+	rc=0
+	output=$(PATH="${bin_dir}:${PATH}" CAS_MAX_RETRIES=5 CAS_WALL_TIMEOUT_S=20 CAS_SSH_FALLBACK_ENABLED=0 \
+		"$CLAIM_SCRIPT" --sync-counter-branch --no-issue --repo-path "$work_dir" 2>&1) || rc=$?
+	if [[ $rc -ne 0 ]] || ! printf '%s\n' "$output" | grep -Fq 'COUNTER_BRANCH_SYNCED branch=task-id-counter value=2000'; then
+		fail "$name_sync" "expected a fast-forward to 2000: rc=${rc}: $output"
+		return 0
+	fi
+	pass "$name_sync"
+
+	rc=0
+	output=$(PATH="${bin_dir}:${PATH}" CAS_MAX_RETRIES=5 CAS_WALL_TIMEOUT_S=20 CAS_SSH_FALLBACK_ENABLED=0 \
+		"$CLAIM_SCRIPT" --title "develop default claim after sync" --no-issue --repo-path "$work_dir" 2>&1) || rc=$?
+	if [[ $rc -ne 0 ]]; then
+		fail "$name_claim" "claim failed after sync: rc=${rc}: $output"
+		return 0
+	fi
+	if ! printf '%s\n' "$output" | grep -Fq 'counter branch auto-selected from validated dedicated branch: task-id-counter'; then
+		fail "$name_claim" "expected the caught-up dedicated branch to be selected: $output"
+		return 0
+	fi
+	task_id=$(printf '%s\n' "$output" | awk -F= '/^task_id=/{print $2; exit}')
+	if [[ "$task_id" != "t2000" ]]; then
+		fail "$name_claim" "expected t2000, got ${task_id:-<empty>}"
+		return 0
+	fi
+	pass "$name_claim"
+	return 0
+}
+
+# GH#34791: explicit config and CLI selections must not bypass freshness checks.
+test_explicit_counter_freshness() {
+	local tmpdir="$1"
+	local case_dir="${tmpdir}/explicit-freshness"
+	local work_dir="" bin_dir="" output="" before="" after="" rc=0
+	local name="explicit counter freshness"
+	mkdir -p "$case_dir" || return 1
+	work_dir=$(setup_develop_default_remote "$case_dir") || return 1
+	bin_dir=$(setup_open_policy_stub "$case_dir") || return 1
+	printf '%s\n' '{"counter_branch":"develop"}' >"${work_dir}/.aidevops.json"
+
+	output=$(PATH="${bin_dir}:${PATH}" CAS_SSH_FALLBACK_ENABLED=0 \
+		"$CLAIM_SCRIPT" --title "fresh explicit config" --no-issue --repo-path "$work_dir" 2>&1) || rc=$?
+	if [[ $rc -eq 0 && "$output" == *'task_id=t2000'* ]]; then
+		pass "$name: up-to-date config allocates normally"
+	else
+		fail "$name" "fresh config rc=${rc}: $output"
+		return 0
+	fi
+
+	# Advance the dedicated branch independently of the configured default.
+	git -C "${case_dir}/seed" checkout -b leading origin/task-id-counter >/dev/null 2>&1 || return 1
+	printf '2500\n' >"${case_dir}/seed/.task-counter"
+	git -C "${case_dir}/seed" add .task-counter || return 1
+	git -C "${case_dir}/seed" commit -m "advance dedicated counter" >/dev/null 2>&1 || return 1
+	git -C "${case_dir}/seed" push origin leading:task-id-counter >/dev/null 2>&1 || return 1
+	before=$(git --git-dir="${case_dir}/remote.git" show-ref --heads)
+	rc=0
+	output=$(PATH="${bin_dir}:${PATH}" CAS_SSH_FALLBACK_ENABLED=0 \
+		"$CLAIM_SCRIPT" --title "stale explicit config" --no-issue --repo-path "$work_dir" 2>&1) || rc=$?
+	after=$(git --git-dir="${case_dir}/remote.git" show-ref --heads)
+	if [[ $rc -eq 4 && "$output" == *'counter_branch_stale'* && "$before" == "$after" && "$output" != *'task_id='* ]]; then
+		pass "$name: stale config exits 4 without any remote update or ID"
+	else
+		fail "$name" "stale config rc=${rc}, remote unchanged=$([[ "$before" == "$after" ]] && printf yes): $output"
+	fi
+
+	# CLI override switches to the leading branch and remains usable.
+	rc=0
+	output=$(PATH="${bin_dir}:${PATH}" CAS_SSH_FALLBACK_ENABLED=0 \
+		"$CLAIM_SCRIPT" --counter-branch task-id-counter --title "leading explicit CLI" --no-issue --repo-path "$work_dir" 2>&1) || rc=$?
+	if [[ $rc -eq 0 && "$output" == *'task_id=t2500'* ]]; then
+		pass "$name: explicit CLI selects leading branch"
+	else
+		fail "$name" "leading CLI rc=${rc}: $output"
+	fi
+
+	# A remote TODO entry must be considered even when the local TODO is old.
+	git -C "${case_dir}/seed" checkout develop >/dev/null 2>&1 || return 1
+	git -C "${case_dir}/seed" pull --ff-only origin develop >/dev/null 2>&1 || return 1
+	printf '# Tasks\n\n- [x] t2600 published task\n' >"${case_dir}/seed/TODO.md"
+	git -C "${case_dir}/seed" add TODO.md || return 1
+	git -C "${case_dir}/seed" commit -m "publish higher task ID" >/dev/null 2>&1 || return 1
+	git -C "${case_dir}/seed" push origin develop >/dev/null 2>&1 || return 1
+	before=$(git --git-dir="${case_dir}/remote.git" show-ref --heads)
+	rc=0
+	output=$(PATH="${bin_dir}:${PATH}" CAS_SSH_FALLBACK_ENABLED=0 \
+		"$CLAIM_SCRIPT" --counter-branch task-id-counter --title "stale versus remote TODO" --no-issue --repo-path "$work_dir" 2>&1) || rc=$?
+	after=$(git --git-dir="${case_dir}/remote.git" show-ref --heads)
+	if [[ $rc -eq 4 && "$output" == *'counter_branch_stale'* && "$output" == *'TODO seed=2601'* && "$before" == "$after" ]]; then
+		pass "$name: default-branch remote TODO prevents reuse without pushing"
+	else
+		fail "$name" "remote TODO rc=${rc}: $output"
+	fi
+	rc=0
+	output=$(PATH="${bin_dir}:${PATH}" "$CLAIM_SCRIPT" --repair-counter-branch --repo-path "$work_dir" 2>&1) || rc=$?
+	after=$(git --git-dir="${case_dir}/remote.git" show-ref --heads)
+	if [[ $rc -eq 4 && "$output" == *'TODO seed=2601'* && "$before" == "$after" ]] &&
+		jq -e '.counter_branch == "develop"' "${work_dir}/.aidevops.json" >/dev/null; then
+		pass "$name: repair refuses a dedicated branch behind remote TODO"
+	else
+		fail "$name" "repair ignored remote TODO: rc=${rc}: $output"
+	fi
+	return 0
+}
+
+# GH#34856: exercise the public maintenance flag against a real sandbox remote.
+test_stale_pin_repair() {
+	local tmpdir="$1"
+	local mode="" case_dir="" work_dir="" bin_dir="" output="" before="" rc=0
+	local name="stale default pin repair" config="" metadata="" repaired=""
+	for mode in 600 644; do
+		case_dir="${tmpdir}/repair-${mode}"
+		mkdir -p "$case_dir" || return 1
+		work_dir=$(setup_develop_default_remote "$case_dir") || return 1
+		bin_dir=$(setup_open_policy_stub "$case_dir") || return 1
+		config="${work_dir}/.aidevops.json"
+		printf '%s\n' '{"counter_branch":"develop","other":{"keep":[1,"two"]}}' >"$config"
+		chmod "$mode" "$config" || return 1
+		# Fresh explicit default pins must remain byte-for-byte unchanged.
+		before=$(git hash-object "$config")
+		rc=0
+		output=$(PATH="${bin_dir}:${PATH}" "$CLAIM_SCRIPT" --repair-counter-branch --repo-path "$work_dir" 2>&1) || rc=$?
+		if [[ $rc -ne 0 || "$(git hash-object "$config")" != "$before" ]]; then
+			fail "$name mode=$mode" "up-to-date pin changed: $output"
+			continue
+		fi
+		git -C "${case_dir}/seed" checkout -b leading origin/task-id-counter >/dev/null 2>&1 || return 1
+		printf '2500\n' >"${case_dir}/seed/.task-counter"
+		git -C "${case_dir}/seed" add .task-counter || return 1
+		git -C "${case_dir}/seed" commit -m "advance dedicated counter" >/dev/null 2>&1 || return 1
+		git -C "${case_dir}/seed" push origin leading:task-id-counter >/dev/null 2>&1 || return 1
+		before=$(git --git-dir="${case_dir}/remote.git" show-ref --heads)
+		metadata=$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(s.st_mode,s.st_uid,s.st_gid,s.st_ino)' "$config")
+		rc=0
+		output=$(PATH="${bin_dir}:${PATH}" "$CLAIM_SCRIPT" --sync-counter-branch --repo-path "$work_dir" 2>&1) || rc=$?
+		if [[ $rc -ne 4 || "$output" != *'--repair-counter-branch'*'--sync-counter-branch'* ||
+			"$(git --git-dir="${case_dir}/remote.git" show-ref --heads)" != "$before" ]]; then
+			fail "$name mode=$mode" "sync did not refuse stale default pin without pushing: $output"
+			continue
+		fi
+		rc=0
+		output=$(PATH="${bin_dir}:${PATH}" "$CLAIM_SCRIPT" --repair-counter-branch --repo-path "$work_dir" 2>&1) || rc=$?
+		if [[ $rc -ne 0 || "$output" != *'COUNTER_BRANCH_CONFIG_REPAIRED'* || "$output" == *'task_id='* ]] ||
+			! jq -e '. == {counter_branch:"task-id-counter",other:{keep:[1,"two"]}}' "$config" >/dev/null ||
+			[[ "$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(s.st_mode,s.st_uid,s.st_gid,s.st_ino)' "$config")" != "$metadata" ||
+			"$(git --git-dir="${case_dir}/remote.git" show-ref --heads)" != "$before" ]]; then
+			fail "$name mode=$mode" "repair mutated metadata/other keys/remote or failed: $output"
+			continue
+		fi
+		repaired=$(git hash-object "$config")
+		output=$(PATH="${bin_dir}:${PATH}" AIDEVOPS_TASK_COORDINATOR_MODE=namespaced "$CLAIM_SCRIPT" --repair-counter-branch --repo-path "$work_dir" 2>&1) || return 1
+		if [[ "$(git hash-object "$config")" != "$repaired" ]]; then
+			fail "$name mode=$mode" "repeated repair changed the config"
+			continue
+		fi
+		output=$(PATH="${bin_dir}:${PATH}" "$CLAIM_SCRIPT" --title "claim after config repair" --no-issue --repo-path "$work_dir" 2>&1) || return 1
+		if [[ "$output" != *'task_id=t2500'* ||
+			"$(git --git-dir="${case_dir}/remote.git" rev-parse develop)" != "$(git -C "$work_dir" rev-parse HEAD)" ]]; then
+			fail "$name mode=$mode" "claim failed or changed develop: $output"
+			continue
+		fi
+		pass "$name mode=$mode: metadata and other keys preserved; idempotent; claim leaves develop untouched"
+	done
+	return 0
+}
+
 main() {
 	local tmpdir=""
 	local work_dir=""
@@ -327,6 +830,12 @@ main() {
 	test_protected_counter_branch_preflight "$tmpdir" "$work_dir" "$bin_dir"
 	test_protected_counter_branch_push_fallback "$tmpdir" "$work_dir" "$bin_dir"
 	test_implicit_dedicated_counter_branch "$tmpdir" "$work_dir" "$bin_dir"
+	test_linked_worktree_preserves_history "$tmpdir" "$bin_dir"
+	test_canonical_implicit_counter_discovery "$tmpdir" "$bin_dir"
+	test_canonical_context_setup_failure "$tmpdir" "$bin_dir"
+	test_develop_default_branch_sync_and_claim "$tmpdir"
+	test_explicit_counter_freshness "$tmpdir" || fail "explicit counter freshness" "fixture failed"
+	test_stale_pin_repair "$tmpdir" || fail "stale pin repair" "fixture failed"
 	rm -rf "$tmpdir"
 	printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 	[[ "$FAIL" -eq 0 ]] || return 1

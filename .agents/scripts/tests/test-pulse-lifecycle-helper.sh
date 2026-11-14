@@ -30,6 +30,9 @@
 #   18. Genuine unkillable snapshot PIDs fail closed with PID evidence
 #   19. Managed replacement requires a new active-bundle PID lease
 #   20. Launchd runtime proof handles prompt, delayed, wrong, and missing starts
+#   21. Default discovery uses the stable link when its env override is unset
+#   22. Default discovery ignores another local user's Pulse process
+#   23. The async post-dispatch housekeeping run is not counted as a cycle
 #
 # No real pulse is touched. We use a unique mock filename and match pattern
 # on pulse-wrapper.sh which we control inside TEST_ROOT.
@@ -107,6 +110,7 @@ SH
 	local _escaped_root="${TEST_ROOT//./\\.}"
 	export AIDEVOPS_PULSE_PROCESS_PATTERN="${_escaped_root}/scripts/pulse-wrapper\\.sh"
 	export AIDEVOPS_PULSE_MERGE_PROCESS_PATTERN="${_escaped_root}/scripts/pulse-merge-routine\\.sh"
+	export AIDEVOPS_PULSE_HOUSEKEEPING_LOCK_DIR="${TEST_ROOT}/logs/post-dispatch-housekeeping.lock"
 
 	# Ensure env overrides don't leak between tests.
 	unset AIDEVOPS_SKIP_PULSE_RESTART 2>/dev/null || true
@@ -657,6 +661,59 @@ test_managed_replacement_requires_new_active_bundle_lease() {
 	return 0
 }
 
+test_managed_start_ignores_non_active_running_pids() {
+	local find_count_file="${TEST_ROOT}/managed-start-find-count"
+	local launch_count_file="${TEST_ROOT}/managed-start-launch-count"
+	local result=""
+	local rc=0
+	printf '0\n' >"$find_count_file"
+	printf '0\n' >"$launch_count_file"
+	result=$(
+		# shellcheck source=../pulse-lifecycle-helper.sh
+		source "$HELPER"
+		_PULSE_LAUNCHD_START_WAIT=3
+		sleep() {
+			return 0
+		}
+		_is_running() {
+			return 0
+		}
+		_pulse_require_script() {
+			return 0
+		}
+		_pulse_launch_unmanaged() {
+			local launch_calls=""
+			IFS= read -r launch_calls <"$launch_count_file" || launch_calls=0
+			launch_calls=$((launch_calls + 1))
+			printf '%s\n' "$launch_calls" >"$launch_count_file"
+			return 0
+		}
+		_pulse_find_active_runtime_pid_since() {
+			local baseline_pids="$1"
+			local find_calls=""
+			: "$baseline_pids"
+			IFS= read -r find_calls <"$find_count_file" || find_calls=0
+			find_calls=$((find_calls + 1))
+			printf '%s\n' "$find_calls" >"$find_count_file"
+			if [[ "$find_calls" -lt 4 ]]; then
+				return 1
+			fi
+			printf '303\n'
+			return 0
+		}
+		_start_activated_runtime
+		local launch_calls=""
+		IFS= read -r launch_calls <"$launch_count_file" || launch_calls=0
+		printf 'launch-calls=%s\n' "$launch_calls"
+	) || rc=$?
+	if [[ "$rc" -eq 0 && "$result" == *"Pulse is running from the activated bundle (PID 303)"* && "$result" == *"launch-calls=1"* ]]; then
+		_print_result "managed start ignores non-active running PIDs" 1
+	else
+		_print_result "managed start failed to bypass non-active running PIDs (rc=$rc result=$result)" 0
+	fi
+	return 0
+}
+
 test_launchd_runtime_wait_accepts_prompt_start() {
 	local result=""
 	local rc=0
@@ -955,6 +1012,61 @@ test_pulse_pids_suppresses_broken_pipe_when_consumer_exits_early() {
 	else
 		_print_result "_pulse_pids emitted Broken pipe noise (stderr=$err)" 0
 	fi
+	return 0
+}
+
+# GH#34456: Bash 3.2 may flush a failed printf again at process exit.
+# Assert the trap contract directly so Linux also catches premature restoration.
+test_pid_emitters_preserve_pipe_trap_after_closed_consumer() {
+	local emitter="" parent_pid="" closed="" out="" rc=0
+	for emitter in _pulse_pids _pulse_pids_sidecar; do
+		for parent_pid in 1 42; do
+			for closed in 0 1; do
+				rc=0
+				out=$(
+					# shellcheck source=../pulse-lifecycle-helper.sh
+					source "$HELPER"
+					trap - PIPE
+					_pulse_pids_raw() {
+						printf '123\n'
+						return 0
+					}
+					ps() {
+						local format="${4:-}"
+						if [[ "$format" == "ppid=" ]]; then
+							printf '%s\n' "$parent_pid"
+						elif [[ "$emitter" == "_pulse_pids_sidecar" ]]; then
+							printf 'bash pulse-wrapper.sh --merge-only\n'
+						else
+							printf 'bash pulse-wrapper.sh\n'
+						fi
+						return 0
+					}
+					_pulse_parent_is_wrapper() {
+						return 1
+					}
+					_pulse_emit_pid() {
+						local pid="$1"
+						: "$pid"
+						[[ "$closed" -eq 0 ]] || return 1
+						return 0
+					}
+					"$emitter" >/dev/null
+					trap -p PIPE
+				) || rc=$?
+				_assert_eq "$emitter returns 0 (parent=$parent_pid closed=$closed)" 0 "$rc"
+				if [[ "$closed" -eq 1 ]]; then
+					if [[ "$out" == *"''"* ]]; then
+						_print_result "$emitter leaves SIGPIPE ignored after EPIPE (parent=$parent_pid)" 1
+					else
+						_print_result "$emitter restored SIGPIPE after EPIPE (parent=$parent_pid trap=$out)" 0
+					fi
+				else
+					_assert_eq "$emitter restores default SIGPIPE on completion (parent=$parent_pid)" "" "$out"
+				fi
+			done
+		done
+	done
 	return 0
 }
 
@@ -1309,6 +1421,282 @@ test_status_sidecar_only_reports_not_running() {
 	return 0
 }
 
+# The async post-dispatch housekeeping run outlives its cycle with the bare
+# wrapper argv. The PID its lock records in async-pid is not a cycle, so a long
+# run can neither mask a dead Pulse nor set the setup drain ceiling. A PID the
+# marker predates was reused, and a pid-only lock (synchronous housekeeping
+# inside the cycle) keeps that cycle counted.
+test_async_housekeeping_is_not_a_main_cycle() {
+	_kill_mocks
+	local _lockdir="$AIDEVOPS_PULSE_HOUSEKEEPING_LOCK_DIR"
+	local _hk_pid="" _out="" _rc=0
+	rm -rf "$_lockdir"
+	if ! _spawn_extra_mock_pulse; then
+		_print_result "async housekeeping: mock run did not start" 0
+		_kill_mocks
+		return 0
+	fi
+	_hk_pid="${MOCK_PIDS[${#MOCK_PIDS[@]} - 1]}"
+	mkdir -p "$_lockdir"
+	printf '%s\n' "$_hk_pid" >"${_lockdir}/pid"
+	printf '%s\n' "$_hk_pid" >"${_lockdir}/async-pid"
+
+	"$HELPER" is-running >/dev/null 2>&1 || _rc=$?
+	_assert_eq "is-running: async housekeeping alone is not a running Pulse" "1" "$_rc"
+	_out=$("$HELPER" status 2>&1) || true
+	if [[ "$_out" == *"not running (async housekeeping only)"* && "$_out" == *"Async housekeeping: PID ${_hk_pid} "* ]]; then
+		_print_result "status: async housekeeping is listed apart from cycles" 1
+	else
+		_print_result "status: async housekeeping not listed apart (out=$_out)" 0
+	fi
+
+	_spawn_extra_mock_pulse || true
+	_out=$("$HELPER" status 2>&1) || true
+	if [[ "$_out" == *"Pulse: running (1 instance)"* ]]; then
+		_print_result "status: one cycle plus async housekeeping is one instance" 1
+	else
+		_print_result "status: async housekeeping counted as a cycle (out=$_out)" 0
+	fi
+
+	# Marker written before the process started: a reused PID, so a cycle.
+	touch -t 202001010000 "${_lockdir}/async-pid"
+	_out=$("$HELPER" status 2>&1) || true
+	if [[ "$_out" == *"Pulse: running (2 instances)"* && "$_out" != *"Async housekeeping:"* ]]; then
+		_print_result "status: a PID the async marker predates counts as a cycle" 1
+	else
+		_print_result "status: reused PID treated as async housekeeping (out=$_out)" 0
+	fi
+
+	# Synchronous housekeeping records only pid: that cycle stays counted.
+	rm -f "${_lockdir}/async-pid"
+	printf '%s\n' "$_hk_pid" >"${_lockdir}/pid"
+	_out=$("$HELPER" status 2>&1) || true
+	if [[ "$_out" == *"Pulse: running (2 instances)"* ]]; then
+		_print_result "status: a pid-only housekeeping lock keeps its cycle counted" 1
+	else
+		_print_result "status: synchronous housekeeping lock hid a cycle (out=$_out)" 0
+	fi
+	rm -rf "$_lockdir"
+	_kill_mocks
+	return 0
+}
+
+test_default_pattern_uses_stable_link_when_active_link_unset() {
+	_kill_mocks
+	local fixture_home="${TEST_ROOT}-default-home"
+	local active_link="${fixture_home}/.aidevops/agents"
+	mkdir -p "${active_link%/*}"
+	ln -s "$TEST_ROOT" "$active_link"
+	bash "${active_link}/scripts/pulse-wrapper.sh" >/dev/null 2>&1 &
+	local current_pid=$!
+	bash "${active_link}/scripts/pulse-merge-routine.sh" >/dev/null 2>&1 &
+	local current_merge_pid=$!
+	sleep 0.3
+
+	local out="" rc=0
+	out=$(env -u AIDEVOPS_PULSE_PROCESS_PATTERN \
+		-u AIDEVOPS_ACTIVE_AGENTS_LINK \
+		HOME="$fixture_home" \
+		AIDEVOPS_AGENTS_DIR="$TEST_ROOT" \
+		AIDEVOPS_RUNTIME_BUNDLES_DIR="${fixture_home}/.aidevops/runtime-bundles" \
+		"$HELPER" status 2>&1) || rc=$?
+	_assert_eq "default pattern: unset active-link env status exits 0" "0" "$rc"
+	if [[ "$out" == *"Pulse: running (1 instance)"* && "$out" == *"PID ${current_pid}"* ]]; then
+		_print_result "default pattern: stable-link Pulse is detected without env override" 1
+	else
+		_print_result "default pattern: stable-link Pulse was missed without env override (out=$out)" 0
+	fi
+
+	local merge_pids=""
+	# $1 intentionally expands in the child shell.
+	# shellcheck disable=SC2016
+	merge_pids=$(env -u AIDEVOPS_PULSE_MERGE_PROCESS_PATTERN \
+		-u AIDEVOPS_ACTIVE_AGENTS_LINK \
+		HOME="$fixture_home" \
+		AIDEVOPS_AGENTS_DIR="$TEST_ROOT" \
+		AIDEVOPS_RUNTIME_BUNDLES_DIR="${fixture_home}/.aidevops/runtime-bundles" \
+		bash -c 'source "$1"; _pulse_merge_pids_raw' _ "$HELPER")
+	if [[ "$merge_pids" == *"${current_merge_pid}"* ]]; then
+		_print_result "default pattern: stable-link merge routine is detected without env override" 1
+	else
+		_print_result "default pattern: stable-link merge routine was missed without env override (pids=$merge_pids)" 0
+	fi
+
+	kill -KILL "$current_pid" "$current_merge_pid" 2>/dev/null || true
+	wait "$current_pid" "$current_merge_pid" 2>/dev/null || true
+	rm -rf "$fixture_home"
+	return 0
+}
+
+test_default_pattern_ignores_foreign_user_pulse() {
+	_kill_mocks
+	local foreign_root="${TEST_ROOT}-foreign-user"
+	local active_link="${TEST_ROOT}-active"
+	ln -s "$TEST_ROOT" "$active_link"
+	mkdir -p "${foreign_root}/scripts"
+	cp "${TEST_ROOT}/scripts/pulse-wrapper.sh" "${foreign_root}/scripts/pulse-wrapper.sh"
+	cp "${TEST_ROOT}/scripts/pulse-merge-routine.sh" "${foreign_root}/scripts/pulse-merge-routine.sh"
+	chmod +x "${foreign_root}/scripts/pulse-wrapper.sh"
+	chmod +x "${foreign_root}/scripts/pulse-merge-routine.sh"
+	bash "${active_link}/scripts/pulse-wrapper.sh" >/dev/null 2>&1 &
+	local current_pid=$!
+	bash "${foreign_root}/scripts/pulse-wrapper.sh" >/dev/null 2>&1 &
+	local foreign_pid=$!
+	bash "${active_link}/scripts/pulse-merge-routine.sh" >/dev/null 2>&1 &
+	local current_merge_pid=$!
+	bash "${foreign_root}/scripts/pulse-merge-routine.sh" >/dev/null 2>&1 &
+	local foreign_merge_pid=$!
+	sleep 0.3
+
+	local out="" rc=0
+	out=$(env -u AIDEVOPS_PULSE_PROCESS_PATTERN AIDEVOPS_AGENTS_DIR="$TEST_ROOT" \
+		AIDEVOPS_ACTIVE_AGENTS_LINK="$active_link" \
+		AIDEVOPS_RUNTIME_BUNDLES_DIR="${TEST_ROOT}/runtime-bundles" \
+		"$HELPER" status 2>&1) || rc=$?
+	_assert_eq "default pattern: current-user Pulse status exits 0" "0" "$rc"
+	if [[ "$out" == *"Pulse: running (1 instance)"* && "$out" == *"PID ${current_pid}"* && "$out" != *"PID ${foreign_pid}"* ]]; then
+		_print_result "default pattern: foreign-user Pulse is ignored" 1
+	else
+		_print_result "default pattern: foreign-user Pulse leaked into status (out=$out)" 0
+	fi
+	local merge_pids=""
+	# $1 intentionally expands in the child shell.
+	# shellcheck disable=SC2016
+	merge_pids=$(env -u AIDEVOPS_PULSE_MERGE_PROCESS_PATTERN \
+		AIDEVOPS_AGENTS_DIR="$TEST_ROOT" \
+		AIDEVOPS_ACTIVE_AGENTS_LINK="$active_link" \
+		AIDEVOPS_RUNTIME_BUNDLES_DIR="${TEST_ROOT}/runtime-bundles" \
+		bash -c 'source "$1"; _pulse_merge_pids_raw' _ "$HELPER")
+	if [[ "$merge_pids" == *"${current_merge_pid}"* && "$merge_pids" != *"${foreign_merge_pid}"* ]]; then
+		_print_result "default pattern: foreign-user merge routine is ignored" 1
+	else
+		_print_result "default pattern: foreign-user merge routine leaked into discovery (pids=$merge_pids)" 0
+	fi
+
+	kill -KILL "$current_pid" "$foreign_pid" "$current_merge_pid" "$foreign_merge_pid" 2>/dev/null || true
+	wait "$current_pid" "$foreign_pid" "$current_merge_pid" "$foreign_merge_pid" 2>/dev/null || true
+	rm "$active_link"
+	rm -rf "$foreign_root"
+	return 0
+}
+
+# Updates on systemd must drain a young leased cycle just like launchd, but
+# must not defer forever when only a service (without a timer) is installed.
+test_systemd_cycle_boundary_drain() {
+	local output="" rc=0
+	output=$(
+		# shellcheck source=../pulse-lifecycle-helper.sh
+		source "$HELPER"
+		AIDEVOPS_PULSE_OS_NAME=Linux
+		timer_active=1
+		systemctl() {
+			if [[ "$*" == *--property=LoadState* ]]; then
+				printf 'loaded\n'
+				return 0
+			elif [[ "$*" == *is-active* ]]; then
+				[[ "$timer_active" == 1 ]] || return 1
+				return 0
+			fi
+			return 1
+		}
+		_pulse_pids() { printf '123\n'; return 0; }
+		_pulse_pid_uses_active_runtime() { return 1; }
+		_pulse_process_age_seconds() { printf '%s\n' "$cycle_age"; return 0; }
+		_PULSE_LOCK_DIR="${TEST_ROOT}/systemd-drain-missing.lockdir"
+		cycle_age=60
+		_pulse_reconcile_defers_to_cycle_boundary || exit 1
+		timer_active=0
+		if _pulse_reconcile_defers_to_cycle_boundary; then exit 1; fi
+		timer_active=1
+		cycle_age="$_PULSE_RECONCILE_DRAIN_MAX_AGE"
+		if _pulse_reconcile_defers_to_cycle_boundary; then exit 1; fi
+		printf 'systemd drain boundaries verified\n'
+	) || rc=$?
+	if [[ "$rc" == 0 && "$output" == *"systemd drain boundaries verified"* ]]; then
+		_print_result "systemd drains young cycles only with an active timer and below the age ceiling" 1
+	else
+		_print_result "systemd drain boundaries (rc=$rc output=$output)" 0
+	fi
+	return 0
+}
+
+# GH#37907: past the drain ceiling, only the lock owner with a fresh heartbeat
+# lease keeps draining, below the hard cap, and gets a drain request.
+test_reconcile_owner_lease_drain() {
+	local output="" rc=0
+	output=$(
+		# shellcheck source=../pulse-lifecycle-helper.sh
+		source "$HELPER"
+		_pulse_launchd_supervisor_loaded() { return 0; }
+		_pulse_pids() { printf '123\n'; return 0; }
+		_pulse_pid_uses_active_runtime() { return 1; }
+		_pulse_process_age_seconds() { printf '%s\n' "$cycle_age"; return 0; }
+		_pulse_runtime_bundle_id() { printf 'bundle-next\n'; return 0; }
+		_PULSE_LOCK_DIR="${TEST_ROOT}/owner-lease.lockdir"
+		_PULSE_RECONCILE_DRAIN_MAX_AGE=3600
+		_PULSE_LOCK_MAX_AGE=1800
+		_PULSE_RECONCILE_DRAIN_HARD_CAP=7200
+		mkdir -p "$_PULSE_LOCK_DIR"
+		printf '123\n' >"${_PULSE_LOCK_DIR}/pid"
+		date +%s >"${_PULSE_LOCK_DIR}/supervisor_heartbeat_epoch"
+		cycle_age=5600
+		_pulse_reconcile_defers_to_cycle_boundary || exit 1
+		grep -qx 'owner=123' "${_PULSE_LOCK_DIR}/drain_requested" || exit 2
+		grep -qx 'bundle=bundle-next' "${_PULSE_LOCK_DIR}/drain_requested" || exit 2
+		rm -f "${_PULSE_LOCK_DIR}/drain_requested"
+		cycle_age=7200
+		if _pulse_reconcile_defers_to_cycle_boundary; then exit 3; fi
+		cycle_age=5600
+		printf '%s\n' "$(($(date +%s) - 1801))" >"${_PULSE_LOCK_DIR}/supervisor_heartbeat_epoch"
+		if _pulse_reconcile_defers_to_cycle_boundary; then exit 4; fi
+		date +%s >"${_PULSE_LOCK_DIR}/supervisor_heartbeat_epoch"
+		printf '456\n' >"${_PULSE_LOCK_DIR}/pid"
+		if _pulse_reconcile_defers_to_cycle_boundary; then exit 5; fi
+		# A young non-owner cycle still drains, but gets no drain request.
+		cycle_age=60
+		_pulse_reconcile_defers_to_cycle_boundary || exit 6
+		[[ ! -e "${_PULSE_LOCK_DIR}/drain_requested" ]] || exit 7
+		printf 'owner lease boundaries verified\n'
+	) || rc=$?
+	rm -rf "${TEST_ROOT}/owner-lease.lockdir"
+	if [[ "$rc" == 0 && "$output" == *"deferring: elastic owner lease fresh (age 5600s, heartbeat "* &&
+		"$output" == *"drain hard cap 7200s"* && "$output" == *"without a fresh owner heartbeat lease"* &&
+		"$output" == *"owner lease boundaries verified"* ]]; then
+		_print_result "reconcile defers past the ceiling only for a fresh owner lease below the hard cap" 1
+	else
+		_print_result "reconcile owner lease boundaries (rc=$rc output=$output)" 0
+	fi
+	return 0
+}
+
+test_systemd_managed_start() {
+	local output="" rc=0
+	output=$(
+		# shellcheck source=../pulse-lifecycle-helper.sh
+		source "$HELPER"
+		_pulse_systemd_supervisor_loaded() { return 0; }
+		_pulse_pids() { printf '123\n'; return 0; }
+		systemctl() {
+			[[ "$*" == '--user start --no-block aidevops-supervisor-pulse.service' ]] || return 1
+			return 0
+		}
+		_pulse_wait_for_launchd_runtime() {
+			local baseline="$1"
+			[[ "$baseline" == 123 ]] || return 1
+			printf '456\n'
+			return 0
+		}
+		_start_activated_runtime() { exit 1; }
+		_pulse_start_managed
+	) || rc=$?
+	if [[ "$rc" == 0 && "$output" == *"Pulse started by systemd"* ]]; then
+		_print_result "systemd queues managed start without waiting for oneshot completion and verifies runtime" 1
+	else
+		_print_result "systemd managed start (rc=$rc output=$output)" 0
+	fi
+	return 0
+}
+
 # -----------------------------------------------------------------------------
 # Runner
 # -----------------------------------------------------------------------------
@@ -1331,6 +1719,7 @@ main() {
 	test_reconciliation_fails_closed_on_unkillable_snapshot
 	test_reconciliation_skips_reused_snapshot_pid
 	test_managed_replacement_requires_new_active_bundle_lease
+	test_managed_start_ignores_non_active_running_pids
 	test_launchd_runtime_wait_accepts_prompt_start
 	test_launchd_runtime_wait_accepts_delayed_start
 	test_launchd_runtime_wait_rejects_wrong_runtime
@@ -1342,6 +1731,7 @@ main() {
 	test_skip_env_honoured_in_restart
 	test_missing_pulse_script_exit_2
 	test_pulse_pids_suppresses_broken_pipe_when_consumer_exits_early
+	test_pid_emitters_preserve_pipe_trap_after_closed_consumer
 	test_pipe_trap_restore_avoids_eval
 	test_pipe_trap_restore_ignored_sigpipe
 
@@ -1358,6 +1748,12 @@ main() {
 	test_status_four_main_plus_sidecar_warns
 	test_is_running_returns_false_with_only_sidecar
 	test_status_sidecar_only_reports_not_running
+	test_async_housekeeping_is_not_a_main_cycle
+	test_default_pattern_uses_stable_link_when_active_link_unset
+	test_default_pattern_ignores_foreign_user_pulse
+	test_systemd_cycle_boundary_drain
+	test_reconcile_owner_lease_drain
+	test_systemd_managed_start
 
 	echo ""
 	echo "----"

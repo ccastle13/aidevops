@@ -33,13 +33,26 @@ _VERSION_MANAGER_PROTECTED_SUPERSESSION_JSON=""
 _VERSION_MANAGER_TAG_STATE_ABSENT="absent"
 _VERSION_MANAGER_TAG_STATE_MATCHING="matching"
 _VERSION_MANAGER_RELEASE_RESULT_QUEUED="queued"
+_VERSION_MANAGER_RELEASE_PR_MISSING="pr-missing"
 _VERSION_MANAGER_MODE_RECONCILE="reconcile"
 _VERSION_MANAGER_PR_STATE_OPEN="open"
 _VERSION_MANAGER_PR_STATE_CLOSED="closed"
 _VERSION_MANAGER_TIMESTAMP_REGEX='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
 
 #aidevops:trust-boundary
+# GH#34434: release-tool pushes (direct main+tags, protected recovery branch,
+# preserved tag, hotfix signal tag) carry only version-file bumps, provenance
+# merges and signed tags on top of CI-verified main. They run from detached,
+# dependency-free release/tag worktrees where the repo-verify pre-push guard
+# (format/lint/typecheck) cannot start, which blocked every release push. Each
+# of those exact push commands sets AIDEVOPS_PREPUSH_REPO_VERIFY=0 for that one
+# command only; the privacy, credential, complexity and scope guards still run.
+
+#aidevops:trust-boundary
 _version_manager_require_aggregate_fence() {
+	if declare -F _version_manager_verify_preserved_lane_fence >/dev/null 2>&1; then
+		_version_manager_verify_preserved_lane_fence || return 1
+	fi
 	if declare -F _version_manager_verify_aggregate_lane_fence >/dev/null 2>&1; then
 		_version_manager_verify_aggregate_lane_fence
 		return $?
@@ -161,8 +174,9 @@ _version_manager_remote_branch_head() {
 _version_manager_fetch_recovery_branch() {
 	local branch_name="$1"
 
+	# Mirror lease-replaced remote heads locally; provenance is checked by callers.
 	if ! git -C "$REPO_ROOT" fetch origin \
-		"refs/heads/${branch_name}:refs/remotes/origin/${branch_name}" --quiet; then
+		"+refs/heads/${branch_name}:refs/remotes/origin/${branch_name}" --quiet; then
 		return 1
 	fi
 	return 0
@@ -294,12 +308,37 @@ _version_manager_verify_protected_pr_identity() {
 	return 0
 }
 
+_version_manager_require_unowned_release_branch() {
+	local branch_name="$1"
+	local stale_head="$2"
+	local repo=""
+	local pulls_json=""
+
+	repo=$(_version_manager_protected_repo_slug) || return 1
+	# Inspect every PR, not just the latest or those targeting main. An open
+	# PR owns the branch; a merged PR owns its immutable historical head.
+	pulls_json=$(gh api --method GET "repos/${repo}/pulls" --paginate \
+		-f "head=${repo%%/*}:${branch_name}" -f state=all -F per_page=100 2>/dev/null) || return 1
+	if ! jq -e -s --arg head "$stale_head" '
+		length > 0 and all(.[]; type == "array") and
+		all(.[][]; .state != "open" and
+			((.merged_at // "") == "" or .head.sha != $head))
+	' <<<"$pulls_json" >/dev/null; then
+		print_error "Existing protected release branch is owned by an open or merged PR"
+		return 1
+	fi
+	return 0
+}
+
 _version_manager_prepare_protected_release_head() {
 	local version="$1"
 	local release_commit="$2"
 	local release_parent="$3"
 	local branch_name="$4"
 	local push_output=""
+	local stale_head=""
+	local ancestry_rc=0
+	local -a push_options=()
 
 	git -C "$REPO_ROOT" fetch origin main --quiet || return 1
 	if ! git -C "$REPO_ROOT" merge-base --is-ancestor "$release_parent" origin/main; then
@@ -315,8 +354,16 @@ _version_manager_prepare_protected_release_head() {
 			"$release_parent" "$(git -C "$REPO_ROOT" rev-parse origin/main)"; then
 			return 0
 		fi
-		print_error "Existing protected release branch has incompatible provenance"
-		return 1
+		# Only a previous attempt without the current release commit is stale.
+		# Other invalid topology must still fail closed, not be overwritten.
+		git -C "$REPO_ROOT" merge-base --is-ancestor "$release_commit" \
+			"$_VERSION_MANAGER_PROTECTED_RELEASE_HEAD" || ancestry_rc=$?
+		if [[ "$ancestry_rc" -ne 1 ]]; then
+			print_error "Existing protected release branch has incompatible provenance"
+			return 1
+		fi
+		stale_head="$_VERSION_MANAGER_PROTECTED_RELEASE_HEAD"
+		push_options=("--force-with-lease=refs/heads/${branch_name}:${stale_head}")
 	fi
 
 	if git -C "$REPO_ROOT" merge-base --is-ancestor "$release_commit" origin/main; then
@@ -347,13 +394,18 @@ _version_manager_prepare_protected_release_head() {
 		return 1
 	fi
 
+	if [[ -n "$stale_head" ]]; then
+		_version_manager_require_unowned_release_branch "$branch_name" "$stale_head" || return 1
+	fi
 	_version_manager_require_aggregate_fence || return 1
-	if push_output=$(git -C "$REPO_ROOT" push origin \
+	# GH#34434: release-tool push; skip only the dependency-bound repo-verify guard.
+	if push_output=$(AIDEVOPS_PREPUSH_REPO_VERIFY=0 git -C "$REPO_ROOT" push origin \
+		${push_options[@]+"${push_options[@]}"} \
 		"${_VERSION_MANAGER_PROTECTED_RELEASE_HEAD}:refs/heads/${branch_name}" 2>&1); then
 		return 0
 	fi
 	# A concurrent creator may have won the branch race. Reuse only an exact,
-	# provenance-preserving remote head; never force-update release recovery.
+	# provenance-preserving remote head; never retry a rejected stale-head lease.
 	_version_manager_remote_branch_head "$branch_name" || return 1
 	if [[ -n "$_VERSION_MANAGER_PROTECTED_RELEASE_HEAD" ]]; then
 		_version_manager_fetch_recovery_branch "$branch_name" || return 1
@@ -514,6 +566,79 @@ _version_manager_create_or_reuse_protected_pr() {
 	return 0
 }
 
+# Snapshot publication may lag main, but only for a cryptographically verified
+# tag explicitly binding the immutable range and direct release parent. A
+# recovery-pinned aggregate (GH#34710) binds its reviewed aggregate merge the
+# same way: the signed pin must equal the direct parent and the source PR must
+# be that commit's immutable aggregator identity.
+_version_manager_is_signed_snapshot() {
+	local tag_name="$1"
+	local base=""
+	local source=""
+	local source_pr=""
+	local pin=""
+	local aggregator_pr=""
+	local verification=""
+	local tagger=""
+	local tag_ref="refs/tags/$tag_name"
+	_VERSION_MANAGER_SNAPSHOT_SIGNATURE_UNTRUSTED=0
+	base=$(git -C "$REPO_ROOT" for-each-ref --format='%(contents:body)' "$tag_ref" |
+		awk '/^Aidevops-Snapshot-Base: / {print $2}') || return 1
+	source=$(git -C "$REPO_ROOT" for-each-ref --format='%(contents:body)' "$tag_ref" |
+		awk '/^Aidevops-Source-Merge: / {print $2}') || return 1
+	[[ "$source" =~ ^[0-9a-f]{40}$ ]] || return 1
+	[[ "$(git -C "$REPO_ROOT" rev-parse "${tag_ref}^{commit}^1")" == "$source" ]] || return 1
+	if [[ -n "$base" ]]; then
+		[[ "$base" =~ ^[0-9a-f]{40}$ ]] || return 1
+		git -C "$REPO_ROOT" merge-base --is-ancestor "$base" "$source" || return 1
+	else
+		pin=$(git -C "$REPO_ROOT" for-each-ref --format='%(contents:body)' "$tag_ref" |
+			awk '/^Aidevops-Aggregate-Pin: / {print $2}') || return 1
+		source_pr=$(git -C "$REPO_ROOT" for-each-ref --format='%(contents:body)' "$tag_ref" |
+			awk '/^Aidevops-Source-PR: / {print $2}') || return 1
+		[[ "$pin" == "$source" && "$source_pr" =~ ^[0-9]+$ ]] || return 1
+		aggregator_pr=$(git -C "$REPO_ROOT" log -1 --format='%B' "$source" |
+			git -C "$REPO_ROOT" interpret-trailers --parse |
+			awk '/^Aidevops-Release-Aggregator-PR: / {print $2}') || return 1
+		[[ "$aggregator_pr" == "$source_pr" ]] || return 1
+	fi
+	if ! verification=$(git -C "$REPO_ROOT" verify-tag "$tag_name" 2>&1); then
+		_VERSION_MANAGER_SNAPSHOT_SIGNATURE_UNTRUSTED=1
+		print_error "Snapshot ${tag_name} is signature-unverified on this host (signer-untrusted)"
+		tagger=$(git -C "$REPO_ROOT" for-each-ref --format='%(taggername) %(taggeremail)' "$tag_ref") || tagger="unknown"
+		print_info "Tagger (unverified identity): $tagger"
+		# Git's diagnostics identify the signer/fingerprint without reading keys.
+		print_info "$verification"
+		print_info "Verify the exact tag object's GitHub signing-key registration and local signer trust; do not recreate the tag or aggregate"
+		return 1
+	fi
+	return 0
+}
+
+# Print a bounded, credential-redacted tail of Git push output so operators can
+# tell transient failures from ruleset, hook, or auth rejections.
+_version_manager_print_push_rejection() {
+	local push_output="$1"
+	local tail_text=""
+	local line=""
+
+	print_info "Git rejected the exact tag push"
+	[[ -n "$push_output" ]] || return 0
+	local redacted=""
+	redacted=$(printf '%s\n' "$push_output" |
+		sed -E \
+			-e 's#(https?|ssh)://[^/@[:space:]]+@#\1://[redacted]@#g' \
+			-e 's#(gh[pousr]_|github_pat_)[A-Za-z0-9_]+#[redacted]#g' \
+			-e 's#([Tt]oken|[Pp]assword|[Aa]uthorization)([=:] *)[^[:space:]]+#\1\2[redacted]#g')
+	tail_text=$(printf '%s\n' "$redacted" |
+		grep -E '^(remote:|error:|fatal:|!| ! |hint:)' | tail -n 5) || true
+	[[ -n "$tail_text" ]] || tail_text=$(printf '%s\n' "$redacted" | tail -n 2)
+	while IFS= read -r line; do
+		[[ -z "$line" ]] || print_info "  git: ${line:0:300}"
+	done <<<"$tail_text"
+	return 0
+}
+
 _version_manager_publish_reachable_tag() {
 	local tag_name="$1"
 	local push_output=""
@@ -538,22 +663,100 @@ _version_manager_publish_reachable_tag() {
 	fi
 	release_tree=$(git -C "$REPO_ROOT" rev-parse "${_VERSION_MANAGER_LOCAL_TAG_COMMIT}^{tree}" 2>/dev/null) || return 1
 	main_tree=$(git -C "$REPO_ROOT" rev-parse "origin/main^{tree}" 2>/dev/null) || return 1
-	if [[ "$release_tree" != "$main_tree" ]]; then
+	if [[ "$release_tree" != "$main_tree" ]] && ! _version_manager_is_signed_snapshot "$tag_name"; then
+		if [[ "${_VERSION_MANAGER_SNAPSHOT_SIGNATURE_UNTRUSTED:-0}" == "1" ]]; then
+			_VERSION_MANAGER_PROTECTED_RELEASE_RESULT="signer-untrusted"
+			return 1
+		fi
 		_VERSION_MANAGER_PROTECTED_RELEASE_RESULT="aggregation-required"
 		print_error "Refusing to publish ${tag_name}: protected main has a different tree from the signed release commit"
 		print_info "Create a newly reviewed exact-tip aggregation release; no tag or package channel was mutated"
 		return 1
 	fi
 	_version_manager_require_aggregate_fence || return 1
-	if ! push_output=$(git -C "$REPO_ROOT" push origin \
+	# GH#34434: release-tool push; skip only the dependency-bound repo-verify guard.
+	if ! push_output=$(AIDEVOPS_PREPUSH_REPO_VERIFY=0 git -C "$REPO_ROOT" push origin \
 		"refs/tags/${tag_name}:refs/tags/${tag_name}" 2>&1); then
 		print_error "Failed to publish preserved ${tag_name} after main became reachable"
-		[[ -z "$push_output" ]] || print_info "Git rejected the exact tag push"
+		_version_manager_print_push_rejection "$push_output"
 		return 1
 	fi
 	_version_manager_classify_remote_tag "$tag_name" || return 1
 	[[ "$_VERSION_MANAGER_REMOTE_TAG_STATE" == "$_VERSION_MANAGER_TAG_STATE_MATCHING" ]] || return 1
 	_VERSION_MANAGER_PROTECTED_RELEASE_RESULT="tag-pushed"
+	return 0
+}
+
+# GH#34753: GitHub rejects annotated tag objects at non-refs/tags refs
+# ("fatal error in commit_refs"). The signed tag therefore travels as the exact
+# raw bytes in blob `tag` of an unsigned commit envelope whose only parent is
+# the tagged release commit. Content addressing keeps the guarantee: recovery
+# accepts only bytes whose tag hash equals the pinned provenance object.
+_version_manager_build_staged_tag_envelope() {
+	local tag_object="$1"
+	local release_commit="$2"
+	local bytes_file="" blob="" tree="" commit_time=""
+
+	_VERSION_MANAGER_STAGED_TAG_ENVELOPE=""
+	bytes_file=$(mktemp) || return 1
+	if ! git -C "$REPO_ROOT" cat-file tag "$tag_object" >"$bytes_file" ||
+		! blob=$(git -C "$REPO_ROOT" hash-object -w "$bytes_file"); then
+		rm -f "$bytes_file"
+		return 1
+	fi
+	rm -f "$bytes_file"
+	tree=$(printf '100644 blob %s\ttag\n' "$blob" | git -C "$REPO_ROOT" mktree) || return 1
+	commit_time=$(git -C "$REPO_ROOT" log -1 --format=%ct "$release_commit") || return 1
+	# Fixed identity and time make the envelope reproducible across hosts.
+	_VERSION_MANAGER_STAGED_TAG_ENVELOPE=$(GIT_AUTHOR_NAME="aidevops release staging" \
+		GIT_AUTHOR_EMAIL="release-staging@aidevops.invalid" \
+		GIT_AUTHOR_DATE="${commit_time} +0000" \
+		GIT_COMMITTER_NAME="aidevops release staging" \
+		GIT_COMMITTER_EMAIL="release-staging@aidevops.invalid" \
+		GIT_COMMITTER_DATE="${commit_time} +0000" \
+		git -C "$REPO_ROOT" commit-tree --no-gpg-sign -p "$release_commit" \
+		-m "aidevops release tag staging ${tag_object}" "$tree") || return 1
+	return 0
+}
+
+# Restore the tag carried by a fetched staging envelope; callers must compare
+# _VERSION_MANAGER_STAGED_TAG_OBJECT with their pinned provenance object.
+_version_manager_decode_staged_tag() {
+	local envelope="$1"
+	local bytes_file=""
+
+	_VERSION_MANAGER_STAGED_TAG_OBJECT=""
+	[[ "$(git -C "$REPO_ROOT" cat-file -t "$envelope" 2>/dev/null)" == "commit" ]] || return 1
+	bytes_file=$(mktemp) || return 1
+	if ! git -C "$REPO_ROOT" cat-file blob "${envelope}:tag" >"$bytes_file" 2>/dev/null ||
+		! _VERSION_MANAGER_STAGED_TAG_OBJECT=$(git -C "$REPO_ROOT" hash-object -t tag -w "$bytes_file"); then
+		rm -f "$bytes_file"
+		_VERSION_MANAGER_STAGED_TAG_OBJECT=""
+		return 1
+	fi
+	rm -f "$bytes_file"
+	return 0
+}
+
+_version_manager_stage_protected_tag() {
+	local tag_name="$1"
+	local tag_object="$2"
+	local staging_ref="refs/aidevops/release-tags/${tag_name}" existing="" fetched=""
+	local release_commit=""
+	existing=$(git -C "$REPO_ROOT" ls-remote origin "$staging_ref") || return 1
+	if [[ -n "$existing" ]]; then
+		git -C "$REPO_ROOT" fetch --no-tags origin "$staging_ref" --quiet || return 1
+		fetched=$(git -C "$REPO_ROOT" rev-parse FETCH_HEAD) || return 1
+		_version_manager_decode_staged_tag "$fetched" || return 1
+		[[ "$_VERSION_MANAGER_STAGED_TAG_OBJECT" == "$tag_object" ]]
+		return $?
+	fi
+	release_commit=$(git -C "$REPO_ROOT" rev-parse "${tag_object}^{commit}") || return 1
+	_version_manager_build_staged_tag_envelope "$tag_object" "$release_commit" || return 1
+	_version_manager_require_aggregate_fence || return 1
+	# The empty lease is create-only CAS, not permission to replace an object.
+	AIDEVOPS_PREPUSH_REPO_VERIFY=0 git -C "$REPO_ROOT" push --force-with-lease="${staging_ref}:" \
+		origin "${_VERSION_MANAGER_STAGED_TAG_ENVELOPE}:${staging_ref}" || return 1
 	return 0
 }
 
@@ -595,6 +798,9 @@ _version_manager_queue_protected_main_release() {
 		_version_manager_publish_reachable_tag "$tag_name" || return 1
 		return 0
 	fi
+	# Preserve the original signed object on a fetchable, non-publication ref
+	# before the PR can merge. Never force a competing object at this name.
+	_version_manager_stage_protected_tag "$tag_name" "$tag_object" || return 1
 	_version_manager_create_or_reuse_protected_pr "$repo" "$version" "$branch_name" \
 		"$_VERSION_MANAGER_PROTECTED_RELEASE_HEAD" "$tag_object" "$release_commit" || return 1
 	_VERSION_MANAGER_PROTECTED_RELEASE_RESULT="$_VERSION_MANAGER_RELEASE_RESULT_QUEUED"
@@ -647,8 +853,9 @@ _version_manager_reconcile_protected_release_tag() {
 	branch_name=$(_version_manager_protected_release_branch_name "$version") || return 1
 	_version_manager_find_protected_release_pr "$repo" "$branch_name" || return 1
 	if [[ -z "$_VERSION_MANAGER_PROTECTED_PR_NUMBER" ]]; then
-		print_error "No protected release PR exists for preserved ${tag_name}"
-		return 1
+		_VERSION_MANAGER_PROTECTED_RELEASE_RESULT="$_VERSION_MANAGER_RELEASE_PR_MISSING"
+		printf 'Protected release PR is not yet queued for preserved %s\n' "$tag_name"
+		return 0
 	fi
 	pr_head=$(jq -r '.head.sha // ""' <<<"$_VERSION_MANAGER_PROTECTED_PR_JSON") || return 1
 	_version_manager_verify_protected_pr_head "$pr_head" || return 1

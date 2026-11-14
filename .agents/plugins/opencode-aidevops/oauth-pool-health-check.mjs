@@ -36,6 +36,12 @@ function interpretValidityStatus(status, okOn403, on403msg) {
   return `HTTP ${status}`;
 }
 
+export function interpretOpenAIValidityStatus(status) {
+  if (status === 401) return "INVALID (401 -- will force refresh on next provider request)";
+  if (status === 403) return "UNVERIFIED (403 -- Platform API probe does not validate ChatGPT OAuth)";
+  return interpretValidityStatus(status, false);
+}
+
 async function checkAccountTokenValidity(prov, account) {
   try {
     if (prov === "anthropic") {
@@ -54,7 +60,7 @@ async function checkAccountTokenValidity(prov, account) {
       const r = await fetch("https://api.openai.com/v1/models", {
         headers: { "Authorization": `Bearer ${account.access}`, "User-Agent": OPENCODE_USER_AGENT },
       });
-      return interpretValidityStatus(r.status, false);
+      return interpretOpenAIValidityStatus(r.status);
     }
     if (prov === "google") {
       const r = await fetch(GOOGLE_HEALTH_CHECK_URL, {
@@ -104,6 +110,6 @@ export async function poolActionCheck(providerArg, now) {
     if (pending) results.push(`  PENDING: Unassigned token (added: ${pending.added})`);
   }
   return results.length === 0
-    ? `No accounts in any pool.\n\nTo add: run \`opencode auth login\` (Ctrl+A), select a pool provider, enter email, complete OAuth, then switch to the main provider.`
+    ? `No accounts in any pool.\n\nTo add an account, run \`aidevops model-accounts-pool add <provider>\` with anthropic, openai, cursor, or google.`
     : `OAuth Pool Health Check${results.join("\n")}`;
 }

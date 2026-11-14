@@ -140,6 +140,7 @@ run_case "status transition failure blocks approval handoff" '
 	# shellcheck disable=SC1090
 	source "$APPROVAL_HELPER_UNDER_TEST" >/dev/null 2>&1
 	set_issue_status() { printf "simulated status failure" >&2; return 1; }
+	gh_issue_view() { printf "bug"; return 0; }
 	gh_issue_edit_safe() { printf "UNEXPECTED EDIT"; return 0; }
 	gh() {
 		if [[ "${1:-}" == "api" && "${2:-}" == "user" ]]; then printf "marcusquinn"; return 0; fi
@@ -164,6 +165,7 @@ run_case "partial lifecycle edit failure restores NMR" '
 		printf "simulated partial mutation" >&2
 		return 1
 	}
+	gh_issue_view() { printf "bug"; return 0; }
 	restore_trace=$(mktemp)
 	gh() {
 		if [[ "${1:-}" == "api" && "${2:-}" == "user" ]]; then printf "marcusquinn"; return 0; fi
@@ -192,6 +194,7 @@ run_case "failed NMR restoration remains explicit" '
 		printf "simulated partial mutation" >&2
 		return 1
 	}
+	gh_issue_view() { printf "bug"; return 0; }
 	gh() {
 		if [[ "${1:-}" == "api" && "${2:-}" == "user" ]]; then printf "marcusquinn"; return 0; fi
 		return 1
@@ -314,18 +317,16 @@ run_case "genuine lock failure is distinguished" '
 	# shellcheck disable=SC1090
 	source "$APPROVAL_HELPER_UNDER_TEST" >/dev/null 2>&1
 	_rest_should_fallback() { return 0; }
-	set_issue_status() { return 0; }
-	gh_issue_edit_safe() { return 0; }
+	_approval_ensure_lifecycle_labels() { return 0; }
 	gh() {
 		local arg1="${1:-}"
 		local arg2="${2:-}"
 		local arg3="${3:-}"
-		if [[ "$arg1" == "api" && "$arg2" == "user" ]]; then printf "marcusquinn"; return 0; fi
 		if [[ "$arg1" == "issue" && "$arg2" == "lock" ]]; then return 1; fi
 		if [[ "$arg1" == "api" && "$arg2" == "-X" && "$arg3" == "PUT" ]]; then return 22; fi
 		return 1
 	}
-	_approval_apply_issue_lifecycle_updates 123 marcusquinn/aidevops
+	_approve_target_after_confirmation issue 123 marcusquinn/aidevops mock-key
 ' 1
 assert_contains "genuine lock failure names advisory lock path" "$LAST_OUTPUT" "Approval advisory lock failure"
 assert_not_contains "genuine lock failure is not mislabeled as label failure" "$LAST_OUTPUT" "Failed to update approval labels/assignee"
@@ -335,7 +336,9 @@ run_case "post-approval protection failure blocks final success" '
 	set -uo pipefail
 	# shellcheck disable=SC1090
 	source "$APPROVAL_HELPER_UNDER_TEST" >/dev/null 2>&1
-	approval_snapshot_v2_payload() { printf "%s" "{\"schema\":\"aidevops-approval/v2\"}"; return 0; }
+	_approval_ensure_lifecycle_labels() { return 0; }
+	_approval_lock_issue() { return 0; }
+	approval_snapshot_v2_payload() { printf "%s" "{\"schema\":\"aidevops-approval/v2\",\"issue\":{\"lifecycle\":{\"locked\":true,\"lock_anchor\":{\"id\":1}}}}"; return 0; }
 	_sign_approval_payload() { local payload="$1"; local actual_key="$2"; local sig_file="$3"; : "$payload" "$actual_key"; printf "mock-signature" >"$sig_file"; return 0; }
 	gh_issue_comment() { return 0; }
 	cmd_verify() { printf "VERIFIED"; return 0; }
@@ -346,6 +349,95 @@ run_case "post-approval protection failure blocks final success" '
 assert_contains "post-approval failure suppresses final success" "$LAST_OUTPUT" "post-approval protection updates did not reach the required state"
 assert_not_contains "post-approval failure does not print success" "$LAST_OUTPUT" "Issue #123 approved and signed"
 assert_contains "post-approval failure queues bounded reconciliation" "$LAST_OUTPUT" "KICKED_RECONCILIATION"
+
+# GH#34554: a locked issue whose timeline exposes no uninterrupted lock event
+# (saturated GitHub timeline) must be refused before signing or commenting.
+# shellcheck disable=SC2016  # literal script is evaluated in the child bash.
+run_case "unanchored issue lock refuses before signing" '
+	set -uo pipefail
+	export AIDEVOPS_APPROVAL_LOCK_ANCHOR_ATTEMPTS=2 AIDEVOPS_APPROVAL_LOCK_ANCHOR_RETRY_SECONDS=0
+	# shellcheck disable=SC1090
+	source "$APPROVAL_HELPER_UNDER_TEST" >/dev/null 2>&1
+	_approval_ensure_lifecycle_labels() { return 0; }
+	_approval_lock_issue() { return 0; }
+	approval_snapshot_v2_payload() { printf "PAYLOAD_READ " >&2; printf "%s" "{\"issue\":{\"lifecycle\":{\"locked\":true,\"lock_anchor\":null}}}"; return 0; }
+	_approval_issue_lifecycle_event_count() { printf "310"; return 0; }
+	_sign_approval_payload() { printf "UNEXPECTED_SIGN"; return 0; }
+	gh_issue_comment() { printf "UNEXPECTED_COMMENT"; return 0; }
+	_post_issue_approval_updates() { printf "UNEXPECTED_LIFECYCLE"; return 0; }
+	_approve_target_after_confirmation issue 123 marcusquinn/aidevops mock-key
+' 1
+assert_contains "unanchored lock names the refusal" "$LAST_OUTPUT" "exposes no uninterrupted lock event"
+assert_contains "saturated timeline gives replacement-issue recovery" "$LAST_OUTPUT" "open a replacement issue"
+assert_eq "unanchored lock re-reads a bounded number of times" "PAYLOAD_READ PAYLOAD_READ " "$(printf '%s' "$LAST_OUTPUT" | grep -o 'PAYLOAD_READ ' | tr -d '\n')"
+assert_not_contains "unanchored lock does not sign" "$LAST_OUTPUT" "UNEXPECTED_SIGN"
+assert_not_contains "unanchored lock does not comment" "$LAST_OUTPUT" "UNEXPECTED_COMMENT"
+assert_not_contains "unanchored lock does not change lifecycle" "$LAST_OUTPUT" "UNEXPECTED_LIFECYCLE"
+assert_not_contains "unanchored lock is not reported as a snapshot build failure" "$LAST_OUTPUT" "Could not build the immutable approval snapshot"
+
+# shellcheck disable=SC2016  # literal script is evaluated in the child bash.
+run_case "unsaturated unanchored lock suggests one bounded retry" '
+	set -uo pipefail
+	export AIDEVOPS_APPROVAL_LOCK_ANCHOR_ATTEMPTS=1 AIDEVOPS_APPROVAL_LOCK_ANCHOR_RETRY_SECONDS=0
+	# shellcheck disable=SC1090
+	source "$APPROVAL_HELPER_UNDER_TEST" >/dev/null 2>&1
+	_approval_ensure_lifecycle_labels() { return 0; }
+	_approval_lock_issue() { return 0; }
+	approval_snapshot_v2_payload() { printf "%s" "{\"issue\":{\"lifecycle\":{\"locked\":true,\"lock_anchor\":null}}}"; return 0; }
+	_approval_issue_lifecycle_event_count() { printf "12"; return 0; }
+	_sign_approval_payload() { printf "UNEXPECTED_SIGN"; return 0; }
+	_approve_target_after_confirmation issue 123 marcusquinn/aidevops mock-key
+' 1
+assert_contains "unsaturated refusal suggests one retry" "$LAST_OUTPUT" "retry approval once after a minute"
+assert_not_contains "unsaturated refusal does not suggest replacement" "$LAST_OUTPUT" "open a replacement issue"
+assert_not_contains "unsaturated refusal does not sign" "$LAST_OUTPUT" "UNEXPECTED_SIGN"
+
+# Event visibility can lag the lock write; a later read with an anchor proceeds.
+# shellcheck disable=SC2016  # literal script is evaluated in the child bash.
+run_case "lock anchor visible on re-read proceeds to signing" '
+	set -uo pipefail
+	export AIDEVOPS_APPROVAL_LOCK_ANCHOR_ATTEMPTS=3 AIDEVOPS_APPROVAL_LOCK_ANCHOR_RETRY_SECONDS=0
+	# shellcheck disable=SC1090
+	source "$APPROVAL_HELPER_UNDER_TEST" >/dev/null 2>&1
+	_approval_ensure_lifecycle_labels() { return 0; }
+	_approval_lock_issue() { return 0; }
+	READS_FILE=$(mktemp)
+	approval_snapshot_v2_payload() {
+		printf "x" >>"$READS_FILE"
+		if [[ "$(cat "$READS_FILE")" == "x" ]]; then
+			printf "%s" "{\"issue\":{\"lifecycle\":{\"locked\":true,\"lock_anchor\":null}}}"
+		else
+			printf "%s" "{\"issue\":{\"lifecycle\":{\"locked\":true,\"lock_anchor\":{\"id\":7}}}}"
+		fi
+		return 0
+	}
+	_sign_approval_payload() { local payload="$1"; local actual_key="$2"; local sig_file="$3"; : "$actual_key"; printf "SIGNED:%s " "$payload"; printf "mock-signature" >"$sig_file"; return 0; }
+	gh_issue_comment() { return 0; }
+	cmd_verify() { printf "VERIFIED"; return 0; }
+	_post_issue_approval_updates() { return 0; }
+	_kick_pulse_after_approval() { return 0; }
+	_approve_target_after_confirmation issue 123 marcusquinn/aidevops mock-key
+	rm -f "$READS_FILE"
+' 0
+assert_contains "re-read signs only the anchored payload" "$LAST_OUTPUT" "SIGNED:{\"issue\":{\"lifecycle\":{\"locked\":true,\"lock_anchor\":{\"id\":7}}}}"
+assert_contains "anchored approval completes" "$LAST_OUTPUT" "Issue #123 approved and signed"
+
+# Missing repository labels must fail before locking, signing, or commenting.
+# shellcheck disable=SC2016  # literal script is evaluated in the child bash.
+run_case "approval label provisioning failure is pre-signature" '
+	set -uo pipefail
+	# shellcheck disable=SC1090
+	source "$APPROVAL_HELPER_UNDER_TEST" >/dev/null 2>&1
+	_approval_ensure_lifecycle_labels() { printf "PROVISION_ATTEMPT"; return 1; }
+	_approval_lock_issue() { printf "UNEXPECTED_LOCK"; return 0; }
+	_sign_approval_payload() { printf "UNEXPECTED_SIGN"; return 0; }
+	gh_issue_comment() { printf "UNEXPECTED_COMMENT"; return 0; }
+	_approve_target_after_confirmation issue 123 marcusquinn/aidevops mock-key
+' 1
+assert_contains "approval attempts lifecycle label provisioning" "$LAST_OUTPUT" "PROVISION_ATTEMPT"
+assert_not_contains "provisioning failure does not lock issue" "$LAST_OUTPUT" "UNEXPECTED_LOCK"
+assert_not_contains "provisioning failure does not sign" "$LAST_OUTPUT" "UNEXPECTED_SIGN"
+assert_not_contains "provisioning failure does not comment" "$LAST_OUTPUT" "UNEXPECTED_COMMENT"
 
 # GH#28717: target reconciliation accepts only the current authenticated actor's
 # signed comment when that actor has maintainer-equivalent authority.
@@ -443,6 +535,7 @@ run_case "reconcile re-verifies authority immediately before issue lifecycle res
 		printf "VERIFIED\n"
 		return 0
 	}
+	_approval_ensure_lifecycle_labels() { return 0; }
 	_post_issue_approval_updates() {
 		local target_type="${1:-}"
 		local target_number="${2:-}"
@@ -476,6 +569,7 @@ run_case "partial reconciliation failure reasserts NMR before returning" '
 		return 0
 	}
 	cmd_verify() { printf "VERIFIED\n"; return 0; }
+	_approval_ensure_lifecycle_labels() { return 0; }
 	_post_issue_approval_updates() { return 1; }
 	_approval_restore_nmr_hold() {
 		local target_type="${1:-}"
@@ -514,6 +608,33 @@ run_case "reconcile leaves an unchanged approved target as a no-op" '
 assert_contains "no-op reconciliation reports absent restored hold" "$LAST_OUTPUT" "NO_NMR"
 assert_not_contains "no-op reconciliation skips signature work" "$LAST_OUTPUT" "SHOULD_NOT_VERIFY"
 assert_not_contains "no-op reconciliation skips lifecycle mutation" "$LAST_OUTPUT" "SHOULD_NOT_APPLY"
+
+# A signed issue stranded by missing repository labels has no NMR and no
+# auto-dispatch. Reconciliation must provision labels and complete that handoff.
+# shellcheck disable=SC2016  # literal script is evaluated in the child bash.
+run_case "reconcile repairs signed issue missing both lifecycle labels" '
+	set -uo pipefail
+	# shellcheck disable=SC1090
+	source "$APPROVAL_HELPER_UNDER_TEST" >/dev/null 2>&1
+	trace=$(mktemp)
+	_require_number_arg() { return 0; }
+	_resolve_slug_or_fail() { local slug="${1:-}"; printf "%s" "$slug"; return 0; }
+	_approval_fetch_issue_json() {
+		printf "%s" "{\"state\":\"open\",\"locked\":true,\"labels\":[{\"name\":\"status:available\"}]}"
+		return 0
+	}
+	cmd_verify() { printf "VERIFIED\n"; return 0; }
+	_approval_ensure_lifecycle_labels() { printf "ENSURE_LABELS\n" >>"$trace"; return 0; }
+	_post_issue_approval_updates() { printf "APPLY_LIFECYCLE\n" >>"$trace"; return 0; }
+	rc=0
+	cmd_reconcile issue 123 marcusquinn/aidevops || rc=$?
+	cat "$trace"
+	rm -f "$trace"
+	exit "$rc"
+' 0
+assert_contains "stranded approval provisions lifecycle labels" "$LAST_OUTPUT" "ENSURE_LABELS"
+assert_contains "stranded approval completes lifecycle handoff" "$LAST_OUTPUT" "APPLY_LIFECYCLE"
+assert_contains "stranded approval reconciliation succeeds" "$LAST_OUTPUT" "RECONCILED"
 
 # shellcheck disable=SC2016  # literal script is evaluated in the child bash.
 run_case "reconcile preserves NMR when authority verification fails" '

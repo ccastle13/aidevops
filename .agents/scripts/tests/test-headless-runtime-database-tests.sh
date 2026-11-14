@@ -70,6 +70,42 @@ SQL
 	return 0
 }
 
+test_seed_worker_db_session_context_restores_archived_session() {
+	local shared_dir="${HOME}/.local/share/opencode"
+	local isolated_dir="${TEST_ROOT}/isolated-opencode-archived"
+	local shared_db="${shared_dir}/opencode.db"
+	local archive_db="${shared_dir}/opencode-archive.db"
+	local worker_db="${isolated_dir}/opencode/opencode.db"
+	local schema="CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT);
+CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT, directory TEXT NOT NULL, title TEXT NOT NULL, time_updated INTEGER NOT NULL);
+CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, data TEXT NOT NULL);"
+	mkdir -p "$shared_dir" "${isolated_dir}/opencode"
+	rm -f "$shared_db" "$archive_db" "$worker_db"
+	sqlite3 "$shared_db" "${schema}"
+	sqlite3 "$archive_db" "${schema}
+INSERT INTO project VALUES ('project-old', 'Old Project');
+INSERT INTO session VALUES ('session-old', 'project-old', NULL, '/work/old', 'Blocked worker', 1);
+INSERT INTO session VALUES ('session-old-child', 'project-old', 'session-old', '/work/old', 'Subagent', 1);
+INSERT INTO message VALUES ('message-old-1', 'session-old', 'history');
+INSERT INTO message VALUES ('message-old-2', 'session-old-child', 'subagent history');"
+	sqlite3 "$shared_db" .schema | sqlite3 "$worker_db"
+
+	local seed_status=0
+	_seed_worker_db_session_context "$isolated_dir" "session-old" >/dev/null 2>&1 || seed_status=$?
+
+	local worker_messages shared_sessions archive_sessions
+	worker_messages=$(sqlite3 "$worker_db" "SELECT COUNT(*) FROM message WHERE session_id = 'session-old';")
+	shared_sessions=$(sqlite3 "$shared_db" "SELECT COUNT(*) FROM session WHERE id IN ('session-old', 'session-old-child');")
+	archive_sessions=$(sqlite3 "$archive_db" "SELECT COUNT(*) FROM session;")
+	if [[ "$seed_status" -eq 0 && "$worker_messages" == "1" && "$shared_sessions" == "2" && "$archive_sessions" == "0" ]]; then
+		print_result "seed worker DB restores an archived continuation session before resuming" 0
+		return 0
+	fi
+	print_result "seed worker DB restores an archived continuation session before resuming" 1 \
+		"seed_status=$seed_status worker_messages=$worker_messages shared_sessions=$shared_sessions archive_sessions=$archive_sessions"
+	return 0
+}
+
 test_seed_worker_db_session_context_rebinds_replacement_worktree() {
 	local shared_dir="${HOME}/.local/share/opencode"
 	local isolated_dir="${TEST_ROOT}/isolated-opencode-rebound"
@@ -612,6 +648,111 @@ test_replay_preserved_worker_db_verifies_before_deletion() {
 	return 0
 }
 
+test_replay_corrupt_worker_db_quarantines_evidence_and_finalizes_healthy() {
+	local shared_dir="${HOME}/.local/share/opencode"
+	local recovery_root="${TEST_ROOT}/corrupt-replay-recovery"
+	local isolated_dir="${TEST_ROOT}/corrupt-replay-current"
+	local shared_db="${shared_dir}/opencode.db"
+	local first_output="" second_output="" suffix kind merged="" preserved=1
+	mkdir -p "$shared_dir" "${isolated_dir}/opencode" "$recovery_root/healthy" "$recovery_root/not-database" "$recovery_root/malformed"
+	rm -f "$shared_db"
+	create_complete_opencode_test_schema "$shared_db"
+	create_complete_opencode_test_schema "${isolated_dir}/opencode/opencode.db"
+	create_complete_opencode_test_schema "$recovery_root/healthy/opencode.db"
+	sqlite3 "${isolated_dir}/opencode/opencode.db" "INSERT INTO project VALUES ('current', 'Current'); INSERT INTO session VALUES ('current', 'current', '/current', 'Current');"
+	sqlite3 "$recovery_root/healthy/opencode.db" "INSERT INTO project VALUES ('recovered', 'Recovered'); INSERT INTO session VALUES ('recovered', 'recovered', '/recovered', 'Recovered');"
+	printf 'not a database\n' >"$recovery_root/not-database/opencode.db"
+	# A valid SQLite header with an invalid schema btree page reproduces SQLITE_CORRUPT (11).
+	sqlite3 "$recovery_root/malformed/opencode.db" 'PRAGMA page_size=4096; CREATE TABLE broken (id TEXT);'
+	python3 -c 'import sys; f = open(sys.argv[1], "r+b"); f.seek(4096); f.write(b"\xff"); f.close()' "$recovery_root/malformed/opencode.db"
+	for kind in not-database malformed; do
+		printf 'retained WAL evidence\n' >"$recovery_root/$kind/opencode.db-wal"
+		printf 'retained SHM evidence\n' >"$recovery_root/$kind/opencode.db-shm"
+		for suffix in "" -wal -shm; do
+			cp "$recovery_root/$kind/opencode.db$suffix" "$TEST_ROOT/expected-$kind.db$suffix"
+		done
+	done
+	first_output=$(AIDEVOPS_WORKER_DB_RECOVERY_DIR="$recovery_root" _finalize_isolated_runtime_data "$isolated_dir" worker 2>&1)
+	second_output=$(AIDEVOPS_WORKER_DB_RECOVERY_DIR="$recovery_root" _replay_preserved_worker_dbs 2>&1)
+	for kind in not-database malformed; do
+		for suffix in "" -wal -shm; do
+			cmp -s "$TEST_ROOT/expected-$kind.db$suffix" "$recovery_root/.quarantine/$kind/opencode.db$suffix" || preserved=0
+		done
+		[[ -f "$recovery_root/.quarantine/$kind/quarantine.txt" && ! -d "$recovery_root/$kind" ]] || preserved=0
+	done
+	merged=$(sqlite3 "$shared_db" 'SELECT id FROM session ORDER BY id;')
+	if [[ "$preserved" -eq 1 && "$merged" == $'current\nrecovered' && ! -d "$isolated_dir" && ! -f "$recovery_root/healthy/opencode.db" && "$first_output" == *"db_merge_recovery_quarantined"* && "$first_output" != *"replay_incomplete"* && -z "$second_output" ]]; then
+		print_result "corrupt replay quarantines evidence once and finalizes healthy workers" 0
+		return 0
+	fi
+	print_result "corrupt replay quarantines evidence once and finalizes healthy workers" 1 \
+		"preserved=$preserved merged=$merged first=$first_output second=$second_output"
+	return 0
+}
+
+test_replay_schema_failure_remains_retryable_without_mutating_evidence() {
+	local shared_dir="${HOME}/.local/share/opencode"
+	local recovery_root="${TEST_ROOT}/schema-replay-recovery"
+	local shared_db="${shared_dir}/opencode.db"
+	local first_status=0 second_status=0 unchanged=0
+	mkdir -p "$shared_dir" "$recovery_root/schema-drift"
+	rm -f "$shared_db"
+	sqlite3 "$shared_db" 'CREATE TABLE project (id TEXT PRIMARY KEY); CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, required_value TEXT NOT NULL);'
+	sqlite3 "$recovery_root/schema-drift/opencode.db" 'CREATE TABLE project (id TEXT PRIMARY KEY); CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT);'
+	cp "$recovery_root/schema-drift/opencode.db" "$TEST_ROOT/expected-schema.db"
+	AIDEVOPS_WORKER_DB_RECOVERY_DIR="$recovery_root" _replay_preserved_worker_dbs || first_status=$?
+	AIDEVOPS_WORKER_DB_RECOVERY_DIR="$recovery_root" _replay_preserved_worker_dbs || second_status=$?
+	cmp -s "$TEST_ROOT/expected-schema.db" "$recovery_root/schema-drift/opencode.db" && unchanged=1
+	if [[ "$first_status" -eq 1 && "$second_status" -eq 1 && "$unchanged" -eq 1 && ! -d "$recovery_root/.quarantine" ]]; then
+		print_result "schema replay failure stays retryable and preserves original evidence" 0
+		return 0
+	fi
+	print_result "schema replay failure stays retryable and preserves original evidence" 1 \
+		"first=$first_status second=$second_status unchanged=$unchanged"
+	return 0
+}
+
+test_quarantine_worker_db_preserves_existing_metadata() {
+	local recovery_root="${TEST_ROOT}/metadata-collision-recovery"
+	local status=0 contents=""
+	mkdir -p "$recovery_root/evidence"
+	printf 'original provenance\n' >"$recovery_root/original.txt"
+	ln -s "$recovery_root/original.txt" "$recovery_root/evidence/quarantine.txt"
+	_quarantine_worker_db "$recovery_root/evidence" "$recovery_root" 2>/dev/null || status=$?
+	IFS= read -r contents <"$recovery_root/original.txt"
+	if [[ "$status" -eq 1 && "$contents" == 'original provenance' && -L "$recovery_root/evidence/quarantine.txt" && ! -d "$recovery_root/.quarantine/evidence" ]]; then
+		print_result "quarantine refuses existing metadata without following symlinks" 0
+		return 0
+	fi
+	print_result "quarantine refuses existing metadata without following symlinks" 1
+	return 0
+}
+
+test_quarantine_worker_db_retries_failed_move() {
+	local recovery_root="${TEST_ROOT}/quarantine-move-retry"
+	local first_status=0 second_status=0 unchanged=1 suffix
+	mkdir -p "$recovery_root/evidence"
+	for suffix in "" -wal -shm; do
+		printf 'unchanged evidence\n' >"$recovery_root/evidence/opencode.db$suffix"
+		cp "$recovery_root/evidence/opencode.db$suffix" "$TEST_ROOT/move-expected.db$suffix"
+	done
+	(
+		mv() { return 1; }
+		_quarantine_worker_db "$recovery_root/evidence" "$recovery_root"
+	) || first_status=$?
+	[[ ! -e "$recovery_root/evidence/quarantine.txt" ]] || unchanged=0
+	_quarantine_worker_db "$recovery_root/evidence" "$recovery_root" || second_status=$?
+	for suffix in "" -wal -shm; do
+		cmp -s "$TEST_ROOT/move-expected.db$suffix" "$recovery_root/.quarantine/evidence/opencode.db$suffix" || unchanged=0
+	done
+	if [[ "$first_status" -eq 1 && "$second_status" -eq 0 && "$unchanged" -eq 1 ]]; then
+		print_result "quarantine retries a failed move without altering evidence" 0
+		return 0
+	fi
+	print_result "quarantine retries a failed move without altering evidence" 1
+	return 0
+}
+
 test_worker_db_replay_lock_recovers_stale_owner_and_waits_for_pid() {
 	local recovery_root="${TEST_ROOT}/replay-lock-recovery"
 	local replay_lock="${recovery_root}/.replay.lock"
@@ -1003,7 +1144,7 @@ test_large_opencode_prompt_uses_file_attachment() {
 	cmd_text=$(
 		while IFS= read -r -d '' arg; do
 			printf '<%s>' "$arg"
-		done < <(_build_run_cmd "anthropic/claude-sonnet-4-6" "$TEST_ROOT" "$prompt_arg" \
+		done < <(_build_run_cmd "anthropic/claude-sonnet-5-5" "$TEST_ROOT" "$prompt_arg" \
 			"Prompt Transport Test" "" "" "" --file "$prompt_file")
 	)
 
@@ -1210,7 +1351,7 @@ test_large_claude_prompt_uses_stdin_file() {
 	cmd_text=$(
 		while IFS= read -r -d '' arg; do
 			printf '<%s>' "$arg"
-		done < <(_build_claude_cmd "anthropic/claude-sonnet-4-6" "$TEST_ROOT" "$prompt_arg" \
+		done < <(_build_claude_cmd "anthropic/claude-sonnet-5-5" "$TEST_ROOT" "$prompt_arg" \
 			"Prompt Transport Test" "")
 	)
 
@@ -1248,9 +1389,21 @@ test_registered_prompt_temp_cleanup_removes_dir() {
 	_prepare_runtime_prompt_transport "opencode" "$prompt"
 	local prompt_file="$_HEADLESS_RUN_PROMPT_FILE"
 	local prompt_dir="${prompt_file%/*}"
+	: >"${prompt_dir}.wait_status"
+	: >"${prompt_dir}.kill_reason"
+	: >"${prompt_dir}.watchdog_killed"
+	: >"${prompt_dir}.watchdog_stall_killed"
+	: >"${prompt_dir}.rate_limit_fast"
+	# Attempts usually delete their base sentinel before final cleanup.
+	local missing_base="${prompt_dir}.missing"
+	_register_headless_runtime_temp_path "$missing_base"
+	: >"${missing_base}.wait_status"
 	_cleanup_headless_runtime_temp_paths
 
-	if [[ -n "$prompt_dir" && ! -e "$prompt_dir" ]]; then
+	if [[ -n "$prompt_dir" && ! -e "$prompt_dir" &&
+		! -e "${prompt_dir}.wait_status" && ! -e "${prompt_dir}.kill_reason" &&
+		! -e "${prompt_dir}.watchdog_killed" && ! -e "${prompt_dir}.watchdog_stall_killed" &&
+		! -e "${prompt_dir}.rate_limit_fast" && ! -e "${missing_base}.wait_status" ]]; then
 		if [[ -n "$old_threshold" ]]; then
 			HEADLESS_PROMPT_FILE_THRESHOLD_BYTES="$old_threshold"
 		else
@@ -1274,7 +1427,8 @@ test_registered_temp_cleanup_failure_is_reported_and_retained() {
 	local managed_root=""
 	managed_root=$(aidevops_sensitive_temp_root)
 	local temp_path="${managed_root}/aidevops-headless-cleanup-failure"
-	mkdir -p "$temp_path"
+	# A retained sidecar alone must fail and preserve registration for retry.
+	: >"${temp_path}.kill_reason"
 	_HEADLESS_RUNTIME_TEMP_PATHS=""
 	_register_headless_runtime_temp_path "$temp_path"
 
@@ -1292,7 +1446,7 @@ test_registered_temp_cleanup_failure_is_reported_and_retained() {
 			"${_HEADLESS_RUNTIME_TEMP_PATHS:-}"
 	)
 	_HEADLESS_RUNTIME_TEMP_PATHS=""
-	command rm -rf "$temp_path"
+	command rm -f "${temp_path}.kill_reason"
 
 	if [[ "$state" == *"headless_runtime_temp_cleanup_failed"* &&
 		"$state" == *"status=1 retained=${temp_path}"* ]]; then

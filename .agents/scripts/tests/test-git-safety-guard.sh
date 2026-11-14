@@ -15,6 +15,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 1
 HOOK="${SCRIPT_DIR}/../../hooks/git_safety_guard.py"
+REAL_GIT=$(python3 -E -s -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from native_git import real_git; print(real_git())' "${SCRIPT_DIR}/..")
 
 if [[ ! -f "$HOOK" ]]; then
 	printf 'ERROR: Hook not found at %s\n' "$HOOK" >&2
@@ -32,8 +33,8 @@ TEST_ROOT=""
 # Fixture construction must bypass the deployed guard shim. Hook assertions
 # continue to exercise the shared command policy and canonical Git guard.
 git() {
-	/usr/bin/git "$@"
-	return $?
+	"$REAL_GIT" "$@" || return 1
+	return 0
 }
 
 print_result() {
@@ -60,6 +61,11 @@ setup_test_repo() {
 	# Resolve symlinks so paths are consistent with what git returns
 	# (macOS: mktemp returns /var/... which is a symlink to /private/var/...)
 	TEST_ROOT=$(cd "$TEST_ROOT" && pwd -P)
+	# The canonical fixture must be registered: unregistered temp marker repos
+	# are intentionally exempt from the Git command guard.
+	printf '{"initialized_repos":[{"path":"%s"}]}\n' "$TEST_ROOT" >"${TEST_ROOT}/repos.json"
+	export AIDEVOPS_REPOS_FILE="${TEST_ROOT}/repos.json"
+	export AIDEVOPS_LIFECYCLE_STATE_DIR="${TEST_ROOT}/lifecycle-state"
 	git -C "$TEST_ROOT" init -b main >/dev/null 2>&1 || {
 		git -C "$TEST_ROOT" init >/dev/null 2>&1
 		git -C "$TEST_ROOT" checkout -b main >/dev/null 2>&1
@@ -93,12 +99,13 @@ run_hook() {
 	local cwd="$1"
 	local json="$2"
 	shift 2
+	json=$(python3 -c 'import json,sys; value=json.loads(sys.argv[1]); value.setdefault("session_id", "fixture"); print(json.dumps(value))' "$json")
 	(
 		cd "$cwd" || exit 1
 		if [[ $# -gt 0 ]]; then
-			env "$@" python3 "$HOOK" <<<"$json"
+			exec env "$@" python3 "$HOOK" <<<"$json"
 		else
-			python3 "$HOOK" <<<"$json"
+			exec python3 "$HOOK" <<<"$json"
 		fi
 	)
 	return $?
@@ -549,6 +556,31 @@ test_worker_network_policy() {
 	return 0
 }
 
+test_controlled_worktree_creation() {
+	local command json output headless
+	for headless in false true; do
+		for command in 'git worktree add ../example' 'git -C . worktree add -b feature/example ../example'; do
+			json=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","tool_input":{"command":sys.argv[1]}}))' "$command")
+			output=$(run_hook "$TEST_ROOT" "$json" "AIDEVOPS_HEADLESS=$headless") || true
+			if hook_is_deny "$output" "git.worktree-controlled-creation-required"; then
+				print_result "raw worktree creation denied (headless=$headless): $command" 0
+			else
+				print_result "raw worktree creation denied (headless=$headless): $command" 1 "$output"
+			fi
+		done
+	done
+	for command in 'git worktree list --porcelain' 'worktree-helper.sh add feature/example' 'aidevops worktree add feature/example'; do
+		json=$(python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","tool_input":{"command":sys.argv[1]}}))' "$command")
+		output=$(run_hook "$TEST_ROOT" "$json") || true
+		if [[ -z "$output" ]]; then
+			print_result "controlled creation or listing allowed: $command" 0
+		else
+			print_result "controlled creation or listing allowed: $command" 1 "$output"
+		fi
+	done
+	return 0
+}
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -567,6 +599,7 @@ main() {
 	test_no_origin_head_falls_back_to_main
 	test_canonical_guard_skip_env_var
 	test_worker_network_policy
+	test_controlled_worktree_creation
 
 	teardown_test_repo
 

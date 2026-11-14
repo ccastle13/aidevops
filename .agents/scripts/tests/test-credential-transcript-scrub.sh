@@ -4,9 +4,9 @@
 #
 # test-credential-transcript-scrub.sh — GH#20207 regression guard.
 #
-# Verifies that credential-transcript-scrub.py correctly redacts all 9 known
-# token-prefix families from tool result payloads and meets the <5ms/10KB
-# performance budget.
+# Verifies that credential-transcript-scrub.py redacts all 10 known token-prefix
+# families and unknown-format values under sensitive field names, while meeting
+# the <5ms/10KB performance budget.
 #
 # Tests:
 #   1.  gho_ token redacted in plain string tool_response
@@ -18,12 +18,16 @@
 #   7.  glpat- token redacted (GitLab PAT)
 #   8.  xoxb- token redacted (Slack bot token)
 #   9.  xoxp- token redacted (Slack user token)
-#   10. Clean input produces no output (fast-path, no redaction)
-#   11. Token shorter than 10 chars NOT redacted (below minimum body length)
-#   12. Multiple tokens in one payload all redacted
-#   13. Nested JSON object tool_response scrubbed recursively
-#   14. Malformed JSON produces no output and exits 0 (fail-open)
-#   15. Performance: <5ms per 10KB tool result
+#   10. GOCSPX- token redacted (Google OAuth client secret)
+#   11. Clean input produces no output (fast-path, no redaction)
+#   12. Token shorter than 10 chars NOT redacted (below minimum body length)
+#   13. Multiple tokens in one payload all redacted
+#   14. Nested JSON object tool_response scrubbed recursively
+#   15-18. Named-field positive and conservative negative cases
+#   18b. Standalone PEM private-key redaction
+#   19. Malformed JSON produces no output and exits 0 (fail-open)
+#   20-26. Word-boundary false-positive regression cases
+#   27-29. Known-prefix, named-field, and unmatched-PEM performance
 #
 # Usage: bash test-credential-transcript-scrub.sh
 
@@ -46,21 +50,24 @@ TESTS_RUN=0
 TESTS_FAILED=0
 
 pass() {
+	local label="$1"
 	TESTS_RUN=$((TESTS_RUN + 1))
-	printf '  %sPASS%s %s\n' "$TEST_GREEN" "$TEST_NC" "$1"
+	printf '  %sPASS%s %s\n' "$TEST_GREEN" "$TEST_NC" "$label"
 	return 0
 }
 
 fail() {
+	local label="$1"
 	TESTS_RUN=$((TESTS_RUN + 1))
 	TESTS_FAILED=$((TESTS_FAILED + 1))
-	printf '  %sFAIL%s %s\n' "$TEST_RED" "$TEST_NC" "$1"
+	printf '  %sFAIL%s %s\n' "$TEST_RED" "$TEST_NC" "$label"
 	return 0
 }
 
 # Helpers
 run_hook() {
-	echo "$1" | python3 "$HOOK_SCRIPT"
+	local payload="$1"
+	echo "$payload" | python3 "$HOOK_SCRIPT"
 	return 0
 }
 
@@ -156,7 +163,7 @@ assert_redacted "6. github_pat_ token" \
 	'{"tool_response": "fine-grained PAT: github_pat_11ABCDEFGHIJ1234567890"}'
 
 assert_redacted "7. glpat- token" \
-	'{"tool_response": "GitLab token: glpat-ABCDEFGHIJ1234567890"}'
+	'{"tool_response": "GitLab token: gl'"pat-"'ABCDEFGHIJ1234567890"}'
 
 assert_redacted "8. xoxb- token" \
 	'{"tool_response": "Slack bot: xoxb-ABCDEFGHIJKLM-1234567890-abcdefghij"}'
@@ -197,8 +204,53 @@ else
 	fail "14. Nested dict tool_response scrubbed recursively — got: $output14"
 fi
 
-# Test 15: malformed JSON exits 0
-assert_exit_zero "15. Malformed JSON exits 0 (fail-open)" \
+LONG_NAMED_KEY=$(python3 -c "print('A' * 129 + '_API_KEY')")
+NAMED_TEXT_PAYLOAD="{\"tool_response\": \"(RESEND-API-KEY=synthetic_unknown_format_1234567890) API_KEY=opaque-value&other=value TOKEN=opaque-value|next PASSWORD=opaque-value>file API KEY=opaque-value AWS_SECRET_ACCESS_KEY=opaque-value AWS_ACCESS_KEY_ID=opaque-value AccessKeyId=opaque-value SIGNING_KEY=[redacted]opaque API_KEY=(opaque-value) API_KEY=(not set)opaque (SECRET_KEY=not set) ${LONG_NAMED_KEY}=opaque-value\"}"
+output15=$(run_hook "$NAMED_TEXT_PAYLOAD")
+if echo "$output15" | python3 -c "
+import json, sys
+response = json.load(sys.stdin).get('tool_response', '')
+assert response == '(RESEND-API-KEY=[redacted-credential]) API_KEY=[redacted-credential]&other=value TOKEN=[redacted-credential]|next PASSWORD=[redacted-credential]>file API KEY=[redacted-credential] AWS_SECRET_ACCESS_KEY=[redacted-credential] AWS_ACCESS_KEY_ID=[redacted-credential] AccessKeyId=[redacted-credential] SIGNING_KEY=[redacted-credential] API_KEY=([redacted-credential]) API_KEY=[redacted-credential] (SECRET_KEY=not set) ${LONG_NAMED_KEY}=[redacted-credential]'
+" 2>/dev/null; then
+	pass "15. Named secrets scrubbed without consuming delimiters"
+else
+	fail "15. Named secrets scrubbed without consuming delimiters — got: $output15"
+fi
+
+NAMED_OBJECT_PAYLOAD='{"tool_response": {"environment": {"RECRAFT_API_KEY": "synthetic_unknown_format_1234567890", "TOKEN": 1234567890, "PRIVATE_KEY": {"material": "synthetic_unknown_format_1234567890"}, "SECRET_KEY": null}}}'
+output16=$(run_hook "$NAMED_OBJECT_PAYLOAD")
+if echo "$output16" | python3 -c "
+import json, sys
+response = json.load(sys.stdin).get('tool_response', {})
+assert response['environment']['RECRAFT_API_KEY'] == '[redacted-credential]'
+assert response['environment']['TOKEN'] == '[redacted-credential]'
+assert response['environment']['PRIVATE_KEY'] == '[redacted-credential]'
+assert response['environment']['SECRET_KEY'] is None
+" 2>/dev/null; then
+	pass "16. Sensitive structured values scrubbed regardless of type"
+else
+	fail "16. Sensitive structured values scrubbed regardless of type — got: $output16"
+fi
+
+assert_no_output "17. Sensitive placeholders remain unchanged" \
+	'{"tool_response": "API_KEY=[REDACTED] PRIVATE_KEY=[redacted-private-key] SECRET_KEY=(not set) ACCESS_TOKEN=null"}'
+
+assert_no_output "18. Sensitive-name substrings remain unchanged" \
+	'{"tool_response": "TOKEN_COUNT=3 PASSWORD_POLICY=strict MONKEY_TOKENIZER=enabled"}'
+
+PEM_PAYLOAD='{"tool_response": "-----BEGIN OPENSSH PRIVATE KEY-----\nsynthetic-material\n-----END OPENSSH PRIVATE KEY-----"}'
+output_pem=$(run_hook "$PEM_PAYLOAD")
+if echo "$output_pem" | python3 -c "
+import json, sys
+assert json.load(sys.stdin).get('tool_response') == '[redacted-private-key]'
+" 2>/dev/null; then
+	pass "18b. Standalone PEM private key scrubbed"
+else
+	fail "18b. Standalone PEM private key scrubbed — got: $output_pem"
+fi
+
+# Test 19: malformed JSON exits 0
+assert_exit_zero "19. Malformed JSON exits 0 (fail-open)" \
 	"not-valid-json"
 
 # ── Word-boundary anchor regression (t2892, GH#21026) ──────────────────────
@@ -215,26 +267,26 @@ printf '\n%s\n' "${TEST_BLUE}Word-boundary anchor (t2892)${TEST_NC}"
 # in `shared-constants.sh::scrub_credentials` corrupts source files at
 # write-time. All three locations must agree on the boundary anchor.
 
-assert_no_output "16. task-failure-handler NOT scrubbed (mid-word sk-)" \
+assert_no_output "20. task-failure-handler NOT scrubbed (mid-word sk-)" \
 	'{"tool_response": "import { handler } from \"./task-failure-handler\""}'
 
-assert_no_output "17. task-decompose-helper NOT scrubbed (mid-word sk-)" \
+assert_no_output "21. task-decompose-helper NOT scrubbed (mid-word sk-)" \
 	'{"tool_response": "Calling task-decompose-helper.sh now"}'
 
-assert_no_output "18. agent-task-failure-handler id NOT scrubbed" \
+assert_no_output "22. agent-task-failure-handler id NOT scrubbed" \
 	'{"tool_response": "inngest function id: agent-task-failure-handler"}'
 
-assert_no_output "19. task-id-collision-guard NOT scrubbed" \
+assert_no_output "23. task-id-collision-guard NOT scrubbed" \
 	'{"tool_response": "workflow: task-id-collision-guard.yml"}'
 
 # Real credentials must still be redacted across boundary contexts.
-assert_redacted "20. real sk- after space still redacted (control)" \
+assert_redacted "24. real sk- after space still redacted (control)" \
 	'{"tool_response": "API key sk-abcdefghij1234567890 invalid"}'
 
-assert_redacted "21. real sk- at start of string still redacted" \
+assert_redacted "25. real sk- at start of string still redacted" \
 	'{"tool_response": "sk-abcdefghij1234567890"}'
 
-assert_redacted "22. real ghp_ after colon still redacted" \
+assert_redacted "26. real ghp_ after colon still redacted" \
 	'{"tool_response": "token:ghp_abcdefghij1234567890"}'
 
 # ── Performance budget ─────────────────────────────────────────────────────
@@ -284,11 +336,135 @@ print(round(avg_ms, 4))
 printf '  In-process regex per 10KB (%d runs): %sms\n' 500 "$BENCH_MS"
 
 if python3 -c "import sys; sys.exit(0 if float('$BENCH_MS') < 5 else 1)" 2>/dev/null; then
-	pass "23. Performance: ${BENCH_MS}ms per 10KB in-process (budget: <5ms)"
+	pass "27. Performance: ${BENCH_MS}ms per 10KB in-process (budget: <5ms)"
 else
-	fail "23. Performance: ${BENCH_MS}ms per 10KB in-process exceeds 5ms budget"
+	fail "27. Performance: ${BENCH_MS}ms per 10KB in-process exceeds 5ms budget"
+fi
+
+NAMED_BENCH_MS=$(PYTHONPATH="$HOOKS_DIR" python3 -c "
+import runpy, time
+
+scrub_credentials = runpy.run_path('$HOOK_SCRIPT')['scrub_credentials']
+payload_str = 'A ' * 5000
+runs = 100
+scrub_credentials(payload_str)
+start = time.monotonic_ns()
+for _ in range(runs):
+    scrubbed, count = scrub_credentials(payload_str)
+end = time.monotonic_ns()
+assert scrubbed == payload_str and count == 0
+avg_ms = (end - start) / runs / 1_000_000
+print(round(avg_ms, 4))
+")
+
+printf '  In-process named scrub per 10KB (%d runs): %sms\n' 100 "$NAMED_BENCH_MS"
+if python3 -c "import sys; sys.exit(0 if float('$NAMED_BENCH_MS') < 5 else 1)" 2>/dev/null; then
+	pass "28. Named-field performance: ${NAMED_BENCH_MS}ms per 10KB (budget: <5ms)"
+else
+	fail "28. Named-field performance: ${NAMED_BENCH_MS}ms per 10KB exceeds 5ms budget"
+fi
+
+PEM_BENCH_MS=$(PYTHONPATH="$HOOKS_DIR" python3 -c "
+import runpy, time
+
+scrub_credentials = runpy.run_path('$HOOK_SCRIPT')['scrub_credentials']
+payload_str = '-----BEGIN OPENSSH PRIVATE KEY-----\n' * 250
+runs = 100
+scrub_credentials(payload_str)
+start = time.monotonic_ns()
+for _ in range(runs):
+    scrubbed, count = scrub_credentials(payload_str)
+end = time.monotonic_ns()
+assert scrubbed == payload_str and count == 0
+avg_ms = (end - start) / runs / 1_000_000
+print(round(avg_ms, 4))
+")
+
+printf '  In-process unmatched PEM scan per 10KB (%d runs): %sms\n' 100 "$PEM_BENCH_MS"
+if python3 -c "import sys; sys.exit(0 if float('$PEM_BENCH_MS') < 5 else 1)" 2>/dev/null; then
+	pass "29. Unmatched-PEM performance: ${PEM_BENCH_MS}ms per 10KB (budget: <5ms)"
+else
+	fail "29. Unmatched-PEM performance: ${PEM_BENCH_MS}ms per 10KB exceeds 5ms budget"
 fi
 printf '  Note: subprocess launch adds ~50ms Python startup; in-process cost shown above.\n'
+
+SIBLING_PAYLOAD='{"tool_response":"[{\"key\":\"SYNTHETIC_API_KEY\",\"value\":\"opaque-synthetic-value-1234567890\"},{\"name\":\"REGION\",\"value\":\"eu-west\"}]"}'
+output_sibling=$(run_hook "$SIBLING_PAYLOAD")
+if echo "$output_sibling" | python3 -c "import json,sys; response=json.loads(json.load(sys.stdin)['tool_response']); assert response == [{'key':'SYNTHETIC_API_KEY','value':'[redacted-credential]'},{'name':'REGION','value':'eu-west'}]" 2>/dev/null; then
+	pass "30. JSON sibling credential records scrubbed without cross-record bleed"
+else
+	fail "30. JSON sibling credential records scrubbed without cross-record bleed — got: $output_sibling"
+fi
+
+NDJSON_SIBLING_PAYLOAD='{"tool_response":"{\"variable\":\"SYNTHETIC_API_KEY\",\"value\":\"opaque-synthetic-value-1234567890\"}\n{\"key\":\"REGION\",\"value\":\"eu-west\"}"}'
+output_ndjson_sibling=$(run_hook "$NDJSON_SIBLING_PAYLOAD")
+if echo "$output_ndjson_sibling" | python3 -c "import json,sys; response=json.load(sys.stdin)['tool_response'].splitlines(); assert [json.loads(record) for record in response] == [{'variable':'SYNTHETIC_API_KEY','value':'[redacted-credential]'},{'key':'REGION','value':'eu-west'}]" 2>/dev/null; then
+	pass "31. NDJSON sibling credential records scrubbed"
+else
+	fail "31. NDJSON sibling credential records scrubbed — got: $output_ndjson_sibling"
+fi
+
+MIXED_NDJSON_PAYLOAD='{"tool_response":"malformed-before\n{\"key\":\"SYNTHETIC_API_KEY\",\"value\":\"opaque-synthetic-value-1234567890\"}\nmalformed-after"}'
+output_mixed_ndjson=$(run_hook "$MIXED_NDJSON_PAYLOAD")
+if echo "$output_mixed_ndjson" | python3 -c "import json,sys; response=json.load(sys.stdin)['tool_response'].splitlines(); assert response[0] == 'malformed-before' and response[2] == 'malformed-after'; assert json.loads(response[1]) == {'key':'SYNTHETIC_API_KEY','value':'[redacted-credential]'}" 2>/dev/null; then
+	pass "32. Valid NDJSON records remain scrubbed beside malformed records"
+else
+	fail "32. Valid NDJSON records remain scrubbed beside malformed records — got: $output_mixed_ndjson"
+fi
+
+CLOUDRON_PAYLOAD='{"tool_response":"db postgres:/''/appuser:s3cretPw@postgresql/appdb env [{\"name\":\"CLOUDRON_MAIL_SMTP_PASSWORD\",\"value\":\"abcdef0123\"},{\"name\":\"CLOUDRON_POSTGRESQL_HOST\",\"value\":\"postgresql\"}] done"}'
+output_cloudron=$(run_hook "$CLOUDRON_PAYLOAD")
+if echo "$output_cloudron" | python3 -c "import json,sys; r=json.load(sys.stdin)['tool_response']; assert 's3cretPw' not in r and 'abcdef0123' not in r and 'appuser:' in r and '@postgresql/appdb' in r and '\"value\":\"postgresql\"' in r" 2>/dev/null; then
+	pass "33. DB URL userinfo and plain-text name/value secret pairs scrubbed; non-secret sibling kept"
+else
+	fail "33. DB URL userinfo and plain-text name/value secret pairs scrubbed — got: $output_cloudron"
+fi
+
+# GH#37382: code and prose after sensitive labels stay visible; literals do not.
+# Mirrors the JS cases in .agents/plugins/opencode-aidevops/tests/test-credential-scrub.mjs.
+if PYTHONPATH="$HOOKS_DIR" python3 - "$HOOK_SCRIPT" <<'PY'; then
+import runpy
+import sys
+
+namespace = runpy.run_path(sys.argv[1])
+scrub = namespace["scrub_credentials"]
+token = namespace["REDACTION_TOKEN"]
+unchanged = [
+    "The secret: keep the originals of anything legally important",
+    "if token == expected: return",
+    "password != expected",
+    "password: str = field(default=None)",
+    "secret: Optional[str] = None",
+    "const namedSecret = registeredNames.has(name) || fallback;",
+    "const SECRET_VALUE_REDACTION_TOKEN = REDACTION_TOKEN;",
+    "const token = process.env.GITHUB_TOKEN;",
+    "const getToken = () => cached;",
+    "**Password:** keep the originals",
+]
+for text in unchanged:
+    assert scrub(text) == (text, 0), text
+redacted = {
+    "password: hunter2value": f"password: {token}",
+    "export SECRET=plainword": f"export SECRET={token}",
+    "token: abcdefgh expires soon": f"token: {token} expires soon",
+    'password := "hunter2value"': f'password := "{token}"',
+}
+for text, expected in redacted.items():
+    assert scrub(text) == (expected, 1), text
+for text in (
+    "PASSWORD=Secret(123)",
+    "export API_KEY=ABCD_1234_EFGH;",
+    "token=process.env.X",
+    "password: hunter # the dev one",
+    "password: hunter // for the box",
+):
+    scrubbed, count = scrub(text)
+    assert count == 1 and token in scrubbed, text
+PY
+	pass "34. Code and prose after sensitive labels kept; literal assignments redacted (GH#37382)"
+else
+	fail "34. Code and prose after sensitive labels kept; literal assignments redacted (GH#37382)"
+fi
 
 # ── Summary ────────────────────────────────────────────────────────────────
 

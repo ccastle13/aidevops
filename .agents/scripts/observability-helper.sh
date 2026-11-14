@@ -632,6 +632,35 @@ cmd_cache_health() {
 	return 1
 }
 
+cmd_rule_violations() {
+	local limit="${1:-20}"
+	local obs_db="${AIDEVOPS_OBS_DB_OVERRIDE:-${AIDEVOPS_RUNTIME_EVENTS_DB:-${OBS_DIR}/llm-requests.db}}"
+	local candidates="${SCRIPT_DIR}/../configs/prompt-hook-candidates.conf"
+	[[ "$limit" =~ ^[0-9]+$ && "$limit" -ge 1 && "$limit" -le 1000 ]] || {
+		print_error "rule-violations limit must be an integer from 1 to 1000"
+		return 1
+	}
+	command -v sqlite3 &>/dev/null || {
+		print_error "rule-violations requires sqlite3"
+		return 1
+	}
+	[[ -f "$obs_db" ]] || {
+		print_error "Rule-violation database not found: $obs_db"
+		return 1
+	}
+	printf 'Most-violated TTSR rules (scan detections, not unique messages):\n'
+	sqlite3 -cmd '.timeout 5000' -header -column "$obs_db" "SELECT subject_id AS rule_id, COUNT(*) AS violations FROM runtime_events WHERE event_type = 'rule.violation' GROUP BY subject_id ORDER BY violations DESC, rule_id ASC LIMIT ${limit};" || return 1
+	printf '\nPrompt-to-hook candidates (SECTION | CLASS | ENFORCEMENT | STATUS | INLINE_BUDGET | REFERENCE | NOTES):\n'
+	# Registry sections are human names, not rule IDs; show them alongside the
+	# counts rather than inventing a join or automatically promoting a rule.
+	if [[ -f "$candidates" ]]; then
+		grep -vE '^[[:space:]]*(#|$)' "$candidates" || true
+	else
+		print_warning "Prompt-hook candidate registry not found"
+	fi
+	return 0
+}
+
 cmd_runtime_events() {
 	local limit="${1:-20}" obs_db="${OBS_DIR}/llm-requests.db"
 	[[ "$limit" =~ ^[0-9]+$ && "$limit" -ge 1 && "$limit" -le 1000 ]] || {
@@ -658,21 +687,37 @@ require_node() {
 	return 0
 }
 
-cmd_storage() {
+# Every retention subcommand prints exactly one JSON result. A successful exit
+# with no output means the CLI body never ran (GH#35206: a symlinked deploy
+# path defeated the entrypoint guard), so treat it as a failure.
+_run_retention_cli() {
+	local subcommand="$1"
+	shift
+	local output=""
+	local status=0
+
 	require_node || return 1
-	node "$RUNTIME_EVENTS_RETENTION" inventory --db "${OBS_DIR}/llm-requests.db" "$@"
+	output=$(node "$RUNTIME_EVENTS_RETENTION" "$subcommand" --db "${OBS_DIR}/llm-requests.db" "$@") || status=$?
+	if [[ "$status" -eq 0 && -z "$output" ]]; then
+		print_error "runtime-event retention ${subcommand} produced no result"
+		return 1
+	fi
+	[[ -z "$output" ]] || printf '%s\n' "$output"
+	return "$status"
+}
+
+cmd_storage() {
+	_run_retention_cli inventory "$@"
 	return $?
 }
 
 cmd_retention() {
-	require_node || return 1
-	node "$RUNTIME_EVENTS_RETENTION" archive --db "${OBS_DIR}/llm-requests.db" "$@"
+	_run_retention_cli archive "$@"
 	return $?
 }
 
 cmd_retention_maintenance() {
-	require_node || return 1
-	node "$RUNTIME_EVENTS_RETENTION" maintain --db "${OBS_DIR}/llm-requests.db" "$@"
+	_run_retention_cli maintain "$@"
 	return $?
 }
 
@@ -681,6 +726,7 @@ cmd_help() {
 Observability Helper — LLM request and runtime-event evidence
 Usage: observability-helper.sh [command] [options]
 Commands: ingest | record (--model X) | rate-limits | cache-health | runtime-events [limit]
+          rule-violations [limit] (rank rules alongside prompt-hook-candidates.conf)
           storage [--json] | retention [--dry-run|--apply] [--before ISO] [--max-rows N]
           retention-maintenance [--dry-run|--apply] [--max-partitions N] [--max-duration-seconds N] | help
 
@@ -718,6 +764,7 @@ main() {
 	rate-limits | rate_limits | ratelimits | rl) cmd_rate_limits "$@" ;;
 	cache-health | cache_health | ch) cmd_cache_health "$@" ;;
 	runtime-events | runtime_events | events) cmd_runtime_events "$@" ;;
+	rule-violations) cmd_rule_violations "$@" ;;
 	storage | storage-inventory) cmd_storage "$@" ;;
 	retention | archive) cmd_retention "$@" ;;
 	retention-maintenance | maintain-retention) cmd_retention_maintenance "$@" ;;

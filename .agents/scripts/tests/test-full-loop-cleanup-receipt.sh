@@ -6,7 +6,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-TEST_ROOT="$(mktemp -d)"
+TEST_GIT="${AIDEVOPS_TEST_GIT_BIN:-$(command -v git)}"
+# Resolve symlinks (macOS /var -> /private/var) so recorded worktree paths match
+# what `git rev-parse --show-toplevel` reports, as they do in production.
+TEST_ROOT="$(cd "$(mktemp -d)" && pwd -P)"
 OWNER_PID=""
 
 teardown() {
@@ -68,6 +71,61 @@ _full_loop_receipt_lock_release
 [[ ! -e "$receipt_lock_dir" ]]
 printf 'PASS dead numeric receipt lock owner is reclaimed\n'
 
+(
+	# Reproduce ENOSPC after redirection has created/truncated the owner file.
+	printf() {
+		local format="$1"
+		[[ "$format" != '%s %s\n' ]] || return 1
+		builtin printf "$@"
+		return $?
+	}
+	if _full_loop_receipt_lock_acquire; then exit 1; fi
+	[[ "$_FULL_LOOP_RECEIPT_LOCK_FAILURE" == receipt-lock-owner-write-failed ]]
+	[[ ! -e "$receipt_lock_dir" ]]
+)
+_full_loop_receipt_lock_acquire
+_full_loop_receipt_lock_release
+printf 'PASS failed owner write leaves no permanent empty-owner lock\n'
+
+# GH#34808: a lock taken inside $(...) and abandoned by a SIGKILLed subshell
+# must be reclaimable while the parent shell is still alive.
+subshell_pidfile="${TEST_ROOT}/subshell-holder.pid"
+(
+	_full_loop_receipt_lock_acquire
+	_full_loop_receipt_self_pid >"$subshell_pidfile"
+	sleep 30
+) &
+subshell_holder=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+	[[ -s "$subshell_pidfile" ]] && break
+	sleep 0.1
+done
+[[ -s "$subshell_pidfile" ]]
+kill -9 "$(<"$subshell_pidfile")" 2>/dev/null || true
+wait "$subshell_holder" 2>/dev/null || true
+[[ -f "${receipt_lock_dir}/owner" ]]
+_full_loop_receipt_lock_acquire
+_full_loop_receipt_lock_release
+[[ ! -e "$receipt_lock_dir" ]]
+printf 'PASS killed subshell receipt lock holder is reclaimed\n'
+
+# A live holder is named, with its hold age, in the timeout reason.
+mkdir -p "$receipt_lock_dir"
+live_holder=$$
+printf '%s\n' "$live_holder" >"${receipt_lock_dir}/owner"
+holder_reason=$(
+	sleep() { return 0; }
+	_full_loop_receipt_lock_acquire && exit 1
+	printf '%s\n' "$_FULL_LOOP_RECEIPT_LOCK_FAILURE"
+)
+[[ "$holder_reason" == "receipt-lock-timeout (holder ${live_holder}, held "*"s)" ]] || {
+	printf 'FAIL timeout reason missing holder: %s\n' "$holder_reason"
+	exit 1
+}
+rm -f "${receipt_lock_dir}/owner"
+rmdir "$receipt_lock_dir"
+printf 'PASS timeout names holder\n'
+
 mkdir -p "$receipt_lock_dir"
 touch -t 202001010000 "$receipt_lock_dir"
 (
@@ -96,6 +154,7 @@ jq -e --argjson owner_pid "$OWNER_PID" '
 	and .cleanup_lease.state == "pending"
 	and .owner.pid == $owner_pid
 	and (.owner.process_identity | length > 0)
+	and (.created_at | test("[.][0-9]{6}Z$"))
 ' "$receipt_one" >/dev/null
 full_loop_cleanup_owner_alive "$receipt_one"
 [[ "$_FULL_LOOP_CLEANUP_OWNER_PID" == "$OWNER_PID" ]]
@@ -162,6 +221,79 @@ log_worktree_removal_event() { return 0; }
 source "${SCRIPTS_DIR}/worktree-clean-lib.sh"
 _clean_deferred_parent_alive "${TEST_ROOT}/worktree-one"
 printf 'PASS guarded cleanup observes the external live-owner receipt\n'
+
+# GH#32528: live interactive owners must not pin merged worktrees forever.
+registry_row_count() {
+	local wt_path=""
+	wt_path=$(_wt_registry_lookup_path "$1")
+	sqlite3 "$WORKTREE_REGISTRY_DB" \
+		"SELECT COUNT(*) FROM worktree_owners WHERE worktree_path = '$(_wt_sql_escape "$wt_path")';"
+	return 0
+}
+cp "$receipt_one" "${TEST_ROOT}/receipt-live-owner.json"
+claim_worktree_ownership "${TEST_ROOT}/worktree-one" feature/one --owner-pid "$OWNER_PID" \
+	--session session-one --task post-merge-cleanup
+jq '.created_at = "2020-01-01T00:00:00Z"' "$receipt_one" >"${receipt_one}.tmp"
+mv "${receipt_one}.tmp" "$receipt_one"
+deferred_state=0
+_clean_deferred_parent_alive "${TEST_ROOT}/worktree-one" 2>/dev/null || deferred_state=$?
+[[ "$deferred_state" -eq 2 && "$(registry_row_count "${TEST_ROOT}/worktree-one")" == "0" ]]
+printf 'PASS aged live-owner lease expires and releases only its post-merge registry claim\n'
+
+cp "${TEST_ROOT}/receipt-live-owner.json" "$receipt_one"
+claim_worktree_ownership "${TEST_ROOT}/worktree-one" feature/one --owner-pid "$OWNER_PID" \
+	--session session-one --task post-merge-cleanup
+claim_worktree_ownership "${TEST_ROOT}/worktree-two" feature/two --owner-pid "$OWNER_PID" \
+	--session session-one --task next-task
+sqlite3 "$WORKTREE_REGISTRY_DB" "UPDATE worktree_owners SET created_at = '2099-01-01T00:00:00Z'
+	WHERE worktree_path = '$(_wt_sql_escape "$(_wt_registry_lookup_path "${TEST_ROOT}/worktree-two")")';"
+jq '.owner.session = "full-loop-lifecycle"' "$receipt_one" >"${receipt_one}.tmp"
+mv "${receipt_one}.tmp" "$receipt_one"
+_clean_deferred_parent_alive "${TEST_ROOT}/worktree-one"
+printf 'PASS generic shared session never infers that the owner moved on\n'
+
+cp "${TEST_ROOT}/receipt-live-owner.json" "$receipt_one"
+deferred_state=0
+_clean_deferred_parent_alive "${TEST_ROOT}/worktree-one" 2>/dev/null || deferred_state=$?
+[[ "$deferred_state" -eq 2 && "$(registry_row_count "${TEST_ROOT}/worktree-one")" == "0" ]]
+[[ "$(registry_row_count "${TEST_ROOT}/worktree-two")" == "1" ]]
+printf 'PASS newer claim by the same session expires the older post-merge lease\n'
+sqlite3 "$WORKTREE_REGISTRY_DB" "DELETE FROM worktree_owners;"
+cp "${TEST_ROOT}/receipt-live-owner.json" "$receipt_one"
+
+# GH#37448: the session that ran `complete` relinquishes its live-owner lease.
+for wrong_owner in "99999999 session-one" "${OWNER_PID} other-session" "${OWNER_PID} full-loop-lifecycle"; do
+	read -r wrong_pid wrong_session <<<"$wrong_owner"
+	if full_loop_mark_cleanup_owner_relinquished example/repo 101 "$wrong_pid" "$wrong_session"; then
+		printf 'FAIL a non-owner relinquished the cleanup lease: %s\n' "$wrong_owner"
+		exit 1
+	fi
+	cmp -s "$receipt_one" "${TEST_ROOT}/receipt-live-owner.json"
+done
+_clean_deferred_parent_alive "${TEST_ROOT}/worktree-one"
+printf 'PASS only the exact receipt owner can relinquish; otherwise the live owner keeps the tree\n'
+
+claim_worktree_ownership "${TEST_ROOT}/worktree-one" feature/one --owner-pid "$OWNER_PID" \
+	--session session-one --task post-merge-cleanup
+full_loop_mark_cleanup_owner_relinquished example/repo 101 "$OWNER_PID" session-one
+cp "$receipt_one" "${TEST_ROOT}/receipt-relinquished.json"
+full_loop_mark_cleanup_owner_relinquished example/repo 101 "$OWNER_PID" session-one
+cmp -s "$receipt_one" "${TEST_ROOT}/receipt-relinquished.json"
+full_loop_cleanup_owner_alive "$receipt_one"
+deferred_state=0
+_clean_deferred_parent_alive "${TEST_ROOT}/worktree-one" 2>/dev/null || deferred_state=$?
+[[ "$deferred_state" -eq 2 && "$(registry_row_count "${TEST_ROOT}/worktree-one")" == "0" ]]
+printf 'PASS relinquished live-owner lease expires and releases only its post-merge registry claim\n'
+
+jq '.owner_relinquished.session = "other-session"' "$receipt_one" >"${receipt_one}.tmp"
+mv "${receipt_one}.tmp" "$receipt_one"
+if full_loop_cleanup_owner_relinquished "$receipt_one"; then
+	printf 'FAIL a relinquish record naming another session was accepted\n'
+	exit 1
+fi
+printf 'PASS a relinquish record that does not name the receipt owner fails closed\n'
+sqlite3 "$WORKTREE_REGISTRY_DB" "DELETE FROM worktree_owners;"
+cp "${TEST_ROOT}/receipt-live-owner.json" "$receipt_one"
 
 jq '.owner.process_identity = "different process generation"' "$receipt_one" >"${receipt_one}.tmp"
 mv "${receipt_one}.tmp" "$receipt_one"
@@ -237,6 +369,20 @@ selected_receipt=$(full_loop_cleanup_receipt_for_worktree "${TEST_ROOT}/worktree
 [[ "$selected_receipt" == "$newest_receipt" ]]
 printf 'PASS reused worktree paths select the newest lifecycle receipt\n'
 
+# Legacy and precise receipts must sort chronologically in the same second.
+(
+	export AIDEVOPS_FULL_LOOP_CLEANUP_DIR="${TEST_ROOT}/precision-receipts"
+	mkdir -p "$AIDEVOPS_FULL_LOOP_CLEANUP_DIR"
+	jq -n '{worktree:"precision",created_at:"2026-08-02T00:00:00Z"}' \
+		>"${AIDEVOPS_FULL_LOOP_CLEANUP_DIR}/legacy.json"
+	jq -n '{worktree:"precision",created_at:"2026-08-02T00:00:00.500000Z"}' \
+		>"${AIDEVOPS_FULL_LOOP_CLEANUP_DIR}/precise.json"
+	[[ "$(full_loop_cleanup_receipt_for_worktree precision)" == "${AIDEVOPS_FULL_LOOP_CLEANUP_DIR}/precise.json" ]]
+	[[ "$(_full_loop_cleanup_receipt_for_worktree_unlocked_fallback precision)" == "${AIDEVOPS_FULL_LOOP_CLEANUP_DIR}/precise.json" ]]
+	full_loop_cleanup_owner_lease_aged "${AIDEVOPS_FULL_LOOP_CLEANUP_DIR}/precise.json"
+)
+printf 'PASS precise receipts retain chronological lookup and lease-age compatibility\n'
+
 migrated_receipt="${AIDEVOPS_FULL_LOOP_CLEANUP_DIR}/example_migrated-104.json"
 jq '.repository = "example/migrated" | .pr_number = 104
 	| .migration = {from_repository:"example/repo",to_repository:"example/migrated",migrated_at:.created_at}' \
@@ -271,6 +417,50 @@ unset AIDEVOPS_TEST_LOOKUP_JQ_COUNTER AIDEVOPS_TEST_REAL_JQ
 IFS= read -r lookup_count <"$lookup_counter"
 [[ "$selected_receipt" == "$migrated_receipt" && "$lookup_count" -eq 1 ]]
 printf 'PASS receipt lookup scans all valid receipts with one jq process\n'
+
+# Exercise the contention-sized set without a timing-sensitive CI assertion.
+# Both validation scans must use a constant number of jq processes.
+(
+	export AIDEVOPS_FULL_LOOP_CLEANUP_DIR="${TEST_ROOT}/bulk-receipts"
+	mkdir -p "$AIDEVOPS_FULL_LOOP_CLEANUP_DIR"
+	for ((receipt_index = 0; receipt_index < 3000; receipt_index++)); do
+		printf '{"worktree":"other","resource_cleanup_state":"CLEANED"}\n' \
+			>"${AIDEVOPS_FULL_LOOP_CLEANUP_DIR}/${receipt_index}.json"
+	done
+	printf '{"worktree":"target","resource_cleanup_state":"CLEANED"}\n' \
+		>"${AIDEVOPS_FULL_LOOP_CLEANUP_DIR}/target.json"
+	printf '0\n' >"$lookup_counter"
+	export AIDEVOPS_TEST_LOOKUP_JQ_COUNTER="$lookup_counter"
+	export AIDEVOPS_TEST_REAL_JQ="$real_jq"
+	export PATH="${lookup_bin}:${PATH}"
+	[[ "$(_full_loop_valid_receipt_file_count "$AIDEVOPS_FULL_LOOP_CLEANUP_DIR")" -eq 3001 ]]
+	_full_loop_active_recreated_receipts_are_cleaned "$AIDEVOPS_FULL_LOOP_CLEANUP_DIR" target
+	IFS= read -r lookup_count <"$lookup_counter"
+	[[ "$lookup_count" -eq 2 ]]
+	export PATH="$lookup_original_path"
+	printf '{"worktree":"target","resource_cleanup_state":"CLEANUP_DEFERRED"}\n' \
+		>"${AIDEVOPS_FULL_LOOP_CLEANUP_DIR}/active.json"
+	if _full_loop_active_recreated_receipts_are_cleaned "$AIDEVOPS_FULL_LOOP_CLEANUP_DIR" target; then
+		exit 1
+	fi
+	for invalid_json in '{bad' '[]' ''; do
+		printf '%s' "$invalid_json" >"${AIDEVOPS_FULL_LOOP_CLEANUP_DIR}/invalid.json"
+		if _full_loop_valid_receipt_file_count "$AIDEVOPS_FULL_LOOP_CLEANUP_DIR"; then
+			exit 1
+		fi
+	done
+	# An extra object in a different file must not mask an empty receipt.
+	printf '{}\n{}\n' >"${AIDEVOPS_FULL_LOOP_CLEANUP_DIR}/multiple.json"
+	if _full_loop_valid_receipt_file_count "$AIDEVOPS_FULL_LOOP_CLEANUP_DIR"; then
+		exit 1
+	fi
+	rm "${AIDEVOPS_FULL_LOOP_CLEANUP_DIR}/invalid.json"
+	ln -s "${AIDEVOPS_FULL_LOOP_CLEANUP_DIR}/target.json" "${AIDEVOPS_FULL_LOOP_CLEANUP_DIR}/linked.json"
+	if _full_loop_valid_receipt_file_count "$AIDEVOPS_FULL_LOOP_CLEANUP_DIR"; then
+		exit 1
+	fi
+)
+printf 'PASS 3000-receipt validation uses two jq processes and rejects unsafe evidence\n'
 
 invalid_receipt="${AIDEVOPS_FULL_LOOP_CLEANUP_DIR}/invalid.json"
 printf '%s\n' '{invalid-json' >"$invalid_receipt"
@@ -432,5 +622,238 @@ fi
 cmp -s "$gap_cleanup_receipt" "${TEST_ROOT}/gap-cleanup-original.json"
 [[ ! -f "${AIDEVOPS_FULL_LOOP_RECEIPT_DIR}/example_repo-29010.status" ]]
 printf 'PASS authorization-gap evidence remains detached from terminal cleanup receipts\n'
+
+# GH#33627: finalization removes only a verified legacy marker; native manual
+# removal still owns all dirty-state, lock, activity and archive safeguards.
+(
+	export HOME="${TEST_ROOT}/marker-home"
+	export AIDEVOPS_FULL_LOOP_CLEANUP_DIR="${TEST_ROOT}/marker-receipts"
+	export AIDEVOPS_FULL_LOOP_RECEIPT_DIR="${TEST_ROOT}/marker-release-receipts"
+	export AIDEVOPS_CLEANUP_LOG="${TEST_ROOT}/marker-cleanup.log"
+	export AIDEVOPS_SESSION_ID="marker-session"
+	export WORKTREE_REGISTRY_DIR="${TEST_ROOT}/marker-registry"
+	export WORKTREE_REGISTRY_DB="${WORKTREE_REGISTRY_DIR}/worktree-registry.db"
+	# Explicitly establish legacy absence; missing registry evidence is unsafe.
+	_init_registry_db
+	marker_repo="${TEST_ROOT}/marker-repo"
+	marker_worktree="${TEST_ROOT}/marker-linked"
+	mkdir -p "$HOME" "$marker_repo"
+	"$TEST_GIT" -C "$marker_repo" init -q -b main
+	"$TEST_GIT" -C "$marker_repo" config user.name Test
+	"$TEST_GIT" -C "$marker_repo" config user.email test@example.invalid
+	"$TEST_GIT" -C "$marker_repo" config commit.gpgsign false
+	printf 'seed\n' >"${marker_repo}/README.md"
+	"$TEST_GIT" -C "$marker_repo" add README.md
+	"$TEST_GIT" -C "$marker_repo" commit -q -m seed
+	"$TEST_GIT" -C "$marker_repo" remote add origin git@github.com:example/repo.git
+	"$TEST_GIT" -C "$marker_repo" worktree add -q -b feature/marker "$marker_worktree"
+	# Enrollment is not deletion authority. The positive cleanup below uses
+	# explicit operator confirmation and verifies the real archive/receipt path.
+	export AIDEVOPS_LIFECYCLE_STATE_DIR="${TEST_ROOT}/marker-native-state"
+	lifecycle_entry="${SCRIPTS_DIR}/../worker-lifecycle/worker-registry.py"
+	python3 -E -s -B "$lifecycle_entry" --state-dir "$AIDEVOPS_LIFECYCLE_STATE_DIR" init >/dev/null
+	python3 -E -s -B "$lifecycle_entry" --state-dir "$AIDEVOPS_LIFECYCLE_STATE_DIR" \
+		enroll --path "$marker_worktree" >/dev/null
+	# shellcheck source=../shared-constants.sh
+	source "${SCRIPT_DIR}/shared-constants.sh"
+	# shellcheck source=../full-loop-helper-merge.sh
+	source "${SCRIPT_DIR}/full-loop-helper-merge.sh"
+	marker_head=$("$TEST_GIT" -C "$marker_worktree" rev-parse HEAD)
+	# Supply only GitHub's exact merged PR metadata; local identity resolution,
+	# receipt finalization and targeted removal use the production code paths.
+	gh() {
+		jq -n --arg head "$marker_head" '{state:"MERGED", mergedAt:"2026-10-05T00:00:00Z",
+			mergeCommit:{oid:$head}, headRefName:"feature/marker", headRefOid:$head,
+			headRepository:{nameWithOwner:"example/repo"}, isCrossRepository:false}'
+		return 0
+	}
+	# Keep nested Bash cleanup helpers offline too.
+	export marker_head
+	export -f gh
+	marker_receipt=$(full_loop_write_cleanup_deferred example/repo 106 "$marker_worktree" feature/marker \
+		"$$" marker-session not-requested FINALIZATION_PENDING)
+	_full_loop_write_release_receipt example/repo 106 not-requested
+	mkdir -p "${marker_worktree}/.agents"
+	marker_path="${marker_worktree}/.agents/.full-loop-cleanup-deferred"
+	printf '%s\n' "$$" >"$marker_path"
+	cd "$marker_worktree"
+	if "$TEST_GIT" -C "$marker_repo" worktree remove "$marker_worktree" >/dev/null 2>&1; then
+		printf 'FAIL native Git accepted marker-only dirty state before finalization\n'
+		exit 1
+	fi
+	cp "$marker_receipt" "${TEST_ROOT}/marker-pending.json"
+	if _full_loop_retire_finalized_cleanup_marker example/repo 106 not-requested; then
+		printf 'FAIL pending receipt retired the marker\n'
+		exit 1
+	fi
+	[[ -f "$marker_path" ]]
+	full_loop_finalize_cleanup_receipt example/repo 106 not-requested
+	cp "$marker_receipt" "${TEST_ROOT}/marker-complete.json"
+	for marker_conflict in \
+		'.schema_version = 99' '.repository = "wrong/repo"' '.pr_number = 999' \
+		'.worktree = "/wrong/worktree"' '.branch = "feature/wrong"' \
+		'.owner.pid = 99999999' '.owner.session = "wrong-session"' \
+		'.owner.process_identity = "wrong-generation"' '.release_status = "pending"' \
+		'.resource_cleanup_state = "CLEANUP_LEASED"' '.cleanup_lease.state = "acquired"'; do
+		jq "$marker_conflict" "${TEST_ROOT}/marker-complete.json" >"$marker_receipt"
+		if _full_loop_retire_finalized_cleanup_marker example/repo 106 not-requested; then
+			printf 'FAIL conflicting marker evidence was retired: %s\n' "$marker_conflict"
+			exit 1
+		fi
+		[[ -f "$marker_path" ]]
+	done
+	printf '{invalid-json\n' >"$marker_receipt"
+	if _full_loop_retire_finalized_cleanup_marker example/repo 106 not-requested; then exit 1; fi
+	rm "$marker_receipt"
+	if _full_loop_retire_finalized_cleanup_marker example/repo 106 not-requested; then exit 1; fi
+	cp "${TEST_ROOT}/marker-complete.json" "$marker_receipt"
+	printf '%s\nextra\n' "$$" >"$marker_path"
+	if _full_loop_retire_finalized_cleanup_marker example/repo 106 not-requested; then exit 1; fi
+	rm "$marker_path"
+	printf '%s\n' "$$" >"${TEST_ROOT}/marker-symlink-target"
+	ln -s "${TEST_ROOT}/marker-symlink-target" "$marker_path"
+	if _full_loop_retire_finalized_cleanup_marker example/repo 106 not-requested; then exit 1; fi
+	[[ -L "$marker_path" && -f "${TEST_ROOT}/marker-symlink-target" ]]
+	rm "$marker_path"
+	printf '%s\n' "$$" >"$marker_path"
+	marker_head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+	if _full_loop_retire_finalized_cleanup_marker example/repo 106 not-requested; then exit 1; fi
+	marker_head=$("$TEST_GIT" rev-parse HEAD)
+	printf 'PASS pending, missing, malformed, mismatched and symlink marker evidence remains protected\n'
+	cp "${TEST_ROOT}/marker-pending.json" "$marker_receipt"
+	cmd_finalize_receipt 106 example/repo
+	[[ ! -e "$marker_path" && -z "$("$TEST_GIT" status --porcelain)" ]]
+	cmd_finalize_receipt 106 example/repo
+	jq -e '.executor_completion_state == "COMPLETE" and .resource_cleanup_state == "CLEANUP_DEFERRED"' \
+		"$marker_receipt" >/dev/null
+	# Finalization is not permission to delete unrelated data or locked worktrees.
+	cd "$marker_repo"
+	# Reuse the existing offline process-inventory seam. Host /proc visibility is
+	# not deterministic in restricted runners; the real guard consumes this list.
+	# shellcheck source=../worktree-helper.sh
+	source "${SCRIPT_DIR}/worktree-helper.sh" help >/dev/null
+	fixture_cwd="$marker_worktree"
+	capture_worktree_process_cwds() {
+		printf '%s\n' "$fixture_cwd"
+		return 0
+	}
+	if cmd_remove "$marker_worktree" >/dev/null 2>&1; then exit 1; fi
+	[[ -d "$marker_worktree" ]]
+	fixture_cwd="$marker_repo"
+	printf 'modified\n' >"${marker_worktree}/README.md"
+	export AIDEVOPS_WORKTREE_TRASH_ROOT="${TEST_ROOT}/marker-modified-archive"
+	if cmd_remove "$marker_worktree" >/dev/null 2>&1; then exit 1; fi
+	[[ "$("$TEST_GIT" -C "$marker_worktree" diff --name-only)" == "README.md" ]]
+	"$TEST_GIT" -C "$marker_worktree" restore -- README.md
+	printf 'keep\n' >"${marker_worktree}/unrelated.txt"
+	export AIDEVOPS_WORKTREE_TRASH_ROOT="${TEST_ROOT}/marker-untracked-archive"
+	if cmd_remove "$marker_worktree" >/dev/null 2>&1; then exit 1; fi
+	[[ -f "${marker_worktree}/unrelated.txt" ]]
+	rm "${marker_worktree}/unrelated.txt"
+	"$TEST_GIT" -C "$marker_repo" worktree lock "$marker_worktree"
+	if cmd_remove "$marker_worktree" >/dev/null 2>&1; then exit 1; fi
+	[[ -d "$marker_worktree" ]]
+	"$TEST_GIT" -C "$marker_repo" worktree unlock "$marker_worktree"
+	export AIDEVOPS_WORKTREE_TRASH_ROOT="${TEST_ROOT}/marker-clean-archive"
+	# No real network is required for this disposable repository's archive.
+	"$TEST_GIT" -C "$marker_repo" remote remove origin
+	jq -n --arg path "$marker_repo" \
+		'{initialized_repos:[{path:$path,slug:"example/repo"}]}' >"${TEST_ROOT}/marker-native-repos.json"
+	mkdir -p "${TEST_ROOT}/marker-native-archives"
+	python3 -E -s -B "$lifecycle_entry" --state-dir "$AIDEVOPS_LIFECYCLE_STATE_DIR" \
+		retire-enrolled-only --path "$marker_worktree" --confirm \
+		--repos-config "${TEST_ROOT}/marker-native-repos.json" \
+		--output-root "${TEST_ROOT}/marker-native-archives" >/dev/null
+	[[ ! -e "$marker_worktree" ]]
+	[[ ! -f "$AIDEVOPS_CLEANUP_LOG" ]]
+	full_loop_mark_cleanup_cleaned_for_identity example/repo 106 "$marker_worktree"
+	jq -e '.resource_cleanup_state == "CLEANED" and .cleanup_lease.state == "released"' "$marker_receipt" >/dev/null
+	printf 'PASS registry retirement archives the finalized tree and records cleanup without a legacy log\n'
+)
+
+# GH#33890: merge cleanup records a same-repository alias (local repair branch
+# at the exact PR head). Finalization must retire that marker, while adoption
+# stays strict and foreign or mismatched evidence still keeps the marker.
+(
+	export HOME="${TEST_ROOT}/alias-home"
+	export AIDEVOPS_FULL_LOOP_CLEANUP_DIR="${TEST_ROOT}/alias-receipts"
+	export AIDEVOPS_FULL_LOOP_RECEIPT_DIR="${TEST_ROOT}/alias-release-receipts"
+	export AIDEVOPS_CLEANUP_LOG="${TEST_ROOT}/alias-cleanup.log"
+	export AIDEVOPS_SESSION_ID="alias-session"
+	export WORKTREE_REGISTRY_DIR="${TEST_ROOT}/alias-registry"
+	export WORKTREE_REGISTRY_DB="${WORKTREE_REGISTRY_DIR}/worktree-registry.db"
+	_init_registry_db
+	alias_repo="${TEST_ROOT}/alias-repo"
+	alias_worktree="${TEST_ROOT}/alias-linked"
+	mkdir -p "$HOME" "$alias_repo"
+	"$TEST_GIT" -C "$alias_repo" init -q -b main
+	"$TEST_GIT" -C "$alias_repo" config user.name Test
+	"$TEST_GIT" -C "$alias_repo" config user.email test@example.invalid
+	"$TEST_GIT" -C "$alias_repo" config commit.gpgsign false
+	printf 'seed\n' >"${alias_repo}/README.md"
+	"$TEST_GIT" -C "$alias_repo" add README.md
+	"$TEST_GIT" -C "$alias_repo" commit -q -m seed
+	"$TEST_GIT" -C "$alias_repo" remote add origin git@github.com:example/repo.git
+	"$TEST_GIT" -C "$alias_repo" worktree add -q -b feature/alias-repair "$alias_worktree"
+	# shellcheck source=../shared-constants.sh
+	source "${SCRIPT_DIR}/shared-constants.sh"
+	# shellcheck source=../full-loop-helper-merge.sh
+	source "${SCRIPT_DIR}/full-loop-helper-merge.sh"
+	alias_head=$("$TEST_GIT" -C "$alias_worktree" rev-parse HEAD)
+	alias_head_repo="example/repo"
+	# The PR head ref differs from the local branch: this is the alias case.
+	gh() {
+		jq -n --arg head "$alias_head" --arg head_repo "$alias_head_repo" '{state:"MERGED",
+			mergedAt:"2026-10-07T00:00:00Z", mergeCommit:{oid:$head}, headRefName:"feature/alias",
+			headRefOid:$head, headRepository:{nameWithOwner:$head_repo}, isCrossRepository:false}'
+		return 0
+	}
+	export alias_head alias_head_repo
+	export -f gh
+	cd "$alias_worktree"
+	if _merge_fresh_adopted_worktree_cleanup_target 107 example/repo >/dev/null; then
+		printf 'FAIL adoption accepted a renamed local branch\n'
+		exit 1
+	fi
+	alias_target=$(_merge_fresh_retirement_worktree_cleanup_target 107 example/repo)
+	[[ "$alias_target" == "$("$TEST_GIT" rev-parse --show-toplevel)"$'\t'"feature/alias-repair"$'\t'"0" ]] || {
+		printf 'FAIL retirement resolver did not return the recorded alias target: %s\n' "$alias_target"
+		exit 1
+	}
+	# Record exactly what merge cleanup records for the alias target.
+	alias_receipt=$(full_loop_write_cleanup_deferred example/repo 107 "$("$TEST_GIT" rev-parse --show-toplevel)" \
+		feature/alias-repair "$$" alias-session not-requested FINALIZATION_PENDING)
+	_full_loop_write_release_receipt example/repo 107 not-requested
+	mkdir -p .agents
+	alias_marker="${alias_worktree}/.agents/.full-loop-cleanup-deferred"
+	printf '%s\n' "$$" >"$alias_marker"
+	# Reproduce the pre-fix stuck state: receipt COMPLETE, marker still present.
+	full_loop_finalize_cleanup_receipt example/repo 107 not-requested
+	cp "$alias_receipt" "${TEST_ROOT}/alias-complete.json"
+	jq '.branch = "feature/alias"' "${TEST_ROOT}/alias-complete.json" >"$alias_receipt"
+	if _full_loop_retire_finalized_cleanup_marker example/repo 107 not-requested; then
+		printf 'FAIL alias marker retired against a receipt recording another branch\n'
+		exit 1
+	fi
+	[[ -f "$alias_marker" ]]
+	cp "${TEST_ROOT}/alias-complete.json" "$alias_receipt"
+	alias_head_repo="fork/repo"
+	if _full_loop_retire_finalized_cleanup_marker example/repo 107 not-requested; then
+		printf 'FAIL alias marker retired for a cross-repository PR head\n'
+		exit 1
+	fi
+	[[ -f "$alias_marker" ]]
+	alias_head_repo="example/repo"
+	printf 'PASS alias adoption stays strict; mismatched branch and foreign head keep the marker\n'
+	if ! cmd_finalize_receipt 107 example/repo; then
+		printf 'FAIL finalize-receipt retry did not retire the recorded alias marker\n'
+		exit 1
+	fi
+	[[ ! -e "$alias_marker" && -z "$("$TEST_GIT" status --porcelain)" ]]
+	cmd_finalize_receipt 107 example/repo
+	jq -e '.executor_completion_state == "COMPLETE" and .resource_cleanup_state == "CLEANUP_DEFERRED"
+		and .branch == "feature/alias-repair"' "$alias_receipt" >/dev/null
+	printf 'PASS finalize-receipt retires the recorded alias marker and retries idempotently\n'
+)
 
 exit 0

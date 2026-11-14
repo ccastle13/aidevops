@@ -3,6 +3,11 @@
 
 # Platform Support
 
+This page describes aidevops runtime compatibility. For opinionated desktop,
+server, development, and security OS recommendations, see
+[OS selection](os-selection.md). Those preferences do not add supported platforms
+here or imply that every derivative, architecture, or provider image was tested.
+
 ## Supported Platforms
 
 | Platform | Status | Scheduler | Notes |
@@ -14,6 +19,101 @@
 | Arch Linux | Full | systemd / cron | |
 | WSL2 (Ubuntu) | Full | systemd / cron | Recommended Windows path |
 | Windows (native) | Limited | — | Experimental `/optimise-windows-indexing-backups` only; use WSL2 for full support |
+
+## Worktree lifecycle backends
+
+Worktree creation and owner registration share `shared-worktree-create.sh`.
+macOS keeps the existing synchronous publication and legacy cleanup guards;
+it does not require systemd or a replacement launchd runner. New legacy creations
+record their backend and physical identity in `worktree_creation_backends`, not
+as managed descendant-completion receipts.
+
+Profile publication uses the managed runner only when Linux cgroup v2 and a
+reachable user-systemd version supporting `ExitType=cgroup` are available.
+`python3 scripts/worktree-managed-run.py --check-backend` probes that capability
+without starting a service. Other hosts select the legacy path **before** creating
+the worktree. A failure after managed execution starts is not retried as legacy.
+Existing managed records cannot be downgraded by a platform or backend change.
+
+These backends have different evidence: legacy cleanup retains its existing
+guards, while managed cleanup requires its cgroup completion receipts. Neither
+backend selection nor a dead owner PID is itself permission to delete a worktree.
+
+The shared creator covers host CLI, profile, Pulse, release/recovery, branch
+cleanup, planning, workflow-sync, plugin and archive-restore producers. Test
+fixtures and the isolated Frontier benchmark guest bootstrap are separate from
+the host worktree lifecycle. Callers retain their base-ref, path and ownership
+policies; an explicitly reserved empty directory may be admitted without
+dropping its reservation. Registration failure preserves the new tree.
+
+Recreating a removed managed worktree at the same path starts a fresh generation,
+not a reuse of its completion receipt. The ownership transaction preserves the
+closed prior record in `worktree_lifetime_history` before replacing it. Rotation
+requires valid completion evidence and a matching creation token durably recorded
+**before** Git runs. That fence invalidates the old receipt even if the filesystem
+reuses both inode numbers or the creator crashes before registration. Failed
+registration rolls back the history/active-record transition but preserves the
+pre-creation fence. Incomplete evidence, a different lifetime manager or a stale
+token fails closed. Existing trees cannot use this creation-only transition.
+
+Registration does not itself start a supervisor. Inside a managed run, generic
+producers bind to the invocation leader; outside one, unavailable Linux
+descendant-completion evidence remains unavailable. Temporary cleanup must
+preserve managed trees without closed proof, even after its synchronous Git
+commands finish. This is not a fallback to a full worktree copy or permission
+to downgrade the recorded backend.
+
+Branch-cleanup deletion transports (`<repo>-{local,remote}-branch-cleanup-<pid>`)
+are synchronous, process-scoped, detached trees that never host handed-off
+work. Their helpers choose the legacy backend before creation and remove the
+transport on exit, including timeout signals (GH#35490). Guarded cleanup
+(`worktree-helper.sh clean` and the async all-repo pass) reclaims transports
+retained by hard kills or by earlier owner-cgroup enrollment. Reclaim requires
+an exited creator and recorded owners, no checkout or an unmodified one, and
+the usual canonical, lock and active-CWD guards. It never adopts Pulse records.
+
+## Command lookup (PATH only)
+
+Tools are resolved through PATH on every platform; there are no distro-specific
+roots. This lets hosts without `/usr/bin/git` or `/bin/bash` (for example NixOS
+without envfs) work with the same code as macOS and Ubuntu.
+
+- **PATH order**: aidevops directories first, then the inherited PATH, then
+  `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` (plus `/opt/homebrew/bin` for
+  services) only as a de-duplicated fallback. Builder: `scripts/runtime-env.sh`.
+- **Services**: generated systemd units and cron lines bake the installing
+  user's sanitised PATH and start via `/usr/bin/env bash`. Launchd plists keep
+  `/bin/bash` (macOS only). Re-run setup to regenerate existing units; running
+  processes keep their original environment.
+- **Shebangs**: `#!/usr/bin/env bash|python3` (`-S python3 -I` for isolated
+  mode). `tests/test-portable-shebangs.sh` rejects new absolute interpreters.
+  Exception: root sudo targets such as `worktree-cwd-inspect.py`.
+- **Native Git**: `aidevops_resolve_native_git` walks PATH, skipping the aidevops
+  Git shim, and exports `AIDEVOPS_REAL_GIT_BIN`. Python policy adapters share
+  `scripts/native_git.py`. Both identify shims by a resolved sibling
+  `canonical-git-command-guard.py`, including symlinked runtime generations.
+  Overrides (`AIDEVOPS_REAL_GIT_BIN`, legacy `AIDEVOPS_REAL_GIT`) must be absolute,
+  executable regular files and not shims; invalid overrides and missing native
+  Git fail closed with `BLOCKED:` rather than falling back to `/usr/bin/git`.
+- **Trusted tools** (source access, vault Python, sudo, release-lane `ps`,
+  `ssh-keygen`, team-interface helpers): root-owned executable, symlink chain
+  and parent directories, with no group/other write. Sticky directories are
+  allowed only as ancestors, never as the executable's immediate PATH directory.
+  Shell selection delegates to `trusted_executable.py` through an unmodifiable
+  `python3 -I -S -B`; the bootstrap uses standard-path portable stat and fails
+  closed when unavailable. The Python CLI accepts `<name> [search_path]`:
+  exit 1 means unavailable, 2 invalid arguments, 3 untrusted interpreter.
+  Python and `trusted-executable.mjs` append platform defaults (`/bin:/usr/bin`)
+  for implicit PATH searches; an explicit search path remains exact.
+- **Runtime library**: source `runtime-env.sh`, never execute it directly.
+  Set `AIDEVOPS_RUNTIME_ENV_LIBRARY_ONLY=1` when sourcing to load functions
+  without modifying PATH or Git overrides. Service PATHs preserve stable
+  per-user directories even before installation; all builders strip trailing
+  slashes before deduplication.
+
+This covers command discovery, not full packaging compatibility: downloaded FHS
+binaries may still need native packages, and the model-replay `bwrap` sandbox
+still looks for `bwrap` in fixed locations.
 
 ## Native Windows Support Posture
 
@@ -157,4 +257,30 @@ echo -e "[boot]\nsystemd=true" | sudo tee /etc/wsl.conf
 
 ## CI/CD
 
-The GitHub Actions CI runs on both `ubuntu-latest` and `macos-latest` to catch platform regressions. See `.github/workflows/code-quality.yml`.
+Required CI runs on `ubuntu-latest`; macOS `/bin/bash` 3.2 parse coverage comes from a digest-pinned `bash:3.2` container in `.github/workflows/code-quality.yml` and from `pre-commit-hook.sh` on any Mac. Hosted macOS runners are not on the merge path (GH#36686); PATH portability CI also runs only on Ubuntu.
+
+`commit-and-pr` runs `.agents/scripts/macos-local-checks.sh` for macOS-sensitive
+changes, including sandbox/model replay, platform detection and PATH portability.
+On Darwin it runs native platform assertions, the model replay benchmark and the
+former macOS PATH suites, recording results in the PR's Runtime Testing section.
+On other hosts it adds `needs-macos-verification` and requests review from the
+registered `macos_maintainer` (falling back to `maintainer`); assignment is used
+when review cannot be requested, including self-review. No sensitive diff means
+no label or request. Missing/ambiguous registration is reported, never guessed.
+
+The maintainer checks out the exact clean PR head on a Mac and runs:
+
+```bash
+bash .agents/scripts/macos-local-checks.sh verify-pr PR_NUMBER OWNER/REPO
+```
+
+This records native results in Runtime Testing and clears the label only after
+successful checks and an unchanged remote head. Fetch the PR base first if its
+object is unavailable locally. `macos-verification-refresh.yml` restores the
+handoff label on every later push to a sensitive PR, without executing PR code.
+Previous SHA-scoped Runtime Testing results remain historical evidence, not
+verification of the new head. A delayed event can conservatively restore the
+label after verification; rerun `verify-pr` for the current head in that case.
+`AIDEVOPS_MACOS_CHECKS_HOST=Linux` forces the
+handoff path for testing; it cannot manufacture a native pass on Linux. The
+label is a verification handoff, not a hosted runner or approval bypass.

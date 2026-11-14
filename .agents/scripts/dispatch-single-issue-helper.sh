@@ -19,7 +19,7 @@
 #
 # Design choice: this helper does NOT call dispatch_with_dedup directly.
 # Instead, it duplicates the launch logic with a subset of the safety gates
-# (is-assigned + parent-task + state checks). Rationale:
+# (is-assigned + has-open-pr + parent-task + state checks). Rationale:
 #   1. dispatch_with_dedup runs 9+ gates including post-claim infrastructure
 #      (claim comments, large-file gate, predispatch validators). For a
 #      smoke-test those gates are over-the-top and harder to debug.
@@ -33,9 +33,11 @@
 #
 # Exit codes:
 #   0  Worker dispatched (or skipped: already claimed / clear dry-run)
-#   1  Validation failure (issue not found, parent-task, etc.)
+#   1  Validation failure (issue not found, parent-task, unregistered or
+#      missing canonical repo path, existing worker/protected draft or other
+#      linked PR evidence — also under --dry-run, etc.)
 #   2  Invalid subcommand or missing required arg
-#   75 Dedup guard is uncertain; recovery checkpoint persisted
+#   75 Dedup or PR-evidence guard is uncertain; recovery checkpoint persisted
 #
 # Part of aidevops framework: https://aidevops.sh
 
@@ -59,6 +61,9 @@ source "${_DSI_SCRIPT_DIR}/shared-gh-wrappers.sh"
 # shellcheck source=./pulse-dispatch-core.sh
 # shellcheck disable=SC1091
 source "${_DSI_SCRIPT_DIR}/pulse-dispatch-core.sh"
+# shellcheck source=./runner-capability-helper.sh
+# shellcheck disable=SC1091
+source "${_DSI_SCRIPT_DIR}/runner-capability-helper.sh"
 
 # Paths
 _DSI_LOG_DIR="${HOME}/.aidevops/logs"
@@ -66,6 +71,7 @@ _DSI_HEADLESS="${_DSI_SCRIPT_DIR}/headless-runtime-helper.sh"
 _DSI_LEDGER_HELPER="${_DSI_SCRIPT_DIR}/dispatch-ledger-helper.sh"
 _DSI_WORKTREE_HELPER="${_DSI_SCRIPT_DIR}/worktree-helper.sh"
 _DSI_DEDUP_HELPER="${_DSI_SCRIPT_DIR}/dispatch-dedup-helper.sh"
+_DSI_CLAIM_HELPER="${_DSI_SCRIPT_DIR}/dispatch-claim-helper.sh"
 _DSI_VALIDATOR_HELPER="${_DSI_SCRIPT_DIR}/pre-dispatch-validator-helper.sh"
 _DSI_BACKOFF_HELPER="${_DSI_SCRIPT_DIR}/dispatch-backoff-helper.sh"
 _DSI_APPROVAL_HELPER="${_DSI_SCRIPT_DIR}/approval-helper.sh"
@@ -73,11 +79,33 @@ _DSI_TOKEN_HELPER="${_DSI_SCRIPT_DIR}/worker-token-helper.sh"
 _DSI_ASKPASS_HELPER="${_DSI_SCRIPT_DIR}/github-auth-askpass.sh"
 _DSI_DISPATCH_BASE_BRANCH=""
 _DSI_STATE_RECOVERING="recovering"
+_DSI_STATE_BLOCKED="blocked"
+_DSI_STATE_CLEAR="clear"
+_DSI_STATE_ERROR="error"
 _DSI_UNKNOWN_VALUE="<unknown>"
 _DSI_JSON_TRUE="true"
+_DSI_VERIFIED="VERIFIED"
 _DSI_DEFAULT_CANARY_TIMEOUT_SECONDS=180
 _DSI_READY_PREPARATION_ALLOWANCE_SECONDS=60
+# Manual preparation before launch: worktree, credentials, conversation lock.
+_DSI_PRELAUNCH_PREPARATION_SECONDS=600
+# Claim/lease marker field carrying the dispatch lease identity (GH#34901).
+_DSI_LEASE_FIELD="lease_token"
+_DSI_LEASE_ID=""
+_DSI_LEASE_DEVICE=""
+# One canonical attempt per manual dispatch, shared by the prelaunch lease and
+# the worker's ready/terminal leases (GH#36005; mirrors _dlw_begin_prelaunch).
+_DSI_ATTEMPT_ID=""
 _DSI_CLAIM_WON=0
+_DSI_RESUME_MODE=0
+# 1 when the worktree is an enrolled managed generation (GH#35295).
+_DSI_MANAGED_WORKTREE=0
+_DSI_RESUME_SESSION=""
+_DSI_RESUME_REQUEST=""
+# Last shared PR-evidence lookup (GH#35616): clear|blocked|recovering|error|skipped.
+_DSI_PR_EVIDENCE_STATE="skipped"
+_DSI_PR_EVIDENCE_RC=0
+_DSI_PR_EVIDENCE_RESULT=""
 
 _dsi_gh_read() {
 	local rc=0
@@ -126,236 +154,10 @@ _dsi_err() {
 	return 0
 }
 
-#######################################
-# Validate issue exists, is OPEN, and emit metadata via stdout (single jq call).
-# Sets _DSI_ISSUE_TITLE, _DSI_ISSUE_LABELS, _DSI_ISSUE_URL, _DSI_ISSUE_ASSIGNEES.
-# Args:
-#   $1 - issue number
-#   $2 - owner/repo slug
-# Returns: 0 ok, 1 not found / closed / API error
-#######################################
-_dsi_load_issue_meta() {
-	local issue_number="$1"
-	local repo_slug="$2"
-	local meta_json
-
-	meta_json=$(gh issue view "$issue_number" --repo "$repo_slug" \
-		--json number,title,state,labels,assignees,url 2>/dev/null) || meta_json=""
-
-	if [[ -z "$meta_json" ]]; then
-		_dsi_err "Cannot fetch issue #${issue_number} from ${repo_slug} (not found, no permission, or network error)"
-		return 1
-	fi
-
-	local state state_normalized
-	state=$(printf '%s' "$meta_json" | jq -r '.state // "UNKNOWN"')
-	state_normalized=$(printf '%s' "$state" | tr '[:lower:]' '[:upper:]')
-	if [[ "$state_normalized" != "OPEN" ]]; then
-		_dsi_err "Issue #${issue_number} is ${state} (must be OPEN for dispatch)"
-		return 1
-	fi
-
-	_DSI_ISSUE_META_JSON="$meta_json"
-	_DSI_ISSUE_TITLE=$(printf '%s' "$meta_json" | jq -r '.title // ""')
-	_DSI_ISSUE_URL=$(printf '%s' "$meta_json" | jq -r '.url // ""')
-	_DSI_ISSUE_LABELS=$(printf '%s' "$meta_json" | jq -r '[.labels[].name] | join(",")')
-	_DSI_ISSUE_ASSIGNEES=$(printf '%s' "$meta_json" | jq -r '[.assignees[].login] | join(",")')
-	return 0
-}
-
-#######################################
-# Determine whether the target number is a pull request, not a plain Issue.
-#
-# Manual dispatch can be pointed at an arbitrary number, and `gh issue view`
-# accepts PR numbers through the issue facade. Use the REST issue object's
-# `pull_request` marker as a trust-boundary guard before any ceremony writes.
-#
-# Args:
-#   $1 - issue number
-#   $2 - owner/repo slug
-# Returns:
-#   0 target is a PR, 1 target is a plain Issue, 2 unable to verify
-#######################################
-_dsi_target_is_pull_request() {
-	local issue_number="$1"
-	local repo_slug="$2"
-	local target_json="" has_pull_request=""
-
-	_DSI_TARGET_JSON=""
-	target_json=$(gh api "repos/${repo_slug}/issues/${issue_number}" 2>/dev/null) || return 2
-	_DSI_TARGET_JSON="$target_json"
-	has_pull_request=$(printf '%s' "$target_json" | jq -r 'has("pull_request")' 2>/dev/null) || return 2
-	if [[ "$has_pull_request" == "$_DSI_JSON_TRUE" ]]; then
-		return 0
-	fi
-	if [[ "$has_pull_request" == "false" ]]; then
-		return 1
-	fi
-	return 2
-}
-
-#######################################
-# Block manual dispatch when live interactive/review hold labels are present.
-# Args: $1 - labels CSV
-# Returns: 0 when safe, 1 when held
-#######################################
-_dsi_guard_no_interactive_hold() {
-	local labels_csv="$1"
-	local labels_with_commas=""
-	labels_with_commas=$(printf ',%s,' "$labels_csv")
-	if [[ "$labels_with_commas" == *",status:in-review,"* && "$labels_with_commas" != *",auto-dispatch,"* ]]; then
-		_dsi_err "Target carries an interactive review hold label; refusing worker dispatch (GH#22948)"
-		return 1
-	fi
-	if [[ "$labels_with_commas" == *",origin:interactive,"* && "$labels_with_commas" != *",auto-dispatch,"* ]]; then
-		_dsi_err "Target carries an interactive review hold label; refusing worker dispatch (GH#22948)"
-		return 1
-	fi
-	return 0
-}
-
-#######################################
-# Independently verify issue-author authority before a manual worker launch.
-# This closes the gap where creation-time NMR labeling failed and the manual
-# dispatcher previously treated the missing label as approval.
-# Args: $1 - issue number, $2 - owner/repo slug
-# Returns: 0 when trusted/approved, 1 when dispatch must remain blocked
-#######################################
-_dsi_guard_issue_author_trust() {
-	local issue_number="$1"
-	local repo_slug="$2"
-	local issue_json="${_DSI_TARGET_JSON:-}"
-	local author_meta="" author_association="NONE" author_type="" author_login="" external_source="false"
-
-	if [[ -z "$issue_json" ]]; then
-		issue_json=$(gh api "repos/${repo_slug}/issues/${issue_number}" 2>/dev/null) || issue_json=""
-	fi
-	if [[ -n "$issue_json" ]]; then
-		author_meta=$(printf '%s' "$issue_json" | jq -r \
-			'[.author_association // "NONE", .user.type // "", .user.login // "", (([.labels[]?.name] | index("external-contributor") != null) | tostring)] | join("|")' 2>/dev/null) || author_meta=""
-	fi
-	if [[ -n "$author_meta" ]]; then
-		IFS='|' read -r author_association author_type author_login external_source <<<"$author_meta"
-	fi
-	[[ -n "$author_association" ]] || author_association="NONE"
-	if [[ "$author_type" == "Bot" && "$external_source" != "$_DSI_JSON_TRUE" ]]; then
-		return 0
-	fi
-
-	local authority_rc=1
-	if [[ "$external_source" != "$_DSI_JSON_TRUE" ]] && declare -F _gh_actor_has_repo_write_authority >/dev/null 2>&1; then
-		authority_rc=0
-		_gh_actor_has_repo_write_authority "$repo_slug" "$author_login" "$author_association" || authority_rc=$?
-	elif [[ "$external_source" != "$_DSI_JSON_TRUE" ]]; then
-		authority_rc=2
-	fi
-	if [[ "$authority_rc" -eq 0 ]]; then
-		return 0
-	fi
-
-	if [[ ! -x "$_DSI_APPROVAL_HELPER" ]]; then
-		_dsi_err "Issue-author approval verifier is unavailable; refusing manual worker dispatch"
-		return 1
-	fi
-	local verification=""
-	verification=$("$_DSI_APPROVAL_HELPER" verify "$issue_number" "$repo_slug" 2>/dev/null) || true
-	if [[ "$verification" == "VERIFIED" ]]; then
-		return 0
-	fi
-	if [[ -n "$verification" && "$verification" != "NO_APPROVAL" ]]; then
-		_dsi_err "Issue #${issue_number} in ${repo_slug} has an unverifiable approval marker (${verification}); refusing manual worker dispatch"
-		return 1
-	fi
-
-	#aidevops:trust-boundary -- label mutation is containment, never the authority source.
-	if declare -F gh_issue_edit_safe >/dev/null 2>&1; then
-		gh_issue_edit_safe "$issue_number" --repo "$repo_slug" \
-			--add-label "needs-maintainer-review" >/dev/null 2>&1 || true
-	else
-		gh issue edit "$issue_number" --repo "$repo_slug" \
-			--add-label "needs-maintainer-review" >/dev/null 2>&1 || true
-	fi
-	_dsi_err "Issue #${issue_number} in ${repo_slug} has untrusted, external-source, or unknown author authority (${author_association}; external_source=${external_source}; ${AIDEVOPS_GH_ACTOR_AUTHORITY_REASON:-unknown}) and no verified approval; refusing manual worker dispatch"
-	return 1
-}
-
-#######################################
-# Block manual worker dispatch until maintainer-review trust gates are cleared.
-# Args: $1 - labels CSV, $2 - issue number, $3 - owner/repo slug
-# Returns: 0 when safe, 1 when maintainer review is still required
-#######################################
-_dsi_guard_no_maintainer_review_required() {
-	local labels_csv="$1"
-	local issue_number="$2"
-	local repo_slug="$3"
-	local labels_with_commas=""
-	labels_with_commas=$(printf ',%s,' "$labels_csv")
-
-	#aidevops:trust-boundary -- manual dispatch must not bypass signed/maintainer issue approval.
-	if [[ "$labels_with_commas" == *",needs-maintainer-review,"* ]]; then
-		_dsi_err "Issue #${issue_number} in ${repo_slug} still requires maintainer review; refusing manual worker dispatch"
-		_dsi_info "  Required action: run 'sudo aidevops approve issue ${issue_number} ${repo_slug}' or record an equivalent maintainer decision before dispatch."
-		return 1
-	fi
-
-	return 0
-}
-
-_dsi_guard_no_maintainer_permission_required() {
-	local labels_csv="$1"
-	local issue_number="$2"
-	local repo_slug="$3"
-	local labels_with_commas=""
-	labels_with_commas=$(printf ',%s,' "$labels_csv")
-	if [[ "$labels_with_commas" == *",needs-maintainer-permissions,"* ]]; then
-		_dsi_err "Issue #${issue_number} in ${repo_slug} is waiting for a scoped maintainer permission grant; refusing manual worker dispatch"
-		_dsi_info "  Run the request-specific 'sudo aidevops approve permissions ... --request perm-...' command from the issue comment."
-		return 1
-	fi
-	return 0
-}
-
-_dsi_guard_permission_history_verified() {
-	local issue_number="$1"
-	local repo_slug="$2"
-	local events_json labeled_count verification
-	events_json=$(gh api "repos/${repo_slug}/issues/${issue_number}/events?per_page=100" --paginate --slurp 2>/dev/null) || {
-		_dsi_err "Unable to inspect permission-request history for issue #${issue_number} in ${repo_slug}; refusing manual worker dispatch"
-		return 1
-	}
-	labeled_count=$(jq '[.[][]? | select(.event == "labeled" and .label.name == "needs-maintainer-permissions")] | length' <<<"$events_json" 2>/dev/null) || {
-		_dsi_err "Permission-request history for issue #${issue_number} in ${repo_slug} is malformed; refusing manual worker dispatch"
-		return 1
-	}
-	[[ "$labeled_count" -gt 0 ]] || return 0
-	[[ -x "$_DSI_APPROVAL_HELPER" ]] || {
-		_dsi_err "Permission verification helper is unavailable; refusing manual worker dispatch"
-		return 1
-	}
-	verification=$("$_DSI_APPROVAL_HELPER" verify-permissions issue "$issue_number" "$repo_slug" 2>/dev/null) || true
-	if [[ "$verification" == "VERIFIED" ]]; then
-		_dsi_err "Issue #${issue_number} in ${repo_slug} has a signed grant bound to its original worker session and worktree; a new manual worker cannot consume it"
-		_dsi_info "  Resume through the original pulse/worker path so the bound pending request can be loaded safely."
-		return 1
-	fi
-	_dsi_err "Issue #${issue_number} in ${repo_slug} has permission-request history without a current matching signed grant (${verification:-NO_APPROVAL}); refusing manual worker dispatch"
-	return 1
-}
-
-#######################################
-# Check parent-task gate. parent-task is always a hard block (never single-dispatch).
-# Args: $1 - labels CSV (from _dsi_load_issue_meta)
-# Returns: 0 not parent-task, 1 IS parent-task (block)
-#######################################
-_dsi_check_parent_task() {
-	local labels_csv="$1"
-	local needle=",${labels_csv},"
-	if [[ "$needle" == *",parent-task,"* ]]; then
-		_dsi_err "Issue is labeled parent-task — these are decomposition trackers and cannot be single-dispatched"
-		return 1
-	fi
-	return 0
-}
+# Issue validation and signed permission gates share the CLI's initialized state.
+# shellcheck source=./dispatch-single-issue-policy.sh
+# shellcheck disable=SC1091 # sibling library resolved at runtime
+source "${_DSI_SCRIPT_DIR}/dispatch-single-issue-policy.sh"
 
 #######################################
 # Resolve model + tier for dispatch.
@@ -435,6 +237,10 @@ _dsi_create_worktree() {
 
 	local attempt max_attempts
 	max_attempts=3
+	# GH#35295: select the lifetime backend before creating the generation,
+	# exactly as Pulse does; systemd hosts enroll a managed generation.
+	_dsi_set_launch_provenance "$issue_number" "$repo_slug"
+	_dlw_managed_creation_env || return 1
 
 	# Retry loop: handles .git/config lock contention under concurrent creation
 	# (GH#21469). git cleans up partial state on a failed add, so retrying the
@@ -442,14 +248,14 @@ _dsi_create_worktree() {
 	for attempt in 1 2 3; do
 		# worktree-helper.sh add: outputs creation messages to stderr; the
 		# branch name is what we passed in.
-		if (cd "$repo_path" && AIDEVOPS_SKIP_AUTO_CLAIM=1 "$_DSI_WORKTREE_HELPER" add "$branch" \
+		if (cd "$repo_path" && AIDEVOPS_SKIP_AUTO_CLAIM=1 env "${_DLW_MANAGED_CREATE_ENV[@]}" "$_DSI_WORKTREE_HELPER" add "$branch" \
 			--base "$dispatch_base_ref" --issue "$issue_number") >&2; then
 			# Query git for the actual worktree path. worktree-helper.sh uses its
 			# own slug logic (lowercases, parent dir from get_repo_root) — recomputing
 			# that here is fragile. Read it back from `git worktree list` instead.
 			# Awk inlined to one line to avoid tripping the positional-ratchet (its
 			# single-quote-strip is line-local; multi-line awk scripts get false-positives).
-			_DSI_WORKTREE_PATH=$(git -C "$repo_path" worktree list --porcelain | awk -v b="$branch" '/^worktree / {p=$0;sub(/^worktree /,"",p)} $0 == "branch refs/heads/" b {print p; exit}')
+			_DSI_WORKTREE_PATH=$(git -C "$repo_path" worktree list --porcelain | awk -v b="$branch" '/^worktree / {p=$0;sub(/^worktree /,"",p)} !found && $0 == "branch refs/heads/" b {print p; found=1}')
 			_DSI_WORKTREE_BRANCH="$branch"
 			if [[ -n "$_DSI_WORKTREE_PATH" && -d "$_DSI_WORKTREE_PATH" ]]; then
 				if declare -F register_worktree >/dev/null; then
@@ -463,7 +269,10 @@ _dsi_create_worktree() {
 					_dsi_err "Worktree registry helper unavailable; dispatch is unsafe"
 					return 1
 				fi
-				return 0
+				local bind_mode="created-legacy"
+				[[ -z "$_DLW_MANAGED_CREATE_MODE" ]] || bind_mode="created-managed"
+				_dsi_bind_worktree_lifetime "$issue_number" "$repo_slug" "$bind_mode"
+				return $?
 			fi
 			_dsi_warn "Worktree path unresolvable after add (attempt ${attempt}/${max_attempts}, branch=${branch})"
 		else
@@ -477,6 +286,102 @@ _dsi_create_worktree() {
 	_dsi_err "Failed to create worktree for branch ${branch} after ${max_attempts} attempts"
 	_dsi_info "  Inspect: git worktree list --porcelain | grep -A1 ${branch}"
 	return 1
+}
+
+#######################################
+# Classify this launcher's trigger for managed provenance (GH#35295). Only an
+# interactive terminal outside headless/unit contexts counts as a manual
+# trigger; automated callers of this CLI record unknown, never a human.
+# No actor identity is recorded. Args: $1 issue, $2 repo slug
+#######################################
+_dsi_set_launch_provenance() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	_DLW_LAUNCH_ENTRYPOINT="dispatch-single-issue"
+	_DLW_LAUNCH_TASK="$issue_number"
+	_DLW_LAUNCH_REPO="$repo_slug"
+	_DLW_LAUNCH_TRIGGER="unknown"
+	_DLW_LAUNCH_TRIGGER_EVIDENCE="none"
+	if [[ -t 0 && -t 2 && -z "${HEADLESS:-}${FULL_LOOP_HEADLESS:-}${INVOCATION_ID:-}${CI:-}" &&
+		"${AIDEVOPS_HEADLESS:-false}" != "$_DSI_JSON_TRUE" && "${AIDEVOPS_SESSION_ORIGIN:-}" != "worker" ]]; then
+		_DLW_LAUNCH_TRIGGER="manual"
+		_DLW_LAUNCH_TRIGGER_EVIDENCE="interactive-terminal"
+	fi
+	return 0
+}
+
+#######################################
+# Bind the prepared worktree to its lifetime contract before launch.
+# Args: $1 issue, $2 repo slug,
+#       $3 created-managed | created-legacy | resume
+# Sets _DSI_MANAGED_WORKTREE and _DLW_WORKTREE_GENERATION.
+# Returns 0 when launch may proceed; 1 refuses. A managed generation is never
+# downgraded to an unmanaged launch, and a sealed one is never reopened.
+#######################################
+_dsi_bind_worktree_lifetime() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local mode="$3"
+	local class="" backend=""
+	_DSI_MANAGED_WORKTREE=0
+	_DLW_WORKTREE_GENERATION=""
+	# The backend chose legacy before creation: nothing was enrolled.
+	[[ "$mode" != "created-legacy" ]] || return 0
+	if ! class=$(_dlw_classify_reuse_candidate "$_DSI_WORKTREE_PATH" "$issue_number" "$repo_slug"); then
+		_dsi_err "Managed lifetime evidence unavailable for ${_DSI_WORKTREE_PATH}; refusing launch (source retained)"
+		return 1
+	fi
+	case "$class" in
+	managed\ *)
+		backend=$(_dlw_select_worker_backend) || backend=""
+		if [[ "$backend" != "systemd" ]]; then
+			_dsi_err "Enrolled managed worktree requires the systemd worker backend; refusing unmanaged launch"
+			return 1
+		fi
+		_DLW_WORKTREE_GENERATION="${class#managed }"
+		_DSI_MANAGED_WORKTREE=1
+		return 0
+		;;
+	legacy)
+		if [[ "$mode" == "created-managed" ]]; then
+			_dsi_err "Managed enrollment missing for new worktree ${_DSI_WORKTREE_PATH}; refusing unmanaged launch (source retained)"
+			return 1
+		fi
+		_dsi_info "Legacy unenrolled worktree: using the legacy detached backend (no managed lifetime receipt)"
+		return 0
+		;;
+	sealed) _dsi_err "Worktree generation is sealed and never reopened; let cleanup archive it, then dispatch a new generation" ;;
+	*) _dsi_err "Worktree is enrolled for a different task; refusing reuse" ;;
+	esac
+	return 1
+}
+
+#######################################
+# Launch through the shared managed launcher (reserve -> systemd service ->
+# bind-exec), the same admission path Pulse uses. Never falls back to nohup.
+# Args: $1 worker_log, $2 issue, $3 worktree, $4.. worker command (no --detach)
+# Stdout: worker PID (the unit's MainPID)
+#######################################
+_dsi_launch_managed_worker() {
+	local worker_log="$1"
+	local issue_number="$2"
+	local worktree_path="$3"
+	shift 3
+	local worker_pid=""
+	# Shared launcher diagnostics land beside the worker output.
+	local LOGFILE="$worker_log"
+	# Readiness contract shared with headless --detach: this file is the
+	# runtime log because the service appends worker output here.
+	printf '[INFO] Detaching worker (log: %s)\n' "$worker_log" >>"$worker_log"
+	if ! worker_pid=$(_DLW_MANAGED_WORKTREE=1 _DLW_WORKTREE_PATH="$worktree_path" \
+		_dlw_launch_systemd_worker "$worker_log" "$issue_number" "$@"); then
+		_dsi_err "Managed worker admission failed; no unmanaged fallback was started"
+		_dsi_info "  Launcher log: ${worker_log}"
+		return 1
+	fi
+	printf '[INFO] Dispatched PID: %s backend=systemd-managed\n' "$worker_pid" >>"$worker_log"
+	printf '%s\n' "$worker_pid"
+	return 0
 }
 
 #######################################
@@ -570,7 +475,49 @@ _dsi_repo_path_for_slug() {
 		.initialized_repos[]?
 		| select((.slug // "") == $slug and (.local_only // false) == false)
 		| .path
-	' "$repos_file" 2>/dev/null | head -n 1
+	' "$repos_file" 2>/dev/null | sed -n '1p'
+	return 0
+}
+
+#######################################
+# Classify the registered canonical path prerequisite (GH#34003). Kept distinct
+# from fresh issue-metadata failures so an unregistered or moved checkout is
+# never reported as metadata_unreadable. Never registers or mutates anything.
+# Args: $1 - resolved repo path (may be empty)
+# Outputs: repo_unregistered | repo_path_missing (only when unmet)
+# Returns: 0 when the path is an existing directory, 1 otherwise
+#######################################
+_dsi_repo_path_prerequisite() {
+	local repo_path="$1"
+	if [[ -z "$repo_path" ]]; then
+		printf 'repo_unregistered\n'
+		return 1
+	fi
+	if [[ ! -d "$repo_path" ]]; then
+		printf 'repo_path_missing\n'
+		return 1
+	fi
+	return 0
+}
+
+#######################################
+# Print the operator action for an unmet repo path prerequisite (GH#34003).
+# Args: $1 - reason, $2 - repo slug
+#######################################
+_dsi_repo_path_hint() {
+	local reason="$1"
+	local repo_slug="$2"
+	case "$reason" in
+	repo_unregistered)
+		printf 'No dispatchable repos.json entry for %s; run aidevops init in its canonical checkout first (dispatch never registers repositories)\n' "$repo_slug"
+		;;
+	repo_path_missing)
+		printf 'Registered canonical path for %s is not a directory; restore the checkout or correct its repos.json path\n' "$repo_slug"
+		;;
+	*)
+		_dsi_origin_identity_hint "$reason" "$repo_slug"
+		;;
+	esac
 	return 0
 }
 
@@ -643,388 +590,31 @@ _dsi_register_ledger() {
 	local repo_slug="$2"
 	local session_key="$3"
 	local worker_pid="$4"
+	local -a lease_args=()
 
+	# GH#34901: the worker registered this session with its lease identity;
+	# the same identity keeps this registration idempotent instead of
+	# appending an unleased prelaunch row over the worker's ready lease.
+	if [[ -n "$_DSI_LEASE_ID" ]]; then
+		lease_args=(--lease-token "$_DSI_LEASE_ID" --device-id "$_DSI_LEASE_DEVICE")
+	fi
 	"$_DSI_LEDGER_HELPER" register \
 		--session-key "$session_key" \
 		--issue "$issue_number" \
 		--repo "$repo_slug" \
 		--pid "$worker_pid" \
 		--worktree "${_DSI_WORKTREE_PATH:-}" \
+		${lease_args[@]+"${lease_args[@]}"} \
 		>/dev/null 2>&1 || _dsi_warn "Dispatch ledger registration failed (non-fatal)"
 	return 0
 }
 
-#######################################
-# Extract a --dir value from a worker command line.
-# Args: $1 - command line
-# Stdout: worktree path, or empty string
-#######################################
-_dsi_extract_worktree_from_cmd() {
-	local cmd="$1"
-	local worktree_path=""
-	if [[ "$cmd" =~ --dir[[:space:]]+([^[:space:]]+) ]]; then
-		worktree_path="${BASH_REMATCH[1]}"
-	fi
-	printf '%s\n' "$worktree_path"
-	return 0
-}
-
-#######################################
-# Resolve a repo slug from a worktree path.
-# Args: $1 - worktree path
-# Stdout: owner/repo slug, or empty string
-#######################################
-_dsi_repo_slug_for_worktree() {
-	local worktree_path="$1"
-	local remote_url=""
-	if [[ -z "$worktree_path" || ! -d "$worktree_path" ]]; then
-		printf '\n'
-		return 0
-	fi
-	remote_url=$(git -C "$worktree_path" remote get-url origin 2>/dev/null || true)
-	if [[ "$remote_url" =~ github\.com[:/]([^/]+/[^/.]+)(\.git)?$ ]]; then
-		printf '%s\n' "${BASH_REMATCH[1]}"
-		return 0
-	fi
-	printf '\n'
-	return 0
-}
-
-#######################################
-# Emit active worker process lines for duplicate detection.
-# Tests override this function with fixture output.
-# Stdout: ps rows: "PID STAT COMMAND..."
-#######################################
-_dsi_ps_worker_lines() {
-	ps axwwo pid=,stat=,command= 2>/dev/null || true
-	return 0
-}
-
-#######################################
-# Check whether a PID is currently signalable by this runner.
-# Tests override this function with deterministic process fixtures.
-# Args: $1 - PID
-# Returns: 0 live, 1 dead/inaccessible
-#######################################
-_dsi_pid_is_live() {
-	local pid="$1"
-	kill -0 "$pid" 2>/dev/null
-	return $?
-}
-
-#######################################
-# Check if a command line belongs to a worker for an issue number.
-# Args: $1 - issue number, $2 - command line
-# Returns: 0 match, 1 no match
-#######################################
-_dsi_cmd_matches_issue() {
-	local issue_number="$1"
-	local cmd="$2"
-	local issue_re="([Ii]ssue[[:space:]]+#|[Ii]ssue[[:space:]]+|GH#)${issue_number}([^0-9]|$)"
-	if [[ "$cmd" =~ $issue_re ]]; then
-		return 0
-	fi
-	if [[ "$cmd" == *"--session-key issue-${issue_number}"* || "$cmd" == *"--session-key manual-cli-${issue_number}-"* ]]; then
-		return 0
-	fi
-	return 1
-}
-
-#######################################
-# Find a manual-dispatch log that names a worker PID.
-# Args: $1 - issue number, $2 - PID
-# Stdout: log path, or "<unknown>"
-#######################################
-_dsi_find_log_for_pid() {
-	local issue_number="$1"
-	local worker_pid="$2"
-	local candidate=""
-	for candidate in "$_DSI_LOG_DIR"/manual-dispatch-"${issue_number}"-*.log; do
-		[[ -f "$candidate" ]] || continue
-		if grep -Fq "Dispatched PID: ${worker_pid}" "$candidate" 2>/dev/null; then
-			printf '%s\n' "$candidate"
-			return 0
-		fi
-	done
-	printf '%s\n' "$_DSI_UNKNOWN_VALUE"
-	return 0
-}
-
-#######################################
-# Find a live worker by repo+issue and/or exact worktree path.
-# Args: $1 - issue number, $2 - repo slug, $3 - worktree path (optional)
-# Stdout: TSV source, pid, log, worktree, session_key
-# Returns: 0 found, 1 none
-#######################################
-_dsi_find_live_dispatch() {
-	local issue_number="$1"
-	local repo_slug="$2"
-	local target_worktree="${3:-}"
-	local line pid stat cmd worktree_path worker_repo log_path session_key
-
-	while IFS= read -r line; do
-		[[ -n "$line" ]] || continue
-		pid="${line%%[[:space:]]*}"
-		line="${line#*[[:space:]]}"
-		stat="${line%%[[:space:]]*}"
-		cmd="${line#*[[:space:]]}"
-		[[ "$pid" =~ ^[0-9]+$ ]] || continue
-		[[ "$stat" == *Z* || "$stat" == *T* ]] && continue
-		[[ "$cmd" == *"dispatch-single-issue-helper.sh"* ]] && continue
-
-		worktree_path=$(_dsi_extract_worktree_from_cmd "$cmd")
-		if [[ -n "$target_worktree" && "$worktree_path" == "$target_worktree" ]]; then
-			log_path=$(_dsi_find_log_for_pid "$issue_number" "$pid")
-			session_key=$(printf '%s' "$cmd" | sed -n 's/.*--session-key[[:space:]]\([^[:space:]]*\).*/\1/p' | head -1)
-			printf 'process\t%s\t%s\t%s\t%s\n' "$pid" "$log_path" "$worktree_path" "${session_key:-$_DSI_UNKNOWN_VALUE}"
-			return 0
-		fi
-
-		_dsi_cmd_matches_issue "$issue_number" "$cmd" || continue
-		worker_repo=$(_dsi_repo_slug_for_worktree "$worktree_path")
-		[[ "$worker_repo" == "$repo_slug" ]] || continue
-		log_path=$(_dsi_find_log_for_pid "$issue_number" "$pid")
-		session_key=$(printf '%s' "$cmd" | sed -n 's/.*--session-key[[:space:]]\([^[:space:]]*\).*/\1/p' | head -1)
-		printf 'process\t%s\t%s\t%s\t%s\n' "$pid" "$log_path" "${worktree_path:-$_DSI_UNKNOWN_VALUE}" "${session_key:-$_DSI_UNKNOWN_VALUE}"
-		return 0
-	done < <(_dsi_ps_worker_lines)
-
-	return 1
-}
-
-#######################################
-# Find a live ledger entry for repo+issue.
-# Args: $1 - issue number, $2 - repo slug
-# Stdout: TSV source, pid, log, worktree, session_key
-# Returns: 0 found, 1 none
-#######################################
-_dsi_find_ledger_dispatch() {
-	local issue_number="$1"
-	local repo_slug="$2"
-	local entry pid session_key worktree_path log_path
-	entry=$("$_DSI_LEDGER_HELPER" check-issue --issue "$issue_number" --repo "$repo_slug" 2>/dev/null) || entry=""
-	[[ -n "$entry" ]] || return 1
-	pid=$(printf '%s' "$entry" | jq -r '.pid // "?"')
-	session_key=$(printf '%s' "$entry" | jq -r --arg unknown "$_DSI_UNKNOWN_VALUE" '.session_key // $unknown')
-	worktree_path=$(printf '%s' "$entry" | jq -r '.worktree_path // ""')
-	[[ -n "$worktree_path" && "$worktree_path" != "null" ]] || worktree_path="$_DSI_UNKNOWN_VALUE"
-	log_path=$(_dsi_find_log_for_pid "$issue_number" "$pid")
-	printf 'ledger\t%s\t%s\t%s\t%s\n' "$pid" "$log_path" "$worktree_path" "$session_key"
-	return 0
-}
-
-#######################################
-# Print active dispatch details from a TSV record.
-# Args: TSV source, pid, log, worktree, session_key
-#######################################
-_dsi_print_dispatch_details() {
-	local record="$1"
-	local source pid log_path worktree_path session_key
-	IFS=$'\t' read -r source pid log_path worktree_path session_key <<<"$record"
-	_dsi_info "  Evidence source:  ${source}"
-	_dsi_info "  Existing PID:     ${pid}"
-	_dsi_info "  Existing log:     ${log_path}"
-	_dsi_info "  Existing worktree:${worktree_path}"
-	_dsi_info "  Existing session: ${session_key}"
-	return 0
-}
-
-#######################################
-# Verify that a ledger record still names the same live worker process.
-# A lease can intentionally outlive its local PID for cross-runner dedup, so
-# launch-worker status must independently validate PID liveness plus the
-# session, worktree, issue, and repository encoded in the process command.
-# Args: $1 - issue number, $2 - repo slug, $3 - ledger TSV record
-# Returns: 0 verified live worker, 1 stale/dead/reused PID evidence
-#######################################
-_dsi_ledger_record_has_live_identity() {
-	local issue_number="$1"
-	local repo_slug="$2"
-	local record="$3"
-	local source="" pid="" log_path="" worktree_path="" session_key=""
-	IFS=$'\t' read -r source pid log_path worktree_path session_key <<<"$record"
-
-	[[ "$source" == "ledger" && "$pid" =~ ^[0-9]+$ ]] || return 1
-	[[ -n "$session_key" && "$session_key" != "$_DSI_UNKNOWN_VALUE" ]] || return 1
-	[[ -n "$worktree_path" && "$worktree_path" != "$_DSI_UNKNOWN_VALUE" ]] || return 1
-	_dsi_pid_is_live "$pid" || return 1
-
-	local line="" process_pid="" stat="" cmd=""
-	local process_session="" process_worktree="" process_repo=""
-	while IFS= read -r line; do
-		[[ -n "$line" ]] || continue
-		process_pid="${line%%[[:space:]]*}"
-		[[ "$process_pid" == "$pid" ]] || continue
-		line="${line#*[[:space:]]}"
-		stat="${line%%[[:space:]]*}"
-		cmd="${line#*[[:space:]]}"
-		[[ "$stat" != *Z* && "$stat" != *T* ]] || return 1
-		[[ "$cmd" == *"headless-runtime-helper.sh"* ]] || return 1
-
-		process_session=$(printf '%s' "$cmd" | sed -n 's/.*--session-key[[:space:]]\([^[:space:]]*\).*/\1/p')
-		[[ "$process_session" == "$session_key" ]] || return 1
-		process_worktree=$(_dsi_extract_worktree_from_cmd "$cmd")
-		[[ "$process_worktree" == "$worktree_path" ]] || return 1
-		_dsi_cmd_matches_issue "$issue_number" "$cmd" || return 1
-		process_repo=$(_dsi_repo_slug_for_worktree "$process_worktree")
-		[[ "$process_repo" == "$repo_slug" ]] || return 1
-		return 0
-	done < <(_dsi_ps_worker_lines)
-
-	return 1
-}
-
-#######################################
-# Print an existing active dispatch as a blocking duplicate.
-# Args: TSV source, pid, log, worktree, session_key
-#######################################
-_dsi_print_existing_dispatch() {
-	local record="$1"
-	local source="${record%%$'\t'*}"
-	_dsi_err "Active worker already owns this issue or worktree (${source})"
-	_dsi_print_dispatch_details "$record"
-	return 0
-}
-
-#######################################
-# Fail closed if an active dispatch already owns repo+issue or worktree.
-# Args: $1 - issue number, $2 - repo slug, $3 - worktree path (optional)
-# Returns: 0 clear, 1 blocked
-#######################################
-_dsi_guard_no_existing_dispatch() {
-	local issue_number="$1"
-	local repo_slug="$2"
-	local worktree_path="${3:-}"
-	local record=""
-	if record=$(_dsi_find_ledger_dispatch "$issue_number" "$repo_slug"); then
-		_dsi_print_existing_dispatch "$record"
-		return 1
-	fi
-	if record=$(_dsi_find_live_dispatch "$issue_number" "$repo_slug" "$worktree_path"); then
-		_dsi_print_existing_dispatch "$record"
-		return 1
-	fi
-	return 0
-}
-
-#######################################
-# Resolve the real worker PID from the worker_log file.
-# headless-runtime-helper.sh _detach_worker prints "Dispatched PID: <pid>"
-# right before forking the actual worker subshell (see headless-runtime-helper.sh:1483).
-# We poll the log briefly waiting for that line; if it never appears,
-# fall back to the launch wrapper PID (degraded — ledger may show dead PID).
-# Args: $1 - worker_log path, $2 - launch_pid (fallback)
-# Stdout: PID (single integer)
-#######################################
-_dsi_resolve_worker_pid() {
-	local worker_log="$1"
-	local launch_pid="$2"
-	local attempts=0
-	while [[ $attempts -lt 30 ]]; do
-		if [[ -s "$worker_log" ]]; then
-			local pid
-			pid=$(grep -oE 'Dispatched PID: [0-9]+' "$worker_log" 2>/dev/null | awk '{print $3}' | head -1)
-			if [[ -n "$pid" ]]; then
-				echo "$pid"
-				return 0
-			fi
-		fi
-		sleep 0.1
-		attempts=$((attempts + 1))
-	done
-	# Fallback: caller can decide what to do with degraded state
-	_dsi_warn "Could not extract worker PID from log within 3s — using launch wrapper PID (ledger may go stale)"
-	echo "$launch_pid"
-	return 0
-}
-
-#######################################
-# Return the detached runtime log path used by headless-runtime-helper.sh.
-# Args: $1 - session_key
-# Stdout: absolute log path
-#######################################
-_dsi_detached_runtime_log() {
-	local session_key="$1"
-	printf '/tmp/worker-%s.log' "$session_key"
-	return 0
-}
-
-#######################################
-# Resolve the bounded manual-dispatch readiness budget.
-# The detached worker may spend the full canary allowance before preparation
-# emits worker_started, so the default must cover canary plus setup overhead.
-# Stdout: timeout seconds
-#######################################
-_dsi_ready_timeout_seconds() {
-	local canary_timeout_s="${CANARY_TIMEOUT_SECONDS:-$_DSI_DEFAULT_CANARY_TIMEOUT_SECONDS}"
-	local configured_timeout_s="${AIDEVOPS_DSI_READY_TIMEOUT_SECONDS:-}"
-	if ! [[ "$canary_timeout_s" =~ ^[0-9]+$ ]]; then
-		canary_timeout_s="$_DSI_DEFAULT_CANARY_TIMEOUT_SECONDS"
-	fi
-	local default_timeout_s=$((canary_timeout_s + _DSI_READY_PREPARATION_ALLOWANCE_SECONDS))
-	if [[ -z "$configured_timeout_s" ]] || ! [[ "$configured_timeout_s" =~ ^[0-9]+$ ]]; then
-		configured_timeout_s="$default_timeout_s"
-	fi
-	printf '%s\n' "$configured_timeout_s"
-	return 0
-}
-
-#######################################
-# Wait until a detached worker reaches an observable readiness signal.
-#
-# The outer nohup wrapper can exit successfully before model selection,
-# canary, and worker preparation complete. Treat launch as ready only when the
-# real child is alive and has emitted the canonical worker-start marker, or has
-# exited/failed with inspectable log evidence. Ledger registration happens
-# before the worker-start marker, so it is progress evidence but not readiness.
-# This prevents silent success when pre-worker setup blocks.
-# Args:
-#   $1 - issue_number
-#   $2 - repo_slug
-#   $3 - session_key
-#   $4 - worker_pid
-#   $5 - launcher_log path
-# Returns: 0 ready, 1 failed/not-ready before timeout
-#######################################
-_dsi_wait_for_worker_readiness() {
-	local issue_number="$1"
-	local repo_slug="$2"
-	local session_key="$3"
-	local worker_pid="$4"
-	local launcher_log="$5"
-	local runtime_log
-	runtime_log=$(_dsi_detached_runtime_log "$session_key")
-	local timeout_s
-	timeout_s=$(_dsi_ready_timeout_seconds)
-	local attempts=0
-	local max_attempts=$((timeout_s * 10))
-
-	while [[ "$attempts" -le "$max_attempts" ]]; do
-		if [[ -s "$runtime_log" ]] &&
-			grep -Fq -e "worker_started" -e "worker_start session=${session_key}" "$runtime_log" 2>/dev/null; then
-			return 0
-		fi
-
-		if [[ -n "$worker_pid" ]] && ! kill -0 "$worker_pid" 2>/dev/null; then
-			_dsi_err "Worker launch failed — detached child exited before readiness"
-			_dsi_info "  Launcher log: ${launcher_log}"
-			_dsi_info "  Runtime log:  ${runtime_log}"
-			return 1
-		fi
-
-		if [[ "$attempts" -eq "$max_attempts" ]]; then
-			break
-		fi
-		sleep 0.1
-		attempts=$((attempts + 1))
-	done
-
-	_dsi_err "Worker launch did not reach readiness within ${timeout_s}s"
-	_dsi_info "  Worker PID:   ${worker_pid}"
-	_dsi_info "  Launcher log: ${launcher_log}"
-	_dsi_info "  Runtime log:  ${runtime_log}"
-	return 1
-}
+# Worker tracking and readiness remain available to dispatch and status callers.
+# shellcheck source=./dispatch-single-issue-tracking.sh
+# shellcheck disable=SC1091 # sibling library resolved at runtime
+source "${_DSI_SCRIPT_DIR}/dispatch-single-issue-tracking.sh"
+# shellcheck disable=SC1091 # sibling library resolved at runtime
+source "${_DSI_SCRIPT_DIR}/dispatch-single-issue-origin.sh"
 
 #######################################
 # Build the worker prompt.  Headless-runtime-lib auto-appends
@@ -1075,13 +665,17 @@ _dsi_prepare_worker_git_auth() {
 	local origin="" normalized_origin="" token_file="" meta_file=""
 	local strategy="" app_slug=""
 	_dsi_clear_worker_git_auth
+	_DSI_GIT_AUTH_FAILURE_REASON="worker_git_auth_failed"
 
 	[[ "${WORKER_SCOPED_TOKENS:-true}" == "true" ]] || return 0
 	[[ -x "$_DSI_TOKEN_HELPER" && -x "$_DSI_ASKPASS_HELPER" ]] || return 0
 	origin=$(git -C "$worktree_path" remote get-url origin 2>/dev/null || true)
 	normalized_origin=$(_dsi_normalize_github_https_origin "$origin") || return 0
 	[[ "$normalized_origin" == "https://github.com/${repo_slug}" ]] || {
+		# GH#33629: a prerequisite (normally caught before claim), not an auth fault.
+		_DSI_GIT_AUTH_FAILURE_REASON="repository_origin_mismatch"
 		_dsi_err "Worker Git origin does not match the dispatch repository"
+		_dsi_info "  $(_dsi_origin_identity_hint repository_origin_mismatch "$repo_slug")" >&2
 		return 1
 	}
 
@@ -1161,10 +755,15 @@ _dsi_launch_worker() {
 	local repo_slug="${10:-}"
 	local self_login="${11:-}"
 
+	# Manual dispatch may inherit interactive/non-headless markers. The worker
+	# must carry its own role so the exact wrapper ownership proof is accepted.
 	local -a cmd=(
-		env
+		env -u AIDEVOPS_ATTEMPT_STARTED_AT
 		HEADLESS=1
 		FULL_LOOP_HEADLESS=true
+		AIDEVOPS_SESSION_ORIGIN=worker
+		AIDEVOPS_HEADLESS=true
+		AIDEVOPS_ATTEMPT_ID="$_DSI_ATTEMPT_ID"
 		WORKER_ISSUE_NUMBER="$issue_number"
 		WORKER_GITHUB_LOGIN="$self_login"
 		WORKER_WORKTREE_PATH="$worktree_path"
@@ -1173,6 +772,17 @@ _dsi_launch_worker() {
 		GITHUB_REPOSITORY="$repo_slug"
 		AIDEVOPS_ALLOW_WORKER_WORKTREE_OWNER_TRANSFER=1
 	)
+	# GH#34901: hand the claim lease to the worker exactly as pulse does. The
+	# claim records session=issue-N while the runtime session is manual-cli-*,
+	# so lease transitions use the claim's session explicitly.
+	if [[ -n "$_DSI_LEASE_ID" ]]; then
+		local lease_env_name="AIDEVOPS_DISPATCH_LEASE_TOKEN"
+		cmd+=(
+			"${lease_env_name}=${_DSI_LEASE_ID}"
+			AIDEVOPS_DISPATCH_LEASE_DEVICE="$_DSI_LEASE_DEVICE"
+			AIDEVOPS_DISPATCH_LEASE_SESSION="issue-${issue_number}"
+		)
+	fi
 	if [[ -n "$_DSI_GIT_AUTH_TOKEN_FILE" ]]; then
 		cmd+=(
 			AIDEVOPS_GIT_AUTH_TOKEN_FILE="$_DSI_GIT_AUTH_TOKEN_FILE"
@@ -1193,8 +803,10 @@ _dsi_launch_worker() {
 		--tier "$tier"
 		--title "$title"
 		--prompt "$prompt"
-		--detach
 	)
+	# A managed unit owns the worker process itself; only the legacy backend
+	# asks the runtime to detach (GH#35295).
+	[[ "${_DSI_MANAGED_WORKTREE:-0}" == "1" ]] || cmd+=(--detach)
 	if [[ -n "$selected_model" ]]; then
 		cmd+=(--model "$selected_model")
 	fi
@@ -1202,10 +814,23 @@ _dsi_launch_worker() {
 		cmd+=(--agent "$agent_name")
 	fi
 
-	# Run in background, redirect stdout/stderr to worker_log so caller
+	# Validate the exact producer envelope synchronously in the same runtime
+	# entrypoint. A known local rejection must not create another detached child.
+	# The preflight flag is command-local, never inherited by the real launch.
+	mkdir -p "$_DSI_LOG_DIR"
+	if ! AIDEVOPS_GIT_AUTH_PREFLIGHT_ONLY=1 "${cmd[@]}" >>"$worker_log" 2>&1; then
+		_dsi_err "Worker Git authentication preflight rejected; evidence retained in launcher log"
+		return 1
+	fi
+	if [[ "${_DSI_MANAGED_WORKTREE:-0}" == "1" ]]; then
+		_dsi_launch_managed_worker "$worker_log" "$issue_number" "$worktree_path" "${cmd[@]}"
+		return $?
+	fi
+
+	# Legacy backend only (explicitly selected before creation, or an
+	# unenrolled resume). Run in background, redirect stdout/stderr to worker_log so caller
 	# doesn't block. Capture launch PID (the env wrapper, which then
 	# exec's the helper).
-	mkdir -p "$_DSI_LOG_DIR"
 	nohup "${cmd[@]}" >>"$worker_log" 2>&1 &
 	local pid=$!
 	disown "$pid" 2>/dev/null || true
@@ -1319,6 +944,10 @@ _dsi_parse_dispatch_args() {
 # Args:
 #   $1 issue_number, $2 repo_slug, $3 session_key
 #   $4 dedup_state (blocked|clear|recovering|error), $5 dedup_rc, $6 dedup_result
+# Reads: _DSI_PR_EVIDENCE_STATE/_RC/_RESULT (GH#35616; "skipped" when unchecked)
+# Returns: 1 when real dispatch would refuse on PR evidence (ownership block
+#   or helper failure, GH#35616) or an unmet local repo-path prerequisite
+#   (GH#34003), 0 otherwise. Read-only either way.
 #######################################
 _dsi_print_dryrun() {
 	local issue_number="$1"
@@ -1327,8 +956,9 @@ _dsi_print_dryrun() {
 	local dedup_state="$4"
 	local dedup_rc="$5"
 	local dedup_result="$6"
-	local repo_path=""
+	local repo_path="" prerequisite=""
 	repo_path=$(_dsi_repo_path_for_slug "$repo_slug" 2>/dev/null || true)
+	prerequisite=$(_dsi_runner_local_prerequisite "$repo_path" "$repo_slug") || true
 	local base_ref=""
 	base_ref=$(_dsi_dispatch_base_ref "$repo_slug" "$repo_path")
 	_dsi_info "DRY RUN — would dispatch:"
@@ -1341,7 +971,22 @@ _dsi_print_dryrun() {
 	_dsi_info "  Session key:  ${session_key}"
 	_dsi_info "  Prompt:       $(_dsi_build_prompt "$issue_number" "$_DSI_ISSUE_URL")"
 	_dsi_info "  Base ref:     ${base_ref}"
-	_dsi_info "  Worktree:     would create auto-<ts>-gh${issue_number}"
+	_dsi_info "  Lifetime:     $([[ "$(_dlw_select_worker_backend 2>/dev/null)" == systemd ]] && printf 'managed systemd generation (shared Pulse launcher)' || printf 'legacy detached backend')"
+	if [[ "$prerequisite" == repository_* ]]; then
+		_dsi_info "  Repo path:    ${repo_path}"
+		_dsi_warn "  Origin:       UNMET (reason=${prerequisite}) — real dispatch would refuse before claim"
+		_dsi_warn "                $(_dsi_repo_path_hint "$prerequisite" "$repo_slug")"
+	elif [[ -n "$prerequisite" ]]; then
+		_dsi_warn "  Repo path:    UNRESOLVED (reason=${prerequisite}) — real dispatch would refuse before claim"
+		_dsi_warn "                $(_dsi_repo_path_hint "$prerequisite" "$repo_slug")"
+	else
+		_dsi_info "  Repo path:    ${repo_path}"
+	fi
+	if [[ "$_DSI_RESUME_MODE" -eq 1 ]]; then
+		_dsi_info "  Worktree:     reuse ${_DSI_WORKTREE_PATH}"
+	else
+		_dsi_info "  Worktree:     would create auto-<ts>-gh${issue_number}"
+	fi
 	if [[ "$_DSI_ARG_NO_CEREMONY" -eq 1 ]]; then
 		_dsi_info "  Ceremony:     SKIPPED (--no-ceremony) — labels and assignee unchanged"
 	else
@@ -1353,8 +998,28 @@ _dsi_print_dryrun() {
 	"$_DSI_STATE_RECOVERING") _dsi_warn "  Dedup:        RECOVERING — dispatch remains unsafe: ${dedup_result}" ;;
 	error) _dsi_err "  Dedup:        ERROR (exit ${dedup_rc}) — would refuse to dispatch: ${dedup_result}" ;;
 	esac
-	if [[ "$dedup_state" == "$_DSI_STATE_RECOVERING" ]]; then
+	local pr_state="${_DSI_PR_EVIDENCE_STATE:-skipped}"
+	case "$pr_state" in
+	clear) _dsi_info "  PR evidence:  clear (no linked PR ownership)" ;;
+	blocked) _dsi_warn "  PR evidence:  WOULD BLOCK — ${_DSI_PR_EVIDENCE_RESULT}" ;;
+	"$_DSI_STATE_RECOVERING") _dsi_warn "  PR evidence:  UNCERTAIN — real dispatch would refuse: ${_DSI_PR_EVIDENCE_RESULT}" ;;
+	error) _dsi_err "  PR evidence:  ERROR (exit ${_DSI_PR_EVIDENCE_RC:-unknown}) — would refuse to dispatch: ${_DSI_PR_EVIDENCE_RESULT}" ;;
+	*)
+		if [[ "$_DSI_RESUME_MODE" -eq 1 ]]; then
+			_dsi_info "  PR evidence:  not applicable (signed resume continues its preserved binding)"
+		else
+			_dsi_info "  PR evidence:  not checked (dedup is not clear)"
+		fi
+		;;
+	esac
+	if [[ "$dedup_state" == "$_DSI_STATE_RECOVERING" || "$pr_state" == "$_DSI_STATE_RECOVERING" ]]; then
 		_dsi_warn "Dry-run stopped at recoverable safety state (no worker launched)"
+	elif [[ "$pr_state" == "$_DSI_STATE_BLOCKED" || "$pr_state" == "$_DSI_STATE_ERROR" ]]; then
+		_dsi_warn "Dry-run stopped: real dispatch would refuse on PR evidence (no worker launched)"
+		return 1
+	elif [[ -n "$prerequisite" ]]; then
+		_dsi_warn "Dry-run stopped: runner_capability_unmet reason=${prerequisite} (no worker launched)"
+		return 1
 	else
 		_dsi_ok "Dry-run complete (no worker launched)"
 	fi
@@ -1373,6 +1038,8 @@ _dsi_run_dedup_check() {
 	local retry_number=0
 	local classification=""
 	local retry_delay=""
+	local hydration_waited=0
+	local hydration_wait=""
 
 	_DSI_DEDUP_ATTEMPTS=0
 	while ((_DSI_DEDUP_ATTEMPTS < 3)); do
@@ -1384,13 +1051,28 @@ _dsi_run_dedup_check() {
 		if [[ "$_DSI_DEDUP_RC" -eq 0 && "$_DSI_DEDUP_RESULT" == GUARD_UNCERTAIN* ]]; then
 			_DSI_DEDUP_STATE="$_DSI_STATE_RECOVERING"
 		elif [[ "$_DSI_DEDUP_RC" -eq 0 ]]; then
-			_DSI_DEDUP_STATE="blocked"
+			_DSI_DEDUP_STATE="$_DSI_STATE_BLOCKED"
 		elif [[ "$_DSI_DEDUP_RC" -eq 1 ]]; then
-			_DSI_DEDUP_STATE="clear"
+			_DSI_DEDUP_STATE="$_DSI_STATE_CLEAR"
 		else
-			_DSI_DEDUP_STATE="error"
+			_DSI_DEDUP_STATE="$_DSI_STATE_ERROR"
 		fi
 
+		# GH#34922: a fresh issue inside the label-hydration window is not owned
+		# by anyone. A real dispatch waits out the remainder once and re-checks
+		# with refreshed metadata, so the operator's first attempt succeeds.
+		if [[ "$_DSI_DEDUP_STATE" == "$_DSI_STATE_BLOCKED" && "$hydration_waited" -eq 0 && "${_DSI_ARG_DRYRUN:-0}" -ne 1 ]] &&
+			hydration_wait=$(_dsi_hydration_wait_seconds "$_DSI_DEDUP_RESULT"); then
+			hydration_waited=1
+			_dsi_info "Issue #${issue_number} is inside the label-hydration window; waiting ${hydration_wait}s for creation-time labels"
+			sleep "$hydration_wait"
+			if ! _dsi_load_issue_meta "$issue_number" "$repo_slug"; then
+				_DSI_DEDUP_RESULT="${_DSI_DEDUP_RESULT} metadata-refresh-failed"
+				return 0
+			fi
+			_DSI_DEDUP_ATTEMPTS=$((_DSI_DEDUP_ATTEMPTS - 1))
+			continue
+		fi
 		[[ "$_DSI_DEDUP_STATE" == "$_DSI_STATE_RECOVERING" ]] || return 0
 		((_DSI_DEDUP_ATTEMPTS < 3)) || return 0
 		classification=$("$_DSI_BACKOFF_HELPER" classify-lookup-failure "$_DSI_DEDUP_RESULT" 2>/dev/null || printf 'unknown')
@@ -1409,6 +1091,276 @@ _dsi_run_dedup_check() {
 	return 0
 }
 
+#######################################
+# GH#35616: shared PR-evidence lookup for ordinary manual dispatch. Reuses the
+# public `dispatch-dedup-helper.sh has-open-pr` interface (Pulse Layer 4), so
+# strict issue linkage, the seed-PR exception and fail-closed uncertainty stay
+# owned by the shared module: worker drafts, protected drafts and other linked
+# PR evidence block a fresh implementation worker; bare prose mentions do not.
+# Sets _DSI_PR_EVIDENCE_STATE (clear|blocked|recovering|error),
+#      _DSI_PR_EVIDENCE_RC and _DSI_PR_EVIDENCE_RESULT. Read-only.
+# Args: $1 issue number, $2 repo slug, $3 issue title (optional)
+#######################################
+_dsi_run_pr_evidence_check() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local issue_title="${3:-}"
+
+	_DSI_PR_EVIDENCE_RC=0
+	_DSI_PR_EVIDENCE_RESULT=""
+	if [[ ! -x "$_DSI_DEDUP_HELPER" ]]; then
+		_DSI_PR_EVIDENCE_STATE="$_DSI_STATE_ERROR"
+		_DSI_PR_EVIDENCE_RC=127
+		_DSI_PR_EVIDENCE_RESULT="dedup helper is not executable: ${_DSI_DEDUP_HELPER}"
+		return 0
+	fi
+	_DSI_PR_EVIDENCE_RESULT=$("$_DSI_DEDUP_HELPER" has-open-pr "$issue_number" "$repo_slug" "$issue_title" 2>&1) ||
+		_DSI_PR_EVIDENCE_RC=$?
+	# Uncertainty takes precedence over every exit code: a partial view can
+	# neither prove ownership nor prove its absence.
+	if [[ "$_DSI_PR_EVIDENCE_RESULT" == *"PR_LOOKUP_RESULT=uncertain"* ]]; then
+		_DSI_PR_EVIDENCE_STATE="$_DSI_STATE_RECOVERING"
+	elif [[ "$_DSI_PR_EVIDENCE_RC" -eq 0 ]]; then
+		_DSI_PR_EVIDENCE_STATE="$_DSI_STATE_BLOCKED"
+		[[ -n "$_DSI_PR_EVIDENCE_RESULT" ]] ||
+			_DSI_PR_EVIDENCE_RESULT="PR evidence exists for issue #${issue_number} (no detail returned)"
+	elif [[ "$_DSI_PR_EVIDENCE_RC" -eq 1 ]]; then
+		_DSI_PR_EVIDENCE_STATE="$_DSI_STATE_CLEAR"
+	else
+		_DSI_PR_EVIDENCE_STATE="$_DSI_STATE_ERROR"
+	fi
+	return 0
+}
+
+#######################################
+# Refuse ordinary dispatch unless the last PR-evidence lookup was clear.
+# Args: $1 issue number, $2 repo slug
+# Returns: 0 clear, 1 ownership block or helper failure, 75 lookup uncertain
+#   (recovery checkpoint persisted).
+#######################################
+_dsi_enforce_pr_evidence() {
+	local issue_number="$1"
+	local repo_slug="$2"
+
+	case "${_DSI_PR_EVIDENCE_STATE:-error}" in
+	clear) return 0 ;;
+	blocked)
+		_dsi_warn "Skipped: existing PR evidence owns issue #${issue_number}; refusing a fresh implementation worker"
+		_dsi_info "  Reason: ${_DSI_PR_EVIDENCE_RESULT}"
+		if [[ "$_DSI_PR_EVIDENCE_RESULT" == WORKER_DRAFT_CHECKPOINT:* ]]; then
+			_dsi_info "  The preserved worker draft is continued or escalated by Pulse checkpoint recovery, never replaced by manual dispatch."
+		elif [[ "$_DSI_PR_EVIDENCE_RESULT" == *"draft PR #"* ]]; then
+			_dsi_info "  Protected drafts (interactive, held or review-gated) stay untouched; resolve that draft first."
+		else
+			_dsi_info "  Finish, close or unlink the existing PR before dispatching a replacement worker."
+		fi
+		return 1
+		;;
+	"$_DSI_STATE_RECOVERING")
+		_dsi_err "PR evidence lookup is uncertain — failing closed, refusing to dispatch"
+		_dsi_info "  Trigger: ${_DSI_PR_EVIDENCE_RESULT}"
+		_dsi_write_recovery_checkpoint "$issue_number" "$repo_slug" "$_DSI_PR_EVIDENCE_RESULT" 1 || true
+		return 75
+		;;
+	*)
+		_dsi_err "PR evidence check failed (exit ${_DSI_PR_EVIDENCE_RC:-unknown}) — failing closed, refusing to dispatch"
+		_dsi_info "  Output: ${_DSI_PR_EVIDENCE_RESULT}"
+		_dsi_info "  Diagnose with: $_DSI_DEDUP_HELPER has-open-pr $issue_number $repo_slug"
+		return 1
+		;;
+	esac
+}
+
+#######################################
+# Ordinary dispatch must not replace existing PR ownership. A signed
+# permission resume continues its exact preserved worker binding (session,
+# branch, worktree) rather than launching a fresh worker, so it is exempt.
+# Args: $1 issue number, $2 repo slug
+# Returns: as _dsi_enforce_pr_evidence
+#######################################
+_dsi_guard_pr_evidence() {
+	local issue_number="$1"
+	local repo_slug="$2"
+
+	[[ "$_DSI_RESUME_MODE" -eq 1 ]] && return 0
+	_dsi_run_pr_evidence_check "$issue_number" "$repo_slug" "${_DSI_ISSUE_TITLE:-}"
+	_dsi_enforce_pr_evidence "$issue_number" "$repo_slug"
+	return $?
+}
+
+#######################################
+# One bounded PR-evidence re-read after the consensus claim win catches a PR
+# opened while the claim settled. Refusal releases the claim before any
+# label, assignee, ceremony or worktree effect.
+# Args: $1 issue number, $2 repo slug, $3 current login
+# Returns: as _dsi_enforce_pr_evidence
+#######################################
+_dsi_recheck_pr_evidence_after_claim() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local self_login="$3"
+	local guard_rc=0
+
+	_dsi_guard_pr_evidence "$issue_number" "$repo_slug" || guard_rc=$?
+	if [[ "$guard_rc" -ne 0 ]]; then
+		_dsi_release_consensus_claim "$issue_number" "$repo_slug" "$self_login" "pr_evidence_after_claim" || true
+		return "$guard_rc"
+	fi
+	return 0
+}
+
+#######################################
+# Dry-run path of cmd_dispatch. With a clear assignment check (and outside a
+# signed resume) it performs the same read-only PR-evidence lookup real
+# dispatch enforces, so ownership blocks and uncertainty are reported exactly.
+# Args: $1 issue, $2 repo, $3 session key, $4 dedup state, $5 dedup rc,
+#   $6 dedup result
+# Returns: 75 on dedup/PR-evidence uncertainty (checkpoint persisted), else
+#   the _dsi_print_dryrun result.
+#######################################
+_dsi_dispatch_dryrun() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local session_key="$3"
+	local dedup_state="$4"
+	local dedup_rc="$5"
+	local dedup_result="$6"
+	local dryrun_rc=0
+
+	_DSI_PR_EVIDENCE_STATE="skipped"
+	_DSI_PR_EVIDENCE_RESULT=""
+	if [[ "$dedup_state" == "$_DSI_STATE_CLEAR" && "$_DSI_RESUME_MODE" -ne 1 ]]; then
+		_dsi_run_pr_evidence_check "$issue_number" "$repo_slug" "${_DSI_ISSUE_TITLE:-}"
+	fi
+	_dsi_print_dryrun "$issue_number" "$repo_slug" "$session_key" "$dedup_state" "$dedup_rc" "$dedup_result" || dryrun_rc=$?
+	if [[ "$dedup_state" == "$_DSI_STATE_RECOVERING" ]]; then
+		_dsi_write_recovery_checkpoint "$issue_number" "$repo_slug" "$dedup_result" "$_DSI_DEDUP_ATTEMPTS" || true
+		return 75
+	fi
+	if [[ "$_DSI_PR_EVIDENCE_STATE" == "$_DSI_STATE_RECOVERING" ]]; then
+		_dsi_write_recovery_checkpoint "$issue_number" "$repo_slug" "$_DSI_PR_EVIDENCE_RESULT" 1 || true
+		return 75
+	fi
+	return "$dryrun_rc"
+}
+
+#######################################
+# Capture the lease identity from a winning CLAIM_WON line (GH#34901).
+# Pulse hands the same identity to its worker, which publishes the
+# DISPATCH_LEASE phase=ready transition that remote stale recovery honours.
+# Only the exact CLAIM_WON line is trusted; malformed values are dropped and
+# dispatch falls back to the legacy unleased launch.
+# Args: $1 - claim helper output
+#######################################
+_dsi_capture_claim_lease() {
+	local claim_output="$1"
+	local won_line="" word="" key="" value="" lease_id="" device=""
+	local -a words=()
+	won_line=$(printf '%s\n' "$claim_output" | awk '/^CLAIM_WON: / && !f {print; f=1}' || true)
+	read -r -a words <<<"$won_line"
+	for word in "${words[@]}"; do
+		key="${word%%=*}"
+		value="${word#*=}"
+		case "$key" in
+		"$_DSI_LEASE_FIELD") lease_id="$value" ;;
+		device) device="$value" ;;
+		esac
+	done
+	if [[ "$lease_id" =~ ^[A-Za-z0-9._:-]{1,128}$ && "$device" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+		_DSI_LEASE_ID="$lease_id"
+		_DSI_LEASE_DEVICE="$device"
+		return 0
+	fi
+	_dsi_warn "Claim output carried no usable lease identity; worker will run without a dispatch lease"
+	return 0
+}
+
+#######################################
+# GH#34922: extract the claim helper's outcome reason (the last
+# `CLAIM_<STATE>:` line: LOST, BLOCKED, SKIPPED, STALE_SELF, REVOKED, ERROR).
+# Output is reduced to printable characters and bounded; the claim helper
+# emits only logins, issue/comment ids, timestamps and reason codes.
+# Args: $1 - claim helper output (stdout+stderr)
+# Output: reason line, or empty when none was emitted
+#######################################
+_dsi_claim_reason_line() {
+	local claim_output="$1"
+	local reason=""
+	reason=$(printf '%s\n' "$claim_output" | awk '/^CLAIM_[A-Z_]+: / {line=$0} END {print line}' || true)
+	reason=$(printf '%s' "$reason" | tr -cd '[:print:]' | cut -c1-400)
+	if [[ "$reason" == CLAIM_LOST:* ]] && [[ "$claim_output" == *own_claim_not_visible* ]]; then
+		reason="${reason} (own claim not yet visible on re-read)"
+	fi
+	printf '%s' "$reason"
+	return 0
+}
+
+#######################################
+# GH#34922: seconds to wait out the issue-age label-hydration window
+# (dispatch-dedup-assignment.sh HYDRATION_WINDOW signal) before retrying.
+# A brand-new issue is refused for DISPATCH_HYDRATION_WINDOW_S seconds so
+# creation-time labels (parent-task, no-auto-dispatch, ...) can land first.
+# Manual dispatch waits for the remainder instead of failing; waits longer
+# than AIDEVOPS_DSI_HYDRATION_MAX_WAIT (default 60s) are not attempted.
+# Args: $1 - guard/claim output text
+# Output: wait seconds on stdout
+# Returns: 0 when a bounded wait applies, 1 otherwise
+#######################################
+_dsi_hydration_wait_seconds() {
+	local signal_text="$1"
+	local max_wait="${AIDEVOPS_DSI_HYDRATION_MAX_WAIT:-60}"
+	local pattern='HYDRATION_WINDOW \(issue=[^ ]* repo=[^ ]* age=(-?[0-9]+)s window=([0-9]+)s'
+	local age="" window="" wait_s=0
+	[[ "$max_wait" =~ ^[0-9]+$ ]] || max_wait=60
+	[[ "$signal_text" =~ $pattern ]] || return 1
+	age="${BASH_REMATCH[1]}"
+	window="${BASH_REMATCH[2]}"
+	wait_s=$((window - age + 1))
+	[[ "$wait_s" -ge 1 ]] || wait_s=1
+	[[ "$wait_s" -le "$max_wait" ]] || return 1
+	printf '%s\n' "$wait_s"
+	return 0
+}
+
+#######################################
+# Allocate this dispatch's canonical attempt ID once. Never reuse an inherited
+# AIDEVOPS_ATTEMPT_ID: that belongs to the calling session, not this worker.
+# Returns: 0 always
+#######################################
+_dsi_ensure_attempt_id() {
+	[[ -n "$_DSI_ATTEMPT_ID" ]] || _DSI_ATTEMPT_ID=$(aidevops_generate_execution_id "attempt")
+	return 0
+}
+
+#######################################
+# Extend the claim's prelaunch lease to cover manual preparation (worktree,
+# credentials, conversation lock, canary) before the worker renews it and
+# publishes phase=ready. The claim helper never shortens an existing lease.
+# Args: $1 - issue_number, $2 - repo_slug
+# Returns: 0 renewed or no lease to renew, 1 renewal denied/failed
+#######################################
+_dsi_renew_prelaunch_lease() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local lease_ttl="${AIDEVOPS_DSI_PRELAUNCH_LEASE_TTL:-}"
+	local renew_stderr="" renew_rc=0 reason=""
+
+	[[ -n "$_DSI_LEASE_ID" ]] || return 0
+	if ! [[ "$lease_ttl" =~ ^[0-9]+$ ]]; then
+		lease_ttl=$(($(_dsi_ready_timeout_seconds) + _DSI_PRELAUNCH_PREPARATION_SECONDS))
+	fi
+	_dsi_ensure_attempt_id
+	renew_stderr=$(AIDEVOPS_DEVICE_ID="$_DSI_LEASE_DEVICE" AIDEVOPS_ATTEMPT_ID="$_DSI_ATTEMPT_ID" \
+		"$_DSI_CLAIM_HELPER" transition prelaunch "$issue_number" "$repo_slug" \
+		"$_DSI_LEASE_ID" "issue-${issue_number}" "$lease_ttl" 2>&1 >/dev/null) || renew_rc=$?
+	if [[ "$renew_rc" -ne 0 ]]; then
+		reason=$(printf '%s\n' "$renew_stderr" | sed -n 's/^DISPATCH_LEASE_TRANSITION_DENIED reason=\([a-z_]*\)$/\1/p' | tail -n 1)
+		_dsi_err "Dispatch prelaunch lease renewal failed for #${issue_number} (reason=${reason:-unclassified})"
+		return 1
+	fi
+	return 0
+}
+
 _dsi_acquire_consensus_claim() {
 	local issue_number="$1"
 	local repo_slug="$2"
@@ -1418,20 +1370,50 @@ _dsi_acquire_consensus_claim() {
 
 	_DSI_CLAIM_WON=0
 	_DSI_CLAIM_COMMENT_ID=""
+	_DSI_LEASE_ID=""
+	_DSI_LEASE_DEVICE=""
 	if [[ -z "$self_login" ]]; then
 		_dsi_err "Cannot resolve runner login for consensus claim; refusing dispatch"
 		return 1
 	fi
 	claim_output=$("$_DSI_DEDUP_HELPER" claim "$issue_number" "$repo_slug" "$self_login" 2>&1) || claim_rc=$?
+	# GH#34922: a just-created issue is refused by the label-hydration window
+	# (rc 1, no claim posted). Wait out the remainder once and claim again
+	# instead of reporting a nonexistent competing runner.
+	local hydration_wait=""
+	if [[ "$claim_rc" -eq 1 ]] && hydration_wait=$(_dsi_hydration_wait_seconds "$claim_output"); then
+		_dsi_info "Issue #${issue_number} is inside the label-hydration window; waiting ${hydration_wait}s before claiming again"
+		sleep "$hydration_wait"
+		claim_rc=0
+		claim_output=$("$_DSI_DEDUP_HELPER" claim "$issue_number" "$repo_slug" "$self_login" 2>&1) || claim_rc=$?
+	fi
 	case "$claim_rc" in
 	0)
 		_DSI_CLAIM_WON=1
 		_DSI_CLAIM_COMMENT_ID=$(printf '%s' "$claim_output" | sed -n 's/.*comment_id=\([0-9][0-9]*\).*/\1/p')
+		_dsi_capture_claim_lease "$claim_output"
 		_dsi_info "Consensus claim won for #${issue_number}"
+		# GH#34901: keep the claim lease alive through manual preparation so
+		# the worker can renew it and publish the phase=ready lease, as pulse
+		# workers do. A denied renewal would fail the worker's own renewal.
+		if ! _dsi_renew_prelaunch_lease "$issue_number" "$repo_slug"; then
+			_dsi_release_consensus_claim "$issue_number" "$repo_slug" "$self_login" "prelaunch_lease_renewal_failed" || true
+			return 1
+		fi
 		return 0
 		;;
 	1)
-		_dsi_warn "Consensus claim lost for #${issue_number}; another runner won"
+		local claim_reason=""
+		claim_reason=$(_dsi_claim_reason_line "$claim_output")
+		case "$claim_reason" in
+		CLAIM_LOST:*)
+			_dsi_warn "Consensus claim lost for #${issue_number}; another runner won"
+			;;
+		*)
+			_dsi_warn "Consensus claim refused for #${issue_number}; no worker launched"
+			;;
+		esac
+		_dsi_info "  Reason: ${claim_reason:-unclassified (claim helper gave no reason line)}"
 		return 1
 		;;
 	*)
@@ -1514,7 +1496,15 @@ _dsi_write_recovery_checkpoint() {
 	local checkpoint_file="${checkpoint_dir}/${repo_slug//\//-}-${issue_number}.json"
 	local checkpoint_tmp="${checkpoint_file}.tmp.$$"
 	local resume_command=""
+	local recovery_owner="automation"
+	local resume_condition="one authoritative metadata/dedup read returns a definitive clear or blocked result"
 	local -a resume_args=("${_DSI_SCRIPT_DIR}/dispatch-single-issue-helper.sh" dispatch "$issue_number" "$repo_slug")
+	if [[ "$trigger" == *"reason=commit_permission_denied"* ]]; then
+		recovery_owner="human"
+		resume_condition="human-owned permission repair or capability context change; otherwise guarded recheck after the 900-second repository cooldown; commit evidence must remain complete"
+	elif [[ "$trigger" == *"reason=keychain_unavailable"* ]]; then
+		resume_condition="restore readiness helper readability and unlock or repair keychain/gh credentials as needed, or supply GH_TOKEN/GITHUB_TOKEN securely; guarded recheck after AIDEVOPS_KEYCHAIN_BACKOFF_SECS (default 600 seconds) when a marker is active"
+	fi
 
 	[[ -n "$_DSI_ARG_MODEL" ]] && resume_args+=(--model "$_DSI_ARG_MODEL")
 	[[ -n "$_DSI_ARG_AGENT" ]] && resume_args+=(--agent "$_DSI_ARG_AGENT")
@@ -1532,11 +1522,12 @@ _dsi_write_recovery_checkpoint() {
 		--arg trigger "$trigger" \
 		--argjson attempts "$attempts" \
 		--arg resume_command "$resume_command" \
-		--arg resume_condition "one authoritative metadata/dedup read returns a definitive clear or blocked result" \
+		--arg resume_condition "$resume_condition" \
+		--arg recovery_owner "$recovery_owner" \
 		'{status:$status, issue:$issue, repo:$repo, trigger:$trigger, dedup_attempts:$attempts,
 		  completed_checks:["issue metadata loaded","target is an issue","dispatch holds checked","parent-task gate checked","dedup remained fail-closed"],
 		  unsafe_route_not_to_repeat:"bypass dedup or repeat an identical lookup without changed conditions",
-		  resume_command:$resume_command, resume_condition:$resume_condition}' >"$checkpoint_tmp" || return 1
+		  recovery_owner:$recovery_owner, resume_command:$resume_command, resume_condition:$resume_condition}' >"$checkpoint_tmp" || return 1
 	mv "$checkpoint_tmp" "$checkpoint_file"
 	_dsi_warn "Recovery checkpoint: ${checkpoint_file}"
 	printf 'RECOVERY_CHECKPOINT_JSON='
@@ -1570,21 +1561,9 @@ _dsi_resolve_runner_login() {
 	return 1
 }
 
-#######################################
-# Subcommand: dispatch <issue> <slug> [--model M] [--dry-run]
-#######################################
-cmd_dispatch() {
-	local rc=0
-	_dsi_parse_dispatch_args "$@" || rc=$?
-	case "$rc" in
-	0) ;;
-	100) return 0 ;;
-	*) return "$rc" ;;
-	esac
-	local issue_number="$_DSI_ARG_ISSUE"
-	local repo_slug="$_DSI_ARG_REPO"
-
-	# Step 1-2: validate + load + parent-task gate
+_dsi_validate_dispatch_target() {
+	local issue_number="$1"
+	local repo_slug="$2"
 	_dsi_load_issue_meta "$issue_number" "$repo_slug" || return 1
 	local target_pr_rc=0
 	_dsi_target_is_pull_request "$issue_number" "$repo_slug" || target_pr_rc=$?
@@ -1600,8 +1579,119 @@ cmd_dispatch() {
 	_dsi_guard_no_maintainer_review_required "$_DSI_ISSUE_LABELS" "$issue_number" "$repo_slug" || return 1
 	_dsi_guard_issue_author_trust "$issue_number" "$repo_slug" || return 1
 	_dsi_guard_no_maintainer_permission_required "$_DSI_ISSUE_LABELS" "$issue_number" "$repo_slug" || return 1
-	_dsi_guard_permission_history_verified "$issue_number" "$repo_slug" || return 1
+	if [[ "$_DSI_RESUME_MODE" -eq 1 ]]; then
+		_dsi_resolve_permission_resume "$issue_number" "$repo_slug" || return 1
+	else
+		_dsi_guard_permission_history_verified "$issue_number" "$repo_slug" || return 1
+	fi
 	_dsi_check_parent_task "$_DSI_ISSUE_LABELS" || return 1
+	return 0
+}
+
+# Read only the shared local denial cache before further admission reads. Load
+# the PR library in a subshell so its symbols cannot alter this CLI's state.
+_dsi_guard_cached_commit_denial() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local cache_rc=0
+	(
+		# shellcheck source=./dispatch-dedup-pr.sh
+		# shellcheck disable=SC1091
+		source "${_DSI_SCRIPT_DIR}/dispatch-dedup-pr.sh"
+		_ddpr_commit_denial_cache check "$repo_slug"
+	) || cache_rc=$?
+	# 0 = cached denial; 3 = keychain unavailable (no safe gh read) -> uncertain
+	if [[ "$cache_rc" -eq 3 ]]; then
+		_dsi_write_recovery_checkpoint "$issue_number" "$repo_slug" \
+			'PR_LOOKUP_RESULT=uncertain reason=keychain_unavailable scope=open_commits' 0 || true
+		return 75
+	fi
+	if [[ "$cache_rc" -eq 0 ]]; then
+		_dsi_write_recovery_checkpoint "$issue_number" "$repo_slug" \
+			'PR_LOOKUP_RESULT=uncertain reason=commit_permission_denied scope=open_commits' 0 || true
+		return 75
+	fi
+	return 0
+}
+
+# GH#37232: check keychain readiness before any gh metadata read, so a locked
+# macOS keychain cannot prompt or fail validation. Returns 75 (uncertain).
+_dsi_guard_keychain_ready() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local ready_rc=0
+	if [[ -r "${_DSI_SCRIPT_DIR}/background-keychain-helper.sh" ]]; then
+		(
+			# shellcheck source=./background-keychain-helper.sh
+			# shellcheck disable=SC1091
+			source "${_DSI_SCRIPT_DIR}/background-keychain-helper.sh"
+			background_keychain_gh_ready "dispatch-single-issue"
+		) || ready_rc=$?
+	elif [[ -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]]; then
+		# Fail closed on macOS (or unknown OS) when readiness cannot be checked.
+		local host_os=""
+		host_os=$(uname -s 2>/dev/null) || host_os=""
+		if [[ -z "$host_os" || "$host_os" == "Darwin" || -n "${AIDEVOPS_KEYCHAIN_FORCE_STATE:-}" ]]; then
+			_dsi_warn "background-keychain-helper.sh unreadable; cannot check keychain readiness"
+			ready_rc=1
+		fi
+	fi
+	if [[ "$ready_rc" -ne 0 ]]; then
+		_dsi_write_recovery_checkpoint "$issue_number" "$repo_slug" \
+			'PR_LOOKUP_RESULT=uncertain reason=keychain_unavailable scope=dispatch_metadata' 0 || true
+		return 75
+	fi
+	return 0
+}
+
+_dsi_check_runner_capability() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local repo_path="" prerequisite=""
+	repo_path=$(_dsi_repo_path_for_slug "$repo_slug") || repo_path=""
+	# GH#34003: report the missing local prerequisite, not a metadata failure;
+	# the fresh metadata read below owns metadata_unreadable. GH#33629: origin
+	# identity drift is classified here, before claim, not as an auth failure.
+	if ! prerequisite=$(_dsi_runner_local_prerequisite "$repo_path" "$repo_slug"); then
+		_dsi_err "runner_capability_unmet source=fresh reason=${prerequisite} repo=${repo_slug}"
+		_dsi_info "  $(_dsi_repo_path_hint "$prerequisite" "$repo_slug")" >&2
+		return 1
+	fi
+	# Keep the existing secret backend and count-only diagnostics. No log file,
+	# claim, or ownership mutation is needed to perform this fresh read.
+	runner_capability_check_fresh "$repo_path" "$issue_number" "$repo_slug" /dev/stderr || return 1
+	return 0
+}
+
+#######################################
+# Subcommand: dispatch <issue> <slug> [--model M] [--dry-run]
+#######################################
+cmd_dispatch() {
+	# GH#36343: supervisor children inherit a restricted lifecycle owner. Do not
+	# acquire claims/labels only to fail native worktree creation later. The
+	# deterministic wrapper outside the LLM session owns worker launches.
+	if [[ "${WORKER_SESSION_KEY:-}" == "supervisor-pulse" ]]; then
+		_dsi_err "supervisor_dispatch_deferred: dispatch runs in the deterministic wrapper outside the supervisor session; no claim or ceremony performed"
+		return 1
+	fi
+	local rc=0
+	_dsi_parse_dispatch_args "$@" || rc=$?
+	case "$rc" in
+	0) ;;
+	100) return 0 ;;
+	*) return "$rc" ;;
+	esac
+	local issue_number="$_DSI_ARG_ISSUE"
+	local repo_slug="$_DSI_ARG_REPO"
+	if [[ "$_DSI_RESUME_MODE" -eq 1 && ("$_DSI_ARG_NO_CEREMONY" -eq 1 || -n "${AIDEVOPS_DISPATCH_BASE_REF:-}") ]]; then
+		_dsi_err "Resume requires normal ownership and its preserved worktree; --no-ceremony/--base are not supported"
+		return 2
+	fi
+
+	# Step 1-2: validate + load + parent-task gate
+	_dsi_guard_keychain_ready "$issue_number" "$repo_slug" || return $?
+	_dsi_validate_dispatch_target "$issue_number" "$repo_slug" || return 1
+	_dsi_guard_cached_commit_denial "$issue_number" "$repo_slug" || return $?
 
 	# Step 3: dedup check (informational under --dry-run, blocking otherwise).
 	# Helper exit codes (per dispatch-dedup-helper.sh::is-assigned):
@@ -1621,22 +1711,19 @@ cmd_dispatch() {
 	# same repo+issue. This closes the gap where labels or ledger entries are
 	# stale/missing but a live worker process is still writing in a worktree.
 	if [[ "$_DSI_ARG_DRYRUN" -ne 1 ]]; then
-		_dsi_guard_no_existing_dispatch "$issue_number" "$repo_slug" || return 1
+		_dsi_guard_no_existing_dispatch "$issue_number" "$repo_slug" "${_DSI_WORKTREE_PATH:-}" || return 1
 	fi
 
 	# Step 5: resolve model
 	_dsi_resolve_model "$_DSI_ISSUE_LABELS" "$_DSI_ARG_MODEL"
 	local session_key
 	session_key="manual-cli-${issue_number}-$(date +%s)"
+	[[ "$_DSI_RESUME_MODE" -eq 1 ]] && session_key="$_DSI_RESUME_SESSION"
 
-	# Step 6: dry-run short-circuit
+	# Step 6: dry-run short-circuit (read-only; reports PR evidence too)
 	if [[ "$_DSI_ARG_DRYRUN" -eq 1 ]]; then
-		_dsi_print_dryrun "$issue_number" "$repo_slug" "$session_key" "$dedup_state" "$dedup_rc" "$dedup_result"
-		if [[ "$dedup_state" == "$_DSI_STATE_RECOVERING" ]]; then
-			_dsi_write_recovery_checkpoint "$issue_number" "$repo_slug" "$dedup_result" "$_DSI_DEDUP_ATTEMPTS" || true
-			return 75
-		fi
-		return 0
+		_dsi_dispatch_dryrun "$issue_number" "$repo_slug" "$session_key" "$dedup_state" "$dedup_rc" "$dedup_result"
+		return $?
 	fi
 
 	# Real dispatch: honour dedup block + fail-closed on errors
@@ -1660,6 +1747,13 @@ cmd_dispatch() {
 		return 1
 		;;
 	esac
+	# GH#35616: preserved worker/protected drafts and other linked PR evidence
+	# block a fresh worker before any claim, label, ceremony or worktree effect.
+	_dsi_guard_pr_evidence "$issue_number" "$repo_slug" || return $?
+	# aidevops:trust-boundary — normal dispatch and signed checkpoint resume
+	# must enforce current requirements, never the prefetched issue body, before
+	# the first persistent claim (including with --no-ceremony).
+	_dsi_check_runner_capability "$issue_number" "$repo_slug" || return 1
 	if ! _dsi_acquire_consensus_claim "$issue_number" "$repo_slug" "$self_login"; then
 		return 1
 	fi
@@ -1667,6 +1761,7 @@ cmd_dispatch() {
 		_dsi_release_consensus_claim "$issue_number" "$repo_slug" "$self_login" "predispatch_validator_blocked" || true
 		return 1
 	fi
+	_dsi_recheck_pr_evidence_after_claim "$issue_number" "$repo_slug" "$self_login" || return $?
 
 	_dsi_dispatch_after_dedup_clear "$issue_number" "$repo_slug" "$self_login" "$session_key"
 	return $?
@@ -1677,6 +1772,8 @@ _dsi_dispatch_after_dedup_clear() {
 	local repo_slug="$2"
 	local self_login="$3"
 	local session_key="$4"
+	local resume_worktree="${_DSI_WORKTREE_PATH:-}" resume_branch="${_DSI_WORKTREE_BRANCH:-}"
+	local resume_request="$_DSI_RESUME_REQUEST"
 
 	if ! _dsi_apply_prelaunch_ceremony_if_enabled "$issue_number" "$repo_slug" "$self_login"; then
 		_dsi_reset_after_prelaunch_failure "$issue_number" "$repo_slug" "$self_login" "dispatch_ceremony_failed"
@@ -1684,9 +1781,25 @@ _dsi_dispatch_after_dedup_clear() {
 	fi
 
 	# Step 7: pre-create worktree
-	if ! _dsi_create_worktree "$issue_number" "$repo_slug"; then
+	if [[ "$_DSI_RESUME_MODE" -ne 1 ]] && ! _dsi_create_worktree "$issue_number" "$repo_slug"; then
 		_dsi_reset_after_prelaunch_failure "$issue_number" "$repo_slug" "$self_login" "worktree_precreation_failed"
 		return 1
+	fi
+	# Revalidate after claims/ceremony without substituting a different binding.
+	if [[ "$_DSI_RESUME_MODE" -eq 1 ]]; then
+		if ! _dsi_resolve_permission_resume "$issue_number" "$repo_slug" ||
+			[[ "$_DSI_RESUME_SESSION" != "$session_key" || "$_DSI_RESUME_REQUEST" != "$resume_request" ||
+				"$_DSI_WORKTREE_PATH" != "$resume_worktree" || "$_DSI_WORKTREE_BRANCH" != "$resume_branch" ]]; then
+			_dsi_reset_after_prelaunch_failure "$issue_number" "$repo_slug" "$self_login" "resume_binding_changed"
+			return 1
+		fi
+		# Sequential resume: a managed generation needs a fresh reservation;
+		# sealed or foreign generations are refused, legacy stays legacy.
+		_dsi_set_launch_provenance "$issue_number" "$repo_slug"
+		if ! _dsi_bind_worktree_lifetime "$issue_number" "$repo_slug" resume; then
+			_dsi_reset_after_prelaunch_failure "$issue_number" "$repo_slug" "$self_login" "resume_lifetime_refused"
+			return 1
+		fi
 	fi
 
 	# Step 7.5: re-check after worktree creation so an existing live process
@@ -1698,7 +1811,7 @@ _dsi_dispatch_after_dedup_clear() {
 	# aidevops:trust-boundary — bind a short-lived credential and commit identity
 	# only after the exact worktree/repository origin is known.
 	if ! _dsi_prepare_worker_git_auth "$repo_slug" "$_DSI_WORKTREE_PATH" "$self_login"; then
-		_dsi_reset_after_prelaunch_failure "$issue_number" "$repo_slug" "$self_login" "worker_git_auth_failed"
+		_dsi_reset_after_prelaunch_failure "$issue_number" "$repo_slug" "$self_login" "${_DSI_GIT_AUTH_FAILURE_REASON:-worker_git_auth_failed}"
 		return 1
 	fi
 
@@ -1779,6 +1892,9 @@ _dsi_launch_and_report() {
 	local prompt worker_log
 	prompt=$(_dsi_build_prompt "$issue_number" "$_DSI_ISSUE_URL")
 	worker_log="${_DSI_LOG_DIR}/manual-dispatch-${issue_number}-$(date +%Y%m%d-%H%M%S).log"
+	# GH#36005: the worker argv carries this attempt (and drops any inherited
+	# start marker) because a managed systemd unit does not inherit our env.
+	_dsi_ensure_attempt_id
 	local launch_pid
 	launch_pid=$(_dsi_launch_worker \
 		"$session_key" "$_DSI_WORKTREE_PATH" "$_DSI_ISSUE_TITLE" \
@@ -1810,6 +1926,8 @@ _dsi_launch_and_report() {
 # including a PID liveness check via kill -0 (same as dispatch-ledger-helper.sh
 # cmd_check_issue). This ensures `status` and the pulse agree on whether a
 # worker is actually running — not just recorded in the ledger.
+# A live ledger PID whose identity cannot be observed is reported as
+# unresolved rather than as a confident "No active dispatch" (GH#33916).
 #######################################
 cmd_status() {
 	local issue_number="${1:-}"
@@ -1820,16 +1938,24 @@ cmd_status() {
 		return 2
 	fi
 
-	local record=""
-	if record=$(_dsi_find_ledger_dispatch "$issue_number" "$repo_slug") &&
-		_dsi_ledger_record_has_live_identity "$issue_number" "$repo_slug" "$record"; then
-		_dsi_ok "Active dispatch for #${issue_number} (${repo_slug}):"
-		_dsi_print_dispatch_details "$record"
-		return 0
+	local record="" identity_rc=0 unresolved_record=""
+	if record=$(_dsi_find_ledger_dispatch "$issue_number" "$repo_slug"); then
+		_dsi_ledger_record_has_live_identity "$issue_number" "$repo_slug" "$record" || identity_rc=$?
+		if [[ "$identity_rc" -eq 0 ]]; then
+			_dsi_ok "Active dispatch for #${issue_number} (${repo_slug}):"
+			_dsi_print_dispatch_details "$record"
+			return 0
+		fi
+		[[ "$identity_rc" -eq 2 ]] && unresolved_record="$record"
 	fi
 	if record=$(_dsi_find_live_dispatch "$issue_number" "$repo_slug" ""); then
 		_dsi_ok "Active dispatch for #${issue_number} (${repo_slug}) from live process evidence:"
 		_dsi_print_dispatch_details "$record"
+		return 0
+	fi
+	if [[ -n "$unresolved_record" ]]; then
+		_dsi_warn "Unresolved dispatch for #${issue_number} (${repo_slug}): ledger PID is live but its worker identity could not be observed"
+		_dsi_print_dispatch_details "$unresolved_record"
 		return 0
 	fi
 
@@ -1871,7 +1997,10 @@ Usage: dispatch-single-issue-helper.sh <command> [args]
 
 Commands:
   dispatch <issue> <slug> [opts]   Launch a worker against a single issue.
+  resume   <issue> <slug> [opts]   Resume a signed grant in its original manual worktree.
   status   <issue> <slug>          Show active dispatch state from ledger.
+  repair-origin <slug> [--apply]   Realign origin after a verified same-ID
+                                   repository transfer (GH#33629).
   help                             Show this help.
 
 Examples:
@@ -1901,8 +2030,12 @@ adaptive cadence, and many other concerns this CLI does NOT cover.
 
 Exit codes:
   0  Success (worker launched, dry-run completed, or skipped: already claimed)
-  1  Validation failure (issue not found, parent-task, etc.)
+  1  Validation failure (issue not found, parent-task, unregistered or
+     missing canonical repo path, origin identity drift/mismatch, existing
+     worker/protected draft or other linked PR evidence — also under
+     --dry-run, etc.)
   2  Invalid subcommand or missing required arg
+  75 Dedup or PR-evidence lookup is uncertain; recovery checkpoint persisted
 EOF
 	return 0
 }
@@ -1915,8 +2048,14 @@ main() {
 	dispatch)
 		cmd_dispatch "$@"
 		;;
+	resume)
+		cmd_resume "$@"
+		;;
 	status)
 		cmd_status "$@"
+		;;
+	repair-origin)
+		cmd_repair_origin "$@"
 		;;
 	-h | --help | help | "")
 		_usage

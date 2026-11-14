@@ -10,11 +10,15 @@
 # Options:
 #   --title "Task title"       Task title for GitHub/GitLab issue (required unless --batch)
 #   --description "Details"    Task description (required for issue creation unless
-#                              a brief file exists at todo/tasks/{task_id}-brief.md)
+#                              --brief-file is supplied or a brief exists at
+#                              todo/tasks/{task_id}-brief.md)
 #   --labels "label1,label2"   Comma-separated labels (optional)
-#   --publication-state STATE  Issue/planning state: pending (default) withholds
-#                              dispatch labels; canonical is for verified
-#                              default-branch creation only
+#   --publication-state STATE  Issue/planning state: canonical (default,
+#                              GH#34232 issue-first) applies the intended
+#                              dispatch labels at creation; pending is an
+#                              explicit hold (publication:pending, no
+#                              auto-dispatch/status:available) for issues whose
+#                              body depends on files not yet published
 #   --count N                  Allocate N consecutive IDs (default: 1)
 #                              Creates one GitHub/GitLab issue per ID using
 #                              the same --title. Output includes ref_tNNN=GH#NNN
@@ -23,11 +27,24 @@
 #   --no-issue                 Skip GitHub/GitLab issue creation
 #   --dry-run                  Show what would be allocated without changes
 #   --repo-path PATH           Path to git repository (default: current directory)
+#   --target-repo OWNER/REPO   Explicit intended repository; validated before allocation
+#   --brief-file PATH          Supplies the issue body and optional Target repository
+#                              field for pre-allocation validation
 #   --remote NAME              Git remote name for counter branch (default: origin,
 #                              or value from .aidevops.json "remote" key)
 #   --counter-branch BRANCH    Branch holding .task-counter (config value first;
 #                              otherwise a validated task-id-counter branch,
-#                              then main)
+#                              then the remote's detected default branch)
+#   --sync-counter-branch      Audited fast-forward catch-up (GH#33152): sets
+#                              the counter branch (--counter-branch/config, or
+#                              the dedicated task-id-counter branch) to
+#                              max(its own counter, the default branch's
+#                              counter, the TODO.md seed), then exits without
+#                              allocating. Use when resolve_implicit_counter_branch
+#                              refused a stale dedicated branch.
+#   --repair-counter-branch    Repair only a stale default-branch config pin to
+#                              a validated leading dedicated branch. Preserves
+#                              other keys, mode and owner; no allocation/push.
 #   --skip-label-validation    Skip pre-flight label existence check (useful for
 #                              bulk --count N allocation or when gh is rate-limited)
 #   --no-blocked-by            Suppress auto-detection of predecessor references
@@ -48,21 +65,28 @@
 #   }
 #   Keys:
 #     remote          - git remote name (default: "origin")
-#     default_branch  - informational default branch name (not used by CAS)
+#     default_branch  - repository default branch; when omitted, detected from
+#                       the remote (`git ls-remote --symref`) rather than
+#                       assumed to be "main" (GH#33152). Also used as the
+#                       stale-check baseline for a dedicated counter branch.
 #     counter_branch  - explicit branch that holds .task-counter; when omitted,
-#                       a validated task-id-counter branch is preferred over main
+#                       a validated task-id-counter branch is preferred over
+#                       the detected default branch
 #   CLI flags --remote and --counter-branch override .aidevops.json values.
+#   Because .aidevops.json may itself be gitignored per-checkout, the
+#   default_branch detection above is the durable, host-independent fallback —
+#   explicit config is only required to pin a non-standard value.
 #
 # Exit codes:
 #   0  - Success (outputs: task_id=tNNN ref=GH#NNN or GL#NNN)
 #   1  - Error (network failure, git error, etc.)
 #   2  - Offline fallback used (outputs: task_id=tNNN ref=offline)
 #   3  - Invalid --labels argument(s): counter NOT advanced (t2800)
-#   4  - Counter branch requires pull requests: counter NOT advanced
+#   4  - Counter setup/discovery error: counter NOT advanced
 #   10 - User declined claim after duplicate warning (interactive TTY only, t2180)
 #
 # Algorithm (CAS loop — compare-and-swap via git push):
-#   1. git fetch <remote> <counter_branch>
+#   1. Prepare a guard-compatible Git context, then fetch <remote>/<counter_branch>
 #   2. Read <remote>/<counter_branch>:.task-counter → current value (e.g. 1048)
 #   3. Claim IDs: 1048 to 1048+count-1
 #   4. Write 1048+count to .task-counter
@@ -87,6 +111,12 @@
 #   - Bootstrap uses the same CAS git plumbing — safe from any branch
 #   - Emits BOOTSTRAP_COUNTER_OK / BOOTSTRAP_COUNTER_FAILED for observability
 #   - Concurrent bootstrap: if another session wins the push, we retry read
+#   - GH#33527: when the counter branch was not chosen explicitly and the
+#     default branch has no counter, bootstrap creates the dedicated
+#     task-id-counter branch (orphan commit, counter file only) and never
+#     pushes to the default branch. Opt in to the historical default-branch
+#     bootstrap with .aidevops.json counter_branch / --counter-branch or
+#     AIDEVOPS_COUNTER_BOOTSTRAP_DEFAULT_BRANCH=1.
 #
 # Migration from TODO.md scanning:
 #   - If .task-counter doesn't exist, initialize from TODO.md highest ID
@@ -113,6 +143,8 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit
 source "${SCRIPT_DIR}/shared-constants.sh"
+# shellcheck source=./task-target-repo-lib.sh
+source "${SCRIPT_DIR}/task-target-repo-lib.sh"
 
 # t2063: Source issue-sync-lib.sh for shared body composition helpers
 # (_compose_issue_worker_guidance, _compose_issue_brief, _compose_issue_html_notes_and_footer).
@@ -139,10 +171,17 @@ DRY_RUN=false
 NO_ISSUE=false
 SKIP_LABEL_VALIDATION=false
 NO_BLOCKED_BY=false
+# GH#33152: explicit, audited fast-forward counter-branch catch-up instead of
+# a normal allocation. See _main_sync_counter_branch / sync_counter_branch.
+SYNC_COUNTER_BRANCH=false
+REPAIR_COUNTER_BRANCH=false
 TASK_TITLE=""
 TASK_DESCRIPTION=""
 TASK_LABELS=""
-TASK_PUBLICATION_STATE="pending"
+# GH#34232: issue-first. The issue body is composed from the validated brief,
+# so the issue is the leading record and is dispatchable at creation; TODO.md
+# and todo/tasks/ are background backups. `pending` is an explicit opt-in hold.
+TASK_PUBLICATION_STATE="canonical"
 TASK_COUNTER_STATUS_FALLBACK="fallback"
 # t2838: populated by --parent-issue N; read by _compose_issue_body for body
 # injection and create_github_issue / _try_issue_sync_delegation for explicit
@@ -151,6 +190,9 @@ PARENT_ISSUE_NUM=""
 # GH#20834: populated by _detect_predecessor_refs; read by _ensure_todo_entry_written
 _CLAIM_BLOCKED_BY_REFS=""
 REPO_PATH="$PWD"
+TARGET_REPO=""
+TASK_BRIEF_FILE=""
+CLAIM_VERIFIED_TARGET=""
 ALLOC_COUNT=1
 OFFLINE_OFFSET=100
 CAS_MAX_RETRIES=${CAS_MAX_RETRIES:-30}
@@ -194,6 +236,14 @@ DEFAULT_BRANCH="main"
 # CLI still wins because config loading only applies while the flag is false.
 _REMOTE_NAME_SET=false
 _COUNTER_BRANCH_SET=false
+# GH#33527: true when the counter was redirected to a not-yet-created
+# dedicated branch because the default branch has no counter.
+_COUNTER_BOOTSTRAP_DEDICATED=false
+# GH#33152: true once .aidevops.json "default_branch" is loaded. When false,
+# _claim_apply_detected_default_branch queries the remote's actual default
+# branch instead of leaving the DEFAULT_BRANCH="main" literal in place —
+# avoids comparing a develop-default repo's counter against the wrong branch.
+_DEFAULT_BRANCH_SET=false
 
 # Logging (all to stderr so stdout is machine-readable)
 # Logging: uses shared log_* from shared-constants.sh
@@ -235,6 +285,7 @@ load_project_config() {
 
 	if [[ -n "$default_branch_val" ]]; then
 		DEFAULT_BRANCH="$default_branch_val"
+		_DEFAULT_BRANCH_SET=true
 		log_info "default_branch set from .aidevops.json: $DEFAULT_BRANCH"
 	fi
 
@@ -321,6 +372,14 @@ parse_args() {
 			REPO_PATH="$2"
 			shift 2
 			;;
+		--target-repo)
+			TARGET_REPO="${2:-}"
+			shift 2
+			;;
+		--brief-file)
+			TASK_BRIEF_FILE="${2:-}"
+			shift 2
+			;;
 		--remote)
 			REMOTE_NAME="$2"
 			_REMOTE_NAME_SET=true
@@ -330,6 +389,14 @@ parse_args() {
 			COUNTER_BRANCH="$2"
 			_COUNTER_BRANCH_SET=true
 			shift 2
+			;;
+		--sync-counter-branch)
+			SYNC_COUNTER_BRANCH=true
+			shift
+			;;
+		--repair-counter-branch)
+			REPAIR_COUNTER_BRANCH=true
+			shift
 			;;
 		--help)
 			grep '^#' "$0" | grep -v '#!/usr/bin/env' | sed 's/^# //' | sed 's/^#//'
@@ -364,8 +431,8 @@ _validate_and_normalize_args() {
 		exit 1
 	fi
 
-	# Title is required unless batch mode
-	if [[ -z "$TASK_TITLE" ]] && [[ "$ALLOC_COUNT" -eq 1 ]]; then
+	# Maintenance actions never allocate, so do not require a task title.
+	if [[ -z "$TASK_TITLE" && "$ALLOC_COUNT" -eq 1 && "$SYNC_COUNTER_BRANCH" != "true" && "$REPAIR_COUNTER_BRANCH" != "true" ]]; then
 		log_error "Missing required argument: --title (or use --count N for bulk allocation)"
 		exit 1
 	fi
@@ -394,7 +461,51 @@ _validate_and_normalize_args() {
 	# GH#21991: advisory structural check on --description before issue creation.
 	# Non-blocking by default; set AIDEVOPS_BODY_FORMAT_STRICT=1 to hard-fail.
 	_validate_description_format
+	if ! _validate_interactive_dispatch_scope; then
+		exit 1
+	fi
 	return 0
+}
+
+# _validate_interactive_dispatch_scope — fail before allocation when an
+# interactive session files auto-dispatch work without a canonical Files Scope.
+# An explicit pending hold withholds auto-dispatch from the created issue
+# (GH#30325), so the gh_create_issue scope gate cannot always see the intent,
+# and issue-first (GH#34232) issues dispatch immediately. The author has the
+# most context, so ask now; unscoped briefs from other paths are dispatched with
+# worker-owned scope discovery (GH#33243) so findings are never lost.
+_validate_interactive_dispatch_scope() {
+	[[ "$NO_ISSUE" == "true" || "$DRY_RUN" == "true" ]] && return 0
+	[[ -n "$TASK_DESCRIPTION" ]] || return 0
+	[[ "$TASK_LABELS" =~ (^|,)auto-dispatch(,|$) ]] || return 0
+	[[ "$(detect_session_origin 2>/dev/null || true)" == "interactive" ]] || return 0
+
+	local scope_lib="${SCRIPT_DIR}/pre-dispatch-validator-lib-brief-scope.sh"
+	local fmt_helper="${SCRIPT_DIR}/issue-body-format-helper.sh"
+	local body="$TASK_DESCRIPTION" normalized=""
+	[[ -r "$scope_lib" ]] || return 0
+	if [[ -n "$TASK_BRIEF_FILE" && -f "$TASK_BRIEF_FILE" && -r "$TASK_BRIEF_FILE" ]]; then
+		body+=$'\n\n'"$(<"$TASK_BRIEF_FILE")"
+	fi
+	# shellcheck source=./pre-dispatch-validator-lib-brief-scope.sh
+	# shellcheck disable=SC1091
+	source "$scope_lib"
+	# Normalization derives Files Scope from explicit "Files to Modify" paths.
+	if [[ -x "$fmt_helper" ]]; then
+		normalized=$("$fmt_helper" normalize "$body" 2>/dev/null) && body="$normalized"
+	fi
+	_brief_requires_files_scope "$body" 1 || return 0
+	_brief_files_scope_has_path "$body" && return 0
+
+	log_error "auto-dispatch brief has no canonical Files Scope; add before claiming:"
+	log_error "  ### Files Scope"
+	log_error "  - \`repo/relative/existing-file\`"
+	log_error "  - \`repo/relative/new-file\`"
+	log_error "One exact path per line: no EDIT:/NEW: prefix, no globs, nothing after it."
+	log_error "Or declare \`EDIT: path[:lines]\` bullets under '### Files to Modify'; they normalize."
+	log_error "Planning-only work: start the body with 'Planning-only:' instead."
+	log_error "You hold the most context now; without it the worker must rediscover the scope (GH#33243)."
+	return 1
 }
 
 # _dedupe_csv_labels — preserve first occurrence while removing duplicate labels.
@@ -445,6 +556,35 @@ _validate_description_format() {
 		rc=0
 	fi
 	return $rc
+}
+
+# _validate_description_scope_before_allocation — reject bodies that issue
+# composition would refuse, before advancing the CAS counter. GH#33527: run
+# the exact post-allocation gates (_compose_issue_body) on the same inputs —
+# description normalization and the caller brief's scope-check — so a body
+# cannot pass here and then fail after an ID is spent.
+_validate_description_scope_before_allocation() {
+	[[ "$NO_ISSUE" == "true" || "$DRY_RUN" == "true" || "$OFFLINE_MODE" == "true" ]] && return 0
+
+	local fmt_helper="${SCRIPT_DIR}/issue-body-format-helper.sh"
+	local readiness_helper="${SCRIPT_DIR}/brief-readiness-helper.sh"
+
+	if [[ -n "$TASK_DESCRIPTION" && -x "$fmt_helper" ]]; then
+		if ! "$fmt_helper" normalize "$TASK_DESCRIPTION" >/dev/null; then
+			log_error "Description body cannot be canonicalized before task-ID allocation."
+			log_error "Recovery: under an existing '### Files Scope', use bare '- path/to/file' bullets."
+			return 1
+		fi
+	fi
+
+	if [[ -n "$TASK_BRIEF_FILE" && -f "$TASK_BRIEF_FILE" && -r "$TASK_BRIEF_FILE" && -r "$readiness_helper" ]]; then
+		if ! bash "$readiness_helper" scope-check "$(<"$TASK_BRIEF_FILE")" >&2; then
+			log_error "Brief file ${TASK_BRIEF_FILE} fails the Files Scope check; no task ID was allocated."
+			log_error "Recovery: under '### Files Scope', list one bare '- path/to/file' (or '- \`path\`') bullet per line, with no notes."
+			return 1
+		fi
+	fi
+	return 0
 }
 
 # t2436: Scan TODO.md for the task entry matching task_id and derive
@@ -588,7 +728,14 @@ create_github_issue() {
 	fi
 
 	# Dedup check before bare creation (t1446)
-	if issue_num=$(_check_duplicate_issue "$title"); then
+	local dup_rc=0
+	issue_num=$(_check_duplicate_issue "$title") || dup_rc=$?
+	if [[ $dup_rc -eq 2 ]]; then
+		# GH#33157: the ID belongs to another session's differently titled issue.
+		log_error "TASK_ID_COLLISION: ${_task_id_for_todo} is already in use by another issue; no issue created. Re-run to allocate the next ID."
+		return 1
+	fi
+	if [[ $dup_rc -eq 0 ]]; then
 		# GH#22381: issue-sync-helper.sh push can create the issue but emit no
 		# parseable number. The duplicate lookup then recovers the issue number;
 		# stamp/verify TODO.md before reporting success so dispatchability sees
@@ -607,6 +754,23 @@ create_github_issue() {
 		return 0
 	fi
 
+	_create_github_issue_fallback "$title" "$description" "$labels" "$repo_path" \
+		"$_task_id_for_todo" "$_slug_for_warn" "$skip_wrapper_auto_assignment"
+	return $?
+}
+
+# Create a structured issue when delegation and duplicate recovery did not succeed.
+_create_github_issue_fallback() {
+	local title="$1"
+	local description="$2"
+	local labels="$3"
+	local repo_path="$4"
+	local _task_id_for_todo="$5"
+	local _slug_for_warn="$6"
+	local skip_wrapper_auto_assignment="$7"
+	local canonical_labels="$labels"
+	local issue_num
+
 	# Fallback: bare issue creation with structured body.
 	# t3039: use gh_create_issue (REST-aware wrapper, from shared-gh-wrappers.sh sourced
 	# transitively via shared-constants.sh) instead of raw gh issue create so that issue
@@ -621,10 +785,11 @@ create_github_issue() {
 	local body=""
 	local compose_rc=0
 	body=$(_compose_issue_body "$title" "$description") || compose_rc=$?
-	# t1937: If body composition failed (no description + no brief), skip issue creation.
-	# The task ID is already secured — issue can be created later with proper content.
+	# The task ID is already secured. Preserve the typed composition outcome so
+	# supplied-but-invalid input is never misreported as an absent description.
 	if [[ $compose_rc -ne 0 || -z "$body" ]]; then
-		log_warn "Skipping issue creation — no description available. Task ID is secured."
+		[[ $compose_rc -eq 0 ]] && compose_rc="$CLAIM_COMPOSE_FAILED_RC"
+		_report_issue_body_compose_failure "$title" "$compose_rc"
 		return 1
 	fi
 	create_args+=(--body "$body")
@@ -682,6 +847,28 @@ create_github_issue() {
 		return 1
 	fi
 
+	_finalize_github_issue_fallback "$issue_num" "$repo_path" "$title" "$labels" "$body" "$_slug_for_warn"
+
+	# Persist the canonical labels, not the publication-filtered API labels.
+	if ! _converge_created_issue_ref \
+		"$_task_id_for_todo" "$issue_num" "$title" "$canonical_labels" "$repo_path"; then
+		log_warn "Created issue #${issue_num}, but failed to persist task mapping for ${_task_id_for_todo}"
+		return 1
+	fi
+
+	echo "$issue_num"
+	return 0
+}
+
+# Preserve bare-creation assignment, locking, relationships and parent warnings.
+_finalize_github_issue_fallback() {
+	local issue_num="$1"
+	local repo_path="$2"
+	local title="$3"
+	local labels="$4"
+	local body="$5"
+	local _slug_for_warn="$6"
+
 	# Auto-assign to current user to prevent duplicate dispatch
 	_auto_assign_issue "$issue_num" "$repo_path"
 	_interactive_session_auto_claim_new_task "$issue_num" "$repo_path"
@@ -725,18 +912,6 @@ create_github_issue() {
 		fi
 	fi
 
-	# t2548: ensure TODO.md has an entry for this task. The bare-fallback
-	# path creates the issue via `gh issue create` directly and never goes
-	# through issue-sync-helper.sh, so _push_process_task never runs and
-	# the TODO entry is never written. This call closes that gap idempotently.
-	# GH#21473: pass $title (one-liner), not $description (full body).
-	if ! _converge_created_issue_ref \
-		"$_task_id_for_todo" "$issue_num" "$title" "$canonical_labels" "$repo_path"; then
-		log_warn "Created issue #${issue_num}, but failed to persist task mapping for ${_task_id_for_todo}"
-		return 1
-	fi
-
-	echo "$issue_num"
 	return 0
 }
 
@@ -763,7 +938,7 @@ check_framework_routing() {
 	# Check if we're already in the aidevops repo — no routing needed
 	local remote_url
 	remote_url=$(git -C "$repo_path" remote get-url origin 2>/dev/null || echo "")
-	if printf '%s' "$remote_url" | grep -qE "marcusquinn/aidevops(\.git)?$"; then
+	if grep -qE "marcusquinn/aidevops(\.git)?$" <<<"$remote_url"; then
 		return 0
 	fi
 
@@ -850,6 +1025,68 @@ _auto_create_blocked_by_label() {
 	fi
 }
 
+# _prepare_label_cache — populate the session label cache ($AIDEVOPS_LABEL_CACHE_FILE)
+# from `gh label list` once per session; reuse it when already populated.
+# Args: $1 repo_slug (owner/repo).
+# Returns: 0 = cache ready (path in AIDEVOPS_LABEL_CACHE_FILE), 1 = unavailable (fail-open).
+_prepare_label_cache() {
+	local repo_slug="$1"
+	local cache_file="${AIDEVOPS_LABEL_CACHE_FILE:-}"
+
+	if [[ -z "$cache_file" ]]; then
+		cache_file=$(mktemp /tmp/aidevops-label-cache-XXXXXX 2>/dev/null) || return 1
+		export AIDEVOPS_LABEL_CACHE_FILE="$cache_file"
+		# shellcheck disable=SC2064
+		trap "rm -f '${cache_file}' 2>/dev/null || true" EXIT
+	fi
+
+	# Fetch label list if cache is empty or stale (> 0 bytes = populated)
+	if [[ ! -s "$cache_file" ]]; then
+		if ! gh label list --repo "$repo_slug" --limit 1000 \
+			--json name --jq '.[].name' >"$cache_file" 2>/dev/null; then
+			log_warn "Label list query failed (rate limit or network) — skipping label validation (fail-open)"
+			return 1
+		fi
+	fi
+	return 0
+}
+
+# _ensure_publication_pending_label — make sure the framework-owned
+# publication:pending label exists before the counter advances. The issue
+# projection (_publication_pending_labels) always appends it for pending tasks,
+# so a fresh repository without it would strand the allocated ID.
+# Args: $1 repo_slug (owner/repo).
+# Returns: 0 = exists/created (or fail-open when labels cannot be listed),
+#          1 = creation failed — caller must abort before allocation.
+_ensure_publication_pending_label() {
+	local repo_slug="$1"
+	local label="publication:pending"
+
+	[[ -z "$repo_slug" ]] && return 0
+	command -v gh >/dev/null 2>&1 || return 0
+	gh auth status >/dev/null 2>&1 || return 0
+
+	_prepare_label_cache "$repo_slug" || return 0
+	local cache_file="${AIDEVOPS_LABEL_CACHE_FILE:-}"
+	[[ -n "$cache_file" ]] || return 0
+
+	grep -Fxq "$label" "$cache_file" 2>/dev/null && return 0
+
+	if gh label create "$label" --repo "$repo_slug" \
+		--color "FBCA04" \
+		--description "Opt-in hold until TODO+brief land on default branch; auto-clears, Pulse repairs after 6h" \
+		>/dev/null 2>&1; then
+		printf '%s\n' "$label" >>"$cache_file" 2>/dev/null || true
+		log_info "Auto-created label '${label}' in ${repo_slug}"
+		return 0
+	fi
+
+	log_error "Could not create required label '${label}' in ${repo_slug} (permission or rate limit)"
+	log_error "  Create it manually and re-run: gh label create '${label}' --repo \"${repo_slug}\""
+	log_error "  Claim aborted — counter NOT advanced."
+	return 1
+}
+
 # _validate_labels_exist — check that every label in $2 exists in repo $1.
 # Args: $1 repo_slug (owner/repo), $2 comma-separated label names.
 # Returns: 0 = all valid (or fail-open), 1 = invalid labels found.
@@ -868,24 +1105,11 @@ _validate_labels_exist() {
 	command -v gh >/dev/null 2>&1 || return 0
 	gh auth status >/dev/null 2>&1 || return 0
 
-	# Populate label cache once per session (or reuse if already set)
+	# Populate label cache once per session (or reuse if already set).
+	# API failure → fail-open: skip validation, proceed with claim.
+	_prepare_label_cache "$repo_slug" || return 0
 	local cache_file="${AIDEVOPS_LABEL_CACHE_FILE:-}"
-	if [[ -z "$cache_file" ]]; then
-		cache_file=$(mktemp /tmp/aidevops-label-cache-XXXXXX 2>/dev/null) || return 0
-		export AIDEVOPS_LABEL_CACHE_FILE="$cache_file"
-		# shellcheck disable=SC2064
-		trap "rm -f '${cache_file}' 2>/dev/null || true" EXIT
-	fi
-
-	# Fetch label list if cache is empty or stale (> 0 bytes = populated)
-	if [[ ! -s "$cache_file" ]]; then
-		if ! gh label list --repo "$repo_slug" --limit 1000 \
-			--json name --jq '.[].name' >"$cache_file" 2>/dev/null; then
-			# API failure → fail-open: skip validation, proceed with claim
-			log_warn "Label list query failed (rate limit or network) — skipping label validation (fail-open)"
-			return 0
-		fi
-	fi
+	[[ -n "$cache_file" ]] || return 0
 
 	# Regex for the auto-create exception class (blocked-by:tNNN / blocked-by:GH#NNN / blocked-by:#NNN).
 	# _normalise_ref() in _detect_predecessor_refs produces GH#NNN for GitHub issue refs,
@@ -948,6 +1172,32 @@ _validate_labels_exist() {
 	return 0
 }
 
+# GH#33152: explicit, audited fast-forward catch-up for a counter branch
+# instead of resolve_implicit_counter_branch's silent refusal when it is
+# behind. Targets --counter-branch/config when explicitly set, otherwise the
+# dedicated task-id-counter branch name. Prints COUNTER_BRANCH_SYNCED and
+# exits without allocating — run a normal claim afterwards to allocate.
+_main_sync_counter_branch() {
+	local repo_path="$1"
+	local target_branch="$COUNTER_BRANCH"
+
+	if [[ "$REPAIR_COUNTER_BRANCH" == "true" ]]; then
+		if [[ "$SYNC_COUNTER_BRANCH" == "true" || "$OFFLINE_MODE" == "true" || "$DRY_RUN" == "true" ]]; then
+			log_error "--repair-counter-branch cannot be combined with sync, offline or dry-run"
+			return 1
+		fi
+		repair_counter_branch_config "$repo_path"
+		return $?
+	fi
+
+	if [[ "${_COUNTER_BRANCH_SET:-false}" == "false" ]]; then
+		target_branch="${AIDEVOPS_DEDICATED_COUNTER_BRANCH:-task-id-counter}"
+	fi
+
+	sync_counter_branch "$repo_path" "$target_branch" "${DEFAULT_BRANCH:-main}"
+	return $?
+}
+
 # Emit the online dry-run allocation without mutating the remote counter.
 _main_emit_online_dry_run_allocation() {
 	local current=""
@@ -981,11 +1231,16 @@ _main_resolve_allocation() {
 		# Non-main counter branches can lag the default branch after release or
 		# merge activity.  Reconcile before claiming so we do not allocate IDs below
 		# the default branch's observed counter and then rely on manual fallback.
-		if [[ "$CAS_RECONCILE_RETRY_ON_FAILURE" == "1" && "${DEFAULT_BRANCH:-main}" != "$COUNTER_BRANCH" ]]; then
+		# GH#33527: a dedicated branch about to be bootstrapped does not exist
+		# yet and the default branch has no counter, so there is nothing to
+		# reconcile; the bootstrap seeds from TODO.md.
+		if [[ "$CAS_RECONCILE_RETRY_ON_FAILURE" == "1" && "${DEFAULT_BRANCH:-main}" != "$COUNTER_BRANCH" &&
+			"$_COUNTER_BOOTSTRAP_DEDICATED" != "true" ]]; then
 			local _pre_reconcile_rc=0
 			_cas_reconcile_counter_branch "$REPO_PATH" "${DEFAULT_BRANCH:-main}" >/dev/null || _pre_reconcile_rc=$?
 			if [[ $_pre_reconcile_rc -ne 0 && $_pre_reconcile_rc -ne 2 ]]; then
-				return 1
+				# Preserve the explicit stale-branch setup error (GH#34791).
+				return "$_pre_reconcile_rc"
 			fi
 		fi
 
@@ -1091,16 +1346,19 @@ _main_create_issues() {
 				issue_title="$(_format_legacy_task_id "$i"): ${TASK_TITLE}"
 				local issue_num=""
 
-				case "$platform" in
-				github)
-					issue_num=$(create_github_issue "$issue_title" "$TASK_DESCRIPTION" "$TASK_LABELS" "$REPO_PATH") || true
+			case "$platform" in
+			github)
+				issue_num=$(create_github_issue "$issue_title" "$TASK_DESCRIPTION" "$TASK_LABELS" "$REPO_PATH") || true
 					;;
 				gitlab)
 					issue_num=$(create_gitlab_issue "$issue_title" "$TASK_DESCRIPTION" "$TASK_LABELS" "$REPO_PATH") || true
 					;;
-				esac
+			esac
 
-				if [[ -n "$issue_num" ]]; then
+			# create_* output is captured for the public ref contract; never log or
+			# parse advisory/noisy output as an issue number.
+			[[ "$issue_num" =~ ^[0-9]+$ ]] || issue_num=""
+			if [[ -n "$issue_num" ]]; then
 					log_success "Created issue: ${ref_prefix}#${issue_num}"
 					issue_nums+=("$issue_num")
 					has_any_issue=true
@@ -1234,7 +1492,7 @@ _pc_sanitize_keywords() {
 	local w
 	for w in "${kw[@]}"; do
 		printf '%s\t%s\n' "${#w}" "$w"
-	done | sort -k1,1nr | head -n 4 | cut -f2-
+	done | sort -k1,1nr | sed -n '1,4p' | cut -f2-
 	return 0
 }
 
@@ -1597,7 +1855,7 @@ _warn_dispatch_path_auto_dispatch() {
 	local _matched=""
 	local _p
 	for _p in "${_patterns[@]}"; do
-		if printf '%s' "$_combined" | grep -qF "$_p"; then
+		if grep -qF "$_p" <<<"$_combined"; then
 			_matched="$_p"
 			break
 		fi
@@ -1616,6 +1874,7 @@ _warn_dispatch_path_auto_dispatch() {
 _main_handle_namespaced_mode() {
 	_CLAIM_NAMESPACED_HANDLED=false
 	_CLAIM_NAMESPACED_RC=0
+	[[ "$REPAIR_COUNTER_BRANCH" != "true" ]] || return 0
 	[[ "${AIDEVOPS_TASK_COORDINATOR_MODE:-legacy}" == "namespaced" ]] || return 0
 	_CLAIM_NAMESPACED_HANDLED=true
 
@@ -1642,14 +1901,32 @@ _main_handle_namespaced_mode() {
 }
 
 # Main execution
-main() {
-	parse_args "$@"
-	_main_handle_namespaced_mode
-	[[ "$_CLAIM_NAMESPACED_HANDLED" == "true" ]] && return "$_CLAIM_NAMESPACED_RC"
+_claim_validate_target_repo() {
+	local resolved declared=""
+	resolved=$(_extract_github_slug "$REPO_PATH" "$REMOTE_NAME")
+	if [[ -n "$TASK_BRIEF_FILE" ]]; then
+		[[ -f "$TASK_BRIEF_FILE" ]] || {
+			log_error "Brief file not found: $TASK_BRIEF_FILE"
+			return 1
+		}
+		declared=$(task_brief_target_repo "$TASK_BRIEF_FILE") || return 1
+	fi
+	if [[ -n "$TARGET_REPO" && ! "$TARGET_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+		log_error "--target-repo must be an owner/repo slug"
+		return 1
+	fi
+	task_require_target_repo "$declared" "$resolved" "$TASK_BRIEF_FILE" || return 1
+	task_require_target_repo "$TARGET_REPO" "$resolved" "--target-repo" || return 1
+	[[ -z "$declared" || -z "$TARGET_REPO" ]] || task_require_target_repo "$declared" "$TARGET_REPO" "brief and --target-repo" || return 1
+	if [[ -n "$declared" || -n "$TARGET_REPO" ]]; then
+		CLAIM_VERIFIED_TARGET="$resolved"
+		log_info "Target repository verified: $resolved"
+	fi
+	return 0
+}
 
-	load_project_config "$REPO_PATH"
-	resolve_implicit_counter_branch "$REPO_PATH"
-
+# Surface routing and duplicate warnings before allocation without mutating IDs.
+_main_preclaim_discovery() {
 	# GH#20834: detect predecessor refs in description and populate
 	# _CLAIM_BLOCKED_BY_REFS for use by _ensure_todo_entry_written.
 	_apply_blocked_by_detection
@@ -1682,11 +1959,12 @@ main() {
 		fi
 	fi
 
-	log_info "Using remote: ${REMOTE_NAME}, counter branch: ${COUNTER_BRANCH}"
+	return 0
+}
 
-	local platform
-	platform=$(detect_platform)
-	log_info "Detected platform: $platform"
+# Validate remote policy, labels and body before advancing the monotonic counter.
+_main_preflight_allocation() {
+	local platform="$1"
 
 	# A CAS counter cannot use a branch whose updates must arrive through pull
 	# requests: review/merge is not an atomic compare-and-swap lock. GitHub's
@@ -1704,16 +1982,80 @@ main() {
 		&& [[ "$OFFLINE_MODE" == "false" ]] \
 		&& [[ "$DRY_RUN" == "false" ]] \
 		&& [[ "$NO_ISSUE" == "false" ]] \
-		&& [[ "$platform" == "github" ]] \
-		&& [[ -n "$TASK_LABELS" ]]; then
+		&& [[ "$platform" == "github" ]]; then
 		local _val_slug=""
 		_val_slug=$(_extract_github_slug "$REPO_PATH" "$REMOTE_NAME")
 		if [[ -n "$_val_slug" ]]; then
-			if ! _validate_labels_exist "$_val_slug" "$TASK_LABELS"; then
+			# Framework-injected label: ensure it exists so a new repository
+			# cannot strand the ID after the counter advances.
+			if [[ "$TASK_PUBLICATION_STATE" == "pending" ]] \
+				&& ! _ensure_publication_pending_label "$_val_slug"; then
+				return 3
+			fi
+			if [[ -n "$TASK_LABELS" ]] \
+				&& ! _validate_labels_exist "$_val_slug" "$TASK_LABELS"; then
 				return 3
 			fi
 		fi
 	fi
+
+	# Reject body-normalization failures before the monotonic CAS allocation so
+	# a retry after correcting the scope does not leave an unused task ID.
+	if ! _validate_description_scope_before_allocation; then
+		return 3
+	fi
+	return 0
+}
+
+# Merge pre-written TODO tags into the canonical issue labels after allocation.
+_main_enrich_todo_labels() {
+	local first_id="$1"
+	local is_offline="$2"
+
+	if [[ "$NO_ISSUE" == "false" ]] && [[ "$is_offline" == "false" ]]; then
+		local _task_id_for_scan
+		_task_id_for_scan=$(_format_legacy_task_id "$first_id") || return 1
+		local _todo_derived_labels=""
+		_todo_derived_labels=$(_scan_todo_labels_for_task "$_task_id_for_scan" "$REPO_PATH") || true
+		if [[ -n "$_todo_derived_labels" ]]; then
+			TASK_LABELS="${TASK_LABELS:+${TASK_LABELS},}${_todo_derived_labels}"
+			# Deduplicate merged label set
+			TASK_LABELS=$(printf '%s' "$TASK_LABELS" | tr ',' '\n' | sort -u | tr '\n' ',' | sed 's/,$//')
+			log_info "t2436: Derived labels from TODO.md tags for ${_task_id_for_scan}: ${_todo_derived_labels}"
+		fi
+	fi
+	return 0
+}
+
+main() {
+	parse_args "$@"
+	load_project_config "$REPO_PATH"
+	_claim_validate_target_repo || return 1
+	_main_handle_namespaced_mode
+	[[ "$_CLAIM_NAMESPACED_HANDLED" == "true" ]] && return "$_CLAIM_NAMESPACED_RC"
+
+	_save_cleanup_scope
+	trap '_run_cleanups' RETURN
+	push_cleanup _claim_counter_cleanup_git_context
+	local counter_setup_rc=0
+	_claim_counter_prepare_git_context "$REPO_PATH" || counter_setup_rc=$?
+	[[ $counter_setup_rc -eq 0 ]] || return "$counter_setup_rc"
+	_claim_apply_detected_default_branch
+
+	if [[ "$SYNC_COUNTER_BRANCH" == "true" || "$REPAIR_COUNTER_BRANCH" == "true" ]]; then
+		_main_sync_counter_branch "$REPO_PATH"
+		return $?
+	fi
+
+	resolve_implicit_counter_branch "$REPO_PATH" || counter_setup_rc=$?
+	[[ $counter_setup_rc -eq 0 ]] || return "$counter_setup_rc"
+
+	_main_preclaim_discovery || return $?
+	log_info "Using remote: ${REMOTE_NAME}, counter branch: ${COUNTER_BRANCH}"
+	local platform
+	platform=$(detect_platform)
+	log_info "Detected platform: $platform"
+	_main_preflight_allocation "$platform" || return $?
 
 	# --- Allocate the ID(s) first (the critical atomic step) ---
 
@@ -1722,8 +2064,9 @@ main() {
 	alloc_output=$(_main_resolve_allocation) || alloc_rc=$?
 
 	# Dry-run paths print directly and return early
-	if echo "$alloc_output" | grep -q "^task_id=tDRY_RUN"; then
+	if grep -q "^task_id=tDRY_RUN" <<<"$alloc_output"; then
 		echo "$alloc_output"
+		[[ -z "$CLAIM_VERIFIED_TARGET" ]] || printf 'target_repo=%s\n' "$CLAIM_VERIFIED_TARGET"
 		return $alloc_rc
 	fi
 
@@ -1744,30 +2087,30 @@ main() {
 	# this ensures protected labels like parent-task are applied at creation
 	# time rather than waiting for the asynchronous issue-sync workflow.
 	# Non-blocking: failure to find the entry leaves TASK_LABELS unchanged.
-	if [[ "$NO_ISSUE" == "false" ]] && [[ "$is_offline" == "false" ]]; then
-		local _task_id_for_scan
-		_task_id_for_scan=$(_format_legacy_task_id "$first_id") || return 1
-		local _todo_derived_labels=""
-		_todo_derived_labels=$(_scan_todo_labels_for_task "$_task_id_for_scan" "$REPO_PATH") || true
-		if [[ -n "$_todo_derived_labels" ]]; then
-			TASK_LABELS="${TASK_LABELS:+${TASK_LABELS},}${_todo_derived_labels}"
-			# Deduplicate merged label set
-			TASK_LABELS=$(printf '%s' "$TASK_LABELS" | tr ',' '\n' | sort -u | tr '\n' ',' | sed 's/,$//')
-			log_info "t2436: Derived labels from TODO.md tags for ${_task_id_for_scan}: ${_todo_derived_labels}"
-		fi
-	fi
+	_main_enrich_todo_labels "$first_id" "$is_offline" || return 1
 
 	local _issue_ref_prefix="" _issue_has_any="" _issue_first_num="" _issue_nums_csv=""
 	if [[ "$NO_ISSUE" == "false" ]] && [[ "$is_offline" == "false" ]] && [[ "$platform" != "unknown" ]]; then
 		local issue_output
 		issue_output=$(_main_create_issues "$first_id" "$platform")
-		eval "$(echo "$issue_output" | grep -E '^_issue_(ref_prefix|has_any|first_num|nums_csv)=')"
+		local issue_key issue_value
+		while IFS='=' read -r issue_key issue_value; do
+			case "$issue_key" in
+			_issue_ref_prefix) _issue_ref_prefix="$issue_value" ;;
+			_issue_has_any) _issue_has_any="$issue_value" ;;
+			_issue_first_num)
+				[[ "$issue_value" =~ ^[0-9]+$ ]] && _issue_first_num="$issue_value"
+				;;
+			_issue_nums_csv) _issue_nums_csv="$issue_value" ;;
+			esac
+		done <<<"$issue_output"
 	fi
 
 	# --- Output machine-readable results ---
 
 	_main_output_results "$first_id" "$is_offline" \
 		"$_issue_ref_prefix" "$_issue_has_any" "$_issue_first_num" "$_issue_nums_csv"
+	[[ -z "$CLAIM_VERIFIED_TARGET" ]] || printf 'target_repo=%s\n' "$CLAIM_VERIFIED_TARGET"
 
 	if [[ "$is_offline" == "true" ]]; then
 		return 2

@@ -96,6 +96,7 @@ Compatible with [todo-md](https://github.com/todo-md/todo-md), [todomd](https://
 - [ ] r047 Knowledge collector freshness — execute due read-only sources and emit content-free health repeat:cron(*/10 * * * *) ~2m run:scripts/knowledge-collector-routine.sh run
 - [ ] r-runtime-audit Runtime health audit — surface operational regressions invisible to the supervisor LLM (counter trends, process leaks, deploy mtime drift, log novelty, stuck pulse state) (t3072) repeat:cron(*/30 * * * *) ~2m run:scripts/runtime-health-audit-helper.sh --apply
 - [x] r-pulse-check Daily pulse/worker utilisation check — aggregate repos.json auto-dispatch queue, active capacity, provider/API budget, and file deduplicated self-improvement issues for high-confidence productivity gaps repeat:daily(@06:20) ~5m run:scripts/pulse-check-helper.sh apply
+- [ ] r-php-cve-watch PHP CVE-2026-109618/109619 patch watch — read-only 2-hourly check of owner hosting PHP builds and app packages; private status in the agent workspace; disabled 2026-10-29: all hosts patched repeat:cron(0 */2 * * *) timezone:UTC ~3m run:custom/scripts/r-php-cve-watch.sh
 
 ## Ready
 
@@ -110,6 +111,43 @@ Tasks with no open blockers - ready to work on. Use `/ready` to refresh this lis
 <!--TOON:ready[0]{id,desc,owner,tags,est,logged}:
 -->
 
+- [x] t18798 fix(plugin): stop denying all compound shell commands in every session (v3.39.87 regression) #bug #priority:critical ref:GH#36017 assignee:marcusquinn started:2026-10-30 logged:2026-10-30 -> [todo/tasks/t18798-brief.md] pr:#36018 completed:2026-10-30
+
+- [x] t18796 fix(full-loop): treat non-markdown data files under todo/ as deliverables, not planning-only #bug #priority:high ref:GH#36002 assignee:marcusquinn started:2026-10-29 pr:#36003 logged:2026-10-29 -> [todo/tasks/t18796-brief.md] completed:2026-10-29
+
+- [x] t18794 Dispatch: minimize finished-attempt lifecycle comments to cut thread noise while keeping the audit trail #auto-dispatch #feat ref:GH#35993 logged:2026-10-29 -> [todo/tasks/t18794-brief.md] pr:#35995 completed:2026-10-29
+
+- [x] t18793 full-loop: implementation intent in maintainer repos finalises interactive draft PRs after verification #feat #interactive ref:GH#35991 assignee:marcusquinn started:2026-10-29 logged:2026-10-29 -> [todo/tasks/t18793-brief.md] pr:#35992 completed:2026-10-29
+
+- [x] t18787 Feedback routes close worker PRs while the worker dispatch lease is still live #bug #priority:high ref:GH#35939 logged:2026-10-29 -> [todo/tasks/t18787-brief.md] pr:#35941 completed:2026-10-29
+
+- [x] t18784 docs: hostinger.md: ImageMagick escalation outcome, CloudLinux changelog check, install dates, maintained OpenSSL 1.1.1w, WPVulnerability hidden = unchecked #documentation ref:GH#35914 logged:2026-10-29 -> [todo/tasks/t18784-brief.md] pr:#35916 completed:2026-10-29
+
+- [ ] t18783 OpenCode 2.x migration-readiness checks (V2 parity tracker) #feat #parent-task ref:GH#35902 logged:2026-10-29 -> [todo/tasks/t18783-brief.md]
+
+- [x] t18782 OpenCode V2: wire DB activity heartbeat and adapt V2 event shape for idle-gated archive #auto-dispatch #bug ref:GH#35898 pr:#35901 logged:2026-10-29 -> [todo/tasks/t18782-brief.md] completed:2026-10-29
+
+- [x] t18781 OpenCode sidebar Prompts shows command templates and timeline dialog closes on click #bug ref:GH#35890 logged:2026-10-29 -> [todo/tasks/t18781-brief.md] pr:#35891 completed:2026-10-29
+
+- [x] t18776 fix(release): stop recurring CodeRabbit CHANGELOG reference-definition blocks on release PRs #auto-dispatch #bug tier:simple ref:GH#35811 pr:#35815 logged:2026-10-28 -> [todo/tasks/t18776-brief.md] completed:2026-10-29
+
+- [x] t18766 Prepare multi-host Tabby/tmux implementation specification and sanitized prototype #docs #no-auto-dispatch logged:2026-10-23 completed:2026-10-23 verified:2026-10-23 -> [todo/plans/t18766-tabby-tmux-session-management.md]
+
+- [x] t18402 Compounding-value architecture and portable organisational knowledge #parent-task #enhancement #architecture #framework #interactive #priority:high tier:thinking ref:GH#31280 logged:2026-09-05 completed:2026-09-07 -> [todo/tasks/t18402-brief.md]
+  - [x] t18403 Establish compounding-value purpose in README and architectural guidance #docs #framework #interactive #auto-dispatch #priority:high tier:standard parent:t18402 ref:GH#31285 logged:2026-09-05 -> [todo/tasks/t18403-brief.md] pr:#31360 completed:2026-09-06
+  - [x] t18404 Prove repo-native plans and progress survive loss of a forge #enhancement #architecture #portability #interactive #auto-dispatch #priority:high tier:thinking parent:t18402 blocked-by:t18403 ref:GH#31286 logged:2026-09-05 -> [todo/tasks/t18404-brief.md] pr:#31365 completed:2026-09-06
+  - [x] t18405 Verify primary-agent knowledge delivery across runtime entry points #enhancement #architecture #context #interactive #auto-dispatch #priority:high tier:thinking parent:t18402 blocked-by:t18403 ref:GH#31287 logged:2026-09-05 -> [todo/tasks/t18405-brief.md] pr:#31371 completed:2026-09-06
+  - [x] t18406 Deduplicate Claude proxy framework context without losing provenance #bug #context #performance #interactive #auto-dispatch tier:standard parent:t18402 blocked-by:t18405 ref:GH#31291 logged:2026-09-05 -> [todo/tasks/t18406-brief.md] pr:#31395 completed:2026-09-06
+  - [x] t18407 Make domain discovery and dependent views structurally consistent #bug #architecture #context #interactive #auto-dispatch tier:standard parent:t18402 blocked-by:t18403 ref:GH#31292 logged:2026-09-05 -> [todo/tasks/t18407-brief.md] pr:#31388 completed:2026-09-06
+  - [x] t18408 Support focused domain-primary and lighter delegated profiles #enhancement #architecture #agents #interactive #auto-dispatch tier:thinking parent:t18402 blocked-by:t18405,t18407 ref:GH#31293 logged:2026-09-05 -> [todo/tasks/t18408-brief.md] pr:#31400 completed:2026-09-06
+  - [x] t18409 Scope detailed guidance to decisions while preserving universal DevOps #enhancement #architecture #context #interactive #auto-dispatch tier:thinking parent:t18402 blocked-by:t18405,t18407 ref:GH#31294 logged:2026-09-05 -> [todo/tasks/t18409-brief.md] pr:#31398 completed:2026-09-07
+  - [x] t18410 Reduce operation-output and helper-discovery round trips #enhancement #performance #framework #interactive #auto-dispatch tier:standard parent:t18402 blocked-by:t18403 ref:GH#31296 logged:2026-09-05 -> [todo/tasks/t18410-brief.md] pr:#31455 completed:2026-09-07
+  - [x] t18411 Calibrate usable context and preserve faithful compaction handoffs #enhancement #context #reliability #interactive #auto-dispatch tier:thinking parent:t18402 blocked-by:t18405 ref:GH#31297 logged:2026-09-05 -> [todo/tasks/t18411-brief.md] pr:#31399 completed:2026-09-06
+  - [x] t18412 Evaluate user time and economic leverage across representative workflows #enhancement #evaluation #architecture #interactive #auto-dispatch tier:thinking parent:t18402 blocked-by:t18404,t18408,t18409,t18410,t18411 ref:GH#31298 logged:2026-09-05 -> [todo/tasks/t18412-brief.md] pr:#31477 completed:2026-09-07
+
+- [x] t18396 Detect Codacy index and configuration drift before remediation #bug #quality #codacy #reliability #auto-dispatch ~4h tier:standard ref:GH#31147 pr:#31153 logged:2026-09-04 -> [todo/tasks/t18396-brief.md] completed:2026-09-24
+- [x] t18397 Make email facade exports explicit and clear Pylint unused-import noise #quality #codacy #python #refactor #auto-dispatch ~2.5h tier:standard ref:GH#31148 logged:2026-09-04 -> [todo/tasks/t18397-brief.md] pr:#31160 completed:2026-09-04
+- [x] t18398 Harden high-signal Python subprocess boundaries reported by Codacy #bug #security #quality #codacy #python #auto-dispatch #priority:high ~5h tier:standard ref:GH#31150 pr:#31163 logged:2026-09-04 -> [todo/tasks/t18398-brief.md] completed:2026-09-24
 - [x] t18293 Reject malformed GitHub login output before approval lifecycle mutation #bug #security #framework #reliability #interactive #auto-dispatch ~2h tier:standard ref:GH#30338 logged:2026-08-17 -> [todo/tasks/t18293-brief.md] pr:#30342 completed:2026-08-17
 
 - [x] t18193 Define provider-neutral team-interface core contracts #mission:m-20260804-5d06b1 #enhancement #framework #auto-dispatch ~4h tier:standard ref:GH#29494 logged:2026-08-04 -> [todo/tasks/t18193-brief.md] pr:#29505 completed:2026-08-04
@@ -124,22 +162,22 @@ Tasks with no open blockers - ready to work on. Use `/ready` to refresh this lis
 - [x] t18203 Generate the canonical aidevops agent roster from discovery metadata #mission:m-20260804-5d06b1 #enhancement #framework #agents #auto-dispatch ~3.5h tier:standard parent:t18201 ref:GH#29543 logged:2026-08-05 -> [todo/tasks/t18203-brief.md] pr:#29605 completed:2026-08-05
 - [x] t18205 Implement the read-only Buzz team-interface adapter #mission:m-20260804-5d06b1 #enhancement #framework #reliability #interactive #auto-dispatch ~5h tier:standard parent:t18201 ref:GH#29637 logged:2026-08-06 -> [todo/tasks/t18205-brief.md] pr:#29636 completed:2026-08-06
 - [x] t18217 Reuse trusted Dependabot verification in full-loop merges #bug #security #framework #full-loop #interactive #auto-dispatch #priority:high ~4h tier:thinking ref:GH#29769 assignee:marcusquinn started:2026-08-07 logged:2026-08-07 -> [todo/tasks/t18217-brief.md] pr:#29770 completed:2026-08-07
-- [ ] t18132 Prevent cross-install upstream-watch duplicate issues #bug #framework #reliability #interactive #auto-dispatch ~4h tier:standard ref:GH#27821 logged:2026-07-15 -> [todo/tasks/t18132-brief.md]
-- [ ] t18133 Normalize raw PR creation origin provenance — make managed headless `gh pr create` calls preserve one session-origin label so worker drafts enter stale-checkpoint recovery without weakening protected drafts or external-write gates. #bug #framework #pulse #auto-dispatch ~2h tier:standard ref:GH#27802 logged:2026-07-15 -> [todo/tasks/t18133-brief.md]
+- [x] t18132 Prevent cross-install upstream-watch duplicate issues #bug #framework #reliability #interactive #auto-dispatch ~4h tier:standard ref:GH#27821 pr:#27857 logged:2026-07-15 -> [todo/tasks/t18132-brief.md] completed:2026-09-24
+- [-] t18133 Normalize raw PR creation origin provenance — make managed headless `gh pr create` calls preserve one session-origin label so worker drafts enter stale-checkpoint recovery without weakening protected drafts or external-write gates. #bug #framework #pulse #auto-dispatch ~2h tier:standard ref:GH#27802 logged:2026-07-15 -> [todo/tasks/t18133-brief.md] declined:2026-07-16
 - [x] t18134 Eliminate jq E2BIG in objective reconciliation — move known-large issue and PR arrays off argv, preserve the objective payload exactly, and extend the existing large-JSON regression guard. #bug #framework #pulse #reliability #auto-dispatch ~1.5h tier:standard ref:GH#27803 logged:2026-07-15 -> [todo/tasks/t18134-brief.md] pr:#27875 completed:2026-07-15
 - [x] t18135 Preserve privacy scanning through native gh reads — let cold-cache privacy probes use the shim-resolved native GitHub CLI for both auth and repository visibility while retaining standalone behavior and the recursion sentinel. #bug #security #framework #privacy #auto-dispatch ~2h tier:standard ref:GH#27804 logged:2026-07-15 -> [todo/tasks/t18135-brief.md] pr:#27876 completed:2026-07-15
 
-- [ ] t18118 security: bind external approvals and advisory merge evidence to immutable current-state snapshots. Replace target-ID-only approval payloads with versioned content/head-bound evidence; invalidate approvals after external issue/PR body, comment, link, linked-issue, or PR-head drift; require PR-specific current-head authority before merging external/fork contributions; canonicalise duplicate maintainer-gate check aliases without making them advisory; and allow configured non-required review-provider failures only after current-head positive review evidence. Preserve NMR, required checks, external/fork defence-in-depth, dispatch deduplication, stale-recovery, and cost/runaway circuit breakers. Provenance only: external report GH#27530; workers must use this trusted brief rather than that issue's body/comments/files/links. #bug #security #framework #pulse #auto-dispatch ~8h tier:thinking ref:GH#27560 logged:2026-07-13 -> [todo/tasks/t18118-brief.md]
+- [x] t18118 security: bind external approvals and advisory merge evidence to immutable current-state snapshots. Replace target-ID-only approval payloads with versioned content/head-bound evidence; invalidate approvals after external issue/PR body, comment, link, linked-issue, or PR-head drift; require PR-specific current-head authority before merging external/fork contributions; canonicalise duplicate maintainer-gate check aliases without making them advisory; and allow configured non-required review-provider failures only after current-head positive review evidence. Preserve NMR, required checks, external/fork defence-in-depth, dispatch deduplication, stale-recovery, and cost/runaway circuit breakers. Provenance only: external report GH#27530; workers must use this trusted brief rather than that issue's body/comments/files/links. #bug #security #framework #pulse #auto-dispatch ~8h tier:thinking ref:GH#27560 pr:#27675 logged:2026-07-13 -> [todo/tasks/t18118-brief.md] completed:2026-09-24
 
 - [x] t18070 Design Secrets interface and repair Vault unlock readiness #bug #enhancement #security #interactive #no-auto-dispatch ~6h tier:thinking ref:GH#26912 started:2026-07-10T00:00:00Z logged:2026-07-10 -> [todo/tasks/t18070-brief.md] pr:#26938 completed:2026-07-10
 
-- [ ] t18098 Prevent worktree infrastructure markers from breaking worker ownership transfer #bug #framework #pulse #reliability #auto-dispatch ~3h tier:thinking ref:GH#27164 logged:2026-07-11 -> [todo/tasks/t18098-brief.md]
-- [ ] t18099 Make dispatch claim-to-worker handoff an atomic expiring lease #bug #framework #pulse #reliability #auto-dispatch ~6h tier:thinking ref:GH#27165 logged:2026-07-11 -> [todo/tasks/t18099-brief.md]
-- [ ] t18100 Normalize issue dependencies before dispatch eligibility #bug #framework #pulse #reliability #auto-dispatch ~4h tier:thinking ref:GH#27166 logged:2026-07-11 -> [todo/tasks/t18100-brief.md]
-- [ ] t18101 Repair terminal CI failures in place on existing PR branches #bug #framework #pulse #reliability #auto-dispatch ~5h tier:thinking ref:GH#27167 logged:2026-07-11 -> [todo/tasks/t18101-brief.md]
-- [ ] t18102 Deploy CLI, agents, and plugins as one atomic version bundle #bug #framework #reliability #auto-dispatch ~5h tier:thinking ref:GH#27168 logged:2026-07-11 -> [todo/tasks/t18102-brief.md]
-- [ ] t18103 Reconcile stale objectives with expiring assumptions and durable recovery #enhancement #framework #pulse #reliability #auto-dispatch ~7h tier:thinking ref:GH#27169 logged:2026-07-11 -> [todo/tasks/t18103-brief.md]
-- [ ] t18104 Automate failure-family remediation and human-gate revalidation #enhancement #framework #pulse #observability #auto-dispatch ~6h tier:thinking ref:GH#27170 logged:2026-07-11 -> [todo/tasks/t18104-brief.md]
+- [x] t18098 Prevent worktree infrastructure markers from breaking worker ownership transfer #bug #framework #pulse #reliability #auto-dispatch ~3h tier:thinking ref:GH#27164 pr:#27248 logged:2026-07-11 -> [todo/tasks/t18098-brief.md] completed:2026-09-24
+- [x] t18099 Make dispatch claim-to-worker handoff an atomic expiring lease #bug #framework #pulse #reliability #auto-dispatch ~6h tier:thinking ref:GH#27165 pr:#27286 logged:2026-07-11 -> [todo/tasks/t18099-brief.md] completed:2026-09-24
+- [x] t18100 Normalize issue dependencies before dispatch eligibility #bug #framework #pulse #reliability #auto-dispatch ~4h tier:thinking ref:GH#27166 pr:#27320 logged:2026-07-11 -> [todo/tasks/t18100-brief.md] completed:2026-09-24
+- [x] t18101 Repair terminal CI failures in place on existing PR branches #bug #framework #pulse #reliability #auto-dispatch ~5h tier:thinking ref:GH#27167 pr:#27304 logged:2026-07-11 -> [todo/tasks/t18101-brief.md] completed:2026-09-24
+- [x] t18102 Deploy CLI, agents, and plugins as one atomic version bundle #bug #framework #reliability #auto-dispatch ~5h tier:thinking ref:GH#27168 pr:#27250 logged:2026-07-11 -> [todo/tasks/t18102-brief.md] completed:2026-09-24
+- [x] t18103 Reconcile stale objectives with expiring assumptions and durable recovery #enhancement #framework #pulse #reliability #auto-dispatch ~7h tier:thinking ref:GH#27169 pr:#27261 logged:2026-07-11 -> [todo/tasks/t18103-brief.md] completed:2026-09-24
+- [x] t18104 Automate failure-family remediation and human-gate revalidation #enhancement #framework #pulse #observability #auto-dispatch ~6h tier:thinking ref:GH#27170 pr:#27265 logged:2026-07-11 -> [todo/tasks/t18104-brief.md] completed:2026-09-24
 
 - [x] t18066 fix(full-loop): resolve commit-and-pr rebase/counter base from the remote default branch instead of hardcoded `origin/main`. Add a default-branch resolver in `.agents/scripts/full-loop-helper-commit.sh`, use `origin/${base_branch}` for ahead-count, fetch, rebase, operator messages, and `.task-counter` reset, fail actionably when the base cannot be resolved, and cover an `origin/develop` regression path. #bug #framework #full-loop #auto-dispatch ~1h tier:standard ref:GH#26626 logged:2026-07-05 -> [todo/tasks/t18066-brief.md] pr:#26630 completed:2026-07-05
 
@@ -338,7 +376,7 @@ Tasks with no open blockers - ready to work on. Use `/ready` to refresh this lis
 - [x] t2101 fix(pulse-simplification): widen ratchet-down dedup to match PRs merged within last 24h — `pulse-simplification.sh:1694-1698` uses `--state open` only, so a PR that merges inside one pulse cycle falls through the dedup and the pulse re-files the same proposal (this exact failure: #19024 filed 2 minutes after #19017 merged). Add `--state all --search "ratchet-down in:title merged:>=<24h ago>"` alongside the existing open check; preserve t2089 keyword search. Single-file ~5-line change; verbatim target code in the issue body. Symmetric completion of t2089/#18959. #bug #pulse #auto-dispatch #interactive ~30m tier:simple ref:GH#19036 logged:2026-04-15 -> [todo/tasks/t2101-brief.md] pr:#19058 completed:2026-04-15
 - [x] t2102 fix(pulse-simplification): pull aidevops worktree fresh before ratchet-check — `_complexity_scan_ratchet_check` runs against whatever state the pulse's simplification workspace has, which may not reflect a just-merged threshold change (secondary cause of #19024 duplicate). Add `git -C "$aidevops_path" pull --ff-only origin main` before the ratchet-check invocation; skip-and-log on pull failure, offline, or non-main HEAD — never crash the pulse. Single-file ~3-line change. #bug #pulse #auto-dispatch #interactive ~20m tier:simple ref:GH#19037 logged:2026-04-15 -> [todo/tasks/t2102-brief.md] pr:#19108 completed:2026-04-15
 - [ ] t2103 feat(pulse): pre-dispatch no-op validator for auto-generated issues — new `pre-dispatch-validator-helper.sh` with a `validate <issue> <slug>` subcommand that runs a registered validator for the issue's generator type in a fresh checkout before spawning a worker. Exit 0=dispatch, 10=falsified+close, 20=validator-error+warn+dispatch. First validator: ratchet-down (runs `complexity-scan-helper.sh ratchet-check . 5`, returns 10 on "No ratchet-down available"). Generator identification via hidden body marker `<!-- aidevops:generator=ratchet-down -->`. Defense-in-depth layer — workers ignored "Worker triage responsibility" prompt rule on #19024, so moving the check before dispatch makes it deterministic. Extensible to quality-debt, review-followup, contribution-watch as follow-ups. Requires research to find the right dispatch hook point. New helper + new test harness + docs in `reference/pre-dispatch-validators.md`. #enhancement #pulse #auto-dispatch #interactive ~3h tier:standard ref:GH#19038 logged:2026-04-15 -> [todo/tasks/t2103-brief.md]
-- [ ] t18195 Add reversible Buzz Desktop OpenCode ACP compatibility remediation to setup and update #auto-dispatch ~1h ref:GH#29498 logged:2026-08-04
+- [x] t18195 Add reversible Buzz Desktop OpenCode ACP compatibility remediation to setup and update #auto-dispatch ~1h ref:GH#29498 pr:#29503 logged:2026-08-04 completed:2026-09-24
 - [x] t18228 Define evidence-backed brand product and offer campaign intake #enhancement #interactive #auto-dispatch ~5h tier:standard ref:GH#30135 logged:2026-08-13 -> [todo/tasks/t18228-brief.md] pr:#30152 completed:2026-08-13
 - [x] t18187 Fix Pulse scheduler regression rejecting generated routines repositories #auto-dispatch #bug ~1h ref:GH#28957 logged:2026-07-31 pr:#28961 completed:2026-07-31
 - [x] t2105 fix(cli): wire `aidevops issue` subcommand to interactive-session-helper.sh — `prompts/build.txt` and `.agents/AGENTS.md` document `aidevops issue release <N>` as a fallback for releasing stale interactive claims, but the subcommand is not in the `aidevops.sh` dispatch table. Calling it falls through to the help text. Discovered live on 2026-04-15 while releasing a stale claim on #18768 during the t2053.1 session. Two-line fix: add `issue) _dispatch_helper "interactive-session-helper.sh" ...` after the `approve)` case at `aidevops.sh:3861`, and a matching one-line entry in `cmd_help()` at `aidevops.sh:3514`. Helper already implements claim/release/status/scan-stale; this is plumbing only. #bug #tooling #auto-dispatch #interactive ~20m tier:simple ref:GH#19042 logged:2026-04-15 -> [todo/tasks/t2105-brief.md] pr:#19052 completed:2026-04-15
@@ -520,6 +558,18 @@ Tasks with no open blockers - ready to work on. Use `/ready` to refresh this lis
 
 ## Backlog
 
+- [x] t18704 Guard V2 MCP adapter output against the OpenCode V2 Mcp config schema shape #enhancement #opencode #interactive #auto-dispatch tier:standard ~40m ref:GH#34794 pr:#34795 logged:2026-10-16 -> [todo/tasks/t18704-brief.md] completed:2026-10-16
+
+- [ ] Reusable protected repository metrics rollout checklist and live validation #docs #plan #deferred #interactive logged:2026-10-12 -> [todo/tasks/tasks-protected-metrics-rollout.md] — Saved brief only; no worker dispatch or downstream changes authorized.
+
+- [x] t18583 Reusable Hostinger fleet onboarding and drift sync — phased: inventory/plan/drift PR #34379, readiness PR #34445, provisioning PR #34447, layout-move wrapper PR #34448. #enhancement #hosting #interactive tier:standard ref:GH#33811 logged:2026-10-03 -> [todo/tasks/t18583-brief.md] pr:#34448 completed:2026-10-11
+
+- [x] t18480 fix(setup): stop duplicate aidevops plugin registration in OpenCode V2 #bug #framework #setup #interactive tier:standard ref:GH#32422 logged:2026-09-26 -> [todo/tasks/t18480-brief.md] pr:#32424 completed:2026-09-26
+- [x] t18475 Fail closed on public routine comments before Pulse worker launch #bug #security #prompt-injection #interactive #auto-dispatch #priority:high tier:thinking ref:GH#32337 logged:2026-09-24 -> [todo/tasks/t18475-brief.md] pr:#32348 completed:2026-09-25
+- [x] t18476 Initialize CI privacy context during planning publication reconciliation #bug #framework #ci #auto-dispatch #interactive #priority:high tier:standard ref:GH#32342 pr:#32343 logged:2026-09-24 -> [todo/tasks/t18476-brief.md] completed:2026-09-25
+
+- [x] t18471 docs: generalize stale local dev server and browser-process diagnostics #documentation #debugging #ops #interactive #auto-dispatch ~1h tier:standard ref:GH#32119 logged:2026-09-20 -> [todo/tasks/t18471-brief.md] pr:#32129 completed:2026-09-20
+
 - [x] t18309 Fix same-user daemon proc cwd cleanup degradation #bug #framework #cleanup #worktree #interactive ~1h tier:standard ref:GH#30740 logged:2026-08-25 -> [todo/tasks/t18309-brief.md] pr:#30741 completed:2026-08-25
 
 - [x] t18294 Stop approval batches after systemic GitHub transport failure #bug #framework #reliability #interactive #auto-dispatch ~3h tier:standard blocked-by:t18293 ref:GH#30339 logged:2026-08-17 -> [todo/tasks/t18294-brief.md] pr:#30352 completed:2026-08-17
@@ -606,6 +656,36 @@ Session baseline grew from ~9.5k tokens (Mar 1) to ~21.8k tokens (Mar 27) in pro
 
 ### SEO/GEO Agent Intelligence
 
+- [x] t18444 Provider-neutral ads, SEO and GEO decision workflows #parent #enhancement #interactive tier:thinking ref:GH#32056 logged:2026-09-20 -> [todo/tasks/t18444-brief.md] verified:2026-09-22 completed:2026-09-24
+- [x] t18445 Shared marketing decision contract and bounded batch runner #enhancement #interactive #auto-dispatch tier:thinking parent:t18444 ref:GH#32057 logged:2026-09-20 -> [todo/tasks/t18445-brief.md] pr:#32095 completed:2026-09-20
+- [x] t18446 Offline marketing and site snapshot importers #enhancement #interactive #auto-dispatch tier:standard parent:t18444 blocked-by:t18445 ref:GH#32058 logged:2026-09-20 -> [todo/tasks/t18446-brief.md] pr:#32107 completed:2026-09-20
+- [x] t18447 Google Ads hygiene and search-term triage #enhancement #interactive #auto-dispatch tier:standard parent:t18444 blocked-by:t18446 ref:GH#32061 pr:#32123 logged:2026-09-20 -> [todo/tasks/t18447-brief.md] completed:2026-09-24
+- [x] t18448 Shared intent-to-page matching and paid-to-organic opportunities #enhancement #interactive #auto-dispatch tier:standard parent:t18444 blocked-by:t18446 ref:GH#32059 logged:2026-09-20 -> [todo/tasks/t18448-brief.md] pr:#32126 completed:2026-09-20
+- [x] t18449 Evidence-backed internal links and cannibalization review #enhancement #interactive #auto-dispatch tier:standard parent:t18444 blocked-by:t18448 ref:GH#32060 logged:2026-09-20 -> [todo/tasks/t18449-brief.md] pr:#32143 completed:2026-09-20
+- [x] t18450 Content disposition, redirect proposals and schema consistency #enhancement #interactive #auto-dispatch tier:standard parent:t18444 blocked-by:t18448 ref:GH#32062 pr:#32132 logged:2026-09-20 -> [todo/tasks/t18450-brief.md] completed:2026-09-24
+- [x] t18451 Creative intelligence, fatigue and UGC policy QA #enhancement #interactive #auto-dispatch tier:standard parent:t18444 blocked-by:t18446 ref:GH#32063 logged:2026-09-20 -> [todo/tasks/t18451-brief.md] pr:#32124 completed:2026-09-20
+- [x] t18452 Engine-specific AI visibility capture and analysis #enhancement #interactive #auto-dispatch tier:standard parent:t18444 blocked-by:t18448 ref:GH#32064 logged:2026-09-20 -> [todo/tasks/t18452-brief.md] pr:#32134 completed:2026-09-20
+- [x] t18453 Comment and forum opportunity triage with safe response routing #enhancement #interactive #auto-dispatch tier:standard parent:t18444 blocked-by:t18446 ref:GH#32065 logged:2026-09-20 -> [todo/tasks/t18453-brief.md] pr:#32122 completed:2026-09-20
+- [x] t18454 Decision reports, calibration and end-to-end ROI evaluation #enhancement #interactive #auto-dispatch tier:standard parent:t18444 blocked-by:t18447,t18449,t18450,t18451,t18452,t18453 ref:GH#32066 logged:2026-09-20 -> [todo/tasks/t18454-brief.md] pr:#32160 completed:2026-09-21
+- [x] t18455 Optional read-only Google Ads and Meta account connectors #enhancement #interactive #auto-dispatch tier:standard parent:t18444 blocked-by:t18447,t18451 ref:GH#32067 logged:2026-09-20 -> [todo/tasks/t18455-brief.md] pr:#32191 completed:2026-09-21
+- [x] t18456 Optional Jev batch adapter with authorized-runtime fallback #enhancement #interactive #auto-dispatch tier:standard parent:t18444 blocked-by:t18455 ref:GH#32068 logged:2026-09-20 -> [todo/tasks/t18456-brief.md] pr:#32195 completed:2026-09-22
+- [x] t18457 Approval-bound local marketing changes and rollback #enhancement #interactive #auto-dispatch tier:thinking parent:t18444 blocked-by:t18454,t18456 ref:GH#32069 pr:#32197 logged:2026-09-20 -> [todo/tasks/t18457-brief.md] completed:2026-09-24
+- [x] t18458 Integrate decision agents, commands and disabled routine templates #enhancement #interactive #auto-dispatch tier:standard parent:t18444 blocked-by:t18457 ref:GH#32070 logged:2026-09-20 -> [todo/tasks/t18458-brief.md] pr:#32203 completed:2026-09-22
+
+### Native Prospecting and Reddit SEO Workbench
+
+- [x] t18459 Native conversational prospecting and Reddit SEO workbench #parent #enhancement #interactive tier:thinking ref:GH#32076 logged:2026-09-20 -> [todo/tasks/t18459-brief.md] verified:2026-09-22 completed:2026-09-24
+- [x] t18460 Native prospecting project and lead-store contract #enhancement #interactive #auto-dispatch tier:thinking parent:t18459 blocked-by:t18446 ref:GH#32078 logged:2026-09-20 -> [todo/tasks/t18460-brief.md] pr:#32121 completed:2026-09-20
+- [x] t18461 Product URL onboarding and evidence-backed prospecting discovery plans #enhancement #interactive #auto-dispatch tier:standard parent:t18459 blocked-by:t18460,t18448 ref:GH#32079 logged:2026-09-20 -> [todo/tasks/t18461-brief.md] pr:#32136 completed:2026-09-20
+- [x] t18462 Incremental Reddit discovery and staged community-triage orchestration #enhancement #interactive #auto-dispatch tier:standard parent:t18459 blocked-by:t18461,t18453 ref:GH#32077 logged:2026-09-20 -> [todo/tasks/t18462-brief.md] pr:#32147 completed:2026-09-20
+- [x] t18463 Google-ranked Reddit opportunities and observed position history #enhancement #interactive #auto-dispatch tier:standard parent:t18459 blocked-by:t18462 ref:GH#32081 logged:2026-09-20 -> [todo/tasks/t18463-brief.md] pr:#32163 completed:2026-09-21
+- [x] t18464 Competitor recommendations and evidence-backed pain-theme insights #enhancement #interactive #auto-dispatch tier:standard parent:t18459 blocked-by:t18462 ref:GH#32080 logged:2026-09-20 -> [todo/tasks/t18464-brief.md] pr:#32154 completed:2026-09-20
+- [x] t18465 Budgeted prospecting routines, usage and internal alert delivery #enhancement #interactive #auto-dispatch tier:standard parent:t18459 blocked-by:t18463,t18464 ref:GH#32082 logged:2026-09-20 -> [todo/tasks/t18465-brief.md] pr:#32166 completed:2026-09-21
+- [x] t18466 Scoped prospecting service APIs, read-only MCP and operator boundary #enhancement #interactive #auto-dispatch tier:thinking parent:t18459 blocked-by:t18465 ref:GH#32085 pr:#32169 logged:2026-09-20 -> [todo/tasks/t18466-brief.md] completed:2026-09-24
+- [x] t18467 Native prospecting operator web workbench #enhancement #interactive #auto-dispatch tier:standard parent:t18459 blocked-by:t18465,t18466 ref:GH#32083 logged:2026-09-20 -> [todo/tasks/t18467-brief.md] pr:#32174 completed:2026-09-21
+- [x] t18468 Self-host prospecting packaging, agent routing and parity handoff #enhancement #interactive #auto-dispatch tier:standard parent:t18459 blocked-by:t18467,t18458 ref:GH#32084 logged:2026-09-20 -> [todo/tasks/t18468-brief.md] pr:#32205 completed:2026-09-22
+- [x] t18469 Scoped public-engagement authority on the existing social outbox #enhancement #interactive #auto-dispatch tier:thinking parent:t18459 blocked-by:t18466 ref:GH#32091 logged:2026-09-20 -> [todo/tasks/t18469-brief.md] pr:#32192 completed:2026-09-21
+- [x] t18470 Public-engagement subagent and bounded Reddit conversation automation #enhancement #interactive #auto-dispatch tier:standard parent:t18459 blocked-by:t18469,t18468 ref:GH#32090 logged:2026-09-20 -> [todo/tasks/t18470-brief.md] pr:#32207 completed:2026-09-22
 
 ### Product Agent Refactoring
 
@@ -1152,69 +1232,69 @@ t193,setup.sh fails in non-interactive supervisor deploy step,,bugfix|setup,1h,4
 
 - [x] t18069 Fix GUI surface row stretching #bug #no-auto-dispatch ref:GH#26823 verified:2026-07-07 completed:2026-07-07
 
-- [ ] t18078 Route OpenAI workers through GPT-5.6 tiers #type:enhancement ref:GH#26913
+- [x] t18078 Route OpenAI workers through GPT-5.6 tiers #type:enhancement ref:GH#26913 pr:#26915 completed:2026-09-24
 
 - [x] t18081 Prevent profile contributions corruption on GitHub API failures #bug #framework ref:GH#26937 pr:#26944 completed:2026-07-10
 
 - [x] t18082 Fix sandbox cleanup for descendants that create new process groups #auto-dispatch #bug #framework #safety tier:standard ref:GH#26951 logged:2026-07-10 -> [todo/tasks/t18082-brief.md] pr:#27000 completed:2026-07-10
 
-- [ ] t18086 Strip image placeholders from OpenCode session titles #bug ref:GH#27036
+- [x] t18086 Strip image placeholders from OpenCode session titles #bug ref:GH#27036 pr:#27037 completed:2026-09-24
 
-- [ ] t18091 Install aidevops CLI independently of release worktrees #auto-dispatch #bug ref:GH#27057
+- [x] t18091 Install aidevops CLI independently of release worktrees #auto-dispatch #bug ref:GH#27057 pr:#27058 completed:2026-09-24
 
-- [ ] t18094 Provision repository lint configuration through init and update #feat ref:GH#27123
+- [x] t18094 Provision repository lint configuration through init and update #feat ref:GH#27123 pr:#27136 completed:2026-09-24
 
-- [ ] t18096 Treat canonical lint policy deferrals as safe skips #auto-dispatch #bug ref:GH#27139
+- [x] t18096 Treat canonical lint policy deferrals as safe skips #auto-dispatch #bug ref:GH#27139 pr:#27142 completed:2026-09-24
 
-- [ ] t18109 Trigger dependency-chain unblocking when blockers close #bug ref:GH#27338
+- [x] t18109 Trigger dependency-chain unblocking when blockers close #bug ref:GH#27338 pr:#27347 completed:2026-09-24
 
-- [ ] t18113 Harden pulse throughput and full-loop continuity #type:bug ref:GH#27452
+- [x] t18113 Harden pulse throughput and full-loop continuity #type:bug ref:GH#27452 pr:#27455 completed:2026-09-24
 
-- [ ] t18114 Fix CI repair infrastructure classification and dead lease recovery #bug #priority:high ref:GH#27487
+- [x] t18114 Fix CI repair infrastructure classification and dead lease recovery #bug #priority:high ref:GH#27487 pr:#27497 completed:2026-09-24
 
-- [ ] t18116 Fix quality-debt dispatch recovery state and pre-runtime telemetry #bug #priority:high ref:GH#27503
+- [x] t18116 Fix quality-debt dispatch recovery state and pre-runtime telemetry #bug #priority:high ref:GH#27503 pr:#27506 completed:2026-09-24
 
-- [>] t18117 Add token-efficient output receipts and delta-aware waits #feat #framework #interactive ref:GH#27529 started:2026-07-13
+- [x] t18117 Add token-efficient output receipts and delta-aware waits #feat #framework #interactive ref:GH#27529 started:2026-07-13 pr:#27535 completed:2026-09-24
 
-- [ ] t18119 Allow OpenCode access to generated global commands #bug ref:GH#27564
+- [x] t18119 Allow OpenCode access to generated global commands #bug ref:GH#27564 pr:#27565 completed:2026-09-24
 
-- [ ] t18121 Route pending full-loop CI through delta-aware wait-checks #bug #framework #full-loop #efficiency #auto-dispatch ~30m tier:simple ref:GH#27585 logged:2026-07-14 -> [todo/tasks/t18121-brief.md]
+- [-] t18121 Route pending full-loop CI through delta-aware wait-checks #bug #framework #full-loop #efficiency #auto-dispatch ~30m tier:simple ref:GH#27585 logged:2026-07-14 -> [todo/tasks/t18121-brief.md] declined:2026-07-14
 
-- [ ] t18122 Add cryptographically scoped worker permission grants ref:GH#27688
+- [x] t18122 Add cryptographically scoped worker permission grants ref:GH#27688 pr:#27689 completed:2026-09-24
 
-- [ ] t18123 Add bounded worker progress blocker logging ref:GH#27732
+- [x] t18123 Add bounded worker progress blocker logging ref:GH#27732 pr:#27733 completed:2026-09-24
 
 - [x] t18137 Update model tier reasoning defaults and migrate custom routing configs #feat ref:GH#27863 pr:#27865 completed:2026-07-15
 
-- [ ] t18138 fix(worker): reconcile attempt outcomes before retry and failure routing #bug #observability #pulse ref:GH#27907
+- [x] t18138 fix(worker): reconcile attempt outcomes before retry and failure routing #bug #observability #pulse ref:GH#27907 pr:#27924 completed:2026-09-24
 
-- [ ] t18146 Enforce a no-write research subagent capability profile #auto-dispatch #security ~2h tier:thinking ref:GH#27991 logged:2026-07-16 -> [todo/tasks/t18146-brief.md]
+- [x] t18146 Enforce a no-write research subagent capability profile #auto-dispatch #security ~2h tier:thinking ref:GH#27991 pr:#28007 logged:2026-07-16 -> [todo/tasks/t18146-brief.md] completed:2026-09-24
 
-- [ ] t18147 Block compaction auto-continue for completed child sessions #auto-dispatch #security ~2h tier:thinking ref:GH#27992 logged:2026-07-16 -> [todo/tasks/t18147-brief.md]
+- [x] t18147 Block compaction auto-continue for completed child sessions #auto-dispatch #security ~2h tier:thinking ref:GH#27992 pr:#28017 logged:2026-07-16 -> [todo/tasks/t18147-brief.md] completed:2026-09-24
 
-- [ ] t18148 Terminate cancelled subagents and report bounded side-effect receipts #auto-dispatch #security blocked-by:GH#27992 ~3h tier:thinking ref:GH#27993 logged:2026-07-16 -> [todo/tasks/t18148-brief.md]
+- [x] t18148 Terminate cancelled subagents and report bounded side-effect receipts #auto-dispatch #security blocked-by:GH#27992 ~3h tier:thinking ref:GH#27993 pr:#28027 logged:2026-07-16 -> [todo/tasks/t18148-brief.md] completed:2026-09-24
 
-- [ ] t18149 Require trusted authorization for account-level GitHub CLI mutations #auto-dispatch #security ~2h tier:thinking ref:GH#27994 logged:2026-07-16 -> [todo/tasks/t18149-brief.md]
+- [x] t18149 Require trusted authorization for account-level GitHub CLI mutations #auto-dispatch #security ~2h tier:thinking ref:GH#27994 pr:#28021 logged:2026-07-16 -> [todo/tasks/t18149-brief.md] completed:2026-09-24
 
-- [ ] t18153 Clarify authority-aware full-loop lifecycle ref:GH#28112
+- [x] t18153 Clarify authority-aware full-loop lifecycle ref:GH#28112 pr:#28113 completed:2026-09-24
 
 - [x] t18154 Repair stale test source paths after helper module splits #bug #framework #reliability #auto-dispatch ~45m tier:standard ref:GH#28133 logged:2026-07-17 -> [todo/tasks/t18154-brief.md] pr:#28137 completed:2026-07-17
 
-- [ ] t18158 Add fail-closed cross-store storage inventory reporting #feat ref:GH#28149
+- [x] t18158 Add fail-closed cross-store storage inventory reporting #feat ref:GH#28149 pr:#28156 completed:2026-09-24
 
-- [ ] t18159 Bound runtime-bundle growth without weakening leases or rollback #feat ref:GH#28150
+- [x] t18159 Bound runtime-bundle growth without weakening leases or rollback #feat ref:GH#28150 pr:#28158 completed:2026-09-24
 
-- [ ] t18160 Bound observability growth while preserving append-only audit evidence #feat ref:GH#28151
+- [x] t18160 Bound observability growth while preserving append-only audit evidence #feat ref:GH#28151 pr:#28160 completed:2026-09-24
 
-- [ ] t18161 Coordinate retention for agent backups logs and worker failure evidence #feat ref:GH#28152
+- [x] t18161 Coordinate retention for agent backups logs and worker failure evidence #feat ref:GH#28152 pr:#28163 completed:2026-09-24
 
-- [ ] t18162 Report and maintain OpenCode storage through ownership-aware contracts #feat ref:GH#28153
+- [x] t18162 Report and maintain OpenCode storage through ownership-aware contracts #feat ref:GH#28153 pr:#28161 completed:2026-09-24
 
-- [ ] t18170 Standardize Cloudron community publishing lifecycle ref:GH#28546
+- [x] t18170 Standardize Cloudron community publishing lifecycle ref:GH#28546 pr:#28547 completed:2026-09-24
 
-- [ ] t18171 Fix Cloudron 7.0.4 versions update option parsing ref:GH#28556
+- [x] t18171 Fix Cloudron 7.0.4 versions update option parsing ref:GH#28556 pr:#28557 completed:2026-09-24
 
-- [ ] t18175 Clarify self-improvement auto-dispatch authority boundary #documentation ref:GH#28582
+- [x] t18175 Clarify self-improvement auto-dispatch authority boundary #documentation ref:GH#28582 pr:#28583 completed:2026-09-24
 
 - [x] t18176 Plan secure personal and shared social knowledge corpora #parent-task #enhancement #framework #knowledge #security ~23h tier:thinking ref:GH#28587 logged:2026-07-25 -> [todo/tasks/t18176-brief.md] pr:#28621 completed:2026-07-25
 
@@ -1226,13 +1306,13 @@ t193,setup.sh fails in non-interactive supervisor deploy step,,bugfix|setup,1h,4
 
 - [x] t18184 Fix status-label reconciliation and REST issue edit array safety #bug #efficiency #framework #github-api #no-auto-dispatch ref:GH#28912 pr:#28933 completed:2026-07-30
 
-- [ ] t18189 Route standard workload tier through OpenAI Luna max reasoning #type:enhancement ref:GH#29070
+- [x] t18189 Route standard workload tier through OpenAI Luna max reasoning #type:enhancement ref:GH#29070 pr:#29082 completed:2026-09-24
 
-- [ ] t18190 Restrict needs-maintainer-review to external trust gates #auto-dispatch #bug ref:GH#29394
+- [x] t18190 Restrict needs-maintainer-review to external trust gates #auto-dispatch #bug ref:GH#29394 pr:#29400 completed:2026-09-24
 
 
 
-- [ ] t18209 Implement provider-neutral routing, observability, and completion feedback #feat #models #observability #interactive #priority:high ~4h tier:thinking ref:GH#29674 assignee:marcusquinn started:2026-08-07T02:34:27Z -> [todo/tasks/t18209-brief.md]
+- [x] t18209 Implement provider-neutral routing, observability, and completion feedback #feat #models #observability #interactive #priority:high ~4h tier:thinking ref:GH#29674 assignee:marcusquinn started:2026-08-07T02:34:27Z -> [todo/tasks/t18209-brief.md] pr:#29682 completed:2026-09-24
 
 - [x] t18210 Verify protected issue-sync fallback and reconcile historical completion proof #bug #framework #interactive #no-auto-dispatch ref:GH#29679 pr:#29704 completed:2026-08-07
 
@@ -1243,12 +1323,12 @@ t193,setup.sh fails in non-interactive supervisor deploy step,,bugfix|setup,1h,4
 - [x] t18213 Allow full-loop merges to preserve explicit commit bodies #bug ref:GH#29733 pr:#29735 completed:2026-08-07
 
 - [x] t18214 Make full-loop helpers use the sibling worktree gh shim #auto-dispatch #bug #priority:high #shell #workflow ref:GH#29750 pr:#29757 completed:2026-08-07
-- [>] t18216 Fix Dependabot review-gate deadlock and preserve deterministic Qlty installs #auto-dispatch #bug #priority:high tier:standard ref:GH#29755 assignee:marcusquinn started:2026-08-07T19:48:48Z -> [todo/tasks/t18216-brief.md]
+- [x] t18216 Fix Dependabot review-gate deadlock and preserve deterministic Qlty installs #auto-dispatch #bug #priority:high tier:standard ref:GH#29755 assignee:marcusquinn started:2026-08-07T19:48:48Z -> [todo/tasks/t18216-brief.md] pr:#29758 completed:2026-09-24
 
 - [x] t18215 Prefer aidevops options in recommendations ref:GH#29751 pr:#29754 completed:2026-08-07
 
 - [x] t18218 Move Cloudron monitor later and repair paginated release reads #bug ref:GH#29775 pr:#29788 completed:2026-08-08
-- [ ] t18219 Persist maintainer role for organization-owned repositories #auto-dispatch #priority:high ref:GH#29785
+- [x] t18219 Persist maintainer role for organization-owned repositories #auto-dispatch #priority:high ref:GH#29785 pr:#29786 completed:2026-09-24
 
 
 - [x] t18223 Self-heal stale Tabby recovery tokens #bug ref:GH#29922 pr:#29925 pr:#29925 completed:2026-08-10
@@ -1287,7 +1367,7 @@ t193,setup.sh fails in non-interactive supervisor deploy step,,bugfix|setup,1h,4
 
 - [x] t18244 Make generated writing and GitHub briefs reader-first #content #documentation #feat ref:GH#30305 pr:#30306 completed:2026-08-16
 
-- [ ] t18295 Build a local domain-auction opportunity research pipeline #enhancement #architecture #database #parent-task #priority:medium #seo #interactive ~39h tier:thinking ref:GH#30492 logged:2026-08-21 -> [todo/tasks/t18295-brief.md]
+- [x] t18295 Build a local domain-auction opportunity research pipeline #enhancement #architecture #database #parent-task #priority:medium #seo #interactive ~39h tier:thinking ref:GH#30492 pr:#30500 logged:2026-08-21 -> [todo/tasks/t18295-brief.md] completed:2026-09-24
 
 - [x] t18296 Define the local domain-opportunity data contract and SQLite foundation #enhancement #architecture #auto-dispatch #cli #database #priority:medium #interactive ~5.5h tier:thinking parent:t18295 ref:GH#30493 logged:2026-08-21 -> [todo/tasks/t18296-brief.md] pr:#30502 completed:2026-08-21
 
@@ -1311,11 +1391,691 @@ t193,setup.sh fails in non-interactive supervisor deploy step,,bugfix|setup,1h,4
 
 - [x] t18306 Fix self-ignore overrides blocking Pulse worker launches #auto-dispatch #priority:high ref:GH#30659 pr:#30663 completed:2026-08-24
 
-- [ ] t18310 Pin reviewed Playwriter MCP package policy #bug ref:GH#30867
+- [x] t18310 Pin reviewed Playwriter MCP package policy #bug ref:GH#30867 pr:#30871 completed:2026-09-24
 
-- [ ] t18311 Add an authenticated Playwriter relay lifecycle #bug ref:GH#30868
+- [x] t18311 Add an authenticated Playwriter relay lifecycle #bug ref:GH#30868 pr:#30874 completed:2026-09-24
+
+- [x] t18313 Add OAuth-first multi-account GPT Image 2 generation #api #auth #auto-dispatch #feat #multi-tenant #opencode #priority:high #tools ref:GH#31054 pr:#31055 completed:2026-09-24
+
+- [x] t18314 Document npm v12 install controls and bypass-2FA token deprecation #auto-dispatch #feat #priority:medium #security ref:GH#31090 pr:#31091 completed:2026-09-24
+
+- [x] t18316 Fix cross-host claim expiry and worktree registry reconciliation #auto-dispatch #bug ref:GH#31117 pr:#31118 completed:2026-09-04
+
+- [x] t18400 Prefer standalone Brave for Playwright automation ref:GH#31168 pr:#31169 completed:2026-09-04
+
+- [x] t18401 Restore profile activity reporting #bug #framework #interactive ref:GH#31199 -> [todo/tasks/t18401-brief.md] pr:#31200 completed:2026-09-05
+
+- [x] t18413 Recover complete comparable Codacy default-branch analysis #codacy #interactive-needed #no-auto-dispatch #quality ref:GH#31457 -> [todo/tasks/t18413-brief.md] pr:#31589 completed:2026-09-08
+
+- [x] t18414 Audit and correct Codacy policy drift after index recovery #auto-dispatch #codacy #quality #verification blocked-by:t18413 ref:GH#31459 -> [todo/tasks/t18414-brief.md] pr:#31664 completed:2026-09-09
+
+- [x] t18415 Triage refreshed Codacy findings into bounded remediation children #auto-dispatch #codacy #decomposition #quality blocked-by:t18414 ref:GH#31460 -> [todo/tasks/t18415-brief.md] verified:2026-09-08 completed:2026-09-24
+
+- [x] t18417 Add provider-neutral S3 object storage integrations for IDrive, Backblaze, and Wasabi #feat #parent-task #tier:thinking #interactive ref:GH#31684 logged:2026-09-09 -> [todo/tasks/t18417-brief.md] verified:2026-09-10 completed:2026-09-24
+
+- [x] t18418 Build provider-neutral rclone-backed S3 object storage foundation #auto-dispatch #feat #tier:standard #interactive ~3h ref:GH#31685 logged:2026-09-09 -> [todo/tasks/t18418-brief.md] pr:#31695 completed:2026-09-09
+
+- [x] t18419 Add guarded IDrive e2 object storage integration #auto-dispatch #feat #tier:standard #interactive ~2h blocked-by:t18418 ref:GH#31686 logged:2026-09-09 -> [todo/tasks/t18419-brief.md] pr:#31704 completed:2026-09-10
+
+- [x] t18420 Add guarded Backblaze B2 object storage and official MCP integration #auto-dispatch #feat #tier:standard #interactive ~4h blocked-by:t18418 ref:GH#31687 logged:2026-09-09 -> [todo/tasks/t18420-brief.md] pr:#31710 completed:2026-09-10
+
+- [x] t18421 Add guarded Wasabi object storage integration with beta MCP boundary #auto-dispatch #feat #tier:standard #interactive ~3h blocked-by:t18418 ref:GH#31688 logged:2026-09-09 -> [todo/tasks/t18421-brief.md] pr:#31719 completed:2026-09-10
+
+- [x] t18428 Fix Dependabot PR lifecycle convergence #priority:high #type:bug #interactive #tier:thinking ref:GH#31795 started:2026-09-11 -> [todo/tasks/t18428-brief.md] pr:#31798 completed:2026-09-11
+
+- [x] t18429 Fix in-progress task completion and planning PR title compatibility #auto-dispatch #bug #framework #priority:high ref:GH#31805 -> [todo/tasks/t18429-brief.md] pr:#31808 completed:2026-09-11
+
+- [x] t18431 Regenerate README for current aidevops capabilities ref:GH#31832 pr:#31834 completed:2026-09-12
+
+- [x] t18432 Fix expected-source normalization on dead preparing release retries #auto-dispatch ref:GH#31870 pr:#31872 completed:2026-09-24
+
+- [x] t18436 Install isolated OpenCode V2 preview alongside V1 #auth #auto-dispatch #feat #medium #opencode #plugin #setup ref:GH#31941 pr:#31944 completed:2026-09-15
+
+- [x] t18438 fix: prevent stale release preflight baselines from blocking releases #bug #quality #release ref:GH#31959 pr:#31960 completed:2026-09-16
+
+- [x] t18439 chore(release): aggregate PR #31958 and PR #31960 provenance #interactive #orchestration #release #tier:standard -> [todo/tasks/t18439-brief.md] ref:GH#31962 pr:#31963 pr:#31963 completed:2026-09-16
+
+- [x] t18443 Add recommended apps and prioritize Recommended tab #auto-dispatch #enhancement #interactive #tier:standard ~1h ref:GH#32002 logged:2026-09-17 -> [todo/tasks/t18443-brief.md] pr:#32004 completed:2026-09-17
+
+- [x] t18472 Improve 3D demo build progress and compact manifests ref:GH#32255 pr:#32256 completed:2026-09-22
+
+- [x] t18473 Document macOS Blender and FreeCAD native-app discovery ref:GH#32260 pr:#32261 completed:2026-09-22
+
+- [x] t18474 Add portrait talking-head reel editing recipe ref:GH#32269 pr:#32270 completed:2026-09-23
+
+- [x] t18477 Add opt-in local Mobile MCP integration ref:GH#32412 pr:#32413 completed:2026-09-26
+
+- [x] t18479 Add opt-in Android adb and Xcode simctl readiness to Mobile MCP setup ref:GH#32420 pr:#32421 completed:2026-09-26
+
+- [x] t18481 fix(opencode-v2): V2 Tabby tab status dot, V2-aware greeting version, V2 render artifacts #bug ref:GH#32438 pr:#32442 completed:2026-09-27
+
+- [x] t18482 OpenCode V2 canonical agents and opt-in 240K context budget ref:GH#32447 pr:#32451 completed:2026-09-27
+
+- [x] t18483 Restart OpenCode V2 background service after agents redeploy #bug ref:GH#32462 pr:#32463 completed:2026-09-27
+
+- [x] t18484 Add forge image-embed helper for PR/issue screenshots without web upload #feature #framework #interactive #auto-dispatch ~1.5h tier:standard ref:GH#32478 logged:2026-09-27 -> [todo/tasks/t18484-brief.md] pr:#32566 completed:2026-09-27
+
+- [x] t18485 docs: record Stagehand v4 deterministic like-for-like benchmark #browser #documentation #interactive tier:simple ~30m ref:GH#32560 logged:2026-09-27 started:2026-09-27 pr:#32562 completed:2026-09-27
+
+- [x] t18486 fix: claim-task-id must not write TODO.md into a canonical checkout #auto-dispatch #bug #framework tier:standard ~1h ref:GH#32561 logged:2026-09-27 -> [todo/tasks/t18486-brief.md] pr:#32564 completed:2026-09-27
+
+- [x] t18498 docs: get code diagnostics from project lint, typecheck, or compiler commands, not LSP #documentation #framework #opencode #interactive #auto-dispatch tier:standard ~20m ref:GH#32694 logged:2026-09-28 -> [todo/tasks/t18498-brief.md] pr:#32784 completed:2026-09-28
+
+- [x] t18487 Allow remote-only repository creation from sessions inside the projects workspace ref:GH#32600 pr:#32601 completed:2026-09-27
+
+- [x] t18501 fix: keep pending auto-dispatch issues dispatchable and make priority:critical/high lead dispatch order #bug #framework #pulse #interactive #auto-dispatch #priority:high tier:standard ~1h ref:GH#32703 logged:2026-09-28 -> [todo/tasks/t18501-brief.md] pr:#32707 completed:2026-09-28
+
+- [x] t18502 OpenCode V2 promotion gates: weekly V2 canary, plugin/tool probe, documented gate checks, requalified pin #enhancement #framework #opencode #interactive #auto-dispatch tier:standard ~3.5h ref:GH#32704 logged:2026-09-28 -> [todo/tasks/t18502-brief.md] pr:#32759 completed:2026-09-28
+
+- [x] t18490 docs: refresh TTS/music provider guidance (NanoGPT audio route, OpenAI TTS, OAuth scope) and Remotion BT.709 delivery flags #auto-dispatch #documentation #interactive tier:simple ~45m ref:GH#32610 logged:2026-09-27 -> [todo/tasks/t18490-brief.md] pr:#32775 completed:2026-09-28
+
+- [x] t18491 fix: session worktree resolver errors say 'Image workdir' for bounded operations and hide which root failed #auto-dispatch #bug #interactive tier:simple ~30m ref:GH#32612 logged:2026-09-27 -> [todo/tasks/t18491-brief.md] pr:#32653 completed:2026-09-27
+
+- [x] t18492 fix: aidevops secret NAME -- cmd redacts short dictionary words (e.g. 'openai') from output #auto-dispatch #bug #interactive tier:standard ~1h ref:GH#32614 logged:2026-09-27 -> [todo/tasks/t18492-brief.md] pr:#33023 completed:2026-09-29
+
+- [x] t18493 feat: media-qa-helper for rendered video/audio deliverables (streams, loudness, contact sheets, whisper intelligibility) #auto-dispatch #feat #interactive tier:standard ~2h ref:GH#32615 logged:2026-09-27 -> [todo/tasks/t18493-brief.md] pr:#32709 completed:2026-09-28
+
+- [x] t18494 fix: claim-task-id strands IDs on rejected bodies, misleading scope hint, polluted issue-number capture, 30s counter fetch budget #auto-dispatch #bug #interactive tier:standard ~1.5h ref:GH#32617 logged:2026-09-27 -> [todo/tasks/t18494-brief.md] pr:#32674 completed:2026-09-27
+
+- [x] t18496 fix(dispatch): stop false missing_files_scope holds and auto-release repaired briefs #auto-dispatch #bug #interactive tier:standard ~2h ref:GH#32689 logged:2026-09-28 pr:#32690 completed:2026-09-28
+
+- [x] t18497 fix(claim-task-id): shallow counter-branch discovery fetches that time out at the 30s default #auto-dispatch #bug #interactive tier:standard ~45m ref:GH#32692 logged:2026-09-28 pr:#33053 completed:2026-09-29
+
+- [x] t18503 test: isolate brief-scope pulse tests from the live pulse.log #bug #interactive tier:simple ~15m ref:GH#32710 logged:2026-09-28 pr:#32712 completed:2026-09-28
+
+- [x] t18504 fix(planning-publisher): 3-way merge TODO.md instead of overwriting concurrent entries #auto-dispatch #bug #interactive tier:thinking ~2h ref:GH#32714 logged:2026-09-28 pr:#33047 completed:2026-09-29
+
+- [x] t18505 perf(dispatch): run read-only dedup layers before costly scope gates #enhancement #interactive tier:standard ~1h ref:GH#32729 logged:2026-09-28 pr:#32732 completed:2026-09-28
+
+- [x] t18510 fix(setup): V1 plugin pass must not write OpenCode V2 live config from ambient V2 env #bug #interactive tier:standard ~1h ref:GH#32738 logged:2026-09-28 pr:#32740 completed:2026-09-28
+
+- [x] t18514 feat(pulse): runner-local AI owner for terminal-blocker circuits #enhancement #interactive tier:thinking ~3h ref:GH#32754 logged:2026-09-28 pr:#32758 completed:2026-09-28
+
+- [x] t18515 Re-measure dispatch stage timings 24h after the gate reorder (GH#32729, deployed v3.37.12 at 2026-09-28T02:52Z): compare `dedup.consolidation` calls per `dedup.dedup_check` (baseline 0.99) and `dedup.dedup_check` p50 (baseline 44s) in `~/.aidevops/logs/dispatch-stages.tsv` for the 24h before vs after; also count `trigger=blocker_recovery` supervisor runs and recorded decisions under `~/.aidevops/.agent-workspace/terminal-blocker-recovery/decisions/` #interactive #chore ~20m ref:GH#32765 logged:2026-09-28 start:2026-09-29T03:00Z verified:2026-09-28 completed:2026-10-03
+
+- [x] t18495 fix: guard merged-PR reconcile stages 1-2 against recurrent file-size debt #auto-dispatch #bug #pulse #interactive tier:standard ~1h ref:GH#32640 logged:2026-09-27 -> [todo/tasks/t18495-brief.md] pr:#32642 completed:2026-09-27
+
+- [x] t18500 Show AIDevOps and OpenCode versions in OpenCode V2 TUI slots #feat ref:GH#32698 pr:#32699 completed:2026-09-28
+
+- [x] t18509 feat(seo): search targets standard — context/keywords.md registry, team hub sync, budgeted rank/AI tracking, ecommerce drill-down, init scaffold and repo backfill #feature #seo #framework #interactive tier:thinking ~6h ref:GH#32739 logged:2026-09-28 -> [todo/tasks/t18509-brief.md] pr:#32746 completed:2026-09-28
+
+- [x] t18511 fix(design): make the brand-identity.toon template valid TOON #bug #design #interactive tier:standard ~45m ref:GH#32741 logged:2026-09-28 -> [todo/tasks/t18511-brief.md] pr:#32750 completed:2026-09-28
+- [x] t18512 fix(release): npm publication verify window shorter than npm async processing lag #auto-dispatch #bug #interactive ref:GH#32749 logged:2026-09-28 pr:#33045 completed:2026-09-29
+
+- [x] t18516 fix(seo): keywords hub clone from canonical cwd; exported env overrides config #bug #seo #framework #interactive tier:standard ~30m ref:GH#32791 logged:2026-09-28 -> [todo/tasks/t18516-brief.md] pr:#32792 completed:2026-09-28
+
+- [x] t18517 fix(seo): keywords DataForSEO credentials fall back to gopass #bug #seo #framework #interactive tier:standard ~20m ref:GH#32803 logged:2026-09-28 -> [todo/tasks/t18517-brief.md] pr:#32804 completed:2026-09-28
+
+- [x] t18518 fix(seo): keywords read DATAFORSEO_API_LOGIN/API_PASSWORD from gopass #bug #seo #framework #interactive tier:standard ~20m ref:GH#32813 logged:2026-09-28 -> [todo/tasks/t18518-brief.md] pr:#32814 completed:2026-09-28
+
+- [x] t18519 docs(seo): DataForSEO subagent credential and connection guidance #docs #seo #interactive tier:standard ~20m ref:GH#32822 logged:2026-09-28 -> [todo/tasks/t18519-brief.md] pr:#32823 completed:2026-09-28
+
+- [x] t18520 fix(seo): shared DataForSEO credential resolver for MCP, export and research helpers #bug #seo #framework #auto-dispatch tier:standard ~2h ref:GH#32821 logged:2026-09-28 -> [todo/tasks/t18520-brief.md] pr:#32839 completed:2026-09-28
+
+- [x] t18521 fix(seo): public-repo keywords backfill issues need hub access, not auto-dispatch #bug #seo #framework #auto-dispatch tier:standard ~1h ref:GH#32836 logged:2026-09-28 -> [todo/tasks/t18521-brief.md] pr:#32872 completed:2026-09-28
+
+- [x] t18522 fix(seo): GSC export token lacks webmasters scope; use documented gsc-credentials.json #bug #seo #auto-dispatch tier:standard ~45m ref:GH#32843 logged:2026-09-28 -> [todo/tasks/t18522-brief.md] pr:#32866 completed:2026-09-28
+
+- [x] t18528 feat(seo): keywords routine refreshes GSC/Bing exports before import #feature #seo #auto-dispatch tier:standard ~1h ref:GH#32877 logged:2026-09-28 -> [todo/tasks/t18528-brief.md] pr:#32937 completed:2026-09-29
+
+- [x] t18529 fix(recovery): opt-in CWD inspector reads same-user setuid-root helpers; advisory names unreadable-processes diagnostic #bug #framework #recovery #interactive #auto-dispatch tier:standard ~1h ref:GH#32871 logged:2026-09-28 -> [todo/tasks/t18529-brief.md] pr:#32890 completed:2026-09-28
+
+- [x] t18530 fix(pulse): classify Actions billing-blocked checks as capability failures in CI repair #bug #framework #pulse #interactive #auto-dispatch tier:standard ~1h ref:GH#32869 logged:2026-09-28 -> [todo/tasks/t18530-brief.md] pr:#32891 completed:2026-09-28
+- [x] t18531 fix(routing): capability escalation re-runs the identical Sol medium route when standard and thinking share a model #auto-dispatch #bug ref:GH#32929 pr:#32931 logged:2026-09-29 completed:2026-09-29
+- [x] t18532 fix(compaction): cap compaction effort and route to first fitting simple-tier candidate #auto-dispatch #bug ref:GH#32934 pr:#32935 logged:2026-09-29 completed:2026-09-29
+- [x] t18534 fix(pulse): restore retry context lost to torn objective-evidence lines; add sanitised failure signals #auto-dispatch #bug ref:GH#32938 pr:#32942 logged:2026-09-29 completed:2026-09-29
+- [x] t18535 fix(command-policy): resolve default git remote for bare push/fetch/pull; classify pushurl and --multiple remotes #auto-dispatch #bug ref:GH#32943 pr:#32947 logged:2026-09-29 completed:2026-09-29
+- [x] t18536 fix(worktree): log dependency provisioning reason codes; skip package dirs without a supported lockfile #auto-dispatch #bug ref:GH#32950 pr:#32952 logged:2026-09-29 completed:2026-09-29
+- [x] t18537 fix(plugin): retry policy helper once on ETIMEDOUT under host load; label second timeout as transient #auto-dispatch #bug ref:GH#32955 logged:2026-09-29 pr:#32962 completed:2026-09-29
+- [x] t18538 feat(pulse): auto-refresh and alert when capacity is zero only from auth-error OAuth accounts #enhancement #framework #pulse #interactive #auto-dispatch tier:standard ~2h ref:GH#32960 pr:#32961 logged:2026-09-29 -> [todo/tasks/t18538-brief.md] completed:2026-10-03
+- [x] t18539 fix(telemetry): keep tier/model on attempt-matched outcomes; window tier-report with model@variant and first-dispatch pass rates #auto-dispatch #bug ref:GH#32964 logged:2026-09-29 pr:#32970 completed:2026-09-29
+- [x] t18541 fix(pulse): break consolidation/Dependabot-target dispatch deadlock and log silent brief-scope blocks #auto-dispatch #bug ref:GH#32979 logged:2026-09-29 pr:#32983 completed:2026-09-29
+- [x] t18542 fix(worker): recognise completed consolidation children instead of worker_noop #auto-dispatch #bug ref:GH#32984 logged:2026-09-29 pr:#32987 completed:2026-09-29
+- [x] t18543 docs(dispatch): correct fail-closed claim, cap, tier-routing and supervisor drift #auto-dispatch #bug ref:GH#32989 logged:2026-09-29 pr:#32994 completed:2026-09-29
+- [x] t18544 fix(release): retry npm attestation verification through registry propagation lag #auto-dispatch #bug tier:standard ref:GH#32999 logged:2026-09-29 -> [todo/tasks/t18544-brief.md] pr:#33021 completed:2026-09-29
+- [x] t18545 fix(pulse-merge): retry transient author permission lookups and stop manual-merge comments for them #auto-dispatch #bug tier:standard ref:GH#33000 pr:#33019 logged:2026-09-29 -> [todo/tasks/t18545-brief.md] completed:2026-10-03
+- [x] t18546 fix(pulse-dependabot): provision the dependencies label before creating intake issues and log the gh error #auto-dispatch #bug tier:standard ref:GH#33003 pr:#33011 logged:2026-09-29 -> [todo/tasks/t18546-brief.md] completed:2026-10-03
+- [x] t18547 fix(pulse-dispatch): re-resolve worker model after tier guard and stop tier-derived defaults bypassing model A/B #auto-dispatch #bug tier:thinking ref:GH#33004 pr:#33012 logged:2026-09-29 -> [todo/tasks/t18547-brief.md] completed:2026-10-03
+- [x] t18548 fix(pulse): clamp stage timeouts to the cycle deadline so full cycles finish before lock force-reclaim kills them #auto-dispatch #bug tier:thinking ref:GH#33007 pr:#33008 logged:2026-09-29 -> [todo/tasks/t18548-brief.md] completed:2026-10-03
+- [x] t18549 fix(brief-readiness): read indented continuation lines so nested sub-bullet fields are not reported empty #auto-dispatch #bug tier:standard ref:GH#33009 logged:2026-09-29 pr:#33018 completed:2026-09-29 -> [todo/tasks/t18549-brief.md]
+- [x] t18550 fix(full-loop-merge): sync canonical through the audited fast-forward and reconcile planning after it, not before #auto-dispatch #bug tier:thinking ref:GH#33013 logged:2026-09-29 -> [todo/tasks/t18550-brief.md] pr:#33022 completed:2026-09-29
+- [x] t18551 fix(planning-publication): defer not-yet-landed tasks instead of failing every main Issue Sync; repair stranded publication:pending issues #auto-dispatch #bug #framework #interactive tier:standard ~2h ref:GH#33031 logged:2026-09-29 -> [todo/tasks/t18551-brief.md] pr:#33039 completed:2026-09-29
+
+- [x] t18552 feat(worktree-cleanup): audited local-branch cleanup so merged branches do not accumulate after worktree removal #auto-dispatch #feat tier:standard ref:GH#33030 logged:2026-09-29 -> [todo/tasks/t18552-brief.md] pr:#33042 completed:2026-09-29
+- [x] t18553 fix(claim-task-id): keep depth-1 counter fetches in the isolated context so linked-worktree claims stop truncating shared repo history #auto-dispatch #bug tier:standard ref:GH#33033 logged:2026-09-29 -> [todo/tasks/t18553-brief.md] pr:#33041 completed:2026-09-29
+- [x] t18554 fix(release): unshallow the release control worktree before lane reservation so a shallow store cannot strand the release lane #auto-dispatch #bug tier:standard ref:GH#33069 logged:2026-09-29 -> [todo/tasks/t18554-brief.md] pr:#33081 completed:2026-09-29
+- [x] t18556 fix(release): look up the tag-push publish run by exact head_sha and skip recovery dispatch when channels are already published #auto-dispatch #bug tier:standard ref:GH#33073 pr:#33098 logged:2026-09-29 -> [todo/tasks/t18556-brief.md] completed:2026-10-03
+- [x] t18559 perf(worktree-cleanup): list open PRs once per local-branch scan and cap per-run GitHub lookups #auto-dispatch #bug tier:standard ref:GH#33077 logged:2026-09-29 -> [todo/tasks/t18559-brief.md] pr:#33102 completed:2026-09-29
+- [x] t18560 fix(pulse): run label-maintenance substages stalest-first so needs-simplification re-evaluation cannot starve #auto-dispatch #bug tier:standard ref:GH#33086 pr:#33087 logged:2026-09-29 -> [todo/tasks/t18560-brief.md] completed:2026-10-03
+- [x] t18563 fix(skill-update): authenticate GitHub lookups and route non-GitHub skill sources #auto-dispatch #bug tier:standard ref:GH#33135 logged:2026-09-30 -> [todo/tasks/t18563-brief.md] pr:#33161 completed:2026-09-30
+- [x] t18564 Framework value audit: retire obsolete scaffolding and keep the ideas worth keeping #parent-task #framework #interactive tier:thinking ref:GH#33139 logged:2026-09-30 -> [todo/tasks/t18564-brief.md] verified:2026-10-03 completed:2026-10-03
+- [x] t18565 chore: retire code-search leftovers, llm-tldr, context-builder/repomix and rapidfuzz #auto-dispatch #chore tier:standard ref:GH#33140 logged:2026-09-30 -> [todo/tasks/t18565-brief.md] pr:#33188 completed:2026-09-30
+- [x] t18566 chore: retire DSPy and DSPyGround from setup, docs and status checks #auto-dispatch #chore tier:standard ref:GH#33141 logged:2026-09-30 -> [todo/tasks/t18566-brief.md] pr:#33222 completed:2026-09-30
+- [x] t18567 feat(hooks): Claude Code keep-going Stop hook matching the OpenCode session-continuation guard #auto-dispatch #feat tier:thinking ref:GH#33143 logged:2026-09-30 -> [todo/tasks/t18567-brief.md] pr:#33215 completed:2026-09-30
+- [x] t18568 chore: retire Ralph loop commands, workflow and state readers #auto-dispatch #chore tier:standard ref:GH#33142 logged:2026-09-30 -> [todo/tasks/t18568-brief.md] pr:#33241 completed:2026-09-30
+- [x] t18569 refactor: remove dead pattern-tracker callers and route rule-violation counts to observability #auto-dispatch #refactor tier:standard ref:GH#33144 pr:#33223 logged:2026-09-30 -> [todo/tasks/t18569-brief.md] completed:2026-10-03
+- [x] t18570 refactor(models): retire contest and response-scoring chain, keep /cross-review, route model comparison to model-replay and model-ab #auto-dispatch #refactor tier:standard ref:GH#33145 logged:2026-09-30 -> [todo/tasks/t18570-brief.md] pr:#33245 completed:2026-09-30
+- [x] t18571 feat(backup): archive issue and PR discussions to a same-repo orphan branch via pulse routine #auto-dispatch #feat tier:thinking ref:GH#33146 logged:2026-09-30 -> [todo/tasks/t18571-brief.md] pr:#33187 completed:2026-09-30
+- [x] t18572 chore: retire Beads integration and todo-ready.sh after the issue archive lands #auto-dispatch #chore tier:standard blocked-by:t18571 ref:GH#33148 pr:#33270 logged:2026-09-30 -> [todo/tasks/t18572-brief.md] completed:2026-10-03
+- [x] t18573 docs: trim textbook skills, fold minor branch-type docs, merge best-practices, retire mission-skill-learner #auto-dispatch #chore tier:standard ref:GH#33149 logged:2026-09-30 -> [todo/tasks/t18573-brief.md] pr:#33280 completed:2026-09-30
+- [x] t18574 docs: re-sync and restructure Remotion and Cloudflare platform skills #auto-dispatch #chore tier:standard blocked-by:t18563 ref:GH#33150 logged:2026-09-30 -> [todo/tasks/t18574-brief.md] pr:#33318 completed:2026-10-03
+- [x] t18575 fix(claim-task-id): write auto-detected GH# predecessors as task IDs in the TODO line so publication can parse it #auto-dispatch #bug tier:standard ref:GH#33159 logged:2026-09-30 -> [todo/tasks/t18575-brief.md] pr:#33213 completed:2026-09-30
+- [x] t18576 fix(pulse-dep-graph): read dependencies only from structured fields, not prose or code spans in issue bodies #auto-dispatch #bug tier:standard ref:GH#33166 pr:#33169 logged:2026-09-30 -> [todo/tasks/t18576-brief.md] completed:2026-10-03
+- [x] t18577 feat: add Rank Math MCP support for WordPress SEO #enhancement #interactive tier:standard ref:GH#33175 logged:2026-09-30 pr:#33179 completed:2026-09-30 -> [todo/tasks/t18577-brief.md]
+- [x] t18579 fix(wordpress): resolve config-http/test-http Application Passwords from secret names, not argv or config #auto-dispatch #bug #security #interactive tier:standard ref:GH#33195 logged:2026-09-30 -> [todo/tasks/t18579-brief.md] pr:#33207 completed:2026-09-30
+
+- [x] t18555 fix(dispatch-dedup): merged-PR keyword check ignores issue reopen, permanently blocking reopened issues #auto-dispatch #bug ref:GH#33071 pr:#33080 completed:2026-09-29
+
+- [x] t18585 docs: refresh stale README hero and inventory counts #auto-dispatch #documentation ref:GH#33501 -> [todo/tasks/t18585-brief.md] pr:#33510 completed:2026-10-04
+
+- [x] t18588 fix(ci): markdownlint changed-line gate never lints changed lines (quoted pathspec) #auto-dispatch #bug ref:GH#33595 pr:#33598 completed:2026-10-04
+
+- [x] t18589 Surface OpenCode provider errors in ai-research-helper.sh failures #bug #interactive tier:standard ref:GH#33637 logged:2026-10-05 -> [todo/tasks/t18589-brief.md] pr:#33643 completed:2026-10-05
+
+- [x] t18590 Transport governor keeps stale low core quota across a new rate-limit window, pacing REST reads ~7.5s #auto-dispatch #bug #framework ref:GH#33651 logged:2026-10-05 -> [todo/tasks/t18590-brief.md] pr:#33688 completed:2026-10-05
+
+- [x] t18591 Bounded operations lose the SIGTERM signal when a timed-out supervisor exits cleanly #auto-dispatch #bug #framework ref:GH#33665 logged:2026-10-05 -> [todo/tasks/t18591-brief.md] pr:#33669 completed:2026-10-05
+
+- [-] t18592 GH transport: stale low core quota persists for multi-credential unresolved scope, pacing all REST reads #auto-dispatch #bug ref:GH#33701 declined:2026-10-06
+
+- [x] t18593 docs: capture Hostinger site retirement, mysqldump backups, MainWP removal and GPLVault update lessons #documentation ref:GH#33734 pr:#33735 completed:2026-10-06
+
+- [x] t18594 wp-plugin-parity-helper: inventory plugin version gaps across sibling sites and sync with health-checked swaps #auto-dispatch #feat ref:GH#33736 pr:#33746 completed:2026-10-06
+
+- [x] t18595 fix(pulse): CI-drift update-branch loops on same failing required checks and never routes to CI fix-worker #auto-dispatch #bug ref:GH#33794 pr:#33807 completed:2026-10-06
+
+- [x] t18596 fix(pulse): malformed .aidevops.json silently blocks every candidate in a repo via runner-capability invalid_requirements cooldown #auto-dispatch #bug ref:GH#33799 pr:#33803 completed:2026-10-06
+
+- [x] t18597 fix(issue-sync): one failed task issue creation skips planning publication and ref sync for all tasks #bug ref:GH#33809 pr:#33815 completed:2026-10-06
+
+- [x] t18598 fix(issue-sync): align save-for-later doctrine with issue-sync tracking issues and stop false planning-PR task ID collision warnings #auto-dispatch #bug tier:standard ref:GH#33810 pr:#33823 completed:2026-10-06
+
+- [x] t18599 fix(issue-sync): concurrent planning-publication reconcile reports silent failure for issues another reconciler already published #bug ref:GH#33821 pr:#33822 completed:2026-10-06
+
+- [x] t18601 Human-only asks give numbered steps with direct links and navigation paths #feat ref:GH#33834 pr:#33836 completed:2026-10-06
+
+- [x] t18602 fix(pulse): released attempt's own terminal lease blocks worker draft checkpoint recovery (blocked attention, stall continuation, approval) #bug tier:standard ref:GH#33839 pr:#33841 completed:2026-10-06
+
+- [x] t18603 fix(pulse): recognise gh 2.102 empty-stdout HTTP 304 in conditional REST and events tickle #auto-dispatch #bug tier:standard ref:GH#33844 -> [todo/tasks/t18603-brief.md] pr:#33846 completed:2026-10-08
+
+- [x] t18604 feat(pulse): dormant repos skip candidate scans until woken by new work or an interactive session #auto-dispatch #feat tier:thinking blocked-by:t18603 ref:GH#33847 -> [todo/tasks/t18604-brief.md] pr:#33856 completed:2026-10-06
+
+- [x] t18605 fix(pulse): worker draft checkpoints released as clean or worker_complete get no continuation or attention #auto-dispatch #bug tier:thinking ref:GH#33850 -> [todo/tasks/t18605-brief.md] pr:#33854 completed:2026-10-06
+
+- [x] t18606 Links in chat go on their own line, bare URL, no Markdown link syntax #feat ref:GH#33867 pr:#33868 release:v3.38.23 completed:2026-10-07
+
+- [x] t18610 Add code-native motion design route and motion QA to the Video agent #feat ref:GH#33902 started:2026-10-07 pr:#33906 completed:2026-10-07
+
+- [x] t18611 Add shell-style rule and diff-scoped gate for early-exit pipe readers under pipefail #auto-dispatch #feat ref:GH#33914 pr:#33973 completed:2026-10-07
+
+- [x] t18612 OpenCode v1 TUI: collapse MCP sidebar by default, show AIDevOps version in sidebar footer, pause session-title version suffix #feat ref:GH#33963 started:2026-10-07 pr:#33965 completed:2026-10-07
+
+- [x] t18613 Document live OpenCode TUI plugin verification (temp tui.json + per-project session DB) #documentation ref:GH#33975 started:2026-10-07 pr:#33977 completed:2026-10-07
+
+- [x] t18614 Add opencode-test-helper.sh tui-capture: headless pty render + text assertions for TUI plugin verification #auto-dispatch #feat ref:GH#33978 blocked-by:t18613 pr:#33994 completed:2026-10-08
+
+- [x] t18615 claim-task-id/publication reconcile: name the missing brief instead of a generic publication failure #auto-dispatch #bug ref:GH#33981 pr:#33992 completed:2026-10-08
+
+- [x] t18616 full-loop commit-and-pr: planning-only diffs must use For #N and keep the issue dispatchable #auto-dispatch #bug ref:GH#33982 pr:#33990 completed:2026-10-08
+
+- [x] t18622 fix(pulse): detached script routine lock is never released, stalling every script routine #auto-dispatch #bug #priority:high tier:standard ref:GH#34018 -> [todo/tasks/t18622-brief.md] pr:#34025 completed:2026-10-08
+
+- [x] t18623 fix(cloudron): honour monitor_upstream/monitor_compatibility false in the package monitor #auto-dispatch #bug tier:simple ref:GH#34019 -> [todo/tasks/t18623-brief.md] pr:#34021 completed:2026-10-08
+
+- [x] t18624 fix(cloudron): monitor issue bodies fail the Files Scope gate, so no update issues are filed #bug #interactive ref:GH#34027 -> [todo/tasks/t18624-brief.md] pr:#34028 completed:2026-10-08
+
+- [x] t18626 Resolve tools through PATH for non-FHS hosts (NixOS) without breaking macOS/Ubuntu #bug #framework ref:GH#34053 pr:#34076 completed:2026-10-08
+- [x] t18627 seo: add link-building playbook with competitor backlink-gap outreach strategy #feat ref:GH#34060 pr:#34061 completed:2026-10-08
+- [x] t18628 refactor: replace 20 _aidevops_path_prefix blocks with a runtime-env.sh helper #refactor ref:GH#34081 -> [todo/tasks/t18628-brief.md] pr:#34093 completed:2026-10-09
+
+- [x] t18631 GH#34125 Phase 2: stop-and-notify on local backend failure and deny protected reads outside a local-only binding #auto-dispatch #feat #security #interactive tier:thinking ref:GH#34146 logged:2026-10-09 -> [todo/tasks/t18631-brief.md] pr:#34155 completed:2026-10-09
+- [x] t18632 GH#34125 Phase 3: block tool-level egress from local-only bound sessions #auto-dispatch #feat #security #interactive tier:thinking blocked-by:t18631 ref:GH#34147 pr:#34162 logged:2026-10-09 -> [todo/tasks/t18632-brief.md] completed:2026-10-10
+- [x] t18633 fix(opencode): tool-schema fallback lacks object and yields host-incompatible schemas when @opencode-ai/plugin is unresolvable #auto-dispatch #bug #interactive tier:standard ref:GH#34148 logged:2026-10-09 -> [todo/tasks/t18633-brief.md] pr:#34154 completed:2026-10-10
+- [x] t18634 Migrate Codacy local analysis to Codacy Analysis CLI (@codacy/analysis-cli) #feat #quality #interactive tier:standard ref:GH#34164 assignee:marcusquinn logged:2026-10-09 started:2026-10-09 -> [todo/tasks/t18634-brief.md] pr:#34165 completed:2026-10-09
+- [x] t18635 fix(pulse): silence missing routines registry noise for repos without routines #bug #interactive ref:GH#34169 assignee:marcusquinn logged:2026-10-09 started:2026-10-09 -> [todo/tasks/t18635-brief.md] pr:#34170 completed:2026-10-09
+- [x] t18636 fix(tests): restore test-pulse-routines-selector Case 9/11 after detached script routines #auto-dispatch #bug #interactive ref:GH#34172 assignee:marcusquinn logged:2026-10-09 started:2026-10-09 -> [todo/tasks/t18636-brief.md] pr:#34176 completed:2026-10-09
+- [x] t18637 fix(pulse): TODO ref sync fails every cycle for SSH remotes and contributor repos #auto-dispatch #bug #pulse #interactive tier:standard ref:GH#34185 logged:2026-10-09 -> [todo/tasks/t18637-brief.md] pr:#34198 completed:2026-10-09
+- [x] t18640 Add SEO Utils MCP support (on-demand @seo-utils) #feat #seo #mcp #interactive tier:standard ref:GH#34205 assignee:marcusquinn logged:2026-10-09 started:2026-10-09 -> [todo/tasks/t18640-brief.md] pr:#34206 completed:2026-10-09
+- [x] t18641 GH#34180 Leaf C: interactive worktree add never provisions node_modules (controller-not-owner) #auto-dispatch #bug tier:thinking ref:GH#34224 logged:2026-10-10 -> [todo/tasks/t18641-brief.md] pr:#34230 completed:2026-10-10
+
+- [x] t18642 feat: issue-first dispatch — issues lead, TODO/brief are background backups #feat #framework ref:GH#34232 pr:#34234 completed:2026-10-10
+
+- [x] t18643 feat: seed draft PRs — companion files for issues without waiting on default-branch merge #feat #framework ref:GH#34233 pr:#34237 completed:2026-10-10
+
+- [x] t18646 fix(pulse): recognise blocked-by:GH#NNN labels so closed blockers unblock issues #bug ref:GH#34264 pr:#34265 completed:2026-10-10
+
+- [x] t18647 fix(approval): maintainer state change on a linked external issue must not stale signed approvals #bug ref:GH#34266 pr:#34275 completed:2026-10-10
+
+- [x] t18648 Approved external parent-task issues never auto-close after children complete (stale approval blocks terminal close) #bug ref:GH#34281 pr:#34284 completed:2026-10-10
+
+- [x] t18656 fix: throttle bounded-operation escaped-process marker scan that costs ~0.4 CPU cores per operation on macOS #bug #framework tier:standard ref:GH#34324 logged:2026-10-11 -> [todo/tasks/t18656-brief.md] pr:#34325 completed:2026-10-11
+
+- [x] t18659 pulse: recover first-wave dispatch capacity lost to timed-out sentinel stages and single-repository first waves #bug #framework tier:standard ref:GH#34331 logged:2026-10-11 -> [todo/tasks/t18659-brief.md] pr:#34335 completed:2026-10-11
+
+- [x] t18660 fix(pulse): explicit For/Ref merge association treats same-line context references as extra declarations #bug #framework tier:standard ref:GH#34338 logged:2026-10-11 -> [todo/tasks/t18660-brief.md] pr:#34339 completed:2026-10-11
+
+- [x] t18661 fix(pulse): keep dependants blocked while a consolidated blocker's successor is open #bug #framework tier:standard ref:GH#34341 logged:2026-10-11 -> [todo/tasks/t18661-brief.md] pr:#34344 completed:2026-10-11
+
+- [x] t18662 fix(pulse): release dependency-ready issues held only by brief terminal-blocker text #bug #framework tier:standard ref:GH#34348 logged:2026-10-11 -> [todo/tasks/t18662-brief.md] pr:#34351 completed:2026-10-11
+
+- [x] t18663 fix(pulse): stop stale-blocked sweep and dep-graph refresh starving repos with real backlogs #bug #framework tier:standard ref:GH#34353 logged:2026-10-11 -> [todo/tasks/t18663-brief.md] pr:#34354 completed:2026-10-11
+
+- [x] t18664 fix(auto-update): stop Pulse-run auto-updates rolling back every verified release #bug #framework tier:standard ref:GH#34357 logged:2026-10-11 -> [todo/tasks/t18664-brief.md] pr:#34358 completed:2026-10-11
+
+- [x] t18665 fix(pulse): rotate dispatch attempts so repeatedly blocked head candidates stop starving the never-attempted backlog #bug #framework tier:standard ref:GH#34363 logged:2026-10-11 -> [todo/tasks/t18665-brief.md] pr:#34365 completed:2026-10-11
+
+- [x] t18666 fix(pulse): log secret-gate issue-fetch skips and restore test-pulse-wrapper-silent-dispatch.sh (4/21 failing since #32748) #auto-dispatch #bug #framework ref:GH#34364 pr:#34368 completed:2026-10-11
+
+- [x] t18667 fix(pulse): reserve the post-label refill's real dispatch admission budget so pre-refill stages cannot spend it #bug #framework tier:standard ref:GH#34370 logged:2026-10-11 -> [todo/tasks/t18667-brief.md] pr:#34371 completed:2026-10-11
+
+- [x] t18668 fix(pulse): restore footprint defer suppression for bodiless candidate snapshots and size its TTL to the reconsideration gap #bug #framework tier:standard ref:GH#34373 logged:2026-10-11 -> [todo/tasks/t18668-brief.md] pr:#34374 completed:2026-10-11
+
+- [x] t18669 fix(pulse): stop footprint extraction turning EDIT/NEW prose and template placeholders into shared file claims #bug #framework tier:standard ref:GH#34380 pr:#34381 logged:2026-10-11 -> [todo/tasks/t18669-brief.md] completed:2026-10-11
+
+- [x] t18670 fix(dispatch-dedup): an open PR with over 100 changed files must not make the open-siblings lookup permanently uncertain #bug #framework tier:standard ref:GH#34385 logged:2026-10-11 -> [todo/tasks/t18670-brief.md] pr:#34386 completed:2026-10-11
+
+- [x] t18671 fix(project-config): stop re-filing the .aidevops.json migration issue from a stale local index and an unmatched duplicate search #bug #framework tier:standard ref:GH#34388 pr:#34389 logged:2026-10-11 -> [todo/tasks/t18671-brief.md] completed:2026-10-11
+
+- [x] t18672 fix(worker-lifecycle): stop the fix-the-fixer log watcher deadlocking workers before model invocation #bug #framework tier:standard ref:GH#34393 logged:2026-10-11 -> [todo/tasks/t18672-brief.md] pr:#34394 completed:2026-10-11
+
+- [x] t18673 fix(pulse): read the exact PR when the prefetch snapshot is stale so worker draft-checkpoint dispatch hints work #bug #framework tier:standard ref:GH#34402 logged:2026-10-11 -> [todo/tasks/t18673-brief.md] pr:#34404 completed:2026-10-11
+
+- [x] t18674 fix(pulse): stop every worker launch scanning the whole temp root with du before model selection #bug #framework tier:standard ref:GH#34421 logged:2026-10-11 -> [todo/tasks/t18674-brief.md] pr:#34423 completed:2026-10-11
+
+- [x] t18675 fix(pulse): stop setup reconciliation killing in-flight Pulse cycles on every deploy #bug #framework tier:standard ref:GH#34452 logged:2026-10-11 -> [todo/tasks/t18675-brief.md] pr:#34453 completed:2026-10-11
+
+- [x] t18676 fix(pulse): keep SIGPIPE ignored after a closed consumer so bash 3.2 PID emitters exit 0 #auto-dispatch #bug #framework tier:simple ref:GH#34456 logged:2026-10-12 -> [todo/tasks/t18676-brief.md] pr:#34458 completed:2026-10-12
+
+- [x] t18677 fix(planning): skip only repo-verify on the dependency-free planning publication push #bug #framework tier:simple ref:GH#34459 assignee:marcusquinn logged:2026-10-12 started:2026-10-12 -> [todo/tasks/t18677-brief.md] pr:#34461 completed:2026-10-12
+
+- [x] t18678 fix(pulse): keep process-lifetime EXIT cleanup off the shared RETURN-trap cleanup stack #bug #framework tier:standard ref:GH#34469 assignee:marcusquinn logged:2026-10-12 started:2026-10-12 -> [todo/tasks/t18678-brief.md] pr:#34472 completed:2026-10-12
+
+- [x] t18679 fix(shared): make the push_cleanup/_run_cleanups stack run each scope only at its owner's return #auto-dispatch #bug #framework tier:thinking ref:GH#34470 logged:2026-10-12 -> [todo/tasks/t18679-brief.md] pr:#34481 completed:2026-10-12
+
+- [x] t18680 fix(pulse): stop counting the async post-dispatch housekeeping run as a Pulse cycle #bug #framework tier:standard ref:GH#34474 assignee:marcusquinn logged:2026-10-12 started:2026-10-12 -> [todo/tasks/t18680-brief.md] pr:#34475 completed:2026-10-12
+
+- [x] t18681 fix(full-loop): define the cleanup-receipt failure helper at file scope #bug #framework tier:simple ref:GH#34477 assignee:marcusquinn logged:2026-10-12 started:2026-10-12 -> [todo/tasks/t18681-brief.md] pr:#34478 completed:2026-10-12
+
+- [x] t18682 fix(tests): update gate-pull-before-measure triage case for pinned-blob measurement #auto-dispatch #bug ref:GH#34514 pr:#34518 completed:2026-10-12
+
+- [x] t18683 fix(tests): stub final ownership fence in worker-detection dispatch_with_dedup cases #auto-dispatch #bug ref:GH#34515 pr:#34519 completed:2026-10-12
+
+- [x] t18684 fix(pulse): stop dependency sweeps starving large blocked backlogs and re-evaluating dependency-blocked available issues #bug ref:GH#34521 pr:#34522 completed:2026-10-13
+
+- [x] t18685 fix(pulse): bound GH#34000 supervisor deferral so a permanently degraded prefetch cannot starve the LLM supervisor #bug ref:GH#34524 pr:#34525 completed:2026-10-13
+
+- [x] t18686 fix(pulse): cool down dispatch re-evaluation of issues pinned by an unchanged draft checkpoint #auto-dispatch #bug ref:GH#34526 pr:#34528 completed:2026-10-13
+
+- [x] t18687 fix(pulse): preflight prefetch times out on every cycle for large repo sets #auto-dispatch #bug ref:GH#34527 pr:#34530 completed:2026-10-13
+
+- [x] t18695 Credential registry: record account, reach, owner, expiry and explicit provider defaults #feat ref:GH#34717 pr:#34726 completed:2026-10-15
+
+- [x] t18696 Credential aliases and explicit provider defaults resolve at secret injection #feat ref:GH#34718 pr:#34732 completed:2026-10-15
+
+- [x] t18697 aidevops secret dependents: show what uses a credential before rename, rotation or revocation #feat ref:GH#34719 pr:#34733 completed:2026-10-15
+
+- [x] t18698 Default-aware credential consumers: onboarding and MCP validation honour the declared provider default #feat ref:GH#34720 pr:#34735 completed:2026-10-15
+
+- [x] t18699 Consolidate credential naming guidance into one convention with registry metadata #documentation ref:GH#34721 pr:#34739 completed:2026-10-15
+
+- [x] t18700 Read-only Cloudflare credential verification, drift report and resource ownership lookup #feat ref:GH#34722 pr:#34741 completed:2026-10-15
+
+- [x] t18701 aidevops secret organise: plan-first cleanup of inconsistent credentials without renames #feat ref:GH#34723 pr:#34742 completed:2026-10-15
+
+- [x] t18706 docs(cloudron): separate catalog updates from source rebuilds; add pre-merge CLI dry run #documentation ref:GH#34864 pr:#34865 completed:2026-10-17
+
+- [x] t18707 fix(pulse): run stale-blocked sweep before partial-continuation revisit and stamp each pass separately #bug ref:GH#34894 pr:#34895 completed:2026-10-17
+
+- [x] t18710 fix(pulse): rotate normalize passes so stage timeouts stop starving stale-claim recovery #bug ref:GH#34933 pr:#34936 completed:2026-10-17
+
+- [x] t18713 fix(dirty-pr-sweep): TODO.md-only auto-rebase never succeeds — -X union is not a strategy option #auto-dispatch #bug ref:GH#34947 pr:#34962 completed:2026-10-18
+
+- [x] t18716 Add Linkup web search API docs and AI web search API comparison (Tavily, Exa, Firecrawl) #auto-dispatch #feat ref:GH#34989 -> [todo/tasks/t18716-brief.md] pr:#34990 completed:2026-10-18
+- [x] t18717 Linkup docs: use account-scoped secret name per credential naming convention #auto-dispatch #bug ref:GH#35007 -> [todo/tasks/t18717-brief.md] pr:#35008 completed:2026-10-18
+- [x] t18719 Linkup agent doc: add official query-writing, endpoint best practices and agent guidance #auto-dispatch #feat ref:GH#35013 -> [todo/tasks/t18719-brief.md] pr:#35016 completed:2026-10-18
+- [x] t18718 fix(badges): enforce README badge layout and require helper-managed blocks in /readme #auto-dispatch #bug ref:GH#35012 -> [todo/tasks/t18718-brief.md] pr:#35015 completed:2026-10-18
+- [x] t18720 fix(badges): drift detector misreports DRIFTED repos; Actions badge picks metrics caller #auto-dispatch #bug ref:GH#35019 -> [todo/tasks/t18720-brief.md] pr:#35021 completed:2026-10-18
+- [x] t18721 feat(badges): worktree-safe badges sync --apply and scheduled drift remediation #auto-dispatch #feat ref:GH#35020 -> [todo/tasks/t18721-brief.md] pr:#35036 completed:2026-10-18
+- [x] t18723 fix(badges): derive owned repos from repos.json instead of hard-coded org allowlist #auto-dispatch #bug ref:GH#35032 -> [todo/tasks/t18723-brief.md] pr:#35033 completed:2026-10-18
+- [x] t18730 docs(readme): put languages chart on its own line in README badge row #bug ref:GH#35058 -> [todo/tasks/t18730-brief.md] pr:#35061 completed:2026-10-18
+- [x] t18731 fix(qlty): qlty-cli.sh runs locally without credentials and in linked worktrees #bug ref:GH#35064 -> [todo/tasks/t18731-brief.md] pr:#35066 completed:2026-10-18
+- [x] t18732 fix(badges): repos opt out with badges:false; never sync upstream mirrors #bug ref:GH#35079 -> [todo/tasks/t18732-brief.md] pr:#35081 completed:2026-10-18
+
+- [-] t18727 fix: test-release-snapshot-migration.sh exits 1 silently in _full_loop_release_start_new block #auto-dispatch #bug ref:GH#35045 declined:2026-10-18
+
+- [x] t18728 fix: exact cmd_add owner contract no longer provisions node_modules in test-worktree-js-dependency-bootstrap.sh #auto-dispatch #bug ref:GH#35047 pr:#35054 completed:2026-10-18
+
+- [x] t18729 feat(dispatch): per-repository cost budget override for the cost circuit breaker #feat #priority:high ref:GH#35049 pr:#35051 completed:2026-10-18
+
+- [x] t18735 fix(cloudron): release evidence rejects manifests with a binary file:// icon #bug ref:GH#35091 pr:#35092 completed:2026-10-21
+
+- [x] t18743 aidevops cleanup: on-demand storage cleanup command and r922 storage hygiene routine #auto-dispatch #feat #interactive ref:GH#35245 assignee:marcusquinn started:2026-10-20 -> [todo/tasks/t18743-brief.md] pr:#35255 completed:2026-10-21
+
+- [x] t18748 Parent: aidevops security tls-trust — data-driven client trust-store checks (local + fleet) #parent-task #security ref:GH#35277 -> [todo/tasks/t18748-brief.md] pr:#35281 completed:2026-10-21
+  - [x] t18749 tls-trust phase 1: local client probe helper, canary config, aidevops security tls-trust #auto-dispatch #security ref:GH#35278 -> [todo/tasks/t18749-brief.md] pr:#35281 completed:2026-10-21
+  - [x] t18750 tls-trust phase 2: read-only fleet probes (hosts, containers, WordPress, shared-hosting PHP) #auto-dispatch #security ref:GH#35279 blocked-by:t18749 -> [todo/tasks/t18750-brief.md] pr:#35286 completed:2026-10-21
+  - [x] t18751 tls-trust phase 3: advisory to check linkage with verified auto-dismiss #auto-dispatch #security ref:GH#35280 blocked-by:t18749 -> [todo/tasks/t18751-brief.md] pr:#35281 completed:2026-10-21
+
+- [x] t18761 cert-watch: Certificate Transparency + CAA routine filing issues in each site's private repo #auto-dispatch #security ref:GH#35479 -> [todo/tasks/t18761-brief.md] pr:#35480 completed:2026-10-23
+
+- [x] t18752 docs(security): PHP RCE CVE-2026-109618/109619 advisory and security-release playbook #documentation #security ref:GH#35322 pr:#35323 completed:2026-10-21
+
+- [x] t18753 fix(tests): split DB URL fixtures that block release secretlint preflight #bug ref:GH#35325 pr:#35327 completed:2026-10-21
+
+- [x] t18755 hostinger-helper api: secret-store token, write methods, PHP version API docs #bug ref:GH#35337 pr:#35338 completed:2026-10-22
+
+- [x] t18763 worker write fence: name the accepted roots instead of redirecting every block to the worktree #bug #priority:high #interactive ref:GH#35495 assignee:marcusquinn started:2026-10-23 -> [todo/tasks/t18763-brief.md] pr:#35497 completed:2026-10-23
+
+- [x] t18767 Make pulse worker admission RAM-only: remove CPU load, idle and core-count throttles #bug #priority:high ref:GH#35537 pr:#35541 completed:2026-10-23
+
+- [x] t18788 Pulse-merge regression suites drift unseen: repair harnesses and run them in Framework Validation #bug #interactive ref:GH#35943 assignee:marcusquinn started:2026-10-29 -> [todo/tasks/t18788-brief.md] pr:#35944 completed:2026-10-29
+
+- [x] t18799 fix(pulse): continue open worker drafts after draft-checkpoint, clean and completed releases #bug #priority:high ref:GH#36019 pr:#36023 completed:2026-10-30
+
+- [x] t18800 fix(pulse): restore stranded worker drafts blocked by pre-v3.39.89 release projections #bug #priority:high ref:GH#36028 pr:#36031 completed:2026-10-30
+
+- [x] t18801 fix(interactive-session): claim must not silently skip when REST core is exhausted #auto-dispatch #bug #priority:medium ref:GH#36036 pr:#36037 completed:2026-10-30
+
+- [x] t18803 fix(terminal-blocker): queue retry-only first observations so a trusted retry re-arms permission_required holds #bug #priority:high #interactive ref:GH#36044 assignee:marcusquinn started:2026-10-30 logged:2026-10-30 -> [todo/tasks/t18803-brief.md] pr:#36045 completed:2026-10-30
+
+- [x] t18802 fix(pulse): give each stale-sweep pass its own minimum share so draft-checkpoint and partial-continuation passes progress on large repos #bug #priority:high ref:GH#36041 pr:#36047 completed:2026-10-30
+
+- [-] t18804 perf(gh-api): attribute the ~49% of REST-core quota drain that no logged attempt explains #auto-dispatch #bug #priority:high ref:GH#36048 declined:2026-10-30
+
+- [x] t18805 fix(terminal-blocker): never hold status:blocked without recorded evidence #bug ref:GH#36058 pr:#36060 completed:2026-10-30
+
+- [x] t18806 fix(terminal-blocker): release pre-fix bare blocked holds on trusted retry or expired backoff #auto-dispatch #bug ref:GH#36061 pr:#36221 completed:2026-10-31
+
+- [x] t18807 fix(terminal-blocker): recovery must fall back to GraphQL instead of stalling while REST core is exhausted #auto-dispatch #bug ref:GH#36063 pr:#36065 completed:2026-10-30
+
+- [x] t18808 fix(pulse): re-arm aged checkpoint attention for untried runners; take over idle interactive PRs after 12h #bug ref:GH#36077 pr:#36079 completed:2026-10-30
+
+- [x] t18809 fix(pulse): link orphan origin:interactive PRs to a tracking issue so 12h handover can route them #auto-dispatch #bug ref:GH#36080 pr:#36093 completed:2026-10-30
+
+- [x] t18810 fix(tests): resolve git and ssh-keygen portably in OpenCode plugin tests #auto-dispatch #bug ref:GH#36081 pr:#36091 completed:2026-10-30
+
+- [x] t18811 fix(release): pre-edit regression test fails on macOS physical tmp path; widen preflight trigger #bug ref:GH#36087 pr:#36088 completed:2026-10-30
+
+- [x] t18812 fix(release): retry network-layer transport failures in release GitHub reads #auto-dispatch #bug ref:GH#36092 pr:#36097 completed:2026-10-30
+
+- [x] t18816 fix(pulse): enforce runner dispatch breakers on every launch path (early fill, post-label refill, --command dispatch) #bug #priority:high ref:GH#36122 pr:#36127 completed:2026-10-30
+
+- [x] t18817 fix(terminal-blocker): re-arm must not release holds with unresolved blocked-by dependencies #bug #priority:high ref:GH#36126 pr:#36129 completed:2026-10-30
+
+- [x] t18818 fix(pulse): defer parent dispatch while its consolidation child is in flight; runner-local preconditions are runner_capability_unmet #bug ref:GH#36133 pr:#36134 completed:2026-10-30
+
+- [x] t18821 fix(worker): transient GitHub read deferral during POST_PR_HANDOFF verification is routed as failure and escalates tier #bug ref:GH#36171 pr:#36176 completed:2026-10-31
+
+- [x] t18822 fix(pulse): rerun orphaned in_progress jobs on GitHub-hosted runners #bug #priority:high ref:GH#36177 pr:#36178 completed:2026-10-31
+
+- [x] t18827 fix(gh): pace REST admissions as time-to-reset divided by remaining quota #bug ref:GH#36199 pr:#36201 completed:2026-10-31
+
+- [x] t18823 fix(release): retry indeterminate repo-state authority instead of silently dropping CLAIM_RELEASED #bug ref:GH#36184 pr:#36191 completed:2026-10-31
+
+- [x] t18824 fix(pulse): recover abandoned worker-draft claims so stranded drafts are continued #auto-dispatch #bug ref:GH#36186 pr:#36197 completed:2026-10-31
+
+- [x] t18826 fix(gh-shim): answer gh api user from GraphQL viewer when REST core is deferred or in cooldown #auto-dispatch #bug ref:GH#36192 pr:#36198 completed:2026-10-31
+
+- [x] t18831 fix(checkpoint): publish continuation mark-blocked findings so frozen drafts surface the concrete need #auto-dispatch #bug #framework ref:GH#36227 pr:#36231 completed:2026-10-31
+
+- [x] t18832 fix(pulse-merge): skip partial parent closeout for planning publication PRs #bug #framework ref:GH#36230 pr:#36234 completed:2026-10-31
+
+- [x] t18833 fix(terminal-blocker): re-arm permission_required holds that have no published permission request #auto-dispatch #bug #framework ref:GH#36232 pr:#36251 completed:2026-10-31
+
+- [x] t18834 fix(pulse-merge): remove early-exit pipe readers from pulse-merge libraries and judge sourced libraries in the pipe gate #bug #framework ref:GH#36235 pr:#36238 completed:2026-10-31
+
+- [x] t18835 fix(issue-sync): remove early-exit pipe readers from issue-sync libraries (GH#36235 sweep) #auto-dispatch #bug #framework ref:GH#36239 pr:#36248 completed:2026-10-31
+
+- [x] t18836 fix(pulse): remove early-exit pipe readers from remaining pulse libraries (GH#36235 sweep) #auto-dispatch #bug #framework ref:GH#36240 pr:#36250 completed:2026-10-31
+
+- [x] t18837 fix(shared): remove early-exit pipe readers from shared, worker, dispatch, full-loop and claim-task-id libraries (GH#36235 sweep) #auto-dispatch #bug #framework ref:GH#36241 pr:#36252 completed:2026-10-31
+
+- [x] t18838 test(pulse-merge): drive planning-publication closeout case through _handle_post_merge_actions (ref GH#36234) #auto-dispatch #feat #framework ref:GH#36242 pr:#36245 completed:2026-10-31
+
+- [x] t18840 fix(signature): CI gh shim signs comments as vunknown because version.sh cannot find VERSION #bug #framework ref:GH#36247 pr:#36254 completed:2026-10-31
+
+- [x] t18841 fix(tests): make test-gh-shim.sh hermetic so deployed libs cannot change its result #bug #framework ref:GH#36255 pr:#36256 completed:2026-10-31
+
+- [x] t18842 fix(pulse-merge): route CI/review repair for worker PRs that use For/Ref instead of a closing keyword #bug #framework ref:GH#36260 pr:#36263 completed:2026-10-31
+
+- [x] t18843 fix(workflows): permission rollout check must not demand caller edits when the reusable permission union is unchanged #auto-dispatch #bug #framework ref:GH#36264 pr:#36267 completed:2026-10-31
+
+- [x] t18844 fix(cloudron-release): held worker bump PRs never get an approval request; obsolete bumps stack forever #bug #framework ref:GH#36268 pr:#36269 completed:2026-10-31
+
+- [x] t18845 fix(cloudron-release): r924 fails creating approval requests in repos without no-auto-dispatch; one failed request blocks unrelated supersession #bug #framework ref:GH#36292 -> [todo/tasks/t18845-brief.md] pr:#36293 completed:2026-10-31
+
+- [x] t18846 fix(pulse-merge): skip partial parent closeout for TODO-projection PRs and closed issues #bug #framework ref:GH#36299 -> [todo/tasks/t18846-brief.md] pr:#36300 completed:2026-10-31
+
+- [x] t18848 docs(hostinger): installed package release without rpm (debug link), Red Hat VEX source, ImageMagick advisories, account policy test #documentation ref:GH#36439 pr:#36440 completed:2026-11-02
+
+- [x] t18850 fix: bound producer recovery archive retention and skip empty-delta archives #bug ref:GH#36470 pr:#36507 completed:2026-11-02
+
+- [x] t18851 Compact-archive prune: replace full restore verification with structural checks before deletion #feat ref:GH#36479 pr:#36503 completed:2026-11-02
+
+- [x] t18852 Local SEO capability for aidevops (parent roadmap) #feat #parent-task #interactive ref:GH#36480 logged:2026-11-02 -> [todo/tasks/t18852-brief.md] verified:2026-11-02 completed:2026-11-02
+
+- [x] t18853 Local SEO: add evidence-labelled local SEO agent (seo/local-seo.md) #auto-dispatch #feat #interactive tier:standard ~2h parent:t18852 ref:GH#36481 pr:#36487 logged:2026-11-02 -> [todo/tasks/t18853-brief.md] completed:2026-11-02
+
+- [x] t18854 Local SEO: geogrid metric definitions and cost-efficient grid collection (SEO Utils, DataForSEO, SerpApi) #auto-dispatch #feat #interactive tier:standard ~2h parent:t18852 ref:GH#36482 pr:#36488 logged:2026-11-02 -> [todo/tasks/t18854-brief.md] completed:2026-11-02
+
+- [x] t18855 Local SEO: Local Services Ads and local paid search guidance (proposal-only) #auto-dispatch #feat #interactive tier:standard ~2h parent:t18852 ref:GH#36483 pr:#36492 logged:2026-11-02 -> [todo/tasks/t18855-brief.md] completed:2026-11-02
+
+- [x] t18856 Local SEO: recurring monitoring and reporting SOPs (routine-ready, draft-only actions) #auto-dispatch #feat #interactive tier:standard ~2h parent:t18852 ref:GH#36484 pr:#36499 logged:2026-11-02 -> [todo/tasks/t18856-brief.md] completed:2026-11-02
+
+- [x] t18857 add-skill: content review for vendor/affiliate bias and unsupported claims before importing external skills #feat #interactive tier:standard ~35m ref:GH#36485 pr:#36489 logged:2026-11-02 -> [todo/tasks/t18857-brief.md] completed:2026-11-02
+
+- [x] t18858 Lifecycle archive-path validation rejects owner-private-group 0775 archive roots (umask 002 hosts) #bug ref:GH#36490 pr:#36497 completed:2026-11-02
+
+- [x] t18859 Document observed ChatGPT fan-out and retrieval capture for SEO/GEO measurement #documentation ref:GH#36517 pr:#36518 completed:2026-11-02
+
+- [x] t18861 test: canonicalise macOS temp roots in profile README boundary tests (state-parent-must-be-canonical) #auto-dispatch #bug ref:GH#36637 pr:#36642 completed:2026-11-04
+
+- [x] t18863 fix(screen-time): Linux README shows 0h before first sample and sampler not installed on incremental updates #bug #interactive ref:GH#36709 assignee:marcusquinn pr:#36713 logged:2026-11-04 started:2026-11-04 -> [todo/tasks/t18863-brief.md] completed:2026-11-04
+
+- [x] t18865 fix(screen-time): Linux first partial sampled day shown as full coverage via history fallback; year extrapolated from under one day #bug #interactive ref:GH#36737 assignee:marcusquinn logged:2026-11-05 started:2026-11-05 -> [todo/tasks/t18865-brief.md] pr:#36740 completed:2026-11-05
+
+- [x] t18866 test: profile README publication sweep still preserves clean trees on macOS after #36721 #auto-dispatch #bug ref:GH#36741 logged:2026-11-05 -> [todo/tasks/t18866-brief.md] pr:#36745 completed:2026-11-05
+
+- [x] t18870 Record request method and endpoint class on REST quota attempt rows #auto-dispatch #feat ref:GH#36803 pr:#36812 completed:2026-11-05
+
+- [x] t18871 Credit same-login CI quota spend across tokens and log every CI sample decision #auto-dispatch #feat ref:GH#36804 pr:#36815 completed:2026-11-05
+
+- [x] t18872 sandbox-exec-helper: stop full-process-table polling in the worker wait loop (~0.2 core per wrapper) #bug ref:GH#36843 pr:#36846 completed:2026-11-05
+
+- [x] t18873 Preserve or reject config.worktree in Git-only worktree archive capture #auto-dispatch #bug ref:GH#36857 pr:#36859 completed:2026-11-06
+
+- [x] t18874 Worker-lifecycle PR hold must see open PRs from a configured fork into its upstream #auto-dispatch #bug ref:GH#36863 pr:#36867 completed:2026-11-06
+
+- [x] t18875 fix(review-bot-gate): request-retry ignores superseded-head reviews and retries per head #auto-dispatch #bug ref:GH#36899 pr:#36918 completed:2026-11-10
+
+- [x] t18876 fix(review-bot-gate): recover external PRs stuck after CodeRabbit review limit #auto-dispatch #bug ref:GH#36900 pr:#36919 completed:2026-11-10
+
+- [x] t18877 feat(full-loop): audited maintainer override to admin-merge past a stuck review-bot-gate #auto-dispatch #feat ref:GH#36901 pr:#36910 completed:2026-11-06
+
+- [x] t18878 fix(approval): canonical review-bot retry comment must not stale PR approvals #auto-dispatch #bug ref:GH#36902 pr:#36958 completed:2026-11-10
+
+- [x] t18879 Verify Buzz Desktop helper against block/buzz-app Desktop #auto-dispatch #bug #interactive tier:standard ~2h ref:GH#36926 pr:#36972 logged:2026-11-06 -> [todo/tasks/t18879-brief.md] completed:2026-11-10
+
+- [x] t18880 review-bot-gate advisory for all authors; review bots never block merges #bug ref:GH#36931 pr:#36949 completed:2026-11-06
+
+- [x] t18881 review-bot-gate: fork PRs must run main's helper, not their own head revision #auto-dispatch #bug ref:GH#36954 pr:#36956 completed:2026-11-06 -> [todo/tasks/t18881-brief.md]
+
+- [x] t18882 review-bot-gate: fork PRs need a base-context status writer (pull_request_target) #bug ref:GH#36961 pr:#36962 completed:2026-11-06 -> [todo/tasks/t18882-brief.md]
+- [x] t18883 Plan and prototype a buzz-aidevops Desktop plugin #feat #interactive #no-auto-dispatch tier:thinking ~10h ref:GH#37233 pr:#36998 logged:2026-11-06 -> [todo/tasks/t18883-brief.md] completed:2026-11-10
+
+- [x] t18884 Skip the aidevops session greeting when OpenCode runs as an ACP server #auto-dispatch #feat ref:GH#36983 pr:#36987 completed:2026-11-10
+
+- [x] t18886 OpenCode session bus: presence and session-to-session messages #feat ref:GH#37149 -> [todo/tasks/t18886-brief.md] pr:#37165 completed:2026-11-08
+
+- [x] t18887 feat: OpenCode browse support (install via setup/update, lazy MCP, routing docs) #feat #interactive ref:GH#37155 assignee:marcusquinn logged:2026-11-08 started:2026-11-08 pr:#37167 completed:2026-11-08 -> [todo/tasks/t18887-brief.md]
+
+- [x] t18888 OpenCode 2 support for the session bus: run the bus from v2.mjs and add the sidebar Messages section #feat #interactive #auto-dispatch tier:thinking ~1d ref:GH#37157 logged:2026-11-08 blocked-by:t18886 pr:#37179 completed:2026-11-08 -> [todo/tasks/t18888-brief.md]
+
+- [x] t18889 test fixtures: copy gh-closing-reference-lib.sh into subagent-index and manifest-index temp trees #auto-dispatch #bug ref:GH#37162 pr:#37164 logged:2026-11-08 -> [todo/tasks/t18889-brief.md] completed:2026-11-10
+
+- [x] t18890 feat: aidevops opencode-browse CLI command #feat #interactive ref:GH#37170 assignee:marcusquinn pr:#37172 logged:2026-11-08 started:2026-11-08 -> [todo/tasks/t18890-brief.md] completed:2026-11-10
+
+- [x] t18891 Session bus chat ingest: scan, verified actor, opt-in owner wakes and redacted listing #feat #interactive #auto-dispatch tier:thinking ~1d ref:GH#37244 pr:#37277 logged:2026-11-08 -> [todo/tasks/t18891-brief.md] completed:2026-11-10
+
+- [x] t18892 Session bus channel bindings and per-task session launch on opencode serve #feat #interactive #auto-dispatch tier:thinking ~1d ref:GH#37245 pr:#37332 logged:2026-11-08 blocked-by:t18891 -> [todo/tasks/t18892-brief.md] completed:2026-11-10
+
+- [x] t18893 Matrix bot adapter for the session bus: room commands, bound rooms and outbox relay #feat #interactive #auto-dispatch tier:standard ~6h ref:GH#37246 pr:#37485 logged:2026-11-08 blocked-by:t18892 -> [todo/tasks/t18893-brief.md] completed:2026-11-10
+
+- [x] t18894 SimpleX bot adapter for the session bus: replace the /sessions and /ask scaffolds #feat #interactive #auto-dispatch tier:standard ~6h ref:GH#37247 pr:#37367 logged:2026-11-08 blocked-by:t18892 -> [todo/tasks/t18894-brief.md] completed:2026-11-10
+
+- [x] t18895 Session bus coordination: who is working on what, and overlap warnings before work starts #feat #interactive #auto-dispatch tier:standard ~6h ref:GH#37248 logged:2026-11-08 -> [todo/tasks/t18895-brief.md] pr:#37311 completed:2026-11-09
+
+- [x] t18896 Release coordination over the session bus: lane owner session, held-lane hints and release notices #feat #interactive #auto-dispatch tier:thinking ~1d ref:GH#37249 pr:#37320 logged:2026-11-08 -> [todo/tasks/t18896-brief.md] completed:2026-11-10
+
+- [x] t18897 Session bus ask with bounded wait, so subagents and scripts get the reply in the same call #feat #interactive #auto-dispatch tier:standard ~4h ref:GH#37250 logged:2026-11-08 -> [todo/tasks/t18897-brief.md] pr:#37257 completed:2026-11-09
+
+- [x] t18898 Session bus for Buzz-hosted agents: labelled presence, remote provenance and safe delivery #feat #interactive #auto-dispatch tier:standard ~6h ref:GH#37264 pr:#37285 logged:2026-11-08 blocked-by:t18891 -> [todo/tasks/t18898-brief.md] completed:2026-11-10
+
+- [x] t18901 buzz-aidevops: visible agent settings fields and correct where-to-set guidance #bug ref:GH#37272 pr:#37274 completed:2026-11-10
+
+- [x] t18903 buzz-aidevops: style the Conversation dropdown like the text fields #feat ref:GH#37284 pr:#37286 completed:2026-11-10
+
+- [x] t18905 Session bus for workers: messageable headless workers, worker presence and pulse steering relay #auto-dispatch #feat ref:GH#37298 pr:#37306 completed:2026-11-09
+
+- [ ] t18907 perf(gh-api): find same-login REST-core consumer spending 57% of quota and blocking Pulse dispatch #auto-dispatch #bug ref:GH#37313
+
+- [x] t18908 fix(runner-health): trip the breaker when workers die before model activity and stop no-op update resume loops #auto-dispatch #bug ref:GH#37316 pr:#37319 completed:2026-11-10
+
+- [x] t18909 fix(lifecycle): reconstructible worktree retirement uses Linux-only /proc census on macOS Pulse hosts #bug ref:GH#37321 pr:#37323 completed:2026-11-10
+
+- [x] t18910 fix(lifecycle): resume interrupted native worktree removal so stranded retirements finish #bug #framework ref:GH#37326 pr:#37328 completed:2026-11-10
+
+- [x] t18911 fix(pulse): run the worker bus relay outside the cycle budget; it has never run since t18905 shipped #bug #framework ref:GH#37327 pr:#37329 completed:2026-11-10
+
+- [x] t18912 fix(cleanup): scale lifecycle cleanup budget under worktree capacity pressure so retirement keeps up and dispatch reopens #bug #framework ref:GH#37330 pr:#37331 completed:2026-11-10
+
+- [x] t18917 fix(privacy): self-heal a root-owned repo-privacy cache so privacy probes stop cold-calling the API on every gh write #bug #framework ref:GH#37355 pr:#37356 completed:2026-11-10
+
+- [x] t18918 perf(pulse): list each repo's issues once per assignment-normalization run and cache the runner login #auto-dispatch #feat #framework ref:GH#37362 pr:#37364 completed:2026-11-10
+
+- [x] t18919 fix(release): make the release executor the lifecycle owner of its worktrees so they retire after it exits #bug #framework ref:GH#37365 pr:#37366 completed:2026-11-10
+
+- [x] t18920 fix(gh): decline REST-first reads when REST core is exhausted and GraphQL has headroom #bug #framework ref:GH#37368 pr:#37371 completed:2026-11-10
+
+- [x] t18921 fix(tests): restore test-gh-shim pr edit safe-body fixture after the edit origin-label guard #auto-dispatch #bug #framework ref:GH#37374 pr:#37378 completed:2026-11-10
+
+- [x] t18922 fix(relay): run the worker bus relay on the worker-watchdog 2-minute cadence #bug #framework ref:GH#37381 pr:#37383 completed:2026-11-10
+
+- [x] t18923 fix(lifecycle): prove open-PR state from GraphQL when REST is deferred so cleanup keeps retiring worktrees #bug #framework ref:GH#37385 pr:#37388 completed:2026-11-10
+
+- [x] t18924 fix(ci): allow framework pull_request_target gates via Actions event policy before GitHub's 2026-12-02 default block #auto-dispatch #bug #framework ref:GH#37391 pr:#37395 completed:2026-11-10
+
+- [x] t18925 fix(lifecycle): close quiescent admission in the observation-era managed takeover #bug #framework ref:GH#37398 pr:#37399 completed:2026-11-10
+
+- [x] t18926 fix(ci-wait): detect required checks whose workflow run never started and rerun them once #auto-dispatch #bug ref:GH#37402 pr:#37410 completed:2026-11-10
+
+- [x] t18927 fix(runner-health): keep a zero-attempt streak across window expiry so slow-failing runners trip the breaker #auto-dispatch #bug ref:GH#37403 pr:#37419 completed:2026-11-10
+
+- [x] t18928 fix(release): reaper starves dead-owner reconcile trees and Spotlight marker resets idle #bug ref:GH#37424 pr:#37427 completed:2026-11-09
+
+- [x] t18929 fix(lifecycle): let a session relinquish its own run so long-lived OpenCode processes stop pinning finished worktrees #bug ref:GH#37432 -> [todo/tasks/t18929-brief.md] pr:#37449 completed:2026-11-09
+
+- [x] t18930 fix(full-loop): release a finished interactive session's worktree ownership at the complete handoff so Pulse can retire merged trees while the app runs #auto-dispatch #bug blocked-by:t18929 ref:GH#37448 -> [todo/tasks/t18930-brief.md] pr:#37473 completed:2026-11-09
+
+- [x] t18932 fix(screen-time): stale macOS source renders 0h instead of unavailable for unobserved periods #auto-dispatch #bug ref:GH#37467 pr:#37475 logged:2026-11-09 -> [todo/tasks/t18932-brief.md] completed:2026-11-10
+
+- [x] t18935 fix: stop dispatching workers on already-satisfied rollout issues #bug #interactive tier:standard ref:GH#37510 assignee:marcusquinn pr:#37512 logged:2026-11-10 started:2026-11-10 -> [todo/tasks/t18935-brief.md] completed:2026-11-10
+
+- [x] t18936 fix(worker): credit verified already-satisfied no-PR closes with an evidence-bound receipt #auto-dispatch #bug ref:GH#37515 pr:#37590 logged:2026-11-10 -> [todo/tasks/t18936-brief.md] completed:2026-11-10
+
+- [x] t18938 fix(pulse): dead-stamp reaper starves every claim stamp after the first 100 #bug #interactive tier:standard ref:GH#37524 assignee:marcusquinn pr:#37529 logged:2026-11-10 started:2026-11-10 -> [todo/tasks/t18938-brief.md] completed:2026-11-10
+
+- [x] t18939 fix(privacy-guard): enumeration expires known-public repos after 10 minutes and blocks dispatch claim comments #bug ref:GH#37530 pr:#37532 completed:2026-11-10
+
+- [x] t18940 fix(pulse): worker-bus relay logs which gate stopped a GitHub read #auto-dispatch #bug ref:GH#37533 pr:#37535 completed:2026-11-10
+
+- [x] t18946 fix(relay): log gh-transport deferral tokens instead of redacted stderr #auto-dispatch #bug ref:GH#37561 pr:#37563 completed:2026-11-10
+
+- [x] t18948 fix(pulse): persist per-pass repo cursor so killed normalization passes resume #bug ref:GH#37568 pr:#37569 completed:2026-11-10
+
+- [x] t18949 fix(gh-transport): bounded delivery admission class so worker-bus relay reads are not starved by pacing #bug ref:GH#37570 pr:#37571 completed:2026-11-10
+
+- [x] t18933 fix(screen-time): macOS screen time under-reports (inverted backlit spans, held pmset assertion, frozen snapshot) #bug #interactive ref:GH#37492 pr:#37495 logged:2026-11-09 started:2026-11-09 -> [todo/tasks/t18933-brief.md] completed:2026-11-10
+
+- [x] t18934 feat(screen-time): macOS input-activity row matching the Linux 5-minute input sampler #feat #interactive ref:GH#37496 pr:#37497 logged:2026-11-09 started:2026-11-09 -> [todo/tasks/t18934-brief.md] completed:2026-11-10
+
+- [x] t18952 session ask rules: own-PR placement and merge order are decisions, not asks #documentation ref:GH#37594 pr:#37596 completed:2026-11-10
+
+- [x] t18950 macOS input sampler: run at standard priority so HID idle reads are not starved under load #bug ref:GH#37588 pr:#37593 completed:2026-11-10
+
+- [x] t18951 profile README publication still retains one worktree per run after #37184 (coverage-gap: enrolled without a registered owner) #auto-dispatch #bug ref:GH#37591 pr:#37602 completed:2026-11-10
+
+- [x] t18953 feat(bounded-op): return terminal output inline from start/status to cut 3-turn polling #feat #interactive tier:standard ref:GH#37605 pr:#37606 logged:2026-11-10 started:2026-11-10 -> [todo/tasks/t18953-brief.md] completed:2026-11-10
+
+- [x] t18954 routing: Luna first on simple tier and compaction (free OpenAI account), Haiku 5.5 fallback #chore #interactive tier:simple ref:GH#37611 pr:#37628 logged:2026-11-10 started:2026-11-10 -> [todo/tasks/t18954-brief.md] completed:2026-11-10
+
+- [x] t18955 fix(availability): OpenAI OAuth probe rejects free ChatGPT accounts that OpenCode can still use for Luna #bug #auto-dispatch tier:standard ref:GH#37627 pr:#37640 logged:2026-11-10 -> [todo/tasks/t18955-brief.md] completed:2026-11-10
+
+- [x] t18957 fix(compaction): recover Luna compaction entitlement rejection onto a fitting credentialed Haiku candidate #bug #auto-dispatch tier:standard ref:GH#37634 pr:#37646 logged:2026-11-10 -> [todo/tasks/t18957-brief.md] completed:2026-11-10
+
+- [x] t18956 feat(session-bus): show addressable session-ID token in session and terminal titles #feat #interactive ref:GH#37630 pr:#37633 logged:2026-11-10 started:2026-11-10 -> [todo/tasks/t18956-brief.md] completed:2026-11-10
+
+- [x] t18958 Sidebar Messages rows open the full session-bus message in a TUI dialog #feat ref:GH#37645 pr:#37647 completed:2026-11-10
+
+- [x] t18959 fix(update): .aidevops.json migration issue fails when target repo lacks tier:simple label #bug #auto-dispatch tier:simple ref:GH#37650 pr:#37653 logged:2026-11-10 -> [todo/tasks/t18959-brief.md] completed:2026-11-10
+
+- [x] t18960 feat(opencode-test-helper): add mouse-click injection to tui-capture #feat #auto-dispatch tier:standard ref:GH#37651 pr:#37655 logged:2026-11-10 -> [todo/tasks/t18960-brief.md] completed:2026-11-11
+
+- [x] t18961 GH#37649 follow-up: fail over subagents stuck in provider rate-limit retry #auto-dispatch #feat ref:GH#37667 pr:#37670 completed:2026-11-11
+
+- [x] t18962 pulse: log every early exit in the simplification creation-hold backfill (GH#37554 follow-up) #auto-dispatch #bug ref:GH#37691 pr:#37694 completed:2026-11-11
+
+- [x] t18963 feat: auto-unblock issues gated on an upstream release tag (upstream-release-gate marker) #auto-dispatch #feat #framework ref:GH#37696 pr:#37700 logged:2026-11-11 -> [todo/tasks/t18963-brief.md] completed:2026-11-11
+
+- [ ] t18966 secret-helper: empty gopass aidevops/ folder makes every secret unresolvable #bug ref:GH#37723
+
+- [x] t18965 Regression test: emptied gopass namespace must not block plaintext secret resolution (implementation superseded by GH#37724) #bug #interactive ~1h ref:GH#37720 pr:#37721 logged:2026-11-11 -> [todo/tasks/t18965-brief.md] completed:2026-11-11
+
+- [ ] t18969 docs(cloudron): ca.cloudron.io Package link now uses packageUrl #documentation ref:GH#37825
+
+- [ ] t18970 docs(cloudron): new package repository onboarding checklist #documentation ref:GH#37830
+
+- [ ] t18971 feat(cloudron): audit package repository setup gaps in the weekly compatibility routine #auto-dispatch #feat ref:GH#37831
+
+- [ ] t18972 docs: general repository onboarding checklist #documentation ref:GH#37837
+
+- [ ] t18973 feat(repos): surface incomplete repository onboarding in the session toast #auto-dispatch #feat ref:GH#37842
+
+- [ ] t18974 fix(ci): actions-event-policy status reads policy details, not list summaries #auto-dispatch #bug #priority:high ref:GH#37846
+
+- [ ] t18975 feat(ci): opt-in Pulse routine that auto-applies the pull_request_target Actions event policy #auto-dispatch #feat #priority:high blocked-by:t18974 ref:GH#37848
+
+- [x] t18976 feat(cloudron): GitHub-signed catalog publish commits with atomic tag push #auto-dispatch #feat #priority:low ref:GH#37852 pr:#37980 completed:2026-11-13
+
+- [ ] t18979 Flag-gated reclaim of finished worktrees while the cleanup evidence collector is missing #bug ref:GH#37901
 
 ## In Progress
+
+- [x] t18849 fix: stop .archive-verify-* scratch leaks from killed archive verification and unbounded prune #bug #type:bug #interactive tier:standard ref:GH#36468 assignee:alex-solovyev pr:#36472 logged:2026-11-02 started:2026-11-02 -> [todo/tasks/t18849-brief.md] completed:2026-11-02
+
+- [x] t18768 Adapt Impeccable, Taste Skill and Fontjoy design guidance without tracking #feat #interactive #auto-dispatch tier:standard ~2h ref:GH#35590 assignee:marcusquinn pr:#35591 logged:2026-10-25 started:2026-10-25 -> [todo/tasks/t18768-brief.md] completed:2026-10-25
+
+- [x] t18769 Playwright-first browser preference: headed-hidden mode and explicit Playwright/Playwriter disambiguation #feat #interactive ref:GH#35617 assignee:marcusquinn pr:#35618 logged:2026-10-25 started:2026-10-25 -> [todo/tasks/t18769-brief.md] completed:2026-10-25
+
+- [x] t18770 Guard Playwriter Task/MCP connect behind an explicit user mention (Playwright is the default) #auto-dispatch #feat tier:standard ref:GH#35637 pr:#35639 logged:2026-10-25 -> [todo/tasks/t18770-brief.md] completed:2026-10-25
+
+- [x] t18771 Strict no-redirect-link policy: auto-close spam, block authors, never open redirect links #feat #priority:high #security #interactive ref:GH#35655 assignee:marcusquinn logged:2026-10-25 started:2026-10-25 -> [todo/tasks/t18771-brief.md] pr:#35658 completed:2026-10-25
+
+- [x] t18772 Permission holds: withdraw non-grantable requests, scratch-temp bash/read recovery, batch withdrawal with one confirmation #bug #interactive ref:GH#35676 assignee:marcusquinn logged:2026-10-26 started:2026-10-26 -> [todo/tasks/t18772-brief.md] pr:#35677 completed:2026-10-26
+
+- [x] t18773 fix: linters-local Python complexity check reports no issues when lizard/pyflakes cannot run #auto-dispatch #bug tier:simple ref:GH#35726 assignee:marcusquinn logged:2026-10-26 started:2026-10-26 -> [todo/tasks/t18773-brief.md] pr:#35727 completed:2026-10-27
+
+- [x] t18774 fix: bash32 gate test leaves a deleted cwd; git shim guard crashes on deleted cwd #auto-dispatch #bug tier:simple ref:GH#35730 logged:2026-10-27 -> [todo/tasks/t18774-brief.md] pr:#35736 completed:2026-10-27
+
+- [x] t18630 GH#34125 Phase 1: enforce operator-bound local-only egress gate in interactive OpenCode sessions #feat #security #interactive tier:standard ref:GH#34140 assignee:marcusquinn pr:#34142 logged:2026-10-09 started:2026-10-09 -> [todo/tasks/t18630-brief.md] completed:2026-10-09
+
+- [x] t18625 Actions-unavailable merge gate: classify Qlty out-of-minutes commit statuses #bug #interactive ref:GH#34030 assignee:marcusquinn logged:2026-10-08 started:2026-10-08 -> [todo/tasks/t18625-brief.md] pr:#34031 completed:2026-10-08
+
+- [x] GH#33891 Fix NixOS PATH and native tool discovery @vladimirdulov #bug #interactive #auto-dispatch tier:thinking ref:GH#33891 assignee:vladimirdulov logged:2026-10-07 started:2026-10-07 -> [todo/tasks/gh33891-brief.md] pr:#33893 completed:2026-10-07
+
+- [x] t18478 Repair Anthropic Opus 5.5 OAuth adaptive-thinking request shape and add opt-in local interactive model/effort defaults without changing shared routes. Verify medium/xhigh Read-tool calls, unpinned OpenCode selection, focused plugin tests and changed-file lint; publish the reviewed fix through full-loop release. #bugfix #framework #auth #interactive #auto-dispatch ~2h tier:standard started:2026-09-26 ref:GH#32415 logged:2026-09-26 pr:#32417 testing:runtime-verified release:v3.36.0 completed:2026-09-26 -> [todo/tasks/t18478-brief.md]
+
+- [x] t18430 Update OpenCode GitHub Action pin to v1.18.30 #auto-dispatch #dependencies #github_actions #interactive #tier:simple ref:GH#31828 started:2026-09-12 pr:#31829 completed:2026-09-12
 
 - [x] t2744 raise GraphQL throttle defaults and reduce pulse/stats cycle pressure — circuit breaker default `0.05`→`0.30` (trips at 1500 remaining instead of 250), REST fallback default `10`→`1000` (REST takes over earlier, GraphQL kept in reserve), pulse interval default `120s`→`180s`, stats-wrapper interval `900s`→`3600s`. Also fixes macOS launchd path that ignored `supervisor.pulse_interval_seconds` from settings. Evidence: GraphQL=0/5000 vs REST=4044/5000 with 21 EXHAUSTED events in current pulse log; per-cycle cost (~400-700 pts) × 30 cycles/hr × 14 repos exceeds 5000/hr ceiling by 2-4×. All env-overridable, fully backwards-compatible. See `todo/tasks/t2744-brief.md`. #framework #pulse #interactive ~1h ref:GH#20482 started:2026-04-22 pr:#20483 completed:2026-04-22
 
@@ -1371,6 +2131,7 @@ t165,Provider-agnostic task claiming via TODO.md,marcusquinn,orchestration archi
 -->
 
 ## Done
+- [x] t18900 docs: macOS account and login-keychain incident triage and recovery reference #documentation #interactive ref:GH#37266 assignee:marcusquinn logged:2026-11-08 started:2026-11-08 -> [todo/tasks/t18900-brief.md] pr:#37268 testing:self-assessed completed:2026-11-09
 - [x] t18222 Ship owner-reviewed Buzz interactive team runtime #agents #auto-dispatch #feat #framework #reliability #security ~8h tier:thinking ref:GH#29831 assignee:marcusquinn started:2026-08-08 logged:2026-08-09 -> [todo/tasks/t18222-brief.md] pr:#29834 testing:runtime-verified completed:2026-08-09
 - [x] t18208 Generate restricted OpenCode conversation launch overlays #mission:m-20260804-5d06b1 #enhancement #security #framework #agents #interactive #auto-dispatch ~5h tier:thinking parent:t18201 ref:GH#29686 logged:2026-08-06 -> [todo/tasks/t18208-brief.md] pr:#29673 testing:runtime-verified completed:2026-08-07
 - [x] t18207 Refactor Matrix behind the team-interface contracts #mission:m-20260804-5d06b1 #enhancement #security #reliability #framework #interactive #auto-dispatch ~6h tier:thinking parent:t18201 ref:GH#29646 logged:2026-08-06 -> [todo/tasks/t18207-brief.md] pr:#29669 testing:runtime-verified completed:2026-08-07
@@ -3442,7 +4203,7 @@ t019.3.4,Update AGENTS.md with Beads integration docs,,beads,1h,45m,2025-12-21T1
 
 - [x] t2715 docs: retire t2218 stale gap notes (AGENTS.md + log-issue-aidevops.md) and close orphan TODO entry #documentation #framework ref:GH#20373 pr:#20374 completed:2026-04-21
 
-- [ ] t2716 sonar cleanup: remove unused locals (S1481) in top 5 heaviest files #framework #quality-debt ref:GH#20376
+- [-] t2716 sonar cleanup: remove unused locals (S1481) in top 5 heaviest files #framework #quality-debt ref:GH#20376 declined:2026-07-06
 
 - [x] t2717 fix: replace misleading 'high/critical' aggregate label in quality-sweep dashboard with per-severity breakdown #framework #quality-debt ref:GH#20384 pr:#20387 completed:2026-04-21
 
@@ -3615,7 +4376,7 @@ t019.3.4,Update AGENTS.md with Beads integration docs,,beads,1h,45m,2025-12-21T1
 
 - [x] t2827 nesting-depth pre-push guard: change-scoped scan to fix 60s timeout #auto-dispatch #bug ref:GH#20842 pr:#20848 completed:2026-04-25
 
-- [ ] t2828 pulse: split merge pass into dedicated 60s launchd plist (decouple from dispatch cycle) #auto-dispatch #framework #pulse ref:GH#20866
+- [-] t2828 pulse: split merge pass into dedicated 60s launchd plist (decouple from dispatch cycle) #auto-dispatch #framework #pulse ref:GH#20866 declined:2026-07-06
 
 - [x] t2829 pulse: aggressive stale-lock breaker for wedged cycles holding lockdir for hours #auto-dispatch #framework #pulse ref:GH#20867 pr:#20886 completed:2026-04-25
 
@@ -3631,7 +4392,7 @@ t019.3.4,Update AGENTS.md with Beads integration docs,,beads,1h,45m,2025-12-21T1
 
 - [x] t2837 document BSD awk and ratchet hazards from t2834 in reference docs #auto-dispatch #documentation ref:GH#20885 pr:#21242 completed:2026-04-27
 
-- [ ] t2836 aidevops badges CLI subcommand + init hook + cross-repo drift detection #enhancement ref:GH#20884
+- [-] t2836 aidevops badges CLI subcommand + init hook + cross-repo drift detection #enhancement ref:GH#20884 declined:2026-07-06
 
 - [x] t2838 periodic parent-task sub-issue backfill in pulse + --parent-issue flag on claim-task-id #auto-dispatch #enhancement #tooling ref:GH#20888 pr:#20890 completed:2026-04-25
 
@@ -3701,7 +4462,7 @@ t019.3.4,Update AGENTS.md with Beads integration docs,,beads,1h,45m,2025-12-21T1
 
 - [x] t2871 pulse-canonical-recovery: switch to local advisory channel (privacy fix) #pulse #security ref:GH#20942 pr:#20945 completed:2026-04-26
 
-- [ ] t2872 redact private repo names + paths from issue/PR bodies posted to public marcusquinn/aidevops #framework #pulse #reliability #security ref:GH#20944
+- [-] t2872 redact private repo names + paths from issue/PR bodies posted to public marcusquinn/aidevops #framework #pulse #reliability #security ref:GH#20944 declined:2026-07-06
 
 - [x] t2873 comment out OpenCode→Claude Code substitution after empirical A/B verification ref:GH#20964 pr:#20965 completed:2026-04-26
 
@@ -3833,13 +4594,13 @@ t019.3.4,Update AGENTS.md with Beads integration docs,,beads,1h,45m,2025-12-21T1
   - Children: one per file, ordered by descending line count, all tagged auto-dispatch+tier:thinking
   - Pulse-path files (pulse-merge, pulse-wrapper, pulse-issue-reconcile, headless-runtime, etc.) auto-elevated to opus-4-7
 
-- [ ] t2935 Block drive-by spam author of GH#17671 (see issue for username) #security ref:GH#21145
+- [-] t2935 Block drive-by spam author of GH#17671 (see issue for username) #security ref:GH#21145 declined:2026-07-06
 
 - [x] t2939 feat(pulse): defense-in-depth restart reliability — KeepAlive dict + watchdog plist #auto-dispatch #enhancement ref:GH#21148 pr:#21155 completed:2026-04-27
 
 - [x] t2940 scrub identifying details from t2933 incident artifacts #security ref:GH#21149 pr:#21152 completed:2026-04-27
 
-- [ ] t2941 redact bad-actor usernames from committed files and live artifacts #auto-dispatch #refactor #security ref:GH#21150
+- [-] t2941 redact bad-actor usernames from committed files and live artifacts #auto-dispatch #refactor #security ref:GH#21150 declined:2026-07-06
 
 - [x] t2937 make maintainer-gate.yml reusable + propagate via aidevops sync-workflows #auto-dispatch #enhancement #security ref:GH#21154 pr:#21178 completed:2026-04-27
 
@@ -3867,7 +4628,7 @@ t019.3.4,Update AGENTS.md with Beads integration docs,,beads,1h,45m,2025-12-21T1
 
 - [x] t2954 fix _resolve_pulse_runtime_binary nvm path discovery + product validation (Linux dispatch broke 9d on alex-solovyev runner) #interactive #bug #framework ref:GH#21199 pr:#21204 completed:2026-04-27
 
-- [ ] t2956 investigate watchdog_stall_continue 21.6% rate (avg 38min wasted vs 16min success) — biggest overnight throughput drain #auto-dispatch #bug #enhancement #framework ref:GH#21201
+- [-] t2956 investigate watchdog_stall_continue 21.6% rate (avg 38min wasted vs 16min success) — biggest overnight throughput drain #auto-dispatch #bug #enhancement #framework ref:GH#21201 declined:2026-07-06
 
 - [x] t2955 cache _is_task_committed_to_main result via dispatch-blocked label — eliminate per-cycle scan on 224 issues #auto-dispatch #bug #enhancement #framework ref:GH#21200 pr:#21205 completed:2026-04-27
 
@@ -3999,7 +4760,7 @@ t019.3.4,Update AGENTS.md with Beads integration docs,,beads,1h,45m,2025-12-21T1
 
 - [x] t3043 Locate dispatch_with_dedup hot spot post-t3040 (target dedup_check <60s) #auto-dispatch #enhancement #model:opus-4-7 #pulse ref:GH#21659 pr:#21660 completed:2026-04-29
 
-- [ ] t3042 fix: claim-task-id.sh emits doubled task-ID prefix in TODO.md line #auto-dispatch #bug ref:GH#21658
+- [-] t3042 fix: claim-task-id.sh emits doubled task-ID prefix in TODO.md line #auto-dispatch #bug ref:GH#21658 declined:2026-07-06
 
 - [x] t3044 bug(log-issue): client-side fingerprint dedup bypassed by direct gh issue create — server-side guard needed #auto-dispatch #bug ref:GH#21744 pr:#21775 completed:2026-04-29
 
@@ -4009,19 +4770,19 @@ t019.3.4,Update AGENTS.md with Beads integration docs,,beads,1h,45m,2025-12-21T1
 
 - [x] t3047 claim-task-id.sh issue_num parser captures stderr digit-noise (causes 2157 prefix and 'awk: newline in string' on every issue creation) #auto-dispatch #bug ref:GH#21747 pr:#3050 completed:2026-07-06
 
-- [ ] t3048 fix claim-task-id.sh phantom issue number from stderr capture (root cause for #21736, #21737) #auto-dispatch #bug ref:GH#21748
+- [-] t3048 fix claim-task-id.sh phantom issue number from stderr capture (root cause for #21736, #21737) #auto-dispatch #bug ref:GH#21748 declined:2026-07-06
 
 - [x] t3049 auto-clear stale-recovery NMR when a subsequent worker produces an approved PR #auto-dispatch #bug ref:GH#21752 pr:#21768 completed:2026-04-29
 
 - [x] t3050 consolidator must skip parents whose work is already merged via children #auto-dispatch #bug ref:GH#21753 pr:#21816 completed:2026-04-30
 
-- [ ] t3051 fix worker exit classifier so SIGTERM/zero-session kills don't masquerade as clean (root cause for #21707 cycle) #auto-dispatch #bug #refactor ref:GH#21754
+- [-] t3051 fix worker exit classifier so SIGTERM/zero-session kills don't masquerade as clean (root cause for #21707 cycle) #auto-dispatch #bug #refactor ref:GH#21754 declined:2026-07-06
 
 - [x] t3052 extend t2449 worker-briefed auto-merge gate to honour cryptographic approval as OWNER/MEMBER bypass #auto-dispatch #bug ref:GH#21755 pr:#21767 completed:2026-04-29
 
 - [x] t3053 bug(pulse): pulse.log polluted with OpenCode tool_use JSON blobs from parallel interactive sessions #auto-dispatch #bug #framework #pulse ref:GH#21761 verified:2026-04-29 completed:2026-07-01
 
-- [ ] t3055 bug(pulse): worker dispatched but no [lifecycle] worker_exited line emitted on detach-path termination #auto-dispatch #bug #framework #pulse ref:GH#21762
+- [-] t3055 bug(pulse): worker dispatched but no [lifecycle] worker_exited line emitted on detach-path termination #auto-dispatch #bug #framework #pulse ref:GH#21762 declined:2026-07-06
 
 - [x] t3054 bug(pulse): preflight_early_dispatch stage timeout (600s SIGTERM rc=143) on managed private webapp issue #auto-dispatch #bug #framework #pulse ref:GH#21763 pr:#21769 completed:2026-04-29
 
@@ -4075,7 +4836,7 @@ t019.3.4,Update AGENTS.md with Beads integration docs,,beads,1h,45m,2025-12-21T1
 
 - [x] t3078 add Meta Ads CLI tooling doc to meta-ads agent #documentation #enhancement ref:GH#21844 pr:#21845 completed:2026-04-30
 
-- [ ] t3083 Fix Bash 3.2 heredoc parse error in counter-trend-delta.sh #auto-dispatch #bug #ci ref:GH#21853
+- [-] t3083 Fix Bash 3.2 heredoc parse error in counter-trend-delta.sh #auto-dispatch #bug #ci ref:GH#21853 declined:2026-07-06
 
 - [x] t3085 init pre-existing local-var declarations in pulse-wrapper.sh + bootstrap #auto-dispatch #bug ref:GH#21856 pr:#21864 completed:2026-04-30
 
@@ -4667,93 +5428,70 @@ t019.3.4,Update AGENTS.md with Beads integration docs,,beads,1h,45m,2025-12-21T1
 - [x] t8177 feat: implement scoped task surface navigation and filters #bug #ui ref:GH#8258 pr:#8484 completed:2026-07-07
 
 
-- [ ] t18078 Route OpenAI workers through GPT-5.6 tiers #bug #type:enhancement ref:GH#26913
 
-- [ ] t18083 Refresh Vault status after terminal handoff #bug #enhancement ref:GH#26998
+- [x] t18083 Refresh Vault status after terminal handoff #bug #enhancement ref:GH#26998 pr:#26999 completed:2026-09-24
 
-- [ ] t18084 Embed secure Vault terminal and populate local secret inventory #bug #enhancement #security ref:GH#27001
+- [x] t18084 Embed secure Vault terminal and populate local secret inventory #bug #enhancement #security ref:GH#27001 pr:#27305 completed:2026-09-24
 
-- [ ] t18085 Evolve runtime-neutral autonomous safety contracts #enhancement #framework #security #observability #interactive #no-auto-dispatch ~16h tier:thinking ref:GH#27030 started:2026-07-11T00:00:00Z logged:2026-07-11 -> [todo/tasks/t18085-brief.md]
+- [x] t18085 Evolve runtime-neutral autonomous safety contracts #enhancement #framework #security #observability #interactive #no-auto-dispatch ~16h tier:thinking ref:GH#27030 started:2026-07-11T00:00:00Z pr:#27063 logged:2026-07-11 -> [todo/tasks/t18085-brief.md] completed:2026-09-24
 
-- [ ] t18086 Strip image placeholders from OpenCode session titles #bug ref:GH#27036
 
-- [ ] t18087 Reap dead interactive claims during pulse dispatch #bug ref:GH#27039
+- [x] t18087 Reap dead interactive claims during pulse dispatch #bug ref:GH#27039 pr:#27040 completed:2026-09-24
 
-- [ ] t18088 Optimise local linter CPU usage #bug ref:GH#27041
+- [x] t18088 Optimise local linter CPU usage #bug ref:GH#27041 pr:#27062 completed:2026-09-24
 
-- [ ] t18089 Align background model tiers and reasoning effort #bug #type:enhancement ref:GH#27045
+- [x] t18089 Align background model tiers and reasoning effort #bug #type:enhancement ref:GH#27045 pr:#27046 completed:2026-09-24
 
-- [ ] t18090 Enforce portable whole-process worker network egress #enhancement #framework #security #auto-dispatch ~8h tier:thinking ref:GH#27056 logged:2026-07-11 -> [todo/tasks/t18090-brief.md]
+- [x] t18090 Enforce portable whole-process worker network egress #enhancement #framework #security #auto-dispatch ~8h tier:thinking ref:GH#27056 pr:#27224 logged:2026-07-11 -> [todo/tasks/t18090-brief.md] completed:2026-09-24
 
-- [ ] t18091 Install aidevops CLI independently of release worktrees #auto-dispatch #bug ref:GH#27057
 
-- [ ] t18092 Canonicalize workload model tiers #enhancement #framework ref:GH#27059
+- [x] t18092 Canonicalize workload model tiers #enhancement #framework ref:GH#27059 pr:#27060 completed:2026-09-24
 
-- [ ] t18093 Record runtime safety Qlty baseline #bug #quality #interactive #no-auto-dispatch ~1h tier:simple ref:GH#27116 logged:2026-07-11 -> [todo/tasks/t18093-brief.md]
+- [x] t18093 Record runtime safety Qlty baseline #bug #quality #interactive #no-auto-dispatch ~1h tier:simple ref:GH#27116 pr:#27117 logged:2026-07-11 -> [todo/tasks/t18093-brief.md] completed:2026-09-24
 
-- [ ] t18094 Provision repository lint configuration through init and update #enhancement ref:GH#27123
 
-- [ ] t18095 Close the autonomous Qlty remediation loop #auto-dispatch #bug #quality ref:GH#27133
+- [x] t18095 Close the autonomous Qlty remediation loop #auto-dispatch #bug #quality ref:GH#27133 pr:#27160 completed:2026-09-24
 
-- [ ] t18096 Treat canonical lint policy deferrals as safe skips #auto-dispatch #bug ref:GH#27139
 
-- [ ] t18097 Enforce evidence-backed full-loop lifecycle #bug #enhancement #framework #security ref:GH#27144
+- [x] t18097 Enforce evidence-backed full-loop lifecycle #bug #enhancement #framework #security ref:GH#27144 pr:#27163 completed:2026-09-24
 
-- [ ] t18098 Prevent worktree infrastructure markers from breaking worker ownership transfer #auto-dispatch #bug #framework #pulse #reliability ref:GH#27164
 
-- [ ] t18099 Make dispatch claim-to-worker handoff an atomic expiring lease #auto-dispatch #bug #framework #pulse #reliability ref:GH#27165
 
-- [ ] t18102 Deploy CLI, agents, and plugins as one atomic version bundle #auto-dispatch #bug #framework #reliability ref:GH#27168
 
-- [ ] t18101 Repair terminal CI failures in place on existing PR branches #auto-dispatch #bug #framework #pulse #reliability ref:GH#27167
 
-- [ ] t18100 Normalize issue dependencies before dispatch eligibility #auto-dispatch #bug #framework #pulse #reliability ref:GH#27166
 
-- [ ] t18104 Automate failure-family remediation and human-gate revalidation #auto-dispatch #enhancement #framework #observability #pulse ref:GH#27170
 
-- [ ] t18103 Reconcile stale objectives with expiring assumptions and durable recovery #auto-dispatch #enhancement #framework #pulse #reliability ref:GH#27169
 
-- [ ] t18105 Validate causal evidence in framework bug reports #bug ref:GH#27271
+- [x] t18105 Validate causal evidence in framework bug reports #bug ref:GH#27271 pr:#27274 completed:2026-09-24
 
-- [ ] t18106 Fix agent deployment verification for symlinked runtime bundles #auto-dispatch #bug ref:GH#27275
+- [x] t18106 Fix agent deployment verification for symlinked runtime bundles #auto-dispatch #bug ref:GH#27275 verified:2026-07-17 completed:2026-09-24
 
-- [ ] t18107 Scope startup greeting to interactive root sessions #bug ref:GH#27328
+- [x] t18107 Scope startup greeting to interactive root sessions #bug ref:GH#27328 pr:#27329 completed:2026-09-24
 
-- [ ] t18108 Fix GPT-5.6 interactive auto-compaction threshold #bug ref:GH#27335
+- [x] t18108 Fix GPT-5.6 interactive auto-compaction threshold #bug ref:GH#27335 pr:#27336 completed:2026-09-24
 
-- [ ] t18109 Trigger dependency-chain unblocking when blockers close #bug ref:GH#27338
 
-- [ ] t18111 Resolve SonarCloud weak-hash finding in session ID fallback #auto-dispatch #bug ref:GH#27349
+- [x] t18111 Resolve SonarCloud weak-hash finding in session ID fallback #auto-dispatch #bug ref:GH#27349 pr:#27415 completed:2026-07-12
 
-- [ ] t18110 Fail postflight when SonarCloud quality gate reports ERROR #auto-dispatch #bug ref:GH#27348
+- [x] t18110 Fail postflight when SonarCloud quality gate reports ERROR #auto-dispatch #bug ref:GH#27348 pr:#27352 completed:2026-07-12
 
-- [ ] t18112 Repair token-refresh LaunchAgent setup failure #auto-dispatch #bug ref:GH#27350
+- [x] t18112 Repair token-refresh LaunchAgent setup failure #auto-dispatch #bug ref:GH#27350 pr:#27413 completed:2026-09-24
 
-- [ ] t18113 Harden pulse throughput and full-loop continuity #bug #type:bug ref:GH#27452
 
-- [ ] t18114 Fix CI repair infrastructure classification and dead lease recovery #bug ref:GH#27487
 
-- [ ] t18115 Add evidence-backed session analysis and compaction continuity #bug ref:GH#27498
+- [x] t18115 Add evidence-backed session analysis and compaction continuity #bug ref:GH#27498 pr:#27499 completed:2026-07-13
 
-- [ ] t18116 Fix quality-debt dispatch recovery state and pre-runtime telemetry #bug ref:GH#27503
 
-- [ ] t18117 Add token-efficient output receipts and delta-aware waits #enhancement #framework ref:GH#27529
 
-- [ ] t18118 security: bind external approvals and advisory merge evidence to immutable cu... #auto-dispatch #bug #framework #pulse #security ref:GH#27560
 
-- [ ] t18119 Allow OpenCode access to generated global commands #bug ref:GH#27564
 
-- [ ] t18120 Fix exact current-session output-efficiency analysis #bug #framework ref:GH#27574
+- [x] t18120 Fix exact current-session output-efficiency analysis #bug #framework ref:GH#27574 pr:#27619 completed:2026-07-14
 
-- [ ] t18122 Add cryptographically scoped worker permission grants #bug ref:GH#27688
 
-- [ ] t18123 Add bounded worker progress blocker logging #bug ref:GH#27732
 
-- [ ] t18132 Prevent cross-install upstream-watch duplicate issues #auto-dispatch #bug #framework #reliability ref:GH#27821
 
 - [x] t18136 Prevent LaunchAgents from pinning stale runtime-bundle PATH entries #bug #framework #pulse #reliability #interactive #no-auto-dispatch ~1.5h tier:standard -> [todo/tasks/t18136-brief.md] ref:GH#27851 pr:#27852 completed:2026-07-15
 
-- [ ] t18138 fix(worker): reconcile attempt outcomes before retry and failure routing #bug #observability #pulse ref:GH#27907
 
 - [x] t18139 Pulse 2: add repository campaigns and swarm-aware execution #architecture #enhancement #orchestration #pulse #release ref:GH#27939 pr:#27951 completed:2026-07-16
 
@@ -4767,13 +5505,9 @@ t019.3.4,Update AGENTS.md with Beads integration docs,,beads,1h,45m,2025-12-21T1
 
 - [x] t18145 Show OpenCode run and wait state in Tabby tab titles #enhancement ref:GH#27989 pr:#27990 completed:2026-07-16
 
-- [ ] t18146 Enforce a no-write research subagent capability profile #auto-dispatch #security ~2h tier:thinking ref:GH#27991 logged:2026-07-16 -> [todo/tasks/t18146-brief.md]
 
-- [ ] t18147 Block compaction auto-continue for completed child sessions #auto-dispatch #security ~2h tier:thinking ref:GH#27992 logged:2026-07-16 -> [todo/tasks/t18147-brief.md]
 
-- [ ] t18148 Terminate cancelled subagents and report bounded side-effect receipts #auto-dispatch #security blocked-by:GH#27992 ~3h tier:thinking ref:GH#27993 logged:2026-07-16 -> [todo/tasks/t18148-brief.md]
 
-- [ ] t18149 Require trusted authorization for account-level GitHub CLI mutations #auto-dispatch #security ~2h tier:thinking ref:GH#27994 logged:2026-07-16 -> [todo/tasks/t18149-brief.md]
 
 - [x] t18150 Use compact emoji indicators in OpenCode terminal tab titles #enhancement ref:GH#28005 pr:#28006 completed:2026-07-16
 
@@ -4781,7 +5515,6 @@ t019.3.4,Update AGENTS.md with Beads integration docs,,beads,1h,45m,2025-12-21T1
 
 - [x] t18152 Restore Pulse temporary-worktree capacity and adaptive timeout recovery #bug ref:GH#28044 pr:#28045 completed:2026-07-17
 
-- [ ] t18153 Clarify authority-aware full-loop lifecycle #bug ref:GH#28112
 
 - [x] t18155 fix: harden autoagent experiment reliability #enhancement #research #self-improvement ref:GH#28139 pr:#28143 completed:2026-07-18
 
@@ -4789,15 +5522,10 @@ t019.3.4,Update AGENTS.md with Beads integration docs,,beads,1h,45m,2025-12-21T1
 
 - [x] t18157 Block reads of credential-bearing runtime configuration #security ref:GH#28141 pr:#28315 completed:2026-07-20
 
-- [ ] t18158 Add fail-closed cross-store storage inventory reporting #enhancement ref:GH#28149
 
-- [ ] t18159 Bound runtime-bundle growth without weakening leases or rollback #enhancement ref:GH#28150
 
-- [ ] t18160 Bound observability growth while preserving append-only audit evidence #enhancement ref:GH#28151
 
-- [ ] t18162 Report and maintain OpenCode storage through ownership-aware contracts #enhancement ref:GH#28153
 
-- [ ] t18161 Coordinate retention for agent backups logs and worker failure evidence #enhancement ref:GH#28152
 
 - [x] t18163 Fix same-task scheduler ownership transfer for preserved worktrees #auto-dispatch #bug #reliability ref:GH#28203 pr:#28246 completed:2026-07-19
 
@@ -4813,9 +5541,7 @@ t019.3.4,Update AGENTS.md with Beads integration docs,,beads,1h,45m,2025-12-21T1
 
 - [x] t18169 Fix init-generated Markdown for default markdownlint #bug ref:GH#28487 pr:#28488 completed:2026-07-22
 
-- [ ] t18170 Standardize Cloudron community publishing lifecycle #bug ref:GH#28546
 
-- [ ] t18171 Fix Cloudron 7.0.4 versions update option parsing #bug ref:GH#28556
 
 - [x] t18172 Document Cloudron package repository metadata #documentation ref:GH#28559 pr:#28561 completed:2026-07-24
 
@@ -4823,7 +5549,6 @@ t019.3.4,Update AGENTS.md with Beads integration docs,,beads,1h,45m,2025-12-21T1
 
 - [x] t18174 Fix Bash 3.2 issue-sync shim PATH precedence regression #auto-dispatch #bug ref:GH#28577 pr:#28578 completed:2026-07-24
 
-- [ ] t18175 Clarify self-improvement auto-dispatch authority boundary #documentation ref:GH#28582
 
 - [x] t18176 Plan secure personal and shared social knowledge corpora #enhancement #framework #knowledge #parent #security ref:GH#28587 pr:#28621 completed:2026-07-25
 
@@ -4840,14 +5565,108 @@ t019.3.4,Update AGENTS.md with Beads integration docs,,beads,1h,45m,2025-12-21T1
 
 - [x] t18188 Default PR approval count to zero for solo-maintainer repos #enhancement ref:GH#28967 pr:#28972 completed:2026-07-31
 
-- [ ] t18189 Route standard workload tier through OpenAI Luna max reasoning #bug #type:enhancement ref:GH#29070
-- [ ] t18221 Show delegated child counts in routing feedback toasts #auto-dispatch #enhancement #framework #observability #opencode ref:GH#29815
-- [ ] t18220 Route output-heavy interactive work through lower-tier subagents #auto-dispatch #enhancement #framework ref:GH#29813
-- [ ] t18241 Fix legacy release lane normalization during published reconciliation #bug ref:GH#30149
-- [ ] t18227 Add provenance-preserving content metadata subagent #feature ref:GH#30062
+- [x] t18221 Show delegated child counts in routing feedback toasts #auto-dispatch #enhancement #framework #observability #opencode ref:GH#29815 pr:#29816 completed:2026-09-24
+- [x] t18220 Route output-heavy interactive work through lower-tier subagents #auto-dispatch #enhancement #framework ref:GH#29813 pr:#29814 completed:2026-09-24
+- [x] t18241 Fix legacy release lane normalization during published reconciliation #bug ref:GH#30149 pr:#30150 completed:2026-09-24
+- [x] t18227 Add provenance-preserving content metadata subagent #feature ref:GH#30062 pr:#30064 completed:2026-09-24
 
 - [x] t18308 Allow cleanup receipt adoption for merged fork PRs #auto-dispatch #bug ref:GH#30708 pr:#30754 completed:2026-08-25
 
 - [x] t18307 Preflight all external PR approval authorities before prompting #auto-dispatch #bug ref:GH#30706 pr:#30760 completed:2026-08-26
 
-- [ ] t18312 Restore deterministic Qlty smell threshold #auto-dispatch #bug #quality-debt ref:GH#30876
+- [x] t18312 Restore deterministic Qlty smell threshold #auto-dispatch #bug #quality-debt ref:GH#30876 verified:2026-08-29 completed:2026-09-24
+
+- [x] t18395 detect and recover stale GitHub runner broker sessions #auto-dispatch #bug #ci #github #infrastructure #monitoring #reliability #self-healing #shell ref:GH#31136 pr:#31142 completed:2026-09-04
+
+- [x] t18416 Preserve actionable terminal evidence for provider and model blockers #auto-dispatch #external-contributor ref:GH#31676 pr:#31680 completed:2026-09-09
+
+## Evidence-based model effort and delegation optimisation
+
+- [x] t18422 Evidence-based model effort and delegation optimisation #parent #enhancement #framework #observability #interactive priority:high tier:thinking ref:GH#31696 logged:2026-09-10 -> [todo/tasks/t18422-brief.md] verified:2026-09-10 completed:2026-09-24
+- [x] t18423 Record model-effort harness and cost provenance #auto-dispatch #enhancement #framework #observability #interactive priority:high tier:standard ~3h parent:t18422 ref:GH#31698 logged:2026-09-10 -> [todo/tasks/t18423-brief.md] pr:#31721 completed:2026-09-10
+- [x] t18424 Correlate objectives with verified outcomes and subagent repair #auto-dispatch #enhancement #framework #observability #interactive priority:high tier:standard ~4h parent:t18422 ref:GH#31699 logged:2026-09-10 -> [todo/tasks/t18424-brief.md] pr:#31726 completed:2026-09-10
+- [x] t18425 Report matched objective cost and routing evidence coverage #auto-dispatch #enhancement #framework #observability #interactive priority:high tier:standard ~3h parent:t18422 ref:GH#31701 logged:2026-09-10 -> [todo/tasks/t18425-brief.md] pr:#31729 completed:2026-09-10
+- [x] t18426 Prepare portable bounded model-effort pilot using existing replay #auto-dispatch #enhancement #framework #observability #interactive priority:medium status:blocked tier:standard ~3h parent:t18422 blocked-by:t18425 ref:GH#31700 logged:2026-09-10 -> [todo/tasks/t18426-brief.md] pr:#31731 completed:2026-09-10
+- [x] t18427 Evaluate effort and delegation economics and document routing decision #auto-dispatch #enhancement #framework #observability #interactive priority:medium status:blocked tier:thinking ~2h parent:t18422 blocked-by:t18426 ref:GH#31702 logged:2026-09-10 -> [todo/tasks/t18427-brief.md] verified:2026-09-10 completed:2026-09-24
+
+
+## Production outcome and repair recording
+
+- [x] t18433 Integrate production objective outcomes and subagent repair evidence #auto-dispatch #enhancement #framework #observability #interactive priority:medium tier:thinking ~4h ref:GH#31874 logged:2026-09-14 -> [todo/tasks/t18433-brief.md] pr:#31876 completed:2026-09-14
+
+- [x] t18435 Prevent ARG_MAX failures in release workflow reconciliation #auto-dispatch #bug ref:GH#31899 pr:#31900 completed:2026-09-15
+
+- [x] t18434 Fix snapshot-mode failed pre-publication release retries #auto-dispatch #bug ref:GH#31897 pr:#31901 completed:2026-09-15
+
+- [x] t18440 Correct retained lane aggregation provenance #interactive #orchestration #release tier:standard ref:GH#31964 pr:#31966 completed:2026-09-16
+
+- [x] t18441 Allow snapshot release retries to expand verified authorization #auto-dispatch #bug #release #security #interactive priority:critical tier:thinking ~2h ref:GH#31967 logged:2026-09-16 -> [todo/tasks/t18441-brief.md] pr:#31969 completed:2026-09-16
+
+- [x] t18442 Repin recovered release snapshot after authorization expansion #auto-dispatch #bug #release #security #interactive priority:critical tier:thinking ~2h ref:GH#31971 logged:2026-09-16 -> [todo/tasks/t18442-brief.md] pr:#31973 completed:2026-09-16
+- [x] t18508 Quality sweep: publish partial results when a large repo exceeds the per-repo budget #auto-dispatch #bug ref:GH#32737 pr:#32902 completed:2026-09-28
+- [x] t18507 test(dispatch): repair four structural tests stale after pulse-dispatch-core split #auto-dispatch #bug ref:GH#32733 pr:#32783 completed:2026-09-28
+- [x] t18506 Persistent dashboard issues: accuracy, privacy and public meaningfulness #enhancement ref:GH#32730 pr:#32735 completed:2026-10-03
+- [x] t18513 Quality dashboard comment hygiene silently no-ops on large threads #bug ref:GH#32752 pr:#32755 completed:2026-10-03
+
+- [x] t18526 Fix stale OpenCode pin assertion in test-tool-version-check-opencode.sh #auto-dispatch #bug ref:GH#32864 pr:#32874 completed:2026-09-28
+- [x] t18527 fix(seo): keywords rollup uses the target's own site platform #bug #seo ref:GH#32867 pr:#32868 completed:2026-10-03
+- [x] t18525 Install and update Cloudflare cf CLI via setup and update-tools #enhancement ref:GH#32862 pr:#32863 completed:2026-10-03
+- [x] t18524 fix(seo): keywords allow one target per phrase per site #bug #seo ref:GH#32854 pr:#32856 completed:2026-10-03
+- [x] t18523 Add Cloudflare cf CLI guidance and routing #enhancement ref:GH#32850 pr:#32851 completed:2026-10-03
+- [x] t18558 fix(prefetch): events tickle 304 must not skip owners whose snapshots are stale (private-org public events feed) #bug ref:GH#33074 pr:#33076 completed:2026-09-29
+
+- [x] t18561 fix: repos migrate-layout apply fails on OpenCode DBs with no matching rows #bug ref:GH#33108 pr:#33111 completed:2026-10-03
+- [x] t18562 fix(worker): route unverified post-PR handoff with durable PR to checkpoint, not failure and tier escalation #bug ref:GH#33115 pr:#33118 completed:2026-09-30
+- [x] t18578 perf(ci): remove duplicate serial ShellCheck pass from required Framework Validation critical path #enhancement ref:GH#33182 pr:#33185 completed:2026-09-30
+
+- [x] t18580 Background routing: Opus 5.5 thinking at high; no sub-medium reasoning for subagents or new A/B arms #enhancement ref:GH#33342 pr:#33347 completed:2026-10-01
+
+- [x] t18581 fix(tests): test-pulse-current-state-guardrails fails 2/26 on main (dispatch_max ledger export, ranked dispatch order) #auto-dispatch #bug ref:GH#33362 pr:#33367 completed:2026-10-01
+
+- [x] t18582 Extend macOS indexing/backup audit with dev churn paths and exclusion coverage #enhancement ref:GH#33398 pr:#33401 completed:2026-10-03
+
+- [ ] to1js8zy8ag99c0gfcn6b16zqrqa-50 Add blind reviewer packets and final requirements acceptance review #auto-dispatch #enhancement ref:GH#33459
+
+- [x] t18586 New WordPress plugin capability: create from WP Plugin Starter with saved maker defaults #enhancement ref:GH#33504 pr:#33515 completed:2026-10-04
+
+- [x] t18600 Decision asks and completion summaries include clickable links to evidence #enhancement ref:GH#33829 pr:#33831 completed:2026-10-06
+
+- [x] t18629 refactor: unify runtime-env trust, Git-shim detection and native Git resoluti... #refactor ref:GH#34133 pr:#34307 completed:2026-10-11
+
+- [x] t18621 fix(worktree): add on existing remote branch fails with silent RECONCILIATION_FAILED #auto-dispatch #bug ref:GH#34002 pr:#34190 completed:2026-10-09
+
+- [x] t18620 feat(pulse): stale queued-run watchdog safely deletes job-less ghost runs #auto-dispatch #enhancement ref:GH#34001 pr:#34192 completed:2026-10-09
+
+- [x] t18619 fix(pulse): preflight timeouts starve the deterministic pipeline (merge pass, dispatch_max, stale_queued_runs) #auto-dispatch #bug ref:GH#34000 pr:#34201 completed:2026-10-09
+
+- [x] t18618 feat(pulse-merge): auto-merge green worker PRs linked via For #N to open non-parent issues #auto-dispatch #enhancement ref:GH#33999 pr:#34194 completed:2026-10-09
+
+- [x] t18617 ci: add timeout-minutes to hung-prone GitHub-hosted jobs (model-replay-linux, code-review-monitoring) #auto-dispatch #bug ref:GH#33986 pr:#34188 completed:2026-10-09
+
+- [x] t18609 fix(pulse): enrichment success check is a false positive when the brief already has Worker Guidance #auto-dispatch #bug #pulse ref:GH#33879 pr:#34189 completed:2026-10-09
+
+- [x] t18608 fix(fast-fail): worker-side failures never flag enrichment_needed #auto-dispatch #bug #pulse ref:GH#33878 pr:#34191 completed:2026-10-09
+
+- [x] t18607 fix(pulse): enrichment worker always aborts on the issue-worker env contract #auto-dispatch #bug #pulse ref:GH#33877 pr:#34207 completed:2026-10-09
+
+
+
+- [x] t18639 GH#34180 Leaf B: durable owner-approved policy for frozen JavaScript worktree installs #auto-dispatch #enhancement tier:thinking ref:GH#34200 pr:#34271 completed:2026-10-10
+
+- [x] t18693 Add VideoRouter, Runpod and H3 media-generation provider awareness with cost comparison #feat #interactive ref:GH#34700 pr:#34702 completed:2026-10-15
+
+- [x] t18694 Record GenAIPro API review: verified contract, do not route (pooled consumer accounts) #feat #interactive ref:GH#34713 pr:#34714 completed:2026-10-14
+
+- [x] t18702 Remove GenAIPro from media-generation provider guidance #feat #interactive ref:GH#34729 pr:#34730 completed:2026-10-15
+
+- [x] t18777 docs: recommend reusable purpose-scoped PATs (extend repo access) instead of per-repo tokens for CLOUDRON_RELEASE_PAT and SYNC_PAT #auto-dispatch #documentation ref:GH#35858 pr:#35969 completed:2026-10-29
+
+- [-] t18797 Deflake bounded-operation timeout case: process_signal null under slow spawn #auto-dispatch #bug ref:GH#36015 declined:2026-10-30
+
+- [-] t18814 fix(sync-workflows): re-pin legacy @main loc-badge callers to release SHA and keep pins current #auto-dispatch #bug ref:GH#36105 declined:2026-10-31
+
+- [-] t18829 Attribute and govern REST core spend outside the local transport governor #bug ref:GH#36212 declined:2026-10-31
+
+- [ ] t18942 pulse-merge-routine: cut fork overhead in the merge pass (~0.45-0.5 core per user) #auto-dispatch #bug ref:GH#37538
+
+- [ ] t18941 pulse-wrapper: cut per-call fork overhead (~0.7-1.2 core per user) #auto-dispatch #bug ref:GH#37537

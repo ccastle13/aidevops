@@ -46,6 +46,46 @@ _normalize_headless_tier() {
 	return 0
 }
 
+# Print routing-table tier candidates that pass the optional provider allowlist,
+# before dispatch-time auth/OAuth-pool availability filtering. Callers use this
+# to distinguish "configured but temporarily unavailable" from "not configured".
+_allowlisted_tier_candidates() {
+	local tier_name="$1"
+	local allowlist_raw="${AIDEVOPS_HEADLESS_PROVIDER_ALLOWLIST:-}"
+	local -a allowlist=()
+	local provider="" model="" allowed_provider="" allowed=false
+	if [[ -n "$allowlist_raw" ]]; then
+		IFS=',' read -r -a allowlist <<<"$allowlist_raw"
+	fi
+	while IFS= read -r model; do
+		[[ -n "$model" ]] || continue
+		provider=$(extract_provider "$model" 2>/dev/null || printf '%s' "")
+		[[ -n "$provider" ]] || continue
+		if [[ ${#allowlist[@]} -gt 0 ]]; then
+			allowed=false
+			for allowed_provider in "${allowlist[@]}"; do
+				allowed_provider=$(trim_spaces "$allowed_provider")
+				if [[ "$allowed_provider" == "$provider" ]]; then
+					allowed=true
+					break
+				fi
+			done
+			[[ "$allowed" == "true" ]] || continue
+		fi
+		printf '%s\n' "$model"
+	done < <(model_tier_candidates "$tier_name" 2>/dev/null || true)
+	return 0
+}
+
+# Return success when the tier has allowlisted candidates, even if every one is
+# currently filtered by auth/OAuth-pool availability (GH#35684).
+_tier_has_allowlisted_candidates() {
+	local tier_name=""
+	tier_name=$(_normalize_headless_tier "${1:-standard}")
+	[[ -n "$(_allowlisted_tier_candidates "$tier_name")" ]] && return 0
+	return 1
+}
+
 # Derive the headless model list from the routing table (GH#17769).
 # Flow: routing table standard tier -> optional provider allowlist -> providers with
 # usable auth at dispatch time. This eliminates AIDEVOPS_HEADLESS_MODELS as a
@@ -55,8 +95,6 @@ get_configured_models() {
 	local requested_tier="${1:-standard}"
 	local tier_name
 	tier_name=$(_normalize_headless_tier "$requested_tier")
-	local allowlist_raw="${AIDEVOPS_HEADLESS_PROVIDER_ALLOWLIST:-}"
-	local -a allowlist=()
 	local -a models=()
 	local provider model
 
@@ -79,27 +117,10 @@ get_configured_models() {
 		fi
 	fi
 
-	if [[ -n "$allowlist_raw" ]]; then
-		IFS=',' read -r -a allowlist <<<"$allowlist_raw"
-	fi
-
 	while IFS= read -r model; do
 			[[ -z "$model" ]] && continue
 			provider=$(extract_provider "$model" 2>/dev/null || printf '%s' "")
 			[[ -z "$provider" ]] && continue
-
-			if [[ ${#allowlist[@]} -gt 0 ]]; then
-				local allowed=false
-				local allowed_provider
-				for allowed_provider in "${allowlist[@]}"; do
-					allowed_provider=$(trim_spaces "$allowed_provider")
-					if [[ "$allowed_provider" == "$provider" ]]; then
-						allowed=true
-						break
-					fi
-				done
-				[[ "$allowed" == "true" ]] || continue
-			fi
 
 			if ! provider_auth_available "$provider"; then
 				continue
@@ -109,7 +130,7 @@ get_configured_models() {
 			fi
 
 			models+=("$model")
-	done < <(model_tier_candidates "$tier_name" 2>/dev/null || true)
+	done < <(_allowlisted_tier_candidates "$tier_name")
 
 	# Local is a privacy boundary: an empty local tier means unavailable, never
 	# permission to use the historical cloud fallback.
@@ -232,9 +253,14 @@ _choose_model_explicit() {
 _first_healthy_configured_model() {
 	local tier_name="${1:-standard}"
 	local selection_mode="${2:-adaptive}"
-	local current_model="" current_provider="" configured_count=0
+	local preferred_model="${3:-}"
+	# GH#32929: capability escalation excludes the route that just failed so a
+	# tier sharing that model can offer its next distinct healthy candidate.
+	local excluded_model="${4:-}"
+	local current_model="" current_provider="" configured_count=0 fallback_model=""
 	while IFS= read -r current_model; do
 		[[ -n "$current_model" ]] || continue
+		[[ -z "$excluded_model" || "$current_model" != "$excluded_model" ]] || continue
 		if [[ "$selection_mode" == "exact-tier" ]] &&
 			! model_tier_candidate_index "$tier_name" "$current_model" >/dev/null 2>&1; then
 			continue
@@ -245,46 +271,86 @@ _first_healthy_configured_model() {
 		provider_auth_available "$current_provider" || continue
 		provider_oauth_pool_available "$current_provider" || continue
 		model_backoff_active "$current_model" && continue
-		printf '%s' "$current_model"
-		return 0
+		if [[ -z "$preferred_model" || "$current_model" == "$preferred_model" ]]; then
+			printf '%s' "$current_model"
+			return 0
+		fi
+		# Search the filtered configured list for the preference, retaining the
+		# first healthy fallback. Preferences cannot bypass provider allowlists.
+		[[ -n "$fallback_model" ]] || fallback_model="$current_model"
 	done < <(get_configured_models "$tier_name")
+	if [[ -n "$fallback_model" ]]; then
+		printf '%s' "$fallback_model"
+		return 0
+	fi
 	[[ "$configured_count" -gt 0 ]] && return 75
 	return 1
 }
 
-# _choose_model_tier_downgrade: check pattern history for a cheaper tier.
-# Prints the downgraded model name if one is recommended; prints nothing otherwise.
-# Non-blocking -- any failure falls through silently.
-_choose_model_tier_downgrade() {
-	local current_model="$1"
-	local downgrade_task_type="${AIDEVOPS_TIER_DOWNGRADE_TASK_TYPE:-}"
-	[[ -n "$downgrade_task_type" ]] || return 0
-
-	local current_tier=""
-	current_tier=$(model_tier_for_model "$current_model" 2>/dev/null || true)
-	[[ -n "$current_tier" ]] || return 0
-
-	local pattern_helper="${SCRIPT_DIR}/archived/pattern-tracker-helper.sh"
-	if [[ ! -x "$pattern_helper" ]]; then
-		pattern_helper="${HOME}/.aidevops/agents/scripts/archived/pattern-tracker-helper.sh"
-	fi
-	[[ -x "$pattern_helper" ]] || return 0
-
-	local lower_tier
-	lower_tier=$("$pattern_helper" tier-downgrade-check \
-		--requested-tier "$current_tier" \
-		--task-type "$downgrade_task_type" \
-		--min-samples "${AIDEVOPS_TIER_DOWNGRADE_MIN_SAMPLES:-3}" \
-		2>/dev/null || true)
-	[[ -n "$lower_tier" ]] || return 0
-
-	local lower_model
-	lower_model=$(_first_healthy_configured_model "$lower_tier" 2>/dev/null || true)
-	if [[ -n "$lower_model" && "$lower_model" != "$current_model" ]]; then
-		print_info "Model for dispatch: pattern data recommends ${lower_tier} over ${current_tier} (TIER_DOWNGRADE_OK, task_type=${downgrade_task_type})"
-		printf '%s' "$lower_model"
-	fi
+# Atomically reserve the next healthy provider for an independent worker
+# dispatch. A per-tier key prevents a simple task from moving the standard tier
+# slot; BEGIN IMMEDIATE serializes concurrent selectors on the same state DB.
+_reserve_worker_provider() {
+	local tier_name="$1"
+	shift
+	local -a providers=("$@")
+	local rotation_role=""
+	local selected_provider=""
+	local cases="" index=0 next=0
+	for ((index = 0; index < ${#providers[@]}; index++)); do
+		next=$(((index + 1) % ${#providers[@]}))
+		cases+=" WHEN '$(sql_escape "${providers[$index]}")' THEN '$(sql_escape "${providers[$next]}")'"
+	done
+	rotation_role=$(sql_escape "worker:${tier_name}")
+	selected_provider=$(db_query "
+BEGIN IMMEDIATE;
+INSERT OR IGNORE INTO provider_rotation (role, last_provider)
+VALUES ('${rotation_role}', '$(sql_escape "${providers[${#providers[@]} - 1]}")');
+UPDATE provider_rotation SET
+  last_provider = CASE last_provider ${cases} ELSE '$(sql_escape "${providers[0]}")' END,
+  updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE role = '${rotation_role}';
+SELECT last_provider FROM provider_rotation WHERE role = '${rotation_role}';
+COMMIT;
+") || return 1
+	printf '%s' "$selected_provider"
 	return 0
+}
+
+# Round-robin only across distinct, healthy same-tier providers. Preserve the
+# first model per provider and the existing preference/retry path unchanged.
+_choose_worker_round_robin_model() {
+	local tier_name="$1"
+	local model="" provider="" selected_provider="" existing="" found=false index=0
+	local -a models=() providers=()
+	while IFS= read -r model; do
+		[[ -n "$model" ]] || continue
+		provider=$(extract_provider "$model" 2>/dev/null || true)
+		[[ -n "$provider" ]] || continue
+		provider_auth_available "$provider" || continue
+		provider_oauth_pool_available "$provider" || continue
+		model_backoff_active "$model" && continue
+		found=false
+		for existing in "${providers[@]}"; do
+			[[ "$existing" != "$provider" ]] || found=true
+		done
+		[[ "$found" == false ]] || continue
+		models+=("$model")
+		providers+=("$provider")
+	done < <(get_configured_models "$tier_name")
+	[[ ${#models[@]} -gt 0 ]] || return 1
+	if [[ ${#models[@]} -eq 1 ]]; then
+		printf '%s' "${models[0]}"
+		return 0
+	fi
+	selected_provider=$(_reserve_worker_provider "$tier_name" "${providers[@]}") || return 75
+	for ((index = 0; index < ${#providers[@]}; index++)); do
+		if [[ "$selected_provider" == "${providers[$index]}" ]]; then
+			printf '%s' "${models[$index]}"
+			return 0
+		fi
+	done
+	return 75
 }
 
 # _choose_model_auto: select the first available model in configured order.
@@ -293,8 +359,24 @@ _choose_model_auto() {
 	local role="$1"
 	local tier_name="${2:-standard}"
 	local selection_mode="${3:-adaptive}"
+	local preferred_model="${4:-}"
 	local current_model="" select_status=0
-	current_model=$(_first_healthy_configured_model "$tier_name" "$selection_mode") || select_status=$?
+	local rotated=false
+	if [[ "$role" == "worker" && "$selection_mode" == "adaptive" && -z "$preferred_model" ]] &&
+		declare -F model_tier_round_robin_enabled >/dev/null &&
+		model_tier_round_robin_enabled "$tier_name"; then
+		current_model=$(_choose_worker_round_robin_model "$tier_name") || select_status=$?
+		[[ "$select_status" -ne 0 ]] || rotated=true
+	else
+		current_model=$(_first_healthy_configured_model "$tier_name" "$selection_mode" "$preferred_model") || select_status=$?
+	fi
+	# GH#35684: get_configured_models drops providers whose auth or OAuth pool
+	# is unavailable, so a transient cooldown of every configured provider
+	# looks like "nothing configured". Classify it as backoff (75) instead of a
+	# permanent configuration failure (1).
+	if [[ "$select_status" -eq 1 ]] && _tier_has_allowlisted_candidates "$tier_name"; then
+		select_status=75
+	fi
 	if [[ "$select_status" -eq 1 ]]; then
 		print_error "No direct provider models configured for headless runtime"
 		return 1
@@ -305,14 +387,7 @@ _choose_model_auto() {
 	fi
 
 	case "$selection_mode" in
-	adaptive)
-		# Pattern-driven tier downgrade (t5148): non-blocking initial-dispatch
-		# optimization. Retry and capability-escalation callers use exact-tier mode.
-		local downgraded=""
-		downgraded=$(_choose_model_tier_downgrade "$current_model")
-		[[ -z "$downgraded" ]] || current_model="$downgraded"
-		;;
-	exact-tier) ;;
+	adaptive | exact-tier) ;;
 	*)
 		print_error "Unknown model selection mode: $selection_mode"
 		return 1
@@ -320,7 +395,11 @@ _choose_model_auto() {
 	esac
 	local current_provider=""
 	current_provider=$(extract_provider "$current_model")
-	set_last_provider "$role" "$current_provider"
+	# The opt-in slot is reserved atomically above. Legacy role-level telemetry
+	# remains for ordinary priority and explicit-preference selection.
+	if [[ "$rotated" == false ]]; then
+		set_last_provider "$role" "$current_provider"
+	fi
 	printf '%s' "$current_model"
 	return 0
 }
@@ -330,35 +409,24 @@ choose_model() {
 	local explicit_model="${2:-}"
 	local tier_name="${3:-standard}"
 	local selection_mode="${4:-adaptive}"
+	local initial_model="${5:-}"
 
 	if [[ -n "$explicit_model" ]]; then
 		_choose_model_explicit "$explicit_model" "$role"
 		return $?
 	fi
 
-	_choose_model_auto "$role" "$tier_name" "$selection_mode"
+	if [[ -n "$initial_model" ]]; then
+		# A stale/unavailable dispatcher preference is not an explicit pin. Keep
+		# fallback inside the requested tier, without adaptive tier downgrades.
+		selection_mode="exact-tier"
+	fi
+
+	_choose_model_auto "$role" "$tier_name" "$selection_mode" "$initial_model"
 	return $?
 }
 
 # --- Cmd Builders ---
-
-_headless_variant_should_omit_gpt55_standard() {
-	local role="$1"
-	local tier_upper="$2"
-	local selected_model="$3"
-	local variant="$4"
-
-	[[ "$role" == "worker" ]] || return 1
-	[[ -n "$variant" ]] || return 1
-	case "$tier_upper" in
-	STANDARD) ;;
-	*) return 1 ;;
-	esac
-	case "$selected_model" in
-	openai/gpt-5.5 | openai/gpt-5.5-*) return 0 ;;
-	*) return 1 ;;
-	esac
-}
 
 _headless_tier_variant() {
 	local requested_tier="$1"
@@ -391,7 +459,6 @@ resolve_headless_variant() {
 	local tier="${2:-}"
 	local selected_model="${3:-}"
 	local variant="${AIDEVOPS_HEADLESS_VARIANT:-}"
-	local tier_upper=""
 	local canonical_tier=""
 	# Replay cells with requested effort "default" must not inherit ambient or
 	# routed effort. Explicit --variant values bypass this resolver.
@@ -401,7 +468,6 @@ resolve_headless_variant() {
 
 	if [[ -n "$tier" ]]; then
 		canonical_tier=$(_normalize_headless_tier "$tier")
-		tier_upper=$(printf '%s' "$canonical_tier" | tr '[:lower:]-' '[:upper:]_')
 		local tier_variant
 		tier_variant=$(_headless_tier_variant "$tier" "$canonical_tier")
 		[[ -n "$tier_variant" ]] && variant="$tier_variant"
@@ -430,13 +496,21 @@ resolve_headless_variant() {
 		variant=$(_headless_routed_variant "$canonical_tier" "$selected_model")
 	fi
 
-	# GPT-5.5 currently benchmarks fastest for standard worker dispatch when
-	# OpenCode sends no explicit reasoning-effort variant. Keep explicit CLI
-	# --variant untouched (caller bypasses this resolver when provided), but
-	# ignore env-derived high/xhigh defaults for non-thinking worker tiers.
-	if _headless_variant_should_omit_gpt55_standard "$role" "$tier_upper" "$selected_model" "$variant"; then
-		variant=""
-	fi
+	# Unknown models without a configured variant keep their provider default.
+	# Explicit effort below the framework floor is raised, never silently omitted.
+	case "$variant" in
+	low | minimal | none)
+		local configured_variant=""
+		configured_variant=$(_headless_routed_variant "$canonical_tier" "$selected_model")
+		if [[ -z "$configured_variant" ]]; then
+			printf 'Warning: headless reasoning %s is below minimum; unknown model uses provider default\n' "$variant" >&2
+			variant=""
+		else
+			printf 'Warning: headless reasoning %s is below minimum; using %s\n' "$variant" "$configured_variant" >&2
+			variant="$configured_variant"
+		fi
+		;;
+	esac
 
 	printf '%s' "$variant"
 	return 0
@@ -497,24 +571,36 @@ _build_run_cmd() {
 	local agent_name="$6"
 	local persisted_session="$7"
 	shift 7
+	local opencode_profile="${AIDEVOPS_OPENCODE_PROFILE:-v1}"
+	local command_model="$selected_model"
+	if [[ "$opencode_profile" == "v2" && -n "$variant_override" ]]; then
+		command_model="${selected_model}#${variant_override}"
+	fi
 
 	# Emit base command args as null-delimited tokens (bash 3.2 compat: no local -a in subshell)
-	printf '%s\0' "${HEADLESS_OPENCODE_BIN:-$OPENCODE_BIN_DEFAULT}" run "$prompt" --dir "$work_dir" -m "$selected_model" --title "$title" --format json
+	printf '%s\0' "${HEADLESS_OPENCODE_BIN:-$OPENCODE_BIN_DEFAULT}" run "$prompt" -m "$command_model" --title "$title" --format json
+	if [[ "$opencode_profile" == "v2" ]]; then
+		# OpenCode V2 removed `run --dir` and defaults to its shared background
+		# service. The invocation layer sets cwd before launch; standalone keeps
+		# each headless run inside its existing isolated runtime boundary.
+		printf '%s\0' --standalone
+	else
+		printf '%s\0' --dir "$work_dir"
+	fi
 	if [[ -n "$agent_name" ]]; then
 		printf '%s\0' --agent "$agent_name"
 	fi
 	if [[ -n "$persisted_session" ]]; then
 		printf '%s\0' --session "$persisted_session" --continue
 	fi
-	if [[ -n "$variant_override" ]]; then
+	if [[ -n "$variant_override" && "$opencode_profile" != "v2" ]]; then
 		printf '%s\0' --variant "$variant_override"
 	fi
-	# GH#17829: Attach persistent runs to an existing opencode server if one is
-	# detected. Ephemeral roles must retain their isolated runtime boundary.
-	# Without this, `opencode run` tries to start an embedded server that
-	# conflicts with the user's `opencode serve`, causing "Session not found".
+	# GH#17829: Preserve ambient-server compatibility only when auth isolation
+	# is disabled. Isolated runs must use their own database and provider auth;
+	# ephemeral roles and v2 always retain their standalone runtime boundary.
 	local _server_info=""
-	if ! _headless_run_is_ephemeral "${role:-}" && _server_info=$(_detect_opencode_server); then
+	if [[ "$opencode_profile" != "v2" && "${AIDEVOPS_HEADLESS_AUTH_ISOLATION:-1}" != "1" ]] && ! _headless_run_is_ephemeral "${role:-}" && _server_info=$(_detect_opencode_server); then
 		local _server_url _server_pass
 		_server_url=$(echo "$_server_info" | head -1)
 		_server_pass=$(echo "$_server_info" | tail -1)
@@ -525,6 +611,28 @@ _build_run_cmd() {
 	# check (which flags $1-$9 usage) stays quiet while behaviour is identical.
 	if [[ $# -gt 0 ]]; then
 		printf '%s\0' "$@"
+	fi
+	return 0
+}
+
+# _claude_agent_id: map an OpenCode agent name to a Claude Code agent ID.
+# "Build+" -> "build-plus"; other names are lowercased with spaces as hyphens.
+# Prints nothing when no matching ~/.claude/agents/<id>.md exists, so the
+# caller falls back to its default instead of passing an unknown --agent.
+_claude_agent_id() {
+	local agent_name="$1"
+	[[ -n "$agent_name" ]] || return 0
+	local claude_agent_dir="${AIDEVOPS_CLAUDE_AGENT_DIR:-$HOME/.claude/agents}"
+	if [[ -f "$claude_agent_dir/${agent_name}.md" ]]; then
+		printf '%s' "$agent_name"
+		return 0
+	fi
+	local agent_id
+	agent_id=$(printf '%s' "$agent_name" | tr '[:upper:]' '[:lower:]')
+	agent_id="${agent_id//+/-plus}"
+	agent_id="${agent_id// /-}"
+	if [[ -f "$claude_agent_dir/${agent_id}.md" ]]; then
+		printf '%s' "$agent_id"
 	fi
 	return 0
 }
@@ -561,6 +669,11 @@ _build_claude_cmd() {
 		printf '%s\0' "$prompt"
 	fi
 	printf '%s\0' "--output-format" "stream-json" "--verbose"
+	# OpenCode agent display names ("Build+") are not Claude Code agent IDs.
+	# Claude Code resolves --agent against ~/.claude/agents/<id>.md and exits 1
+	# with "--agent 'Build+' not found" otherwise, which surfaced as
+	# local_error on every Claude-runtime dispatch.
+	agent_name=$(_claude_agent_id "$agent_name")
 	if [[ -n "$agent_name" ]]; then
 		printf '%s\0' "--agent" "$agent_name"
 	elif type -P claude >/dev/null 2>&1; then
@@ -591,8 +704,16 @@ _build_claude_cmd() {
 	return 0
 }
 
+# GH#33274: terminal BLOCKED must start a model-text line, optionally after
+# blockquote or emphasis markup (`BLOCKED:`, `**BLOCKED**`, `> BLOCKED -`).
+# Quoted instructions such as "stop only at `FULL_LOOP_COMPLETE` or `BLOCKED`"
+# are prose mentions, not a terminal state.
+# shellcheck disable=SC2016 # literal backticks are Python regex syntax, not expansion
+_HEADLESS_BLOCKED_LINE_PATTERN='^[ \t]*(?:>[ \t]*)?(?:(?:\*\*|__)?(?:Outcome|Status|Result)(?:[ \t]*:(?:\*\*|__)?|(?:\*\*|__)[ \t]*:)[ \t]*)?(?:\*\*|__|`)?BLOCKED(?:\*\*|__|`)?(?=$|[ \t:.,;!\-])'
+
 # output_has_completion_signal: check if a worker run produced a meaningful
-# completion signal (FULL_LOOP_COMPLETE, exact POST_PR_HANDOFF, BLOCKED, or PR creation).
+# completion signal (FULL_LOOP_COMPLETE, exact POST_PR_HANDOFF, anchored
+# BLOCKED, or PR creation).
 # Workers that produce tool calls but exit without these signals stopped
 # prematurely -- typically after investigation/setup but before implementation.
 #
@@ -601,8 +722,8 @@ _build_claude_cmd() {
 output_has_completion_signal() {
 	local file_path="$1"
 	[[ -f "$file_path" ]] || return 1
-	python3 - "$file_path" <<'PY'
-import sys, json
+	python3 - "$file_path" "$_HEADLESS_BLOCKED_LINE_PATTERN" <<'PY'
+import sys, json, re
 from pathlib import Path
 
 # GH#17549: Only check the MODEL'S OWN text output, not tool call results.
@@ -615,7 +736,10 @@ from pathlib import Path
 # check only those. Fall back to raw grep for non-JSON output (claude CLI).
 
 raw = Path(sys.argv[1]).read_text(errors='ignore')
-blocked_marker = chr(66) + chr(76) + chr(79) + chr(67) + chr(75) + chr(69) + chr(68)
+# GH#33274: completion markers count bare or as <promise>MARKER</promise>,
+# not when quoted or backticked as a mention.
+blocked_line = re.compile(sys.argv[2], re.MULTILINE)
+completion_marker = re.compile(r"(?<![`'\"\w])(?:FULL_LOOP_COMPLETE|TASK_COMPLETE)(?![`'\"\w])")
 
 # Extract model text from JSON stream (OpenCode format)
 model_text_parts = []
@@ -633,11 +757,10 @@ for line in raw.splitlines():
     event_type = obj.get("type", "")
     if event_type == "text":
         part = obj.get("part", {})
-        text = (
-            obj.get("text")
-            or part.get("text")
-            or ""
-        )
+        # GH#33274: runtime-injected parts are not model output.
+        if part.get("synthetic") is True:
+            continue
+        text = obj.get("text") or part.get("text") or ""
         if text:
             model_text_parts.append(text)
     # Also check tool calls where the MODEL invoked gh pr create/merge
@@ -652,10 +775,11 @@ for line in raw.splitlines():
             or state.get("input")
             or {}
         )
-        if isinstance(inp, dict):
-            cmd = inp.get("command", "")
-            if cmd:
-                model_text_parts.append(cmd)
+        cmd = inp.get("command", "") if isinstance(inp, dict) else ""
+        if isinstance(cmd, (list, tuple)):  # argv tools: a list crashed join() -> false premature_exit
+            cmd = " ".join(map(str, cmd))
+        if isinstance(cmd, str) and cmd:
+            model_text_parts.append(cmd)
 
 model_text = "\n".join(model_text_parts)
 
@@ -664,11 +788,10 @@ def has_post_pr_handoff(text):
 
 # If we extracted model text, use it exclusively
 if model_text.strip():
-    if has_post_pr_handoff(model_text):
+    if has_post_pr_handoff(model_text) or blocked_line.search(model_text):
         sys.exit(0)
-    for marker in ("FULL_LOOP_COMPLETE", blocked_marker, "TASK_COMPLETE"):
-        if marker in model_text:
-            sys.exit(0)
+    if completion_marker.search(model_text):
+        sys.exit(0)
     # GH#17596 (HIGH): verify both model intent AND actual success signal in raw.
     # Checking model_text alone may match commands the model merely mentioned
     # or invoked but that failed. Requiring a success signal in raw (same as
@@ -681,12 +804,11 @@ if model_text.strip():
         sys.exit(0)
     sys.exit(1)
 
-# Fallback for non-JSON output (claude CLI, plain text)
-if has_post_pr_handoff(raw):
+# Fallback for non-JSON output (claude CLI, plain text). Escaped newlines and
+# JSON text/result value starts count as line starts for anchored BLOCKED.
+raw_lines = re.sub(r'\\n|"(?:text|result)":\s*"', "\n", raw)
+if has_post_pr_handoff(raw) or blocked_line.search(raw_lines) or completion_marker.search(raw):
     sys.exit(0)
-for marker in ("FULL_LOOP_COMPLETE", blocked_marker, "TASK_COMPLETE"):
-    if marker in raw:
-        sys.exit(0)
 if "gh pr create" in raw and ("pull/" in raw or "Created pull request" in raw.lower()):
     sys.exit(0)
 if "gh pr merge" in raw and ("Merged" in raw or "merged" in raw):
@@ -746,16 +868,16 @@ output_has_post_pr_handoff_signal() {
 # successful implementation and must not inflate PR-throughput success metrics.
 #
 # Args: $1 = output file path
-# Returns: 0 if the model emitted BLOCKED, 1 otherwise
+# Returns: 0 if a non-synthetic model-text line starts with BLOCKED, 1 otherwise
 output_has_blocked_signal() {
 	local file_path="$1"
 	[[ -f "$file_path" ]] || return 1
-	python3 - "$file_path" <<'PY'
-import sys, json
+	python3 - "$file_path" "$_HEADLESS_BLOCKED_LINE_PATTERN" <<'PY'
+import sys, json, re
 from pathlib import Path
 
 raw = Path(sys.argv[1]).read_text(errors="ignore")
-blocked_marker = chr(66) + chr(76) + chr(79) + chr(67) + chr(75) + chr(69) + chr(68)
+blocked_line = re.compile(sys.argv[2], re.MULTILINE)
 model_text_parts = []
 for line in raw.splitlines():
     line = line.strip()
@@ -765,17 +887,21 @@ for line in raw.splitlines():
         obj = json.loads(line)
     except (json.JSONDecodeError, ValueError):
         continue
-    if obj.get("type", "") != "text":
+    if not isinstance(obj, dict) or obj.get("type", "") != "text":
         continue
     part = obj.get("part", {})
+    # GH#33274: runtime-injected parts are not model output.
+    if isinstance(part, dict) and part.get("synthetic") is True:
+        continue
     text = obj.get("text") or part.get("text") or ""
     if text:
         model_text_parts.append(text)
 
 model_text = "\n".join(model_text_parts)
-if model_text.strip():
-    sys.exit(0 if blocked_marker in model_text else 1)
-sys.exit(0 if blocked_marker in raw else 1)
+# Fallback (claude CLI stream-json, plain text): treat escaped newlines and
+# JSON text/result value starts as line starts for the anchored match.
+candidate = model_text if model_text.strip() else re.sub(r'\\n|"(?:text|result)":\s*"', "\n", raw)
+sys.exit(0 if blocked_line.search(candidate) else 1)
 PY
 	return $?
 }
@@ -839,12 +965,12 @@ PY
 output_has_missing_context_blocked_signal() {
 	local file_path="$1"
 	[[ -f "$file_path" ]] || return 1
-	python3 - "$file_path" <<'PY'
+	python3 - "$file_path" "$_HEADLESS_BLOCKED_LINE_PATTERN" <<'PY'
 import sys, json, re
 from pathlib import Path
 
 error_mode = "ign" "ore"
-blocked_marker = chr(66) + chr(76) + chr(79) + chr(67) + chr(75) + chr(69) + chr(68)
+blocked_line = re.compile(sys.argv[2], re.MULTILINE)
 raw = Path(sys.argv[1]).read_text(errors=error_mode)
 model_text_parts = []
 for line in raw.splitlines():
@@ -855,16 +981,19 @@ for line in raw.splitlines():
         obj = json.loads(line)
     except (json.JSONDecodeError, ValueError):
         continue
-    if obj.get("type", "") != "text":
+    if not isinstance(obj, dict) or obj.get("type", "") != "text":
         continue
     part = obj.get("part", {})
+    # GH#33274: runtime-injected parts are not model output.
+    if isinstance(part, dict) and part.get("synthetic") is True:
+        continue
     text = obj.get("text") or part.get("text") or ""
     if text:
         model_text_parts.append(text)
 
 model_text = "\n".join(model_text_parts)
 text = model_text if model_text.strip() else raw
-has_blocked = blocked_marker in text
+has_blocked = blocked_line.search(text) is not None
 has_missing_context = re.search(r"missing[ -]implementation[ -]context", text, re.IGNORECASE) is not None
 sys.exit(0 if has_blocked and has_missing_context else 1)
 PY

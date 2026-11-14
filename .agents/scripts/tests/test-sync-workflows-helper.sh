@@ -13,11 +13,19 @@
 
 set -uo pipefail
 
+# Resolve native Git once from the system default PATH (portable to non-FHS
+# hosts such as NixOS); fixtures must bypass the aidevops git wrapper.
+TEST_NATIVE_GIT=$(command -p -v git) || {
+	printf '%s\n' 'Native Git is unavailable on the system PATH' >&2
+	exit 1
+}
+export TEST_NATIVE_GIT
+
 # Fixture repositories are disposable. Export a test-local native Git boundary
 # so child helper shells cannot inherit the runtime's canonical-repo guard while
 # the normal PATH remains available for dependencies such as jq.
 git() {
-	local _git_bin="${AIDEVOPS_TEST_GIT_BIN:-/usr/bin/git}"
+	local _git_bin="${AIDEVOPS_TEST_GIT_BIN:-${TEST_NATIVE_GIT}}"
 	"$_git_bin" "$@"
 	return $?
 }
@@ -105,8 +113,22 @@ _setup_mock_gh() {
 	cat >"$_tmpdir/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${GH_CALL_LOG:?}"
-if [[ "${1:-} ${2:-}" == "pr create" ]]; then
-	printf 'mock-pr\n'
+if [[ "${1:-}" == api && "${2:-}" == repos/* && "$*" == *'.private | tostring'* ]]; then
+	# Model a known public repository; keep the real privacy scanner enabled.
+	printf 'false\n'
+elif [[ "${1:-} ${2:-}" == "pr create" ]]; then
+	repo=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--repo) repo="$2"; shift ;;
+		origin:*) printf '%s\n' "$1" >"$GH_CALL_LOG.origin" ;;
+		esac
+		shift
+	done
+	[[ -n "$repo" && -s "$GH_CALL_LOG.origin" ]] || exit 1
+	printf 'https://github.com/%s/pull/1\n' "$repo"
+elif [[ "${1:-}" == api && "${2:-}" == /repos/*/issues/* ]]; then
+	cat "$GH_CALL_LOG.origin"
 fi
 exit 0
 EOF
@@ -247,10 +269,10 @@ _assert_contains "unknown option error message" "$OUT_9" "unknown option"
 # Strategy: create a local git repo with develop as default branch + a local bare
 # remote so push succeeds. Run --apply; verify the committed workflow has
 # `branches: [develop]` even though the canonical template ships `branches: [main]`.
-# Note: _sync_open_pr will fail (gh_create_pr unavailable) but _sync_write_commit_push
-# will have already committed the file to the feature branch before that.
+# GitHub is mocked; pushes go only to the disposable local bare remote.
 TMPDIR_10="$(mktemp -d)"
 _setup_fake_home "$TMPDIR_10"
+_setup_mock_gh "$TMPDIR_10"
 # Local bare remote so `git push` succeeds.
 BARE_10="$TMPDIR_10/bare.git"
 git init --bare -q "$BARE_10" 2>/dev/null
@@ -277,7 +299,9 @@ git -C "$REPO_10" fetch -q origin 2>/dev/null
 git -C "$REPO_10" remote set-head origin develop 2>/dev/null
 _write_repos_json "$TMPDIR_10" "{\"initialized_repos\":[{\"path\":\"$REPO_10\",\"slug\":\"owner/repo-develop\"}]}"
 SYNC_BRANCH_10="chore/workflow-sync-$(date +%Y%m%d)"
-HOME="$TMPDIR_10" bash "$HELPER" --apply 2>/dev/null || true
+HOME="$TMPDIR_10" PATH="$TMPDIR_10/bin:$PATH" GH_CALL_LOG="$TMPDIR_10/gh-calls.log" \
+	bash "$HELPER" --apply 2>/dev/null
+_assert_exit "develop-branch apply succeeds with mocked GitHub" 0 "$?"
 # Verify the committed file on the feature branch has branches: [develop].
 WF_BRANCHES_10=$(git -C "$REPO_10" show "${SYNC_BRANCH_10}:.github/workflows/issue-sync.yml" 2>/dev/null \
 	| grep -E "^\s+branches:" | head -1 || true)
@@ -306,24 +330,25 @@ _setup_fake_home "$TMPDIR_11"
 mkdir -p \
 	"$TMPDIR_11/repo-runneradd/.github/workflows" \
 	"$TMPDIR_11/repo-runnerchange/.github/workflows" \
-	"$TMPDIR_11/repo-runnerremove/.github/workflows"
+	"$TMPDIR_11/repo-runnerkeep/.github/workflows"
 # Canonical caller — no runner: line.
 printf '%s\n' "$CANONICAL_CALLER_CONTENT" >"$TMPDIR_11/repo-runneradd/.github/workflows/issue-sync.yml"
-# Canonical callers with stale runner values exercise change and removal.
+# Canonical callers with existing runner values exercise change and preservation.
 RUNNER_CONTENT_11=$(printf '%s\n' "$CANONICAL_CALLER_CONTENT" \
 	| sed -E 's|^(    with:)$|\1\n      runner: ubuntu-old|')
 printf '%s\n' "$RUNNER_CONTENT_11" >"$TMPDIR_11/repo-runnerchange/.github/workflows/issue-sync.yml"
-printf '%s\n' "$RUNNER_CONTENT_11" >"$TMPDIR_11/repo-runnerremove/.github/workflows/issue-sync.yml"
-# repos.json adds, changes, and removes runner overrides across the fixtures.
+printf '%s\n' "$RUNNER_CONTENT_11" >"$TMPDIR_11/repo-runnerkeep/.github/workflows/issue-sync.yml"
+# repos.json adds and changes overrides, but absence preserves the caller choice.
 _write_repos_json "$TMPDIR_11" \
-	"{\"initialized_repos\":[{\"path\":\"$TMPDIR_11/repo-runneradd\",\"slug\":\"owner/repo-runneradd\",\"runner\":\"ubuntu-latest-arm64\"},{\"path\":\"$TMPDIR_11/repo-runnerchange\",\"slug\":\"owner/repo-runnerchange\",\"runner\":\"ubuntu-new\"},{\"path\":\"$TMPDIR_11/repo-runnerremove\",\"slug\":\"owner/repo-runnerremove\"}]}"
+	"{\"initialized_repos\":[{\"path\":\"$TMPDIR_11/repo-runneradd\",\"slug\":\"owner/repo-runneradd\",\"runner\":\"ubuntu-latest-arm64\"},{\"path\":\"$TMPDIR_11/repo-runnerchange\",\"slug\":\"owner/repo-runnerchange\",\"runner\":\"ubuntu-new\"},{\"path\":\"$TMPDIR_11/repo-runnerkeep\",\"slug\":\"owner/repo-runnerkeep\"}]}"
 OUT_11=$(HOME="$TMPDIR_11" bash "$HELPER" --json 2>/dev/null)
 _assert_contains "GH#21897 → CURRENT/CALLER + repos.json runner is actionable" "$OUT_11" '"slug":"owner/repo-runneradd"'
 _assert_contains "GH#21897 → planned outcome on runner add" "$OUT_11" '"outcome":"PLANNED"'
 _assert_contains "GH#21897 → CURRENT/CALLER classification preserved" "$OUT_11" '"classification":"CURRENT/CALLER"'
 _assert_contains "GH#27725 → runner-add dry-run describes runner update" "$OUT_11" '"slug":"owner/repo-runneradd","classification":"CURRENT/CALLER","outcome":"PLANNED","detail":"update runner → .github/workflows/issue-sync.yml'
 _assert_contains "GH#27725 → runner-change dry-run describes runner update" "$OUT_11" '"slug":"owner/repo-runnerchange","classification":"CURRENT/CALLER","outcome":"PLANNED","detail":"update runner → .github/workflows/issue-sync.yml'
-_assert_contains "GH#27725 → runner-removal dry-run describes runner update" "$OUT_11" '"slug":"owner/repo-runnerremove","classification":"CURRENT/CALLER","outcome":"PLANNED","detail":"update runner → .github/workflows/issue-sync.yml'
+_assert_exit "GH#34873 → caller-only runner has no registry drift" 0 \
+	"$(printf '%s\n' "$OUT_11" | jq -s '[.[] | select(.slug == "owner/repo-runnerkeep")] | length')"
 rm -rf "$TMPDIR_11"
 
 # ─── Test 12: GH#21897 — CURRENT/CALLER + matching runner already injected → no work ───
@@ -382,9 +407,36 @@ _assert_contains "GH#27725 → maintainer-gate dry-run names selected workflow" 
 	"$OUT_12_MAINTAINER" '"detail":"refresh → .github/workflows/maintainer-gate.yml'
 rm -rf "$TMPDIR_12_MAINTAINER"
 
+# GH#34872: identify policy refresh separately from workflow-only drift.
+TMPDIR_POLICY="$(mktemp -d)"
+_setup_fake_home "$TMPDIR_POLICY"
+for POLICY_CASE in legacy current; do
+	mkdir -p "$TMPDIR_POLICY/$POLICY_CASE/.github/workflows"
+	cp "$SCRIPT_DIR/../../templates/workflows/linked-issue-check-caller.yml" \
+		"$TMPDIR_POLICY/$POLICY_CASE/.github/workflows/linked-issue-check.yml"
+	printf '\n# workflow drift\n' >>"$TMPDIR_POLICY/$POLICY_CASE/.github/workflows/linked-issue-check.yml"
+	cp "$SCRIPT_DIR/../../templates/issue-first-pr-contributing.md" \
+		"$TMPDIR_POLICY/$POLICY_CASE/CONTRIBUTING.md"
+done
+# Remove only the scope declaration, matching the original managed rollout.
+grep -v 'aidevops:issue-first-pr:scope=' \
+	"$TMPDIR_POLICY/current/CONTRIBUTING.md" >"$TMPDIR_POLICY/legacy/CONTRIBUTING.md"
+_write_repos_json "$TMPDIR_POLICY" \
+	"{\"initialized_repos\":[{\"path\":\"$TMPDIR_POLICY/legacy\",\"slug\":\"owner/policy-legacy\"},{\"path\":\"$TMPDIR_POLICY/current\",\"slug\":\"owner/policy-current\"}]}"
+OUT_POLICY=$(HOME="$TMPDIR_POLICY" bash "$HELPER" --workflow linked-issue-check --json 2>&1)
+_assert_exit "GH#34872 policy dry run succeeds" 0 "$?"
+DETAIL_LEGACY=$(printf '%s\n' "$OUT_POLICY" | jq -r 'select(.slug == "owner/policy-legacy") | .detail')
+DETAIL_CURRENT=$(printf '%s\n' "$OUT_POLICY" | jq -r 'select(.slug == "owner/policy-current") | .detail')
+_assert_contains "GH#34872 legacy block refresh is visible" "$DETAIL_LEGACY" \
+	'CONTRIBUTING.md (managed block refresh)'
+_assert_contains "GH#34872 current policy shows workflow-only drift" "$DETAIL_CURRENT" \
+	'refresh → .github/workflows/linked-issue-check.yml at ref'
+rm -rf "$TMPDIR_POLICY"
+
 # ─── Test 13: GH#24520 — apply renders configured reusable repo/ref ─────────
 TMPDIR_13="$(mktemp -d)"
 _setup_fake_home "$TMPDIR_13"
+_setup_mock_gh "$TMPDIR_13"
 MIRROR_13="$TMPDIR_13/org-dotgithub"
 mkdir -p "$MIRROR_13/.github/workflows"
 git -C "$MIRROR_13" init -q 2>/dev/null
@@ -394,6 +446,8 @@ git -C "$MIRROR_13" config commit.gpgsign false
 git -C "$MIRROR_13" symbolic-ref HEAD refs/heads/main 2>/dev/null
 cp "$REPO_ROOT/.github/workflows/issue-sync-reusable.yml" \
 	"$MIRROR_13/.github/workflows/issue-sync-reusable.yml"
+cp "$REPO_ROOT/.github/workflows/issue-sync-artifact-maintenance-reusable.yml" \
+	"$MIRROR_13/.github/workflows/issue-sync-artifact-maintenance-reusable.yml"
 git -C "$MIRROR_13" add -A >/dev/null
 git -C "$MIRROR_13" commit -q -m "current mirror contract"
 MIRROR_REF_13=$(git -C "$MIRROR_13" rev-parse HEAD)
@@ -415,7 +469,9 @@ git -C "$REPO_13" fetch -q origin 2>/dev/null
 git -C "$REPO_13" remote set-head origin main 2>/dev/null
 _write_repos_json "$TMPDIR_13" "{\"workflow_reusable_repo\":\"ORG/.github\",\"workflow_reusable_ref\":\"$MIRROR_REF_13\",\"initialized_repos\":[{\"path\":\"$REPO_13\",\"slug\":\"owner/repo-org-target\",\"runner\":\"ubuntu-latest-arm64\"},{\"path\":\"$MIRROR_13\",\"slug\":\"ORG/.github\"}]}"
 SYNC_BRANCH_13="chore/workflow-sync-$(date +%Y%m%d)"
-HOME="$TMPDIR_13" bash "$HELPER" --apply 2>/dev/null || true
+HOME="$TMPDIR_13" PATH="$TMPDIR_13/bin:$PATH" GH_CALL_LOG="$TMPDIR_13/gh-calls.log" \
+	bash "$HELPER" --apply 2>/dev/null
+_assert_exit "configured mirror apply succeeds with mocked GitHub" 0 "$?"
 WF_USES_13=$(git -C "$REPO_13" show "${SYNC_BRANCH_13}:.github/workflows/issue-sync.yml" 2>/dev/null \
 	| grep -E "^[[:space:]]+uses:" | head -n 1 || true)
 WF_RUNNER_13=$(git -C "$REPO_13" show "${SYNC_BRANCH_13}:.github/workflows/issue-sync.yml" 2>/dev/null \
@@ -586,7 +642,7 @@ rm -rf "$TMPDIR_16"
 TMPDIR_17="$(mktemp -d)"
 _setup_fake_home "$TMPDIR_17"
 _setup_mock_gh "$TMPDIR_17"
-REAL_GIT_17="${AIDEVOPS_TEST_GIT_BIN:-/usr/bin/git}"
+REAL_GIT_17="${AIDEVOPS_TEST_GIT_BIN:-${TEST_NATIVE_GIT}}"
 cat >"$TMPDIR_17/bin/git" <<'EOF'
 #!/usr/bin/env bash
 for _arg in "$@"; do
@@ -657,6 +713,109 @@ else
 	printf '%sFAIL%s GH#28011 HOME fallback is not nounset-safe\n' "$RED" "$NC"
 	((_FAIL++))
 fi
+
+# ─── Test 19: GH#34095 — --force-ref bumps a lagging pin on a CURRENT caller ─
+# check-workflows classifies callers modulo @ref, so a tag-pinned caller is
+# CURRENT/CALLER. Without --force-ref the pin is preserved (no work); with it,
+# a differing pin becomes a planned bump, and an already-matching pin is a no-op.
+TMPDIR_19="$(mktemp -d)"
+_setup_fake_home "$TMPDIR_19"
+mkdir -p "$TMPDIR_19/repo-pinned/.github/workflows"
+PINNED_CONTENT_19=$(printf '%s\n' "$CANONICAL_CALLER_CONTENT" | sed -E \
+	-e 's|(uses:[[:space:]]*marcusquinn/aidevops/\.github/workflows/[^@[:space:]]+)@main|\1@v3.0.0|' \
+	-e 's|^(      aidevops_ref:).*$|\1 v3.0.0|')
+printf '%s\n' "$PINNED_CONTENT_19" >"$TMPDIR_19/repo-pinned/.github/workflows/issue-sync.yml"
+_write_repos_json "$TMPDIR_19" "{\"initialized_repos\":[{\"path\":\"$TMPDIR_19/repo-pinned\",\"slug\":\"owner/repo-pinned\"}]}"
+OUT_19_CHECK=$(HOME="$TMPDIR_19" bash "$CHECK_HELPER" --json --workflow issue-sync 2>/dev/null)
+_assert_contains "GH#34095 → pinned caller stays CURRENT/CALLER" "$OUT_19_CHECK" '"classification":"CURRENT/CALLER"'
+_assert_contains "GH#34095 → check-workflows reports pin lag" "$OUT_19_CHECK" 'pinned @v3.0.0; installed v'
+OUT_19_KEEP=$(HOME="$TMPDIR_19" bash "$HELPER" --workflow issue-sync --ref @v3.38.35 2>&1)
+_assert_contains "GH#34095 → pin preserved without --force-ref" "$OUT_19_KEEP" "no actionable repos"
+OUT_19_BUMP=$(HOME="$TMPDIR_19" bash "$HELPER" --workflow issue-sync --force-ref --ref @v3.38.35 --json 2>/dev/null)
+_assert_contains "GH#34095 → --force-ref plans a pin bump" "$OUT_19_BUMP" \
+	'"slug":"owner/repo-pinned","classification":"CURRENT/CALLER","outcome":"PLANNED","detail":"bump ref @v3.0.0 → .github/workflows/issue-sync.yml at ref @v3.38.35'
+OUT_19_SAME=$(HOME="$TMPDIR_19" bash "$HELPER" --workflow issue-sync --force-ref --ref @v3.0.0 2>&1)
+_assert_contains "GH#34095 → --force-ref with matching pin is a no-op" "$OUT_19_SAME" "no actionable repos"
+# A runner-only sync without --force-ref must keep the existing tag pin.
+_write_repos_json "$TMPDIR_19" "{\"initialized_repos\":[{\"path\":\"$TMPDIR_19/repo-pinned\",\"slug\":\"owner/repo-pinned\",\"runner\":\"ubuntu-new\"}]}"
+OUT_19_RUNNER=$(HOME="$TMPDIR_19" bash "$HELPER" --workflow issue-sync --json 2>/dev/null)
+_assert_contains "GH#34095 → runner-only sync preserves the tag pin" "$OUT_19_RUNNER" \
+	'"outcome":"PLANNED","detail":"update runner → .github/workflows/issue-sync.yml at ref @v3.0.0'
+rm -rf "$TMPDIR_19"
+
+# ─── Test 20: GH#34873 — apply preserves caller runners unless overridden ───
+# Force a real rewrite with unrelated permissions drift, then inspect the pushed
+# workflow in a local bare remote. Cover both a template with an existing with:
+# block (issue-sync) and one without it (linked-issue-check).
+_test_runner_preservation() {
+	local _workflow_name="$1"
+	local _caller_runner="$2"
+	local _registry_runner="$3"
+	local _expected_runner="$4"
+	local _tmpdir _repo _bare _template _caller _registry_field _applied _expected
+	_tmpdir=$(mktemp -d) || return 1
+	_setup_fake_home "$_tmpdir"
+	_setup_mock_gh "$_tmpdir"
+	_repo="$_tmpdir/repo"
+	_bare="$_tmpdir/bare.git"
+	_template=$(cat "$SCRIPT_DIR/../../templates/workflows/${_workflow_name}-caller.yml")
+	_caller=$(printf '%s\n' "$_template" | sed 's/issues: write/issues: read/')
+	if [[ -n "$_caller_runner" ]]; then
+		_caller=$(printf '%s\n' "$_caller" | sed -E \
+			"s|^(    uses:.*)$|\1\n    with:\n      runner: ${_caller_runner}|")
+		# issue-sync already has a with: block: inject there instead.
+		if [[ "$_template" == *'    with:'* ]]; then
+			_caller=$(printf '%s\n' "$_template" | sed -E \
+				-e 's/issues: write/issues: read/' \
+				-e "s|^(    with:)$|\1\n      runner: ${_caller_runner}|")
+		fi
+	fi
+	mkdir -p "$_repo/.github/workflows"
+	git init --bare -q "$_bare"
+	git -C "$_repo" init -q
+	git -C "$_repo" config user.email test@example.com
+	git -C "$_repo" config user.name Test
+	git -C "$_repo" checkout -q -b main
+	printf '%s\n' "$_caller" >"$_repo/.github/workflows/${_workflow_name}.yml"
+	git -C "$_repo" add -A
+	git -C "$_repo" commit -q -m "caller with unrelated drift"
+	git -C "$_repo" remote add origin "$_bare"
+	git -C "$_repo" push -q -u origin main
+	git --git-dir="$_bare" symbolic-ref HEAD refs/heads/main
+	git -C "$_repo" remote set-head origin main
+	_registry_field=""
+	[[ -n "$_registry_runner" ]] && _registry_field=",\"runner\":\"$_registry_runner\""
+	_write_repos_json "$_tmpdir" \
+		"{\"initialized_repos\":[{\"path\":\"$_repo\",\"slug\":\"owner/repo\"${_registry_field}}]}"
+	# As in Test 10, PR creation may fail in this offline fixture after the
+	# workflow commit is pushed. Assert the actual pushed artifact, not gh output.
+	HOME="$_tmpdir" PATH="$_tmpdir/bin:$PATH" \
+		GH_CALL_LOG="$_tmpdir/gh-calls.log" \
+		AIDEVOPS_WORKTREE_BASE_DIR="$_tmpdir/worktrees" \
+		bash "$HELPER" --apply --repo owner/repo --workflow "$_workflow_name" \
+		--branch chore/test-runner-preservation >/dev/null 2>&1 || true
+	_applied=$(git --git-dir="$_bare" show \
+		"refs/heads/chore/test-runner-preservation:.github/workflows/${_workflow_name}.yml" 2>/dev/null)
+	_expected="$_template"
+	if [[ -n "$_expected_runner" ]]; then
+		if [[ "$_template" == *'    with:'* ]]; then
+			_expected=$(printf '%s\n' "$_template" | sed -E \
+				"s|^(    with:)$|\1\n      runner: ${_expected_runner}|")
+		else
+			_expected=$(printf '%s\n' "$_template" | sed -E \
+				"s|^(    uses:.*)$|\1\n    with:\n      runner: ${_expected_runner}|")
+		fi
+	fi
+	_assert_exit "GH#34873 ${_workflow_name} caller=${_caller_runner:-none} registry=${_registry_runner:-none} pushed caller matches expected template" \
+		"$_expected" "$_applied"
+	rm -rf "$_tmpdir"
+	return 0
+}
+for RUNNER_WORKFLOW in issue-sync linked-issue-check; do
+	_test_runner_preservation "$RUNNER_WORKFLOW" 1cpu-2gb "" 1cpu-2gb
+	_test_runner_preservation "$RUNNER_WORKFLOW" 1cpu-2gb ubuntu-new ubuntu-new
+	_test_runner_preservation "$RUNNER_WORKFLOW" "" "" ""
+done
 
 # ─── Summary ────────────────────────────────────────────────────────────────
 printf '\n'

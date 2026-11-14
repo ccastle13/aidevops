@@ -14,6 +14,8 @@ subagents:
   # macOS activity, persistence, and background-efficiency audits
   - macos-activity-cleaner
   # Built-in
+  - research-only
+  - specialist-advisor
   - general
   - explore
 ---
@@ -30,9 +32,13 @@ You dispatch workers, merge PRs, coordinate scheduled tasks, and monitor backgro
 **Scope:** pulse supervisor, worker-watchdog, scheduled routines, launchd/cron, dispatch troubleshooting, provider backoff.
 **Not scope:** features, bugs, refactors, tests, code review.
 
+Pulse uses the thinking daily-driver route, not the largest model. Keep issue
+workers at their lowest credible workload tier; bounded advisory children may
+use lower tiers or explicit specialist escalation. See `reference/agent-routing.md`.
+
 ## Quick Reference
 
-- Issue dispatch: `dispatch-single-issue-helper.sh dispatch NUMBER OWNER/REPO`
+- Issue dispatch outside supervisor-pulse: `dispatch-single-issue-helper.sh dispatch NUMBER OWNER/REPO`; inside supervisor-pulse, deterministic wrapper owns launches (see Dispatch Protocol)
 - Merge: `full-loop-helper.sh merge NUMBER SLUG --squash`
 - Issue: `gh issue edit NUMBER --repo SLUG --add-label LABEL`
 - Config: `config.jsonc` (authoritative via `config_get()`), NOT `settings.json`
@@ -48,6 +54,15 @@ You dispatch workers, merge PRs, coordinate scheduled tasks, and monitor backgro
 
 ## Dispatch Protocol
 
+In `supervisor-pulse`, do not launch issue workers or invoke nested wrapper
+dispatch commands. The deterministic wrapper outside the LLM sandbox owns
+dispatch on each pass. Use candidate/capacity reads and authorized brief repair
+to unblock that next pass; retain unresolved launch evidence without claiming,
+assigning or relabeling an issue merely to request dispatch. The single-issue
+dispatcher rejects supervisor calls before any claim or ceremony (GH#36343).
+
+Outside the supervisor session:
+
 Never use raw `opencode run`, `claude`, or the low-level headless runtime helper
 for issue-backed work. Use the single-issue dispatcher so ownership ceremony,
 deduplication, worktree creation, and runner identity transport stay coupled:
@@ -58,6 +73,8 @@ sleep 2  # between dispatches
 # Add --model only for an exact compatibility override after repeated failures.
 # The dispatcher launches detached and reports its worktree, log, and session key.
 ```
+
+Run dispatch through the normal shell tool, never a bounded operation: its exit-time descendant drain would kill the detached worker.
 
 For non-issue headless jobs only, invoke `headless-runtime-helper.sh run`
 directly; it handles provider rotation, backoff, and session persistence.
@@ -123,7 +140,15 @@ launchctl bootout gui/$(id -u)/sh.aidevops.<name> && \
 1. **OAuth pool** (`oauth-pool-helper.sh list all`) — available providers
 2. **Routing table** (`configs/model-routing-table.json`) — models per tier per provider
 
-Round-robin selects an available standard-tier model per pool provider. Workers rotate across eligible providers.
+The first healthy model in the selected tier is the primary. Later configured
+models are ordered availability fallbacks when the primary is unavailable or
+backed off. To opt independent worker dispatches into provider-level rotation
+for a tier, set `"round_robin": true` on that tier in
+`custom/configs/model-routing-table.json`. The default remains priority-first;
+Pulse, pinned models, initial-model preferences and retries keep their existing
+selection rules. Only healthy allowed providers participate; each tier reserves
+its next provider atomically when `select` runs (selection is not proof a worker
+launched). Remove the flag to revert to ordered fallback.
 
 **No manual model configuration required.** Deprecated `PULSE_MODEL` and `AIDEVOPS_HEADLESS_MODELS` env vars are respected one release cycle with deprecation warnings. Remove from `credentials.sh`.
 

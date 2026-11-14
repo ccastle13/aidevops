@@ -24,6 +24,8 @@ wp theme install kadence --activate
 
 **Pro/Premium**: Require license activation via vendor dashboards. Keys in `~/.config/aidevops/credentials.sh` (see `api-key-setup.md`). Git Updater for Git-hosted plugin updates.
 
+**Site mail (data privacy, owner policy)**: outbound mail goes through the site's SMTP plugin (FluentSMTP) to the owner's own mail provider. Inbound support mail is read from the owner's own mailbox over IMAP: for Fluent Support, SEO Pro Stack's **Fluent Support email by IMAP**, or whichever plugin manages the mailbox. Never route customer email through a vendor's hosted relay or piping service (for example Fluent Support Pro email piping, whose relay receives every email), and never make a GPL feature that can run locally wait on a licence check or call-home: call the plugin's own local code instead.
+
 **URL convention**: Free plugins at `https://wordpress.org/plugins/{slug}/`. Premium vendor URLs in [Premium Sources](#premium-plugin-sources) below.
 
 <!-- AI-CONTEXT-END -->
@@ -116,13 +118,9 @@ Also see: `network-plugin-auditor` (Admin).
 
 `ultimate-multisite` Ultimate Multisite
 
-### Hosting-Specific
-
-Legacy Closte estates only: `closte-requirements`, `eos-deactivate-plugins` (Closte variant of Freesoul Deactivate Plugins).
-
 ## Premium Plugin Sources
 
-Slugs marked \* above. Free plugins: `https://wordpress.org/plugins/{slug}/`.
+Slugs marked \* above. Free plugins: `https://wordpress.org/plugins/{slug}/`. Stale premium updates: `premium-plugin-updates.md`.
 
 | Slug | Vendor URL |
 |------|-----------|

@@ -103,6 +103,26 @@ _WT_ID_COMMON_REAL=""
 _WT_ID_HEAD=""
 _WT_ID_BRANCH=""
 
+# Recoverable-archive functions live in a sibling library (GH#36924).
+_wtar_lib_path="${BASH_SOURCE[0]%/*}"
+[[ "$_wtar_lib_path" == "${BASH_SOURCE[0]}" ]] && _wtar_lib_path="."
+if ! _WTAR_LIB_DIR="$(cd "$_wtar_lib_path" && pwd)"; then
+	printf '[audit-worktree-removal-helper] ERROR: cannot resolve library directory: %s\n' \
+		"$_wtar_lib_path" >&2
+	unset _wtar_lib_path _AUDIT_WORKTREE_REMOVAL_HELPER_LOADED
+	return 1
+fi
+unset _wtar_lib_path
+# shellcheck source=./audit-worktree-removal-recovery.sh
+# shellcheck disable=SC1091  # sub-library resolved at runtime
+if ! source "${_WTAR_LIB_DIR}/audit-worktree-removal-recovery.sh"; then
+	printf '[audit-worktree-removal-helper] ERROR: cannot source recovery library: %s\n' \
+		"${_WTAR_LIB_DIR}/audit-worktree-removal-recovery.sh" >&2
+	unset _AUDIT_WORKTREE_REMOVAL_HELPER_LOADED _AUDIT_WORKTREE_REMOVAL_RECOVERY_LIB_LOADED
+	return 1
+fi
+
+
 # =============================================================================
 # log_worktree_removal_event — write one structured log line per event
 #
@@ -187,6 +207,32 @@ _worktree_proc_entry_is_provably_foreign_uid() {
 	return 1
 }
 
+# Mirror of uid_fields_accepted() in worktree-cwd-inspect.py (GH#32871): the
+# opt-in inspector can read a process whose real UID is the caller and whose
+# effective, saved and filesystem UIDs are the caller or root. Used only to
+# label the operator diagnostic; the installed inspector alone decides reads.
+_worktree_proc_entry_is_inspectable_uid() {
+	local proc_dir="$1"
+	local current_uid="$2"
+	local field=""
+	local real_uid=""
+	local effective_uid=""
+	local saved_uid=""
+	local filesystem_uid=""
+	local process_uid=""
+
+	[[ "$current_uid" =~ ^[1-9][0-9]*$ && -r "$proc_dir/status" ]] || return 1
+	while IFS=$' \t' read -r field real_uid effective_uid saved_uid filesystem_uid _; do
+		[[ "$field" == "Uid:" ]] || continue
+		[[ "$real_uid" == "$current_uid" ]] || return 1
+		for process_uid in "$effective_uid" "$saved_uid" "$filesystem_uid"; do
+			[[ "$process_uid" == "$current_uid" || "$process_uid" == "0" ]] || return 1
+		done
+		return 0
+	done <"$proc_dir/status"
+	return 1
+}
+
 _worktree_proc_entry_owner_uid() {
 	local proc_dir="$1"
 
@@ -202,115 +248,99 @@ PY
 	return $?
 }
 
-_worktree_proc_entry_is_known_non_worktree_daemon() {
+_worktree_proc_entry_is_zombie() {
 	local proc_dir="$1"
-	local proc_name=""
-	local proc_cmdline=""
+	local field=""
+	local state=""
 
-	if [[ -r "$proc_dir/comm" ]]; then
-		IFS= read -r proc_name <"$proc_dir/comm" || proc_name=""
-	fi
-	case "$proc_name" in
-	"(sd-pam)" | gpg-agent)
-		return 0
-		;;
-	sshd)
-		proc_cmdline=$(tr '\0' ' ' <"$proc_dir/cmdline" 2>/dev/null || true)
-		case "$proc_cmdline" in
-		sshd:*@pts/* | sshd:*@notty*) return 0 ;;
-		esac
-		;;
-	esac
+	[[ -r "$proc_dir/status" ]] || return 1
+	while IFS=$' \t' read -r field state _; do
+		[[ "$field" == "State:" ]] || continue
+		[[ "$state" == Z* ]]
+		return $?
+	done <"$proc_dir/status"
 	return 1
 }
 
-_capture_worktree_proc_cwds() {
+# Optional, read-only escalation for protected same-UID process CWDs. The
+# installed inspector must be root-owned and sudoers must allow only that
+# executable; neither a failed sudo call nor an untrusted /proc root grants
+# removal permission. See .agents/reference/worktree-cwd-visibility.md.
+# shellcheck source=worktree-process-policy.sh
+source "$(dirname "${BASH_SOURCE[0]}")/worktree-process-policy.sh"
+
+_worktree_privileged_read_cwd() {
 	local proc_root="$1"
+	local proc_dir="$2"
+	local pid="${proc_dir##*/}"
+	local timeout_seconds=5
+	[[ "$proc_root" == /proc && "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+	worktree_process_inspector_allowed || return 1
+	if declare -F timeout_sec >/dev/null 2>&1; then
+		timeout_sec "$timeout_seconds" sudo -n -- \
+			/usr/local/libexec/aidevops-worktree-cwd-inspect "$pid" 2>/dev/null
+		return $?
+	fi
+	command -v timeout >/dev/null 2>&1 || return 1
+	command timeout "$timeout_seconds" sudo -n -- \
+		/usr/local/libexec/aidevops-worktree-cwd-inspect "$pid" 2>/dev/null
+	return $?
+}
+
+# Providers collect evidence only; ownership, Git and removal policy stay here.
+# shellcheck source=worktree-process-providers.sh
+source "$(dirname "${BASH_SOURCE[0]}")/worktree-process-providers.sh"
+
+# Operator-invoked diagnostic only (GH#32853). Print "<pid>\t<comm>\t<remedy>"
+# for each process that makes _capture_worktree_proc_cwds report degraded
+# visibility, applying the same vanished, zombie, provably-foreign-UID, and
+# opt-in inspector rules. <remedy> is "inspector" when the opt-in inspector's
+# UID rule accepts the process (install or repair it) and "stop-only" when only
+# stopping the process clears it (GH#32871). Automatic maintenance output must
+# never call this: its results stay free of process names under the #31690
+# contract. Returns 0 on a completed scan (even when nothing is listed) and 1
+# when proc_root is not a directory.
+list_worktree_unreadable_proc_cwds() {
+	local proc_root="${1:-/proc}"
 	local cwd_link=""
 	local cwd_target=""
-	local captured_count=0
-	local current_uid=""
-	local visibility_degraded=0
 	local proc_dir=""
+	local pid=""
+	local comm=""
+	local current_uid=""
+	local remedy=""
 
+	[[ -d "$proc_root" ]] || return 1
+	if [[ "$proc_root" == /proc && "$(worktree_process_platform)" == nixos ]]; then
+		_worktree_unprivileged_proc_scan denied
+		return $?
+	fi
 	current_uid=$(id -u 2>/dev/null) || current_uid=""
-
 	for cwd_link in "$proc_root"/[0-9]*/cwd; do
 		[[ -L "$cwd_link" || -e "$cwd_link" ]] || continue
-		if ! cwd_target=$(readlink "$cwd_link" 2>/dev/null); then
-			# Vanished processes are harmless. Linux commonly denies cwd reads for
-			# other users, so skip entries whose ownership proves they are foreign.
-			# Some same-UID session daemons intentionally hide cwd via dumpability
-			# hardening even though they are not worktree-scoped jobs; ignoring those
-			# prevents one login daemon from globally blocking autonomous cleanup.
-			# Unknown same-user processes still degrade visibility fail-closed.
-			[[ -L "$cwd_link" || -e "$cwd_link" ]] || continue
-			proc_dir="${cwd_link%/cwd}"
-			_worktree_proc_entry_is_provably_foreign_uid "$proc_dir" "$current_uid" && continue
-			_worktree_proc_entry_is_known_non_worktree_daemon "$proc_dir" && continue
-			visibility_degraded=1
-			continue
+		readlink "$cwd_link" >/dev/null 2>&1 && continue
+		[[ -L "$cwd_link" || -e "$cwd_link" ]] || continue
+		proc_dir="${cwd_link%/cwd}"
+		_worktree_proc_entry_is_zombie "$proc_dir" && continue
+		_worktree_proc_entry_is_provably_foreign_uid "$proc_dir" "$current_uid" && continue
+		if cwd_target=$(_worktree_privileged_read_cwd "$proc_root" "$proc_dir"); then
+			[[ "$cwd_target" == /* && "$cwd_target" != *$'\n'* ]] && continue
 		fi
-		if [[ -n "$cwd_target" ]]; then
-			printf '%s\n' "$cwd_target"
-			captured_count=$((captured_count + 1))
+		[[ -L "$cwd_link" || -e "$cwd_link" ]] || continue
+		pid="${proc_dir##*/}"
+		comm=""
+		if [[ -r "$proc_dir/comm" ]]; then
+			IFS= read -r comm <"$proc_dir/comm" 2>/dev/null || comm=""
 		fi
+		comm=$(printf '%s' "$comm" | LC_ALL=C tr -cd '[:print:]' | cut -c1-32)
+		remedy="stop-only"
+		_worktree_proc_entry_is_inspectable_uid "$proc_dir" "$current_uid" && remedy="inspector"
+		if ! worktree_process_inspector_allowed; then
+			remedy="unprivileged-review"
+		fi
+		printf '%s\t%s\t%s\n' "$pid" "${comm:-unknown}" "$remedy"
 	done
-	if [[ "$visibility_degraded" -eq 1 ]]; then
-		return "$_WT_CWD_CAPTURE_DEGRADED_RC"
-	fi
-	[[ "$captured_count" -gt 0 ]] || return 1
 	return 0
-}
-
-_capture_worktree_lsof_cwds() {
-	local cwd_target=""
-	local captured_count=0
-	local lsof_line=""
-	local lsof_output=""
-	local lsof_status=0
-
-	if lsof_output=$(lsof -n -F n -d cwd 2>/dev/null); then
-		lsof_status=0
-	else
-		lsof_status=$?
-	fi
-	while IFS= read -r lsof_line; do
-		case "$lsof_line" in
-		n*)
-			cwd_target="${lsof_line#n}"
-			if [[ -n "$cwd_target" ]]; then
-				printf '%s\n' "$cwd_target"
-				captured_count=$((captured_count + 1))
-			fi
-			;;
-		esac
-	done <<<"$lsof_output"
-	[[ "$captured_count" -gt 0 ]] || return 1
-	if [[ "$lsof_status" -ne 0 ]]; then
-		return "$_WT_CWD_CAPTURE_DEGRADED_RC"
-	fi
-	return 0
-}
-
-# Capture every visible live-process cwd. stdout always preserves readable
-# targets. Return 0 for complete visibility, 2 for degraded visibility with
-# same-UID/unknown denials, and 1 when no usable snapshot can be established.
-# Callers may supply the resulting snapshot and visibility to the guard so one
-# safety check performs only one platform scan.
-capture_worktree_process_cwds() {
-	if [[ -d /proc ]]; then
-		_capture_worktree_proc_cwds /proc
-		return $?
-	fi
-
-	if command -v lsof >/dev/null 2>&1; then
-		# macOS lacks /proc, but `lsof +D <worktree>` recursively walks the
-		# whole tree (including node_modules). Query only cwd descriptors once.
-		_capture_worktree_lsof_cwds
-		return $?
-	fi
-	return 1
 }
 
 # Return 0 when a captured cwd is inside the candidate worktree.
@@ -616,783 +646,6 @@ PY
 	return $?
 }
 
-_worktree_recovery_cache_policy() {
-	local mode="$1"
-	local source_path="$2"
-	local archive_path="${3:-}"
-	local git_bin="${4:-git}"
-	local helper_dir=""
-	local helper_path=""
-
-	command -v python3 >/dev/null 2>&1 || return 2
-	helper_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd) || return 2
-	helper_path="${helper_dir}/worktree-recovery-cache-policy.py"
-	[[ -f "$helper_path" && ! -L "$helper_path" ]] || return 2
-	python3 "$helper_path" "$mode" "$source_path" "$archive_path" "$git_bin"
-	return $?
-}
-
-_worktree_prune_regenerable_archive_caches() {
-	local source_path="$1"
-	local archive_path="$2"
-	local git_bin="$3"
-
-	_worktree_recovery_cache_policy "prune" "$source_path" "$archive_path" "$git_bin"
-	return $?
-}
-
-_worktree_recovery_status_has_user_data() {
-	local status_path="$1"
-	local archive_path="$2"
-
-	_worktree_recovery_cache_policy "status" "$status_path" "$archive_path"
-	return $?
-}
-
-# Copy exactly once into a unique destination. In particular, do not retry into
-# a partially populated directory: cp changes semantics when the destination
-# already exists, which could make a partial archive look complete.
-_worktree_copy_directory_once() {
-	local source_path="$1"
-	local destination_path="$2"
-	local platform=""
-
-	[[ -d "$source_path" && ! -e "$destination_path" && ! -L "$destination_path" ]] || return 1
-	platform=$(uname -s 2>/dev/null) || return 1
-	case "$platform" in
-	Darwin) cp -ac "$source_path" "$destination_path" 2>/dev/null || return 1 ;;
-	Linux) cp -a --reflink=auto "$source_path" "$destination_path" 2>/dev/null || return 1 ;;
-	*) cp -Rp "$source_path" "$destination_path" 2>/dev/null || return 1 ;;
-	esac
-	return 0
-}
-
-_worktree_capture_git_identity() {
-	local wt_path="$1"
-	local candidate_root=""
-	local branch_status=0
-
-	_WT_ID_REAL_GIT=""
-	_WT_ID_SOURCE_REAL=""
-	_WT_ID_SOURCE_INODE=""
-	_WT_ID_ADMIN_REAL=""
-	_WT_ID_ADMIN_INODE=""
-	_WT_ID_COMMON_REAL=""
-	_WT_ID_HEAD=""
-	_WT_ID_BRANCH=""
-	[[ -d "$wt_path" && ! -L "$wt_path" ]] || return 1
-	_WT_ID_SOURCE_REAL=$(cd "$wt_path" 2>/dev/null && pwd -P) || return 1
-	_WT_ID_SOURCE_INODE=$(_worktree_path_identity "$wt_path") || return 1
-	_WT_ID_REAL_GIT=$(_worktree_cleanup_real_git) || return 1
-	candidate_root=$("$_WT_ID_REAL_GIT" -C "$wt_path" rev-parse --show-toplevel 2>/dev/null) || return 1
-	candidate_root=$(cd "$candidate_root" 2>/dev/null && pwd -P) || return 1
-	[[ "$candidate_root" == "$_WT_ID_SOURCE_REAL" ]] || return 1
-	_WT_ID_ADMIN_REAL=$("$_WT_ID_REAL_GIT" -C "$wt_path" rev-parse --absolute-git-dir 2>/dev/null) || return 1
-	_WT_ID_ADMIN_REAL=$(cd "$_WT_ID_ADMIN_REAL" 2>/dev/null && pwd -P) || return 1
-	_WT_ID_ADMIN_INODE=$(_worktree_path_identity "$_WT_ID_ADMIN_REAL") || return 1
-	_WT_ID_COMMON_REAL=$(_worktree_git_common_dir "$_WT_ID_REAL_GIT" "$wt_path") || return 1
-	_WT_ID_HEAD=$("$_WT_ID_REAL_GIT" -C "$wt_path" rev-parse --verify HEAD 2>/dev/null) || return 1
-	_worktree_git_head_payload_is_valid "$_WT_ID_HEAD" || return 1
-	if _WT_ID_BRANCH=$("$_WT_ID_REAL_GIT" -C "$wt_path" symbolic-ref -q HEAD 2>/dev/null); then
-		_worktree_git_branch_payload_is_valid "$_WT_ID_BRANCH" || return 1
-	else
-		branch_status=$?
-		[[ "$branch_status" -eq 1 ]] || return 1
-		_WT_ID_BRANCH="$_WT_RECOVERY_BRANCH_DETACHED"
-	fi
-	case "$_WT_ID_SOURCE_REAL$_WT_ID_ADMIN_REAL$_WT_ID_COMMON_REAL" in
-	*$'\n'*) return 1 ;;
-	esac
-	return 0
-}
-
-_worktree_recovery_dir_for_archive() {
-	local archive_path="$1"
-	local archive_parent="${archive_path%/*}"
-
-	[[ -n "$archive_path" && "$archive_parent" != "$archive_path" ]] || return 1
-	printf '%s/%s\n' "$archive_parent" "$_WT_RECOVERY_DIR_NAME"
-	return 0
-}
-
-_worktree_recovery_format_is_supported() {
-	local format="$1"
-	case "$format" in
-	"$_WT_RECOVERY_FORMAT_V1" | "$_WT_RECOVERY_FORMAT_V2") return 0 ;;
-	esac
-	return 1
-}
-
-_worktree_recovery_line_payload_is_valid() {
-	local payload="$1"
-	[[ -n "$payload" ]] || return 1
-	case "$payload" in
-	*$'\n'* | *$'\r'*) return 1 ;;
-	esac
-	return 0
-}
-
-_worktree_recovery_v2_contract_is_valid() {
-	local recovery_dir="$1"
-	local created_at=""
-	local producer=""
-	local producer_context=""
-	local session_id=""
-	local archive_outcome=""
-	local source_outcome=""
-	local metadata_name=""
-
-	for metadata_name in created-at producer producer-context session-id archive-outcome source-removal-outcome; do
-		[[ -f "$recovery_dir/$metadata_name" && ! -L "$recovery_dir/$metadata_name" ]] || return 1
-	done
-	IFS= read -r created_at <"$recovery_dir/created-at" || return 1
-	IFS= read -r producer <"$recovery_dir/producer" || return 1
-	IFS= read -r producer_context <"$recovery_dir/producer-context" || return 1
-	IFS= read -r session_id <"$recovery_dir/session-id" || return 1
-	IFS= read -r archive_outcome <"$recovery_dir/archive-outcome" || return 1
-	IFS= read -r source_outcome <"$recovery_dir/source-removal-outcome" || return 1
-	[[ "$created_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
-	_worktree_recovery_line_payload_is_valid "$producer" || return 1
-	_worktree_recovery_line_payload_is_valid "$producer_context" || return 1
-	[[ "$session_id" == "$_WT_STATE_UNAVAILABLE" || "$session_id" =~ ^[A-Za-z0-9._:-]+$ ]] || return 1
-	[[ "$archive_outcome" == "$_WT_STATE_COMPLETE" ]] || return 1
-	case "$source_outcome" in
-	"$_WT_RECOVERY_OUTCOME_PENDING" | "$_WT_RECOVERY_OUTCOME_REMOVED") return 0 ;;
-	esac
-	return 1
-}
-
-_worktree_write_recovery_v2_metadata() {
-	local recovery_dir="$1"
-	local caller="$2"
-	local context="${3:-unspecified}"
-	local created_at=""
-	local session_id="${AIDEVOPS_SESSION_ID:-${OPENCODE_SESSION_ID:-${CLAUDE_SESSION_ID:-unavailable}}}"
-
-	[[ -n "$context" ]] || context="unspecified"
-	created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ) || return 1
-	_worktree_recovery_line_payload_is_valid "$caller" || return 1
-	_worktree_recovery_line_payload_is_valid "$context" || return 1
-	[[ "$session_id" == "$_WT_STATE_UNAVAILABLE" || "$session_id" =~ ^[A-Za-z0-9._:-]+$ ]] || session_id="$_WT_STATE_UNAVAILABLE"
-	printf '%s\n' "$created_at" >"${recovery_dir}/created-at" || return 1
-	printf '%s\n' "$caller" >"${recovery_dir}/producer" || return 1
-	printf '%s\n' "$context" >"${recovery_dir}/producer-context" || return 1
-	printf '%s\n' "$session_id" >"${recovery_dir}/session-id" || return 1
-	printf '%s\n' "$_WT_STATE_COMPLETE" >"${recovery_dir}/archive-outcome" || return 1
-	printf '%s\n' "$_WT_RECOVERY_OUTCOME_PENDING" >"${recovery_dir}/source-removal-outcome" || return 1
-	return 0
-}
-
-_worktree_recovery_record_source_outcome() {
-	local archive_path="$1"
-	local outcome="$2"
-	local recovery_dir=""
-	local format=""
-	local outcome_tmp=""
-
-	case "$outcome" in
-	"$_WT_RECOVERY_OUTCOME_PENDING" | "$_WT_RECOVERY_OUTCOME_REMOVED") ;;
-	*) return 1 ;;
-	esac
-	recovery_dir=$(_worktree_recovery_dir_for_archive "$archive_path") || return 1
-	IFS= read -r format <"$recovery_dir/format" || return 1
-	[[ "$format" == "$_WT_RECOVERY_FORMAT_V2" ]] || return 0
-	outcome_tmp="${recovery_dir}/.source-removal-outcome.$$-${RANDOM}"
-	printf '%s\n' "$outcome" >"$outcome_tmp" || return 1
-	mv "$outcome_tmp" "$recovery_dir/source-removal-outcome" || return 1
-	_worktree_recovery_v2_contract_is_valid "$recovery_dir" || return 1
-	return 0
-}
-
-_worktree_write_recovery_identity() {
-	local recovery_dir="$1"
-
-	printf '%s\n' "$_WT_RECOVERY_FORMAT" >"${recovery_dir}/format" || return 1
-	printf '%s\n' "$_WT_ID_SOURCE_REAL" >"${recovery_dir}/source-real" || return 1
-	printf '%s\n' "$_WT_ID_SOURCE_INODE" >"${recovery_dir}/source-inode" || return 1
-	printf '%s\n' "$_WT_ID_ADMIN_REAL" >"${recovery_dir}/admin-real" || return 1
-	printf '%s\n' "$_WT_ID_ADMIN_INODE" >"${recovery_dir}/admin-inode" || return 1
-	printf '%s\n' "$_WT_ID_COMMON_REAL" >"${recovery_dir}/common-real" || return 1
-	printf '%s\n' "$_WT_ID_HEAD" >"${recovery_dir}/head" || return 1
-	printf '%s\n' "$_WT_ID_BRANCH" >"${recovery_dir}/branch" || return 1
-	return 0
-}
-
-_worktree_recovery_run_before_epoch() {
-	local deadline_epoch="$1"
-	shift
-	local current_epoch=0
-	local remaining_seconds=0
-
-	if [[ "$deadline_epoch" -eq 0 ]]; then
-		"$@"
-		return $?
-	fi
-	current_epoch=$(date +%s) || return 1
-	remaining_seconds=$((deadline_epoch - current_epoch))
-	[[ "$remaining_seconds" -gt 0 ]] || return 124
-	declare -F timeout_sec >/dev/null 2>&1 || return 124
-	timeout_sec "$remaining_seconds" "$@"
-	return $?
-}
-
-_worktree_recovery_archive_is_valid() {
-	local archive_path="$1"
-	local deadline_epoch="${2:-0}"
-	local recovery_dir=""
-	local recovery_admin=""
-	local recovery_admin_real=""
-	local format=""
-	local expected_head=""
-	local expected_branch=""
-	local actual_admin=""
-	local actual_head=""
-	local real_git=""
-
-	recovery_dir=$(_worktree_recovery_dir_for_archive "$archive_path") || return 1
-	recovery_admin="${recovery_dir}/admin"
-	[[ -d "$archive_path" && -f "$archive_path/.git" && ! -L "$archive_path/.git" ]] || return 1
-	[[ -d "$recovery_admin" && -f "$recovery_admin/HEAD" && -f "$recovery_admin/index" ]] || return 1
-	IFS= read -r format <"${recovery_dir}/format" || return 1
-	IFS= read -r expected_head <"${recovery_dir}/head" || return 1
-	IFS= read -r expected_branch <"${recovery_dir}/branch" || return 1
-	_worktree_recovery_format_is_supported "$format" || return 1
-	if [[ "$format" == "$_WT_RECOVERY_FORMAT_V2" ]]; then
-		_worktree_recovery_v2_contract_is_valid "$recovery_dir" || return 1
-	fi
-	_worktree_git_head_payload_is_valid "$expected_head" || return 1
-	if [[ "$expected_branch" != "$_WT_RECOVERY_BRANCH_DETACHED" ]]; then
-		_worktree_git_branch_payload_is_valid "$expected_branch" || return 1
-	fi
-	real_git=$(_worktree_cleanup_real_git) || return 1
-	recovery_admin_real=$(cd "$recovery_admin" 2>/dev/null && pwd -P) || return 1
-	actual_admin=$(_worktree_recovery_run_before_epoch "$deadline_epoch" \
-		"$real_git" -C "$archive_path" rev-parse --absolute-git-dir 2>/dev/null) || return $?
-	actual_admin=$(cd "$actual_admin" 2>/dev/null && pwd -P) || return 1
-	[[ "$actual_admin" == "$recovery_admin_real" ]] || return 1
-	actual_head=$(_worktree_recovery_run_before_epoch "$deadline_epoch" \
-		"$real_git" -C "$archive_path" rev-parse --verify HEAD 2>/dev/null) || return $?
-	[[ "$actual_head" == "$expected_head" ]] || return 1
-	_worktree_recovery_run_before_epoch "$deadline_epoch" \
-		"$real_git" -C "$archive_path" status --porcelain=v1 -z --untracked-files=all \
-		>/dev/null 2>&1 || return $?
-	return 0
-}
-
-_worktree_archive_source_matches() {
-	local wt_path="$1"
-	local archive_path="$2"
-	local recovery_dir=""
-	local expected_source_real=""
-	local expected_source_inode=""
-	local expected_admin_real=""
-	local expected_admin_inode=""
-	local expected_common_real=""
-	local expected_head=""
-	local expected_branch=""
-
-	recovery_dir=$(_worktree_recovery_dir_for_archive "$archive_path") || return 1
-	IFS= read -r expected_source_real <"${recovery_dir}/source-real" || return 1
-	IFS= read -r expected_source_inode <"${recovery_dir}/source-inode" || return 1
-	IFS= read -r expected_admin_real <"${recovery_dir}/admin-real" || return 1
-	IFS= read -r expected_admin_inode <"${recovery_dir}/admin-inode" || return 1
-	IFS= read -r expected_common_real <"${recovery_dir}/common-real" || return 1
-	IFS= read -r expected_head <"${recovery_dir}/head" || return 1
-	IFS= read -r expected_branch <"${recovery_dir}/branch" || return 1
-	_worktree_capture_git_identity "$wt_path" || return 1
-	[[ "$_WT_ID_SOURCE_REAL" == "$expected_source_real" ]] || return 1
-	[[ "$_WT_ID_SOURCE_INODE" == "$expected_source_inode" ]] || return 1
-	[[ "$_WT_ID_ADMIN_REAL" == "$expected_admin_real" ]] || return 1
-	[[ "$_WT_ID_ADMIN_INODE" == "$expected_admin_inode" ]] || return 1
-	[[ "$_WT_ID_COMMON_REAL" == "$expected_common_real" ]] || return 1
-	[[ "$_WT_ID_HEAD" == "$expected_head" ]] || return 1
-	[[ "$_WT_ID_BRANCH" == "$expected_branch" ]] || return 1
-	return 0
-}
-
-# Recoverable archives are framework-owned recovery data, not ordinary Trash on
-# platforms where $HOME/.Trash has no OS meaning. macOS keeps its established
-# OS Trash destination; Linux and other platforms use an explicit aidevops store.
-# Explicit operator overrides retain precedence on every platform.
-_worktree_recovery_store_root() {
-	local platform="${1:-}"
-	local configured_root="${AIDEVOPS_WORKTREE_TRASH_ROOT:-${AIDEVOPS_ORPHAN_TRASH_ROOT:-}}"
-
-	if [[ -n "$configured_root" ]]; then
-		[[ "$configured_root" == /* ]] || return 1
-		printf '%s\n' "$configured_root"
-		return 0
-	fi
-	[[ -n "${HOME:-}" ]] || return 1
-	if [[ -z "$platform" ]]; then
-		platform=$(uname -s 2>/dev/null) || return 1
-	fi
-	case "$platform" in
-	Darwin) printf '%s/.Trash\n' "$HOME" ;;
-	*) printf '%s/.aidevops/recovery/worktrees\n' "$HOME" ;;
-	esac
-	return 0
-}
-
-_worktree_legacy_recovery_root() {
-	local platform="${1:-}"
-
-	[[ -n "${HOME:-}" ]] || return 1
-	if [[ -z "$platform" ]]; then
-		platform=$(uname -s 2>/dev/null) || return 1
-	fi
-	[[ "$platform" != "$_WT_PLATFORM_DARWIN" ]] || return 1
-	printf '%s/.Trash\n' "$HOME"
-	return 0
-}
-
-_worktree_legacy_recovery_bucket_is_valid() {
-	local bucket="$1"
-	local deadline_epoch="${2:-0}"
-	local recovery_dir="${bucket}/${_WT_RECOVERY_DIR_NAME}"
-	local recorded_gitdir=""
-	local archive_path=""
-
-	[[ -f "$recovery_dir/admin/gitdir" && ! -L "$recovery_dir/admin/gitdir" ]] || return 1
-	IFS= read -r recorded_gitdir <"$recovery_dir/admin/gitdir" || return 1
-	case "$recorded_gitdir" in
-	"$bucket"/*/.git) archive_path="${recorded_gitdir%/.git}" ;;
-	*) return 1 ;;
-	esac
-	[[ "${archive_path%/*}" == "$bucket" ]] || return 1
-	_worktree_recovery_archive_is_valid "$archive_path" "$deadline_epoch" || return $?
-	return 0
-}
-
-_worktree_recovery_extended_metadata_is_present() {
-	local bucket="$1"
-	local recovery_dir="${bucket}/${_WT_RECOVERY_DIR_NAME}"
-	local metadata_name=""
-
-	for metadata_name in "$_WT_RECOVERY_COMPLETE_MARKER" storage-owner storage-class storage-policy storage-root \
-		created-at producer producer-context session-id archive-outcome source-removal-outcome; do
-		if [[ -e "$recovery_dir/$metadata_name" || -L "$recovery_dir/$metadata_name" ]]; then
-			return 0
-		fi
-	done
-	return 1
-}
-
-_worktree_recovery_storage_contract_is_valid() {
-	local bucket="$1"
-	local expected_root="$2"
-	local recovery_dir="${bucket}/${_WT_RECOVERY_DIR_NAME}"
-	local storage_owner=""
-	local storage_class=""
-	local storage_policy=""
-	local storage_root=""
-	local metadata_name=""
-
-	for metadata_name in storage-owner storage-class storage-policy storage-root; do
-		[[ -f "$recovery_dir/$metadata_name" && ! -L "$recovery_dir/$metadata_name" ]] || return 1
-	done
-	IFS= read -r storage_owner <"$recovery_dir/storage-owner" || return 1
-	IFS= read -r storage_class <"$recovery_dir/storage-class" || return 1
-	IFS= read -r storage_policy <"$recovery_dir/storage-policy" || return 1
-	IFS= read -r storage_root <"$recovery_dir/storage-root" || return 1
-	[[ "$storage_owner" == "$_WT_RECOVERY_STORAGE_OWNER" ]] || return 1
-	[[ "$storage_class" == "recovery" ]] || return 1
-	[[ "$storage_policy" == "manual-review" ]] || return 1
-	[[ "$storage_root" == "$expected_root" ]] || return 1
-	return 0
-}
-
-_worktree_recovery_inventory_bucket_state() {
-	local bucket="$1"
-	local root_real="$2"
-	local deadline_epoch="${3:-0}"
-	local completion=""
-	local format=""
-	local state="unknown"
-	local validation_status=1
-
-	if [[ -d "$bucket" && ! -L "$bucket" &&
-		-d "$bucket/${_WT_RECOVERY_DIR_NAME}" &&
-		! -L "$bucket/${_WT_RECOVERY_DIR_NAME}" &&
-		-f "$bucket/${_WT_RECOVERY_DIR_NAME}/format" &&
-		! -L "$bucket/${_WT_RECOVERY_DIR_NAME}/format" &&
-		-f "$bucket/${_WT_RECOVERY_DIR_NAME}/${_WT_RECOVERY_COMPLETE_MARKER}" &&
-		! -L "$bucket/${_WT_RECOVERY_DIR_NAME}/${_WT_RECOVERY_COMPLETE_MARKER}" ]]; then
-		IFS= read -r format <"$bucket/${_WT_RECOVERY_DIR_NAME}/format" || format=""
-		IFS= read -r completion < \
-			"$bucket/${_WT_RECOVERY_DIR_NAME}/${_WT_RECOVERY_COMPLETE_MARKER}" || completion=""
-		validation_status=1
-		if _worktree_recovery_format_is_supported "$format" &&
-			[[ "$completion" == "$format" ]] &&
-			_worktree_recovery_storage_contract_is_valid "$bucket" "$root_real"; then
-			validation_status=0
-			_worktree_legacy_recovery_bucket_is_valid "$bucket" "$deadline_epoch" || validation_status=$?
-			[[ "$validation_status" -ne 0 ]] || state="attributed"
-		fi
-	elif [[ -d "$bucket" && ! -L "$bucket" &&
-		-f "$bucket/${_WT_RECOVERY_DIR_NAME}/format" &&
-		! -L "$bucket/${_WT_RECOVERY_DIR_NAME}/format" ]]; then
-		IFS= read -r format <"$bucket/${_WT_RECOVERY_DIR_NAME}/format" || format=""
-		validation_status=1
-		if [[ "$format" == "$_WT_RECOVERY_FORMAT_V1" ]] &&
-			! _worktree_recovery_extended_metadata_is_present "$bucket"; then
-			validation_status=0
-			_worktree_legacy_recovery_bucket_is_valid "$bucket" "$deadline_epoch" || validation_status=$?
-			[[ "$validation_status" -ne 0 ]] || state="attributed-legacy"
-		fi
-	fi
-	[[ "$validation_status" -ne 124 ]] || return 124
-	printf '%s\n' "$state"
-	return 0
-}
-
-_worktree_recovery_inventory_paths_root() {
-	local root_path="$1"
-	local store_role="$2"
-	local root_owner="$3"
-	local root_real="$root_path"
-	local bucket=""
-
-	[[ -d "$root_path" && ! -L "$root_path" ]] || return 0
-	root_real=$(cd "$root_path" 2>/dev/null && pwd -P) || return 1
-	for bucket in "$root_real"/aidevops-worktree-cleanup-*; do
-		[[ -e "$bucket" || -L "$bucket" ]] || continue
-		printf 'bucket\t%s\t%s\t%s\n' \
-			"$store_role" "$root_owner" "$bucket"
-	done
-	return 0
-}
-
-_worktree_recovery_inventory_root() {
-	local root_path="$1"
-	local store_role="$2"
-	local root_owner="$3"
-	local root_real="$root_path"
-	local root_state="missing"
-	local bucket=""
-	local state="unknown"
-
-	if [[ -d "$root_path" ]]; then
-		root_real=$(cd "$root_path" 2>/dev/null && pwd -P) || root_state="$_WT_RECOVERY_ROOT_UNAVAILABLE"
-		[[ "$root_state" == "$_WT_RECOVERY_ROOT_UNAVAILABLE" ]] || root_state="present"
-	elif [[ -e "$root_path" || -L "$root_path" ]]; then
-		root_state="$_WT_RECOVERY_ROOT_UNAVAILABLE"
-	fi
-	printf 'store\t%s\t%s\trecovery\tmanual-review\t%s\t%s\n' \
-		"$store_role" "$root_owner" "$root_state" "$root_real"
-	[[ "$root_state" == "present" ]] || return 0
-	for bucket in "$root_real"/aidevops-worktree-cleanup-*; do
-		[[ -e "$bucket" || -L "$bucket" ]] || continue
-		state=$(_worktree_recovery_inventory_bucket_state "$bucket" "$root_real") || return 1
-		printf 'bucket\t%s\t%s\t%s\t%s\n' \
-			"$store_role" "$_WT_RECOVERY_STORAGE_OWNER" "$state" "$bucket"
-	done
-	return 0
-}
-
-# Read-only, fail-closed inventory for current and attributable legacy buckets.
-# Unknown or interrupted buckets are reported, never treated as reclaimable.
-worktree_recovery_inventory() {
-	local platform="${1:-}"
-	local current_root=""
-	local current_root_compare=""
-	local current_owner="$_WT_RECOVERY_STORAGE_OWNER"
-	local legacy_root=""
-	local legacy_root_compare=""
-
-	if [[ -z "$platform" ]]; then
-		platform=$(uname -s 2>/dev/null) || return 1
-	fi
-	if [[ "$platform" == "$_WT_PLATFORM_DARWIN" ||
-		-n "${AIDEVOPS_WORKTREE_TRASH_ROOT:-${AIDEVOPS_ORPHAN_TRASH_ROOT:-}}" ]]; then
-		current_owner="$_WT_RECOVERY_STORAGE_OWNER_JOINT"
-	fi
-	current_root=$(_worktree_recovery_store_root "$platform") || return 1
-	current_root_compare="$current_root"
-	if [[ -d "$current_root" ]]; then
-		current_root_compare=$(cd "$current_root" 2>/dev/null && pwd -P) || return 1
-	fi
-	_worktree_recovery_inventory_root "$current_root" "current" "$current_owner" || return 1
-	if legacy_root=$(_worktree_legacy_recovery_root "$platform"); then
-		legacy_root_compare="$legacy_root"
-		if [[ -d "$legacy_root" ]]; then
-			legacy_root_compare=$(cd "$legacy_root" 2>/dev/null && pwd -P) || return 1
-		fi
-		if [[ "$legacy_root_compare" != "$current_root_compare" ]]; then
-			_worktree_recovery_inventory_root "$legacy_root" "legacy" \
-				"$_WT_RECOVERY_STORAGE_OWNER_JOINT" || return 1
-		fi
-	fi
-	return 0
-}
-
-# Cheap path-only enumeration for bounded consumers. Bucket attribution remains
-# fail-closed and must be performed separately inside the consumer's work window.
-worktree_recovery_inventory_paths() {
-	local platform="${1:-}"
-	local current_root=""
-	local current_root_compare=""
-	local current_owner="$_WT_RECOVERY_STORAGE_OWNER"
-	local legacy_root=""
-	local legacy_root_compare=""
-
-	if [[ -z "$platform" ]]; then
-		platform=$(uname -s 2>/dev/null) || return 1
-	fi
-	if [[ "$platform" == "$_WT_PLATFORM_DARWIN" ||
-		-n "${AIDEVOPS_WORKTREE_TRASH_ROOT:-${AIDEVOPS_ORPHAN_TRASH_ROOT:-}}" ]]; then
-		current_owner="$_WT_RECOVERY_STORAGE_OWNER_JOINT"
-	fi
-	current_root=$(_worktree_recovery_store_root "$platform") || return 1
-	current_root_compare="$current_root"
-	if [[ -d "$current_root" ]]; then
-		current_root_compare=$(cd "$current_root" 2>/dev/null && pwd -P) || return 1
-	fi
-	_worktree_recovery_inventory_paths_root "$current_root" "current" "$current_owner" || return 1
-	if legacy_root=$(_worktree_legacy_recovery_root "$platform"); then
-		legacy_root_compare="$legacy_root"
-		if [[ -d "$legacy_root" ]]; then
-			legacy_root_compare=$(cd "$legacy_root" 2>/dev/null && pwd -P) || return 1
-		fi
-		if [[ "$legacy_root_compare" != "$current_root_compare" ]]; then
-			_worktree_recovery_inventory_paths_root "$legacy_root" "legacy" \
-				"$_WT_RECOVERY_STORAGE_OWNER_JOINT" || return 1
-		fi
-	fi
-	return 0
-}
-
-_worktree_recovery_process_lstart() {
-	local pid="$1"
-	local process_lstart=""
-
-	[[ "$pid" =~ ^[0-9]+$ ]] || return 1
-	process_lstart=$(LC_ALL=C TZ=UTC ps -ww -p "$pid" -o lstart= 2>/dev/null || true)
-	process_lstart="${process_lstart#"${process_lstart%%[![:space:]]*}"}"
-	[[ -n "$process_lstart" ]] || return 1
-	printf '%s\n' "$process_lstart"
-	return 0
-}
-
-_worktree_recovery_lock_owner_state() {
-	local lock_path="$1"
-	local owner_pid=""
-	local owner_lstart=""
-	local current_lstart=""
-	local metadata_name=""
-
-	[[ -d "$lock_path" && ! -L "$lock_path" ]] || {
-		printf '%s\n' "$_WT_RECOVERY_LOCK_STATE_UNCERTAIN"
-		return 0
-	}
-	for metadata_name in pid lstart token initialized; do
-		[[ -f "$lock_path/$metadata_name" && ! -L "$lock_path/$metadata_name" ]] || {
-			printf '%s\n' "$_WT_RECOVERY_LOCK_STATE_UNCERTAIN"
-			return 0
-		}
-	done
-	IFS= read -r owner_pid <"$lock_path/pid" || owner_pid=""
-	IFS= read -r owner_lstart <"$lock_path/lstart" || owner_lstart=""
-	[[ "$owner_pid" =~ ^[0-9]+$ && -n "$owner_lstart" ]] || {
-		printf '%s\n' "$_WT_RECOVERY_LOCK_STATE_UNCERTAIN"
-		return 0
-	}
-	if ! kill -0 "$owner_pid" 2>/dev/null; then
-		printf '%s\n' "$_WT_RECOVERY_LOCK_STATE_STALE"
-		return 0
-	fi
-	current_lstart=$(_worktree_recovery_process_lstart "$owner_pid" 2>/dev/null || true)
-	if [[ -z "$current_lstart" ]]; then
-		if kill -0 "$owner_pid" 2>/dev/null; then
-			printf '%s\n' "$_WT_RECOVERY_LOCK_STATE_UNCERTAIN"
-		else
-			printf '%s\n' "$_WT_RECOVERY_LOCK_STATE_STALE"
-		fi
-	elif [[ "$current_lstart" == "$owner_lstart" ]]; then
-		printf '%s\n' "$_WT_RECOVERY_LOCK_STATE_LIVE"
-	else
-		printf '%s\n' "$_WT_RECOVERY_LOCK_STATE_STALE"
-	fi
-	return 0
-}
-
-_worktree_recovery_acquire_producer_lock() {
-	local recovery_root="$1"
-	local lock_path="${recovery_root}/${_WT_RECOVERY_PRODUCER_LOCK_NAME}"
-	local reclaim_path=""
-	local owner_state=""
-	local process_lstart=""
-	local owner_token=""
-	local observed_pid=""
-	local observed_lstart=""
-	local observed_token=""
-	local reclaimed_pid=""
-	local reclaimed_lstart=""
-	local reclaimed_token=""
-	local reclaim_state=""
-	local attempt=0
-
-	WORKTREE_RECOVERY_PRODUCER_LOCK_PATH=""
-	WORKTREE_RECOVERY_PRODUCER_LOCK_TOKEN=""
-	WORKTREE_RECOVERY_PRODUCER_LOCK_LSTART=""
-	[[ -d "$recovery_root" && ! -L "$recovery_root" ]] || return 1
-	process_lstart=$(_worktree_recovery_process_lstart "$$") || return 1
-	owner_token="$$-${RANDOM}-$(date -u '+%Y%m%dT%H%M%SZ')"
-	while [[ "$attempt" -lt 2 ]]; do
-		if mkdir "$lock_path" 2>/dev/null; then
-			if ! printf '%s\n' "$$" >"$lock_path/pid" ||
-				! printf '%s\n' "$process_lstart" >"$lock_path/lstart" ||
-				! printf '%s\n' "$owner_token" >"$lock_path/token" ||
-				! printf '%s\n' "complete" >"$lock_path/initialized"; then
-				rm -f "$lock_path/pid" "$lock_path/lstart" "$lock_path/token" \
-					"$lock_path/initialized" 2>/dev/null || true
-				rmdir "$lock_path" 2>/dev/null || true
-				return 1
-			fi
-			WORKTREE_RECOVERY_PRODUCER_LOCK_PATH="$lock_path"
-			WORKTREE_RECOVERY_PRODUCER_LOCK_TOKEN="$owner_token"
-			WORKTREE_RECOVERY_PRODUCER_LOCK_LSTART="$process_lstart"
-			return 0
-		fi
-		[[ -e "$lock_path" || -L "$lock_path" ]] || return 1
-		owner_state=$(_worktree_recovery_lock_owner_state "$lock_path") || return 1
-		[[ "$owner_state" == "$_WT_RECOVERY_LOCK_STATE_STALE" ]] || return 1
-		IFS= read -r observed_pid <"$lock_path/pid" || return 1
-		IFS= read -r observed_lstart <"$lock_path/lstart" || return 1
-		IFS= read -r observed_token <"$lock_path/token" || return 1
-		reclaim_path="${lock_path}.reclaim.$$-${RANDOM}"
-		mv "$lock_path" "$reclaim_path" 2>/dev/null || return 1
-		reclaim_state=$(_worktree_recovery_lock_owner_state "$reclaim_path") || return 1
-		IFS= read -r reclaimed_pid <"$reclaim_path/pid" || return 1
-		IFS= read -r reclaimed_lstart <"$reclaim_path/lstart" || return 1
-		IFS= read -r reclaimed_token <"$reclaim_path/token" || return 1
-		if [[ "$reclaim_state" != "$_WT_RECOVERY_LOCK_STATE_STALE" ||
-			"$reclaimed_pid" != "$observed_pid" || "$reclaimed_lstart" != "$observed_lstart" ||
-			"$reclaimed_token" != "$observed_token" ]]; then
-			if [[ ! -e "$lock_path" && ! -L "$lock_path" ]]; then
-				mv "$reclaim_path" "$lock_path" 2>/dev/null || true
-			fi
-			return 1
-		fi
-		rm -rf "$reclaim_path" || return 1
-		attempt=$((attempt + 1))
-	done
-	return 1
-}
-
-_worktree_recovery_release_producer_lock() {
-	local lock_path="${WORKTREE_RECOVERY_PRODUCER_LOCK_PATH:-}"
-	local owner_pid=""
-	local owner_lstart=""
-	local owner_token=""
-
-	[[ -n "$lock_path" && -d "$lock_path" && ! -L "$lock_path" ]] || return 1
-	IFS= read -r owner_pid <"$lock_path/pid" || return 1
-	IFS= read -r owner_lstart <"$lock_path/lstart" || return 1
-	IFS= read -r owner_token <"$lock_path/token" || return 1
-	[[ "$owner_pid" == "$$" && "$owner_lstart" == "$WORKTREE_RECOVERY_PRODUCER_LOCK_LSTART" &&
-		"$owner_token" == "$WORKTREE_RECOVERY_PRODUCER_LOCK_TOKEN" ]] || return 1
-	rm -f "$lock_path/initialized" "$lock_path/pid" "$lock_path/lstart" \
-		"$lock_path/token" || return 1
-	rmdir "$lock_path" || return 1
-	WORKTREE_RECOVERY_PRODUCER_LOCK_PATH=""
-	WORKTREE_RECOVERY_PRODUCER_LOCK_TOKEN=""
-	WORKTREE_RECOVERY_PRODUCER_LOCK_LSTART=""
-	return 0
-}
-
-_archive_worktree_path_recoverably_under_lock() {
-	local wt_path="$1"
-	local caller="$2"
-	local context="${3:-}"
-	local wt_path_real="$wt_path"
-	local recovery_root=""
-	local recovery_root_real=""
-	local recovery_bucket=""
-	local archive_path=""
-	local recovery_dir=""
-	local recovery_admin=""
-	local completion_marker_tmp=""
-	local worktree_basename=""
-	local git_state=""
-
-	WORKTREE_RECOVERABLE_ARCHIVE_PATH=""
-	_worktree_capture_git_identity "$wt_path" || return 1
-	wt_path_real="$_WT_ID_SOURCE_REAL"
-	git_state=$(_worktree_git_lock_state "$wt_path" "$wt_path_real") ||
-		git_state="$_WT_GIT_STATE_UNREADABLE"
-	if [[ "$git_state" != "$_WT_GIT_STATE_CLEAR" ]]; then
-		_worktree_log_git_refusal "$wt_path" "$caller" "$git_state" "$context"
-		return 1
-	fi
-	recovery_root=$(_worktree_recovery_store_root) || return 1
-	mkdir -p "$recovery_root" 2>/dev/null || return 1
-	recovery_root_real=$(cd "$recovery_root" 2>/dev/null && pwd -P) || return 1
-	case "$recovery_root_real" in
-	"$wt_path_real" | "$wt_path_real"/*) return 1 ;;
-	esac
-	worktree_basename="${wt_path%/}"
-	worktree_basename="${worktree_basename##*/}"
-	[[ -n "$worktree_basename" && "$worktree_basename" != "." &&
-		"$worktree_basename" != "$_WT_RECOVERY_DIR_NAME" ]] || return 1
-	recovery_bucket="${recovery_root_real}/aidevops-worktree-cleanup-$(date -u '+%Y%m%dT%H%M%SZ')-$$-${RANDOM}"
-	archive_path="${recovery_bucket}/${worktree_basename}"
-	recovery_dir="${recovery_bucket}/${_WT_RECOVERY_DIR_NAME}"
-	recovery_admin="${recovery_dir}/admin"
-	mkdir "$recovery_bucket" 2>/dev/null || return 1
-	_worktree_copy_directory_once "$wt_path_real" "$archive_path" || return 1
-	_worktree_prune_regenerable_archive_caches "$wt_path_real" "$archive_path" \
-		"$_WT_ID_REAL_GIT" || return 1
-	mkdir "$recovery_dir" 2>/dev/null || return 1
-	_worktree_copy_directory_once "$_WT_ID_ADMIN_REAL" "$recovery_admin" || return 1
-	_worktree_write_recovery_identity "$recovery_dir" || return 1
-	_worktree_write_recovery_v2_metadata "$recovery_dir" "$caller" "$context" || return 1
-	printf '%s\n' "$_WT_RECOVERY_STORAGE_OWNER" >"${recovery_dir}/storage-owner" || return 1
-	printf '%s\n' "recovery" >"${recovery_dir}/storage-class" || return 1
-	printf '%s\n' "manual-review" >"${recovery_dir}/storage-policy" || return 1
-	printf '%s\n' "$recovery_root_real" >"${recovery_dir}/storage-root" || return 1
-	printf '%s\n' "$_WT_ID_HEAD" >"${recovery_admin}/HEAD" || return 1
-	printf '%s\n' "$_WT_ID_COMMON_REAL" >"${recovery_admin}/commondir" || return 1
-	printf '%s\n' "${archive_path}/.git" >"${recovery_admin}/gitdir" || return 1
-	printf 'gitdir: %s\n' "$recovery_admin" >"${archive_path}/.git" || return 1
-	_worktree_recovery_archive_is_valid "$archive_path" || return 1
-	_worktree_archive_source_matches "$wt_path" "$archive_path" || return 1
-	completion_marker_tmp="${recovery_dir}/.${_WT_RECOVERY_COMPLETE_MARKER}.$$-${RANDOM}"
-	printf '%s\n' "$_WT_RECOVERY_FORMAT" >"$completion_marker_tmp" || return 1
-	mv "$completion_marker_tmp" "${recovery_dir}/${_WT_RECOVERY_COMPLETE_MARKER}" || return 1
-	git_state=$(_worktree_git_lock_state "$wt_path" "$wt_path_real") ||
-		git_state="$_WT_GIT_STATE_UNREADABLE"
-	if [[ "$git_state" != "$_WT_GIT_STATE_CLEAR" ]]; then
-		_worktree_log_git_refusal "$wt_path" "$caller" "$git_state" "$context"
-		return 1
-	fi
-	WORKTREE_RECOVERABLE_ARCHIVE_PATH="$archive_path"
-	return 0
-}
-
-archive_worktree_path_recoverably() {
-	local wt_path="$1"
-	local caller="$2"
-	local context="${3:-}"
-	local recovery_root=""
-	local recovery_root_real=""
-	local archive_status=0
-	local hold_seconds="${AIDEVOPS_WORKTREE_RECOVERY_TEST_HOLD_LOCK_SECONDS:-0}"
-
-	WORKTREE_RECOVERABLE_ARCHIVE_PATH=""
-	recovery_root=$(_worktree_recovery_store_root) || return 1
-	mkdir -p "$recovery_root" 2>/dev/null || return 1
-	recovery_root_real=$(cd "$recovery_root" 2>/dev/null && pwd -P) || return 1
-	_worktree_recovery_acquire_producer_lock "$recovery_root_real" || return 1
-	case "$hold_seconds" in
-	'' | *[!0-9]*) hold_seconds=0 ;;
-	esac
-	[[ "$hold_seconds" -eq 0 ]] || sleep "$hold_seconds"
-	_archive_worktree_path_recoverably_under_lock "$wt_path" "$caller" "$context" || archive_status=$?
-	_worktree_recovery_release_producer_lock || archive_status=1
-	return "$archive_status"
-}
-
 _worktree_guard_path_is_usable() {
 	local wt_path="$1"
 	local caller="$2"
@@ -1427,6 +680,100 @@ _worktree_guard_path_is_usable() {
 # Returns 0 for complete no-match, 2 for degraded no-match (recoverable path
 # required), and 1 for every hard refusal or unusable snapshot.
 # =============================================================================
+worktree_managed_lifetime_proof() {
+	local wt_path="$1"
+	shift
+	local helper="${BASH_SOURCE[0]%/*}/worktree-managed-lifetime.py"
+	[[ -f "$helper" ]] || return 1
+	WORKTREE_REGISTRY_DB="${WORKTREE_REGISTRY_DB:-}" python3 "$helper" proof "$wt_path" "$@" >/dev/null 2>&1 || return 1
+	return 0
+}
+
+# Separate, present-tense maintenance authorization for legacy observations.
+# Never supplies a managed proof to the degraded-CWD fallback above/below.
+worktree_maintenance_removal_proof() {
+	local wt_path="$1"
+	local helper="${BASH_SOURCE[0]%/*}/worktree-maintenance.py"
+	[[ -n "${AIDEVOPS_WORKTREE_MAINTENANCE_PLAN:-}" &&
+		-n "${AIDEVOPS_WORKTREE_MAINTENANCE_CONFIRM:-}" && -f "$helper" ]] || return 1
+	PYTHONDONTWRITEBYTECODE=1 python3 "$helper" proof "$wt_path" \
+		--plan "$AIDEVOPS_WORKTREE_MAINTENANCE_PLAN" \
+		--confirm "$AIDEVOPS_WORKTREE_MAINTENANCE_CONFIRM" || return 1
+	return 0
+}
+
+worktree_maintenance_requested() {
+	[[ -n "${AIDEVOPS_WORKTREE_MAINTENANCE_PLAN:-}" ||
+		-n "${AIDEVOPS_WORKTREE_MAINTENANCE_CONFIRM:-}" ]] || return 1
+	return 0
+}
+
+worktree_managed_require_removal_proof() {
+	local wt_path="$1"
+	local helper="${BASH_SOURCE[0]%/*}/worktree-managed-lifetime.py"
+	local managed_status=0
+	# Missing or changed enrollment must not turn a planned maintenance removal
+	# into an ordinary unregistered removal after its initial authorization.
+	if worktree_maintenance_requested; then
+		worktree_maintenance_removal_proof "$wt_path" || return 1
+		return 0
+	fi
+	WORKTREE_REGISTRY_DB="${WORKTREE_REGISTRY_DB:-}" python3 "$helper" status "$wt_path" >/dev/null 2>&1 || managed_status=$?
+	[[ "$managed_status" -ne 3 ]] || return 0
+	worktree_managed_lifetime_proof "$wt_path" || return 1
+	return 0
+}
+
+worktree_managed_prepare_removal() {
+	local wt_path="$1"
+	local branch="$2"
+	local helper="${BASH_SOURCE[0]%/*}/worktree-managed-lifetime.py"
+	local managed_status=0
+	# Never claim, re-enroll or seal after a failed maintenance authorization.
+	if worktree_maintenance_requested; then
+		worktree_maintenance_removal_proof "$wt_path" || return 1
+		return 0
+	fi
+	# Only confirmed absence uses legacy guards; unavailable evidence refuses.
+	[[ -f "$helper" ]] || return 1
+	WORKTREE_REGISTRY_DB="${WORKTREE_REGISTRY_DB:-}" python3 "$helper" status "$wt_path" >/dev/null 2>&1 || managed_status=$?
+	[[ "$managed_status" -ne 3 ]] || return 0
+	[[ "$managed_status" -eq 0 ]] || return 1
+	worktree_managed_lifetime_proof "$wt_path" && return 0
+	declare -F claim_worktree_ownership >/dev/null 2>&1 || return 1
+	claim_worktree_ownership "$wt_path" "$branch" --owner-pid "$$" \
+		--session "cleanup:$$" --task worktree-removal >/dev/null 2>&1 || return 1
+	if ! WORKTREE_REGISTRY_DB="${WORKTREE_REGISTRY_DB:-}" python3 "$helper" seal "$wt_path"; then
+		unregister_worktree_if_owner_contract "$wt_path" "$$" "cleanup:$$" worktree-removal >/dev/null 2>&1 || true
+		return 1
+	fi
+	return 0
+}
+
+_worktree_guard_degraded_cwd() {
+	local wt_path="$1"
+	local wt_path_real="$2"
+	local caller="$3"
+	# Maintenance never enters manual degraded recovery or acquires its lease.
+	if worktree_maintenance_requested; then
+		WORKTREE_REMOVAL_GUARD_VISIBILITY="$_WT_CWD_VISIBILITY_DEGRADED"
+		WORKTREE_REMOVAL_GUARD_REASON="maintenance-cwd-visibility-degraded"
+		log_worktree_removal_event "$_WTAR_SKIPPED" "$caller" "$wt_path" \
+			"$WORKTREE_REMOVAL_GUARD_REASON" "$_WTAR_MODE_SKIPPED"
+		return 1
+	fi
+	# Only a sealed, explicitly enrolled Pulse generation can replace the
+	# unknown part of a scan. The caller checks readable positive matches first.
+	if worktree_managed_lifetime_proof "$wt_path_real"; then
+		WORKTREE_REMOVAL_GUARD_VISIBILITY="managed-lifetime"
+		return 0
+	fi
+	WORKTREE_REMOVAL_GUARD_VISIBILITY="$_WT_CWD_VISIBILITY_DEGRADED"
+	WORKTREE_REMOVAL_GUARD_REASON="$_WT_CWD_REASON_DEGRADED"
+	log_worktree_removal_event "$_WTAR_SKIPPED" "$caller" "$wt_path" "$_WT_CWD_REASON_DEGRADED" "recoverable-required"
+	return "$_WT_CWD_CAPTURE_DEGRADED_RC"
+}
+
 worktree_removal_guard() {
 	local wt_path="$1"
 	local caller="$2"
@@ -1505,10 +852,8 @@ worktree_removal_guard() {
 		return 1
 	fi
 	if [[ "$cwd_match_status" -eq "$_WT_CWD_CAPTURE_DEGRADED_RC" ]]; then
-		WORKTREE_REMOVAL_GUARD_VISIBILITY="$_WT_CWD_VISIBILITY_DEGRADED"
-		WORKTREE_REMOVAL_GUARD_REASON="$_WT_CWD_REASON_DEGRADED"
-		log_worktree_removal_event "$_WTAR_SKIPPED" "$caller" "$wt_path" "$_WT_CWD_REASON_DEGRADED" "recoverable-required"
-		return "$_WT_CWD_CAPTURE_DEGRADED_RC"
+		_worktree_guard_degraded_cwd "$wt_path" "$wt_path_real" "$caller" || return $?
+		return 0
 	fi
 	if [[ "$cwd_match_status" -eq "$_WT_CWD_MATCH_UNUSABLE_RC" ]]; then
 		WORKTREE_REMOVAL_GUARD_VISIBILITY="$_WT_CWD_VISIBILITY_UNUSABLE"
@@ -1522,68 +867,34 @@ worktree_removal_guard() {
 	return 0
 }
 
-_worktree_remove_with_native_git() {
+# Succeed only when WT_PATH still matches the source fingerprint recorded in
+# COMPACT_DIR by worktree-archive-helper.sh (GH#34943). Any failure, including
+# an unavailable helper, preserves the worktree.
+_worktree_compact_source_matches() {
 	local wt_path="$1"
-	local caller="$2"
-	local context="$3"
-	local force_remove="$4"
-	local archive_path="${5:-}"
-	local real_git=""
-	local common_dir=""
-	local wt_path_real="$wt_path"
-	local git_state=""
+	local compact_dir="$2"
+	local caller="$3"
+	local context="$4"
+	local helper="${AIDEVOPS_WORKTREE_ARCHIVE_HELPER:-${BASH_SOURCE[0]%/*}/worktree-archive-helper.sh}"
 
-	if [[ -L "$wt_path" ]]; then
-		_worktree_log_identity_refusal "$wt_path" "$caller" "$context"
-		return 1
-	fi
-	if [[ ! -e "$wt_path" ]]; then
-		if [[ -n "$archive_path" ]]; then
-			_worktree_log_identity_refusal "$wt_path" "$caller" "$context"
-			return 1
-		fi
+	if "$helper" source-matches "$compact_dir" "$wt_path" >/dev/null 2>&1; then
 		return 0
 	fi
-	if [[ -e "$wt_path" ]]; then
-		wt_path_real=$(cd "$wt_path" 2>/dev/null && pwd -P) || wt_path_real="$wt_path"
-	fi
-	git_state=$(_worktree_git_lock_state "$wt_path" "$wt_path_real") ||
-		git_state="$_WT_GIT_STATE_UNREADABLE"
-	if [[ "$git_state" != "$_WT_GIT_STATE_CLEAR" ]]; then
-		_worktree_log_git_refusal "$wt_path" "$caller" "$git_state" "$context"
-		return 1
-	fi
-	if ! real_git=$(_worktree_cleanup_real_git); then
-		_worktree_log_git_refusal "$wt_path" "$caller" "$_WT_GIT_STATE_UNREADABLE" "$context"
-		return 1
-	fi
-	if ! common_dir=$(_worktree_git_common_dir "$real_git" "$wt_path"); then
-		_worktree_log_git_refusal "$wt_path" "$caller" "$_WT_GIT_STATE_UNREADABLE" "$context"
-		return 1
-	fi
-	if [[ -n "$archive_path" ]] && ! _worktree_archive_source_matches "$wt_path" "$archive_path"; then
-		_worktree_log_identity_refusal "$wt_path" "$caller" "$context"
-		return 1
-	fi
+	log_worktree_removal_event "$_WTAR_SKIPPED" "$caller" "$wt_path" \
+		"compact-archive-source-changed" "$_WTAR_MODE_SKIPPED" "$context"
+	return 1
+}
 
-	if [[ "$force_remove" == "$_WTAR_BOOL_TRUE" ]]; then
-		# One force can remove dirty state, but Git requires force twice to
-		# override a worktree lock acquired after our final metadata check.
-		"$real_git" --git-dir="$common_dir" worktree remove --force "$wt_path_real" 2>/dev/null || {
-			git_state=$(_worktree_git_lock_state "$wt_path" "$wt_path_real") ||
-				git_state="$_WT_GIT_STATE_UNREADABLE"
-			_worktree_log_git_refusal "$wt_path" "$caller" "$git_state" "$context"
-			return 1
-		}
-	else
-		"$real_git" --git-dir="$common_dir" worktree remove "$wt_path_real" 2>/dev/null || {
-			git_state=$(_worktree_git_lock_state "$wt_path" "$wt_path_real") ||
-				git_state="$_WT_GIT_STATE_UNREADABLE"
-			_worktree_log_git_refusal "$wt_path" "$caller" "$git_state" "$context"
-			return 1
-		}
-	fi
-	[[ ! -e "$wt_path" && ! -e "$wt_path_real" ]] || return 1
+# Args: $1=worktree, $2=caller, $3=context, $4=force, $5=recovery archive
+# (optional), $6=compact archive dir (optional; its source fingerprint is
+# re-checked after every other probe, immediately before native removal).
+_worktree_remove_with_native_git() {
+	local wt_path="$1"
+	# Compatibility entrypoint only: old proof/force/archive arguments cannot
+	# authorize deletion. The registry executor verifies its own preservation.
+	# shellcheck source=./worker-lifecycle-state.sh
+	source "${BASH_SOURCE[0]%/*}/worker-lifecycle-state.sh" || return 1
+	worker_lifecycle_cleanup_worktree "$wt_path" || return 1
 	return 0
 }
 
@@ -1661,19 +972,17 @@ remove_worktree_path_permanently() {
 # helper is the audited exception for an already-guarded linked worktree's
 # lock-aware removal and missing-metadata prune operations.
 _worktree_cleanup_real_git() {
-	local candidate="${AIDEVOPS_REAL_GIT_BIN:-}"
+	local candidate=""
 
+	if ! declare -F aidevops_resolve_native_git >/dev/null 2>&1; then
+		# shellcheck source=runtime-env.sh
+		source "$(dirname "${BASH_SOURCE[0]}")/runtime-env.sh" || return 1
+	fi
+	candidate=$(aidevops_resolve_native_git) || return 1
 	if [[ -n "$candidate" && -x "$candidate" ]]; then
 		printf '%s\n' "$candidate"
 		return 0
 	fi
-
-	for candidate in /usr/bin/git /usr/local/bin/git /opt/homebrew/bin/git; do
-		if [[ -x "$candidate" ]]; then
-			printf '%s\n' "$candidate"
-			return 0
-		fi
-	done
 
 	return 1
 }
@@ -1785,5 +1094,174 @@ prune_missing_worktree_metadata() {
 	fi
 	[[ "$metadata_status" -eq 1 ]] || return 1
 
+	return 0
+}
+
+# =============================================================================
+# Branch-cleanup transport reclaim (GH#35490)
+#
+# local-/remote-branch-cleanup-helper.sh create a detached deletion transport
+# named `<repo>-{local,remote}-branch-cleanup-<pid>`. Before GH#35490 those
+# trees enrolled as owner-cgroup managed generations whose completion receipt
+# can never be produced once the creating (unmanaged) process exits, so every
+# run leaked one tree into the dispatch worktree cap. A transport never hosts
+# handed-off work: it is detached and either has no checkout or an unmodified
+# one. Reclaim is therefore based on content, not on a synthetic completion
+# receipt: no Pulse-managed record is adopted, a live creator or owner keeps its
+# tree, and canonical, locked, current-directory and active-CWD guards still
+# veto. The managed record is left untouched as lifetime history.
+# =============================================================================
+_WT_TRANSPORT_NAME_PATTERN='-(local|remote)-branch-cleanup-([0-9]+)$'
+_WT_TRANSPORT_REASON="branch-cleanup-transport-reclaim"
+
+_worktree_transport_pid_is_absent() {
+	local pid="$1"
+	local helper="${BASH_SOURCE[0]%/*}/shared-worktree-registry-platform.py"
+	[[ "$pid" =~ ^[1-9][0-9]*$ && -f "$helper" ]] || return 1
+	python3 "$helper" pid-absent "$pid" >/dev/null 2>&1 || return 1
+	return 0
+}
+
+# Succeed when the creator named by the path and every recorded owner are gone.
+# Legacy (unenrolled) and properly sealed generations need only the creator
+# check; only an unsealed owner-cgroup record may be considered, never Pulse's.
+_worktree_transport_owner_gone() {
+	local wt_path_real="$1"
+	local creator_pid="$2"
+	local helper="${BASH_SOURCE[0]%/*}/worktree-managed-lifetime.py"
+	local record="" managed_status=0 owner_pid=""
+
+	_worktree_transport_pid_is_absent "$creator_pid" || return 1
+	[[ -f "$helper" ]] || return 1
+	record=$(WORKTREE_REGISTRY_DB="${WORKTREE_REGISTRY_DB:-}" python3 "$helper" status "$wt_path_real" 2>/dev/null) ||
+		managed_status=$?
+	[[ "$managed_status" -ne 3 ]] || return 0
+	[[ "$managed_status" -eq 0 && -n "$record" ]] || return 1
+	worktree_managed_lifetime_proof "$wt_path_real" && return 0
+	command -v jq >/dev/null 2>&1 || return 1
+	printf '%s' "$record" | jq -e '.manager == "owner-cgroup" and .state == "running"' >/dev/null 2>&1 || return 1
+	# The recorded owner cgroup is often a long-lived session or service scope,
+	# so its population is not evidence about this tree. A descendant still
+	# using the transport (for example `git -C`) has its CWD inside it, which
+	# worktree_removal_guard vetoes.
+	while IFS= read -r owner_pid; do
+		_worktree_transport_pid_is_absent "$owner_pid" || return 1
+	done < <(printf '%s' "$record" | jq -r '.launches[]? | (.owner_pid // 0 | tostring)' 2>/dev/null)
+	return 0
+}
+
+# Succeed when the transport is detached and holds nothing beyond its Git link
+# (no-checkout) or an unmodified checkout with no untracked or ignored files.
+_worktree_transport_is_content_free() {
+	local real_git="$1"
+	local wt_path_real="$2"
+	local entry="" status_out=""
+
+	[[ -f "$wt_path_real/.git" && ! -L "$wt_path_real/.git" ]] || return 1
+	if "$real_git" -C "$wt_path_real" symbolic-ref -q HEAD >/dev/null 2>&1; then
+		return 1
+	fi
+	for entry in "$wt_path_real"/* "$wt_path_real"/.[!.]* "$wt_path_real"/..?*; do
+		[[ -e "$entry" || -L "$entry" ]] || continue
+		[[ "${entry##*/}" == ".git" ]] && continue
+		status_out=$("$real_git" -C "$wt_path_real" status --porcelain --untracked-files=all --ignored 2>/dev/null) ||
+			return 1
+		[[ -z "$status_out" ]] || return 1
+		return 0
+	done
+	return 0
+}
+
+# Args: $1=repository context, $2=transport path, $3=audit caller,
+#       $4=CWD snapshot, $5=CWD visibility (complete|degraded|unusable)
+# Returns 0 only when the transport was removed and its path is gone.
+reclaim_branch_cleanup_transport() {
+	local repo_context="$1"
+	local wt_path="$2"
+	local caller="$3"
+	local cwd_snapshot="$4"
+	local cwd_visibility="$5"
+	local name="${wt_path##*/}"
+	local creator_pid="" wt_path_real="" real_git="" common_dir="" repo_common_dir="" git_state=""
+
+	[[ "$name" =~ $_WT_TRANSPORT_NAME_PATTERN ]] || return 1
+	creator_pid="${BASH_REMATCH[2]}"
+	[[ -d "$wt_path" && ! -L "$wt_path" ]] || return 1
+	wt_path_real=$(cd "$wt_path" 2>/dev/null && pwd -P) || return 1
+	if ! _worktree_transport_owner_gone "$wt_path_real" "$creator_pid"; then
+		log_worktree_removal_event "$_WTAR_SKIPPED" "$caller" "$wt_path" "transport-owner-active-or-unproven" "$_WTAR_MODE_SKIPPED"
+		return 1
+	fi
+	real_git=$(_worktree_cleanup_real_git) || return 1
+	if ! _worktree_transport_is_content_free "$real_git" "$wt_path_real"; then
+		log_worktree_removal_event "$_WTAR_SKIPPED" "$caller" "$wt_path" "transport-has-content" "$_WTAR_MODE_SKIPPED"
+		return 1
+	fi
+	worktree_removal_guard "$wt_path" "$caller" "$_WT_TRANSPORT_REASON" "$cwd_snapshot" "$cwd_visibility" || return 1
+	common_dir=$(_worktree_git_common_dir "$real_git" "$wt_path_real") || return 1
+	repo_common_dir=$(_worktree_git_common_dir "$real_git" "$repo_context") || return 1
+	[[ "$common_dir" == "$repo_common_dir" ]] || return 1
+	git_state=$(_worktree_git_lock_state "$wt_path" "$wt_path_real") || git_state="$_WT_GIT_STATE_UNREADABLE"
+	if [[ "$git_state" != "$_WT_GIT_STATE_CLEAR" ]]; then
+		_worktree_log_git_refusal "$wt_path" "$caller" "$git_state" ""
+		return 1
+	fi
+	# One --force: a no-checkout tree reports its empty index as changes. Git
+	# still refuses a lock acquired after the check above.
+	if ! "$real_git" --git-dir="$common_dir" worktree remove --force "$wt_path_real" >/dev/null 2>&1; then
+		log_worktree_removal_event "$_WTAR_SKIPPED" "$caller" "$wt_path" "$_WT_GIT_REASON_REMOVE_FAILED" "$_WTAR_MODE_SKIPPED"
+		return 1
+	fi
+	[[ ! -e "$wt_path_real" ]] || return 1
+	log_worktree_removal_event "$_WTAR_REMOVED" "$caller" "$wt_path" "$_WT_TRANSPORT_REASON" "permanent"
+	return 0
+}
+
+# Reclaim retained branch-cleanup transports of one repository. Local and
+# API-free, so it runs before any GitHub-dependent cleanup can time out.
+# Args: $1=repository context, $2=audit caller, $3=optional max removals
+# Prints the number of reclaimed transports; always returns 0.
+reclaim_branch_cleanup_transports() {
+	local repo_context="$1"
+	local caller="$2"
+	local limit="${3:-${AIDEVOPS_TRANSPORT_RECLAIM_MAX:-250}}"
+	local real_git="" field="" wt_path="" detached=0 first=1 candidates="" candidate=""
+	local cwd_snapshot="" cwd_status=0 cwd_visibility="$_WT_CWD_VISIBILITY_COMPLETE" reclaimed=0
+
+	[[ "$limit" =~ ^[0-9]+$ ]] || limit=250
+	if [[ -z "$repo_context" || ! -d "$repo_context" ]] || ! real_git=$(_worktree_cleanup_real_git); then
+		printf '0\n'
+		return 0
+	fi
+	while IFS= read -r -d '' field; do
+		case "$field" in
+		worktree\ *) wt_path="${field#worktree }" detached=0 ;;
+		detached) detached=1 ;;
+		"")
+			if [[ "$first" -eq 0 && "$detached" -eq 1 && "${wt_path##*/}" =~ $_WT_TRANSPORT_NAME_PATTERN ]]; then
+				candidates="${candidates}${wt_path}"$'\n'
+			fi
+			first=0 wt_path="" detached=0
+			;;
+		esac
+	done < <("$real_git" -C "$repo_context" worktree list --porcelain -z 2>/dev/null || true)
+	if [[ -z "$candidates" ]]; then
+		printf '0\n'
+		return 0
+	fi
+	# One CWD snapshot per pass; each removal still rechecks Git lock state.
+	cwd_snapshot=$(capture_worktree_process_cwds) || cwd_status=$?
+	if [[ "$cwd_status" -eq "$_WT_CWD_CAPTURE_DEGRADED_RC" ]]; then
+		cwd_visibility="$_WT_CWD_VISIBILITY_DEGRADED"
+	elif [[ "$cwd_status" -ne 0 ]]; then
+		cwd_visibility="$_WT_CWD_VISIBILITY_UNUSABLE"
+	fi
+	while IFS= read -r candidate; do
+		[[ -n "$candidate" && "$reclaimed" -lt "$limit" ]] || continue
+		if reclaim_branch_cleanup_transport "$repo_context" "$candidate" "$caller" "$cwd_snapshot" "$cwd_visibility"; then
+			reclaimed=$((reclaimed + 1))
+		fi
+	done <<<"$candidates"
+	printf '%s\n' "$reclaimed"
 	return 0
 }

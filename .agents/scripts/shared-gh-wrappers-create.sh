@@ -49,6 +49,9 @@ if ! command -v privacy_guard_public_write >/dev/null 2>&1; then
 	printf 'shared-gh-wrappers-create: privacy_guard_public_write did not load\n' >&2
 	return 1
 fi
+# shellcheck source=shared-gh-wrappers-comment-selector.sh
+# shellcheck disable=SC1091  # resolved from this module's directory at runtime
+source "${_GH_WRAPPERS_CREATE_DIR}/shared-gh-wrappers-comment-selector.sh" || return 1
 
 #######################################
 # Scan normalized GitHub write arguments before public transport.
@@ -87,8 +90,11 @@ _gh_guard_public_write_args() {
 		esac
 	done
 	[[ "$expect" != "repo" ]] || return 1
-	privacy_guard_public_write "$repo" "$text"
-	return $?
+	if ! privacy_guard_public_write "$repo" "$text"; then
+		_gh_edit_audit_rejection "public write" "privacy guard blocked write" --repo "$repo"
+		return 1
+	fi
+	return 0
 }
 
 # t2436: Extract the tNNN task ID from a --title "tNNN: ..." argument.
@@ -231,12 +237,128 @@ _gh_ci_prepare_todo_labels() {
 # created origin-labelled issues from entering the reconciler's triage-missing
 # bucket when callers also omit tier/auto-dispatch metadata.
 _GH_CI_STATUS_LABEL_ARGS=()
+
+# GH#37993: long-lived non-task records (dashboards, routine logs, signed
+# approval/policy issues) are never task-lifecycle subjects. They receive no
+# derived status:available and no creator self-assignment.
+_GH_CI_NON_TASK_CREATE_LABELS=(
+	"persistent" "supervisor" "contributor" "quality-review" "routine-tracking"
+	"release-approval-required" "release-standing-policy"
+)
+_gh_ci_args_are_non_task() {
+	local label=""
+	for label in "${_GH_CI_NON_TASK_CREATE_LABELS[@]}"; do
+		_gh_wrapper_args_have_label "$label" "$@" && return 0
+	done
+	return 1
+}
+
+# t2028/t2406/GH#27929: choose an eligible auto-assignee before creation,
+# but keep durable creation independent from the best-effort assignment.
+# Result in _GH_CI_AUTO_ASSIGNEE (empty = no self-assignment); print_info
+# diagnostics must not be captured as the assignee.
+_GH_CI_AUTO_ASSIGNEE=""
+_gh_ci_select_auto_assignee() {
+	local target_repo="$1"
+	shift
+	_GH_CI_AUTO_ASSIGNEE=""
+	_gh_wrapper_args_have_assignee "$@" && return 0
+	if [[ "${AIDEVOPS_GH_SKIP_AUTO_ASSIGNMENT:-0}" == 1 ]]; then
+		# GH#30325: pending publication withholds auto-dispatch from the
+		# issue, so trusted callers pass the original ownership intent
+		# separately for the shared GraphQL/REST creation path.
+		print_info "[INFO] caller ownership policy skips self-assignment"
+	elif _gh_wrapper_args_have_label "$_GH_CREATE_AUTO_DISPATCH_LABEL" "$@"; then
+		# t2157/t2406: auto-dispatch means worker-owned; skip self-assignment.
+		print_info "[INFO] auto-dispatch label present — skipping self-assignment per t2157"
+	elif _gh_ci_args_are_non_task "$@"; then
+		print_info "[INFO] non-task issue — skipping self-assignment per GH#37993"
+	else
+		_GH_CI_AUTO_ASSIGNEE=$(_gh_wrapper_auto_assignee "$target_repo")
+	fi
+	return 0
+}
+
 _gh_ci_prepare_status_label() {
 	_GH_CI_STATUS_LABEL_ARGS=()
+	_gh_ci_args_are_non_task "$@" && return 0
 	if ! _gh_wrapper_args_have_label_prefix "status:" "$@"; then
 		_GH_CI_STATUS_LABEL_ARGS=(--label "status:available")
 	fi
 	return 0
+}
+
+# GH#32880: agent sessions (interactive and headless workers) create issues
+# through the `gh_create_issue` PATH shim, which sets
+# AIDEVOPS_STRICT_DISPATCH_SCOPE=1. Those callers can repair a brief the moment
+# creation fails but do not act on warnings. Scripted/routine callers source
+# the library directly and keep warn-only, so scheduled findings are never lost.
+_gh_ci_dispatch_scope_strict() {
+	[[ "${AIDEVOPS_STRICT_DISPATCH_SCOPE:-0}" == "1" ]] && return 0
+	return 1
+}
+
+# Fail closed at publication rather than creating a worker-owned issue whose
+# first worker can only report missing_files_scope. Explicit declarations in
+# legacy Files sections need author review before they become write authority.
+_gh_ci_validate_dispatch_scope() {
+	local body="" body_file="" expect="" arg
+	_gh_wrapper_args_have_label "$_GH_CREATE_AUTO_DISPATCH_LABEL" "$@" || return 0
+	for arg in "$@"; do
+		if [[ -n "$expect" ]]; then
+			case "$expect" in
+			body) body="$arg" ;;
+			file) body_file="$arg" ;;
+			esac
+			expect=""
+			continue
+		fi
+		case "$arg" in
+		--body) expect=body ;;
+		--body-file) expect="file" ;;
+		--body=*) body="${arg#--body=}" ;;
+		--body-file=*) body_file="${arg#--body-file=}" ;;
+		esac
+	done
+	if [[ -n "$body_file" ]]; then
+		[[ -r "$body_file" ]] || return 1
+		body=$(<"$body_file")
+	fi
+	if grep -Eqi '^[[:space:]]*(#{1,3}[[:space:]]*)?(planning-only|pure planning|brief-only|no code changes)(:|[[:space:]]*$)' <<<"$body"; then
+		return 0
+	fi
+	# GH#33227: shared by both rejection paths below so the "no Files Scope
+	# heading" and "heading present but no accepted path line" messages
+	# describe one accepted line shape instead of contradicting each other.
+	# shellcheck disable=SC2016 # literal Markdown backticks, not expansions
+	local scope_hint='Add a "### Files Scope" section with one "- `repo/relative/path`" line per file (optional EDIT:/NEW: prefix, nothing after the path), then verify with pre-dispatch-validator-helper.sh scope-check <N> "<body>" 1. See workflows/brief.md section 6.'
+	# Creation-time repair is limited to explicit file declarations; bodies
+	# without them remain subject to the pre-claim validator. Deterministic
+	# routine callers only warn here; the agent-facing shim fails closed (GH#32880).
+	if ! printf '%s\n' "$body" | awk '
+		/^###? (Files to Modify|Files|Relevant Files)[[:space:]]*$/ { section=1; next }
+		/^# / || /^## / || /^### / { section=0 }
+		section && /^[[:space:]]*-[[:space:]]*(EDIT|NEW):[[:space:]]*`?[^`[:space:]]/ { found=1 }
+		END { exit !found }
+	' && ! grep -Eq '^#{2,3} Files Scope[[:space:]]*$' <<<"$body"; then
+		# GH#32531/GH#33243: the author has the most context to choose the scope,
+		# so ask while the brief is still in hand. Without it the worker spends
+		# its first step on scope discovery; the pulse no longer holds the issue.
+		if _gh_ci_dispatch_scope_strict; then
+			print_error "auto-dispatch issue not created: body has no canonical Files Scope. ${scope_hint} Or drop auto-dispatch / mark it planning-only."
+			return 1
+		fi
+		print_warning "auto-dispatch issue has no canonical ### Files Scope; its worker must discover and record the scope before editing. ${scope_hint}"
+		return 0
+	fi
+	# shellcheck source=./pre-dispatch-validator-lib-brief-scope.sh
+	# shellcheck disable=SC1091
+	source "${_GH_WRAPPERS_CREATE_DIR}/pre-dispatch-validator-lib-brief-scope.sh"
+	if _brief_files_scope_has_path "$body"; then
+		return 0
+	fi
+	print_error "auto-dispatch issue not created: Files Scope heading is present but no line matches the accepted shape. ${scope_hint}"
+	return 1
 }
 
 # GH#29394/GH#29408: NMR is reserved for external-author trust gates.
@@ -292,6 +414,12 @@ _gh_ci_prepare_trusted_nmr_labels() {
 		print_info "[INFO] GH#29394: preserving external-origin needs-maintainer-review"
 		return 0
 	fi
+	# #aidevops:trust-boundary — throughput-throttling reports are maintainer
+	# decisions by design (reference/throughput-throttling-policy.md).
+	if _gh_wrapper_args_have_label "throughput-throttle-report" "$@"; then
+		print_info "[INFO] preserving throughput-throttle-report needs-maintainer-review"
+		return 0
+	fi
 
 	local target_repo=""
 	target_repo=$(_gh_extract_repo_from_args "$@" 2>/dev/null || true)
@@ -311,19 +439,19 @@ _gh_ci_prepare_trusted_nmr_labels() {
 		"persistent" "supervisor" "contributor" "quality-review" \
 		"routine-tracking" "needs-credentials" "needs-maintainer-permissions" \
 		"status:done" "status:resolved"; do
-		if _gh_wrapper_args_have_label "$suppression_label" "${_GH_CI_TRUST_NORMALIZED_ARGS[@]}"; then
+		if _gh_wrapper_args_have_label "$suppression_label" ${_GH_CI_TRUST_NORMALIZED_ARGS[@]+"${_GH_CI_TRUST_NORMALIZED_ARGS[@]}"}; then
 			explicit_suppress=1
 			infer_dispatch=0
 			replacement_label=""
 			break
 		fi
 	done
-	if _gh_wrapper_args_have_label "security" "${_GH_CI_TRUST_NORMALIZED_ARGS[@]}" \
-		|| _gh_wrapper_args_have_label "security-review" "${_GH_CI_TRUST_NORMALIZED_ARGS[@]}"; then
+	if _gh_wrapper_args_have_label "security" ${_GH_CI_TRUST_NORMALIZED_ARGS[@]+"${_GH_CI_TRUST_NORMALIZED_ARGS[@]}"} \
+		|| _gh_wrapper_args_have_label "security-review" ${_GH_CI_TRUST_NORMALIZED_ARGS[@]+"${_GH_CI_TRUST_NORMALIZED_ARGS[@]}"}; then
 		infer_dispatch=0
 		replacement_label="hold-for-review"
 	elif [[ "$explicit_suppress" -eq 0 ]] \
-		&& _gh_wrapper_args_have_label "$_GH_CREATE_AUTO_DISPATCH_LABEL" "${_GH_CI_TRUST_NORMALIZED_ARGS[@]}"; then
+		&& _gh_wrapper_args_have_label "$_GH_CREATE_AUTO_DISPATCH_LABEL" ${_GH_CI_TRUST_NORMALIZED_ARGS[@]+"${_GH_CI_TRUST_NORMALIZED_ARGS[@]}"}; then
 		infer_dispatch=0
 		replacement_label=""
 	fi
@@ -363,7 +491,7 @@ _gh_ci_prepare_trusted_nmr_labels() {
 		esac
 		i=$((i + 1))
 	done
-	_GH_CI_TRUST_NORMALIZED_ARGS=("${normalized_args[@]}")
+	_GH_CI_TRUST_NORMALIZED_ARGS=(${normalized_args[@]+"${normalized_args[@]}"})
 	if [[ "$infer_dispatch" -eq 1 ]]; then
 		print_info "[INFO] GH#29408: translated trusted-author needs-maintainer-review to auto-dispatch"
 	else
@@ -410,16 +538,32 @@ _gh_ci_prepare_parent_close_contract() {
 	[[ -n "$body" ]] || return 0
 	[[ "$body" == *"<!-- parent-close-contract:"* ]] && return 0
 
+	# needs-decomposition is a provisional default meaning "no decomposition
+	# was declared at creation". It blocks closure only until the parent
+	# declares its children (GH#37679); use keep-open for an explicit hold.
 	local marker='<!-- parent-close-contract: needs-decomposition -->'
-	if printf '%s\n' "$body" | grep -qE '^##[[:space:]]+Phases([[:space:]]|$)'; then
-		marker='<!-- parent-close-contract: phase-plan -->'
+	if grep -qE '^##[[:space:]]+Phases([[:space:]]|$)' <<<"$body"; then
+		local phase_rows="" phase_lib=""
+		phase_lib="$(dirname "${BASH_SOURCE[0]}")/shared-phase-filing.sh"
+		if [[ -r "$phase_lib" ]]; then
+			phase_rows=$( (
+				# shellcheck source=/dev/null
+				source "$phase_lib" >/dev/null 2>&1 || exit 0
+				_parse_phases_section "$body"
+			) 2>/dev/null || true)
+		fi
+		if [[ -r "$phase_lib" && -z "$phase_rows" ]]; then
+			printf '%s\n' "[WARN] ## Phases section has no parseable phase lines; not adding phase-plan close contract. Accepted forms: '- Phase N: desc #child', '**Phase N — desc** #child', 'N. desc #child'." >&2
+		else
+			marker='<!-- parent-close-contract: phase-plan -->'
+		fi
 	else
 		local children_count=0
-		children_count=$(printf '%s\n' "$body" | awk '
+		children_count=$(awk '
 			/^##[[:space:]]+(Children|Child Issues|Sub-issues|Sub-tasks)([[:space:]]|$)/ { in_children=1; next }
 			in_children && /^##[[:space:]]/ { exit }
 			in_children { print }
-		' | grep -oE '#[0-9]+' | sort -u | wc -l | tr -d ' ' || true)
+		' <<<"$body" | grep -oE '#[0-9]+' | sort -u | wc -l | tr -d ' ' || true)
 		if [[ "$children_count" =~ ^[0-9]+$ ]] && [[ "$children_count" -gt 0 ]]; then
 			marker="<!-- parent-close-contract: expected-children=${children_count} -->"
 		fi
@@ -453,12 +597,12 @@ ${marker}"
 _GH_CI_READY_ARGS=()
 _gh_ci_prepare_parent_contract_and_signature() {
 	local is_parent_task=0
-	if _gh_wrapper_args_have_label "parent-task" "$@" "${_GH_CI_TODO_LABEL_ARGS[@]}"; then
+	if _gh_wrapper_args_have_label "parent-task" "$@" ${_GH_CI_TODO_LABEL_ARGS[@]+"${_GH_CI_TODO_LABEL_ARGS[@]}"}; then
 		is_parent_task=1
 	fi
 	_gh_ci_prepare_parent_close_contract "$is_parent_task" "$@"
-	_gh_wrapper_auto_sig "${_GH_CI_CONTRACT_ARGS[@]}"
-	_GH_CI_READY_ARGS=("${_GH_WRAPPER_SIG_MODIFIED_ARGS[@]}")
+	_gh_wrapper_auto_sig ${_GH_CI_CONTRACT_ARGS[@]+"${_GH_CI_CONTRACT_ARGS[@]}"}
+	_GH_CI_READY_ARGS=(${_GH_WRAPPER_SIG_MODIFIED_ARGS[@]+"${_GH_WRAPPER_SIG_MODIFIED_ARGS[@]}"})
 	return 0
 }
 
@@ -503,6 +647,83 @@ _gh_finish_created_issue() {
 	return 0
 }
 
+_gh_ci_ensure_requested_reminder_label() {
+	local target_repo="$1"
+	shift
+	_gh_wrapper_args_have_label "continuation-reminder" "$@" || return 0
+	[[ -n "$target_repo" ]] || target_repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)
+	if [[ -z "$target_repo" ]] || ! ensure_continuation_reminder_label_exists "$target_repo"; then
+		printf 'gh_create_issue: could not ensure continuation-reminder label on target repo; issue not created\n' >&2
+		return 1
+	fi
+	return 0
+}
+
+# GH#34003: provision the lifecycle label this wrapper derives itself
+# (_gh_ci_prepare_status_label), using the canonical status-label contract.
+# Caller-supplied labels are never created here. Best-effort by design: a
+# converged repo costs one cached exact-label read, while customised label
+# definitions, missing label permissions, or a transient read failure must not
+# block creation in repos where the label already exists. When provisioning
+# fails, explain the prerequisite before gh reports any missing label.
+# GH#35954: when provisioning failed AND an exact read confirms the derived
+# label is absent (external repo, no label permission), clear the derived
+# arguments so the caller's issue is still created. An unreadable label state
+# keeps the label (fail as before); caller-supplied labels are never touched.
+_gh_ci_ensure_derived_status_label() {
+	local target_repo="$1"
+	local snapshot=""
+	[[ ${#_GH_CI_STATUS_LABEL_ARGS[@]} -gt 0 ]] || return 0
+	declare -F ensure_status_labels_exist >/dev/null 2>&1 || return 0
+	[[ -n "$target_repo" ]] || target_repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)
+	[[ -n "$target_repo" ]] || return 0
+	ensure_status_labels_exist "$target_repo" 2>/dev/null && return 0
+	if declare -F _status_labels_snapshot >/dev/null 2>&1 &&
+		snapshot=$(_status_labels_snapshot "$target_repo" 2>/dev/null) &&
+		! _status_label_snapshot_definition "$snapshot" "status:available" >/dev/null 2>&1; then
+		_GH_CI_STATUS_LABEL_ARGS=()
+		print_info "[INFO] gh_create_issue: status:available is absent on ${target_repo} and cannot be provisioned; creating without the derived status label"
+		return 0
+	fi
+	printf 'gh_create_issue: could not verify or provision canonical status:* labels on %s (label-create permission or API failure); creation fails if derived status:available is absent — create the standard status labels or pass an existing status:* label\n' "$target_repo" >&2
+	return 0
+}
+
+# GH#35954: succeed (drop the label) only when origin-label provisioning failed
+# for this repo in this process and the label inventory confirms the derived
+# origin label is absent. Unknown inventory state keeps the label.
+_gh_ci_origin_label_unavailable() {
+	local target_repo="$1"
+	local origin_label="$2"
+	local snapshot=""
+	[[ -n "$target_repo" && -n "$origin_label" ]] || return 1
+	case ",${_ORIGIN_LABELS_FAILED}," in
+	*",${target_repo},"*) ;;
+	*) return 1 ;;
+	esac
+	case ",${_ORIGIN_LABELS_ENSURED}," in
+	*",${target_repo},"*) return 1 ;;
+	esac
+	declare -F _gh_managed_label_names_snapshot >/dev/null 2>&1 || return 1
+	snapshot=$(_gh_managed_label_names_snapshot "$target_repo" 2>/dev/null) || return 1
+	_gh_managed_label_snapshot_has "$snapshot" "$origin_label" && return 1
+	print_info "[INFO] gh_create_issue: ${origin_label} is absent on ${target_repo} and cannot be provisioned; creating without the derived origin label"
+	return 0
+}
+
+# GH#35954: settle both wrapper-derived labels before the create argv is built.
+# Clears _GH_CI_STATUS_LABEL_ARGS itself; returns 1 when the caller must drop
+# its derived origin label ($2 empty means the caller supplied its own origin).
+_gh_ci_settle_derived_labels() {
+	local target_repo="$1"
+	local origin_label="$2"
+	_gh_ci_ensure_derived_status_label "$target_repo"
+	if [[ -n "$origin_label" ]] && _gh_ci_origin_label_unavailable "$target_repo" "$origin_label"; then
+		return 1
+	fi
+	return 0
+}
+
 gh_create_issue() {
 	_gh_wrapper_enter_cleanup_scope
 	gh_record_call graphql gh_create_issue 2>/dev/null || true
@@ -510,7 +731,7 @@ gh_create_issue() {
 		_gh_edit_audit_rejection "gh issue create" "$_GH_EDIT_REJECTION_REASON" "$@"
 		return 1
 	fi
-	set -- "${_GH_WRAPPER_BODY_FILE_ARGS[@]}"
+	set -- ${_GH_WRAPPER_BODY_FILE_ARGS[@]+"${_GH_WRAPPER_BODY_FILE_ARGS[@]}"}
 	# GH#19857: validate title/body before creating (same invariant as edit wrappers)
 	if ! _gh_validate_edit_args "$@"; then
 		_gh_edit_audit_rejection "gh issue create" "$_GH_EDIT_REJECTION_REASON" "$@"
@@ -519,8 +740,8 @@ gh_create_issue() {
 
 	# t3088: inject session origin only when the caller has not supplied one.
 	local -a _origin_label_args=()
+	local origin_label=""
 	if ! _gh_wrapper_args_have_origin_label "$@"; then
-		local origin_label
 		origin_label=$(session_origin_label)
 		_origin_label_args=(--label "$origin_label")
 	fi
@@ -531,7 +752,7 @@ gh_create_issue() {
 	# Helper writes _GH_CI_FILTERED_ARGS and _GH_CI_TODO_LABEL_ARGS globals.
 	_gh_ci_prepare_todo_labels "$@"
 	if [[ ${#_GH_CI_FILTERED_ARGS[@]} -gt 0 ]]; then
-		set -- "${_GH_CI_FILTERED_ARGS[@]}"
+		set -- ${_GH_CI_FILTERED_ARGS[@]+"${_GH_CI_FILTERED_ARGS[@]}"}
 	else
 		set --
 	fi
@@ -542,7 +763,7 @@ gh_create_issue() {
 
 	# Stamp parent close contracts before the signature so it remains the footer.
 	_gh_ci_prepare_parent_contract_and_signature "$@"
-	set -- "${_GH_CI_READY_ARGS[@]}"
+	set -- ${_GH_CI_READY_ARGS[@]+"${_GH_CI_READY_ARGS[@]}"}
 
 	# Fold derived labels into one list, then normalize trusted-author NMR before
 	# building either the GraphQL or REST creation command.
@@ -551,13 +772,18 @@ gh_create_issue() {
 	else
 		_gh_ci_prepare_trusted_nmr_labels "$@"
 	fi
-	set -- "${_GH_CI_TRUST_NORMALIZED_ARGS[@]}"
+	set -- ${_GH_CI_TRUST_NORMALIZED_ARGS[@]+"${_GH_CI_TRUST_NORMALIZED_ARGS[@]}"}
 	_todo_label_args=()
 	_gh_ci_prepare_status_label "$@"
+	_gh_ci_validate_dispatch_scope "$@" || return 1
 	if ! _gh_guard_public_write_args "$@"; then
 		return 1
 	fi
 
+	local issue_output rc auto_assignee="" target_repo=""
+	target_repo=$(_gh_extract_repo_from_args "$@" 2>/dev/null || true)
+	_gh_ci_ensure_requested_reminder_label "$target_repo" "$@" || return 1
+	_gh_ci_settle_derived_labels "$target_repo" "$origin_label" || _origin_label_args=()
 	# Build command arrays safely; avoid empty-arg injection (GH#22056).
 	local -a _issue_cmd=(gh issue create "$@")
 	local -a _rest_args=("$@")
@@ -570,23 +796,8 @@ gh_create_issue() {
 		_rest_args+=("${_origin_label_args[@]}")
 	fi
 
-	# t2028/t2406/GH#27929: choose an eligible auto-assignee before creation,
-	# but keep durable creation independent from the best-effort assignment.
-	local issue_output rc auto_assignee="" target_repo=""
-	target_repo=$(_gh_extract_repo_from_args "$@" 2>/dev/null || true)
-	if ! _gh_wrapper_args_have_assignee "$@"; then
-		if [[ "${AIDEVOPS_GH_SKIP_AUTO_ASSIGNMENT:-0}" == 1 ]]; then
-			# GH#30325: pending publication withholds auto-dispatch from the
-			# issue, so trusted callers pass the original ownership intent
-			# separately for the shared GraphQL/REST creation path.
-			print_info "[INFO] caller ownership policy skips self-assignment"
-		elif _gh_wrapper_args_have_label "$_GH_CREATE_AUTO_DISPATCH_LABEL" "$@"; then
-			# t2157/t2406: auto-dispatch means worker-owned; skip self-assignment.
-			print_info "[INFO] auto-dispatch label present — skipping self-assignment per t2157"
-		else
-			auto_assignee=$(_gh_wrapper_auto_assignee "$target_repo")
-		fi
-	fi
+	_gh_ci_select_auto_assignee "$target_repo" "$@"
+	auto_assignee="$_GH_CI_AUTO_ASSIGNEE"
 
 	issue_output=$("${_issue_cmd[@]}") # aidevops-allow: raw-gh-wrapper
 	rc=$?
@@ -613,7 +824,7 @@ _gh_resolve_task_id_to_issue() {
 		--search "${tid}: in:title" --json number,title --limit 5 2>/dev/null |
 		jq -r --arg prefix "${tid}: " \
 			'.[] | select(.title | startswith($prefix)) | .number // ""' 2>/dev/null |
-		head -1
+		sed -n '1p'
 	return 0
 }
 
@@ -630,7 +841,7 @@ _gh_parse_parent_from_body() {
 	# shellcheck disable=SC2016  # sed pattern contains literal `*` and backticks
 	parent_ref=$(printf '%s\n' "$body" |
 		sed -nE 's/^[[:space:]]*\**Parent:\**[[:space:]]*`?(t[0-9]+|GH#[0-9]+|#[0-9]+)`?.*/\1/p' |
-		head -1 || true)
+		sed -n '1p' || true)
 	[[ -z "$parent_ref" ]] && return 0
 	if [[ "$parent_ref" =~ ^#([0-9]+)$ ]]; then
 		echo "${BASH_REMATCH[1]}"
@@ -1003,16 +1214,46 @@ _gh_create_pr_enforce_origin_postcondition() {
 	fi
 
 	local origin_name="${expected_origin#origin:}"
+	local origin_error_file=""
+	local origin_write_rc=127
 	if declare -F set_origin_label >/dev/null 2>&1; then
-		set_origin_label "$_GH_CREATE_PR_DURABLE_NUMBER" \
-			"$_GH_CREATE_PR_DURABLE_REPO" "$origin_name" --pr >/dev/null 2>&1 || true
+		local previous_umask=""
+		previous_umask=$(umask)
+		umask 077
+		origin_error_file=$(mktemp -t aidevops-pr-origin-error.XXXXXX 2>/dev/null) || origin_error_file=""
+		umask "$previous_umask"
+		if [[ -n "$origin_error_file" ]]; then
+			local cleanup_cmd=""
+			printf -v cleanup_cmd 'rm -f -- %q' "$origin_error_file"
+			push_cleanup "$cleanup_cmd"
+		fi
+		origin_write_rc=0
+		if [[ -n "$origin_error_file" ]]; then
+			set_origin_label "$_GH_CREATE_PR_DURABLE_NUMBER" \
+				"$_GH_CREATE_PR_DURABLE_REPO" "$origin_name" --pr \
+				>/dev/null 2>"$origin_error_file" || origin_write_rc=$?
+		else
+			set_origin_label "$_GH_CREATE_PR_DURABLE_NUMBER" \
+				"$_GH_CREATE_PR_DURABLE_REPO" "$origin_name" --pr \
+				>/dev/null 2>&1 || origin_write_rc=$?
+		fi
 	fi
 	# A transport can report failure after applying its mutation. Read back even
 	# when set_origin_label returned non-zero before classifying partial success.
 	if _gh_create_pr_origin_is_exact "$_GH_CREATE_PR_DURABLE_REPO" \
 		"$_GH_CREATE_PR_DURABLE_NUMBER" "$expected_origin"; then
+		[[ -z "$origin_error_file" ]] || rm -f "$origin_error_file"
 		return 0
 	fi
+	local origin_failure_kind="origin-label reconciler is unavailable"
+	if [[ "$origin_write_rc" -eq 0 ]]; then
+		origin_failure_kind="label write returned success but exact provenance readback failed"
+	elif [[ "$origin_write_rc" -ne 127 ]]; then
+		origin_failure_kind=$(_gh_origin_label_failure_kind "$origin_error_file" "$origin_write_rc")
+	fi
+	[[ -z "$origin_error_file" ]] || rm -f "$origin_error_file"
+	printf '[aidevops] gh_create_pr: origin label reconciliation failed: %s\n' \
+		"$origin_failure_kind" >&2
 	printf '[aidevops] gh_create_pr: durable PR #%s exists but exact %s provenance is unverified; not retrying creation\n' \
 		"$_GH_CREATE_PR_DURABLE_NUMBER" "$expected_origin" >&2
 	return "$_GH_PR_CREATE_PARTIAL_RC"
@@ -1025,7 +1266,7 @@ gh_create_pr() {
 		_gh_edit_audit_rejection "gh pr create" "$_GH_EDIT_REJECTION_REASON" "$@"
 		return 1
 	fi
-	set -- "${_GH_WRAPPER_BODY_FILE_ARGS[@]}"
+	set -- ${_GH_WRAPPER_BODY_FILE_ARGS[@]+"${_GH_WRAPPER_BODY_FILE_ARGS[@]}"}
 	# GH#19857: validate title/body before creating (same invariant as edit wrappers)
 	if ! _gh_validate_edit_args "$@"; then
 		_gh_edit_audit_rejection "gh pr create" "$_GH_EDIT_REJECTION_REASON" "$@"
@@ -1033,6 +1274,13 @@ gh_create_pr() {
 	fi
 	local expected_origin_label=""
 	expected_origin_label=$(_gh_create_pr_expected_origin_label "$@") || return $?
+	local _GH_PR_IDENTITY_ORIGIN="$expected_origin_label"
+	# GH#33539: negated closing keywords still close issues on merge.
+	if command -v _gh_validate_pr_closing_keywords >/dev/null 2>&1 &&
+		! _gh_validate_pr_closing_keywords "$@"; then
+		_gh_edit_audit_rejection "gh pr create" "$_GH_EDIT_REJECTION_REASON" "$@"
+		return 1
+	fi
 	local is_help=0
 	_gh_wrapper_args_have_flag "--help" "$@" && is_help=1
 
@@ -1055,7 +1303,7 @@ gh_create_pr() {
 
 	# t2115: auto-append signature footer when body lacks one
 	_gh_wrapper_auto_sig "$@"
-	set -- "${_GH_WRAPPER_SIG_MODIFIED_ARGS[@]}"
+	set -- ${_GH_WRAPPER_SIG_MODIFIED_ARGS[@]+"${_GH_WRAPPER_SIG_MODIFIED_ARGS[@]}"}
 	if ! _gh_guard_public_write_args "$@"; then
 		return 1
 	fi
@@ -1145,11 +1393,15 @@ _gh_recover_pr_if_exists() {
 # are not double-signed.
 gh_issue_comment() {
 	_gh_wrapper_enter_cleanup_scope
+	# Before any transport, so the REST fallback cannot turn it into a new comment.
+	if gh_comment_selector_refused issue "$@"; then
+		return 1
+	fi
 	if ! _gh_wrapper_normalize_stdin_body_file "$@"; then
 		_gh_edit_audit_rejection "gh issue comment" "$_GH_EDIT_REJECTION_REASON" "$@"
 		return 1
 	fi
-	set -- "${_GH_WRAPPER_BODY_FILE_ARGS[@]}"
+	set -- ${_GH_WRAPPER_BODY_FILE_ARGS[@]+"${_GH_WRAPPER_BODY_FILE_ARGS[@]}"}
 	if ! _gh_validate_edit_args "$@"; then
 		_gh_edit_audit_rejection "gh issue comment" "$_GH_EDIT_REJECTION_REASON" "$@"
 		return 1
@@ -1175,13 +1427,13 @@ gh_issue_comment() {
 	fi
 	gh_record_call graphql gh_issue_comment 2>/dev/null || true
 	_gh_wrapper_auto_sig "$@"
-	set -- "${_GH_WRAPPER_SIG_MODIFIED_ARGS[@]}"
+	set -- ${_GH_WRAPPER_SIG_MODIFIED_ARGS[@]+"${_GH_WRAPPER_SIG_MODIFIED_ARGS[@]}"}
 	if ! _gh_guard_public_write_args "$@"; then
 		return 1
 	fi
 	_gh_with_timeout write "$gh_command" issue comment "$@"
 	local rc=$?
-	if [[ $rc -ne 0 && -z "$ephemeral_body_file" ]] && _rest_should_fallback; then
+	if [[ $rc -ne 0 && -z "$ephemeral_body_file" && "${_GH_WRITE_PRIVACY_BLOCKED:-0}" -ne 1 ]] && _rest_should_fallback; then
 		print_info "[INFO] gh-wrapper: GraphQL exhausted, falling back to REST for issue comment"
 		_rest_issue_comment "$@"
 		rc=$?
@@ -1191,24 +1443,27 @@ gh_issue_comment() {
 
 gh_pr_comment() {
 	_gh_wrapper_enter_cleanup_scope
+	if gh_comment_selector_refused pr "$@"; then
+		return 1
+	fi
 	if ! _gh_wrapper_normalize_stdin_body_file "$@"; then
 		_gh_edit_audit_rejection "gh pr comment" "$_GH_EDIT_REJECTION_REASON" "$@"
 		return 1
 	fi
-	set -- "${_GH_WRAPPER_BODY_FILE_ARGS[@]}"
+	set -- ${_GH_WRAPPER_BODY_FILE_ARGS[@]+"${_GH_WRAPPER_BODY_FILE_ARGS[@]}"}
 	if ! _gh_validate_edit_args "$@"; then
 		_gh_edit_audit_rejection "gh pr comment" "$_GH_EDIT_REJECTION_REASON" "$@"
 		return 1
 	fi
 	gh_record_call graphql gh_pr_comment 2>/dev/null || true
 	_gh_wrapper_auto_sig "$@"
-	set -- "${_GH_WRAPPER_SIG_MODIFIED_ARGS[@]}"
+	set -- ${_GH_WRAPPER_SIG_MODIFIED_ARGS[@]+"${_GH_WRAPPER_SIG_MODIFIED_ARGS[@]}"}
 	if ! _gh_guard_public_write_args "$@"; then
 		return 1
 	fi
 	_gh_with_timeout write gh pr comment "$@"
 	local rc=$?
-	if [[ $rc -ne 0 ]] && _rest_should_fallback; then
+	if [[ $rc -ne 0 && "${_GH_WRITE_PRIVACY_BLOCKED:-0}" -ne 1 ]] && _rest_should_fallback; then
 		print_info "[INFO] gh-wrapper: GraphQL exhausted, falling back to REST for pr comment"
 		_rest_pr_comment "$@"
 		rc=$?
@@ -1217,7 +1472,10 @@ gh_pr_comment() {
 }
 
 # Internal: extract --repo from args and ensure labels exist (cached per repo).
+# GH#35954: repos where provisioning failed are recorded separately so issue
+# creation can drop a wrapper-derived origin label that is confirmed absent.
 _ORIGIN_LABELS_ENSURED=""
+_ORIGIN_LABELS_FAILED=""
 _ensure_origin_labels_for_args() {
 	local repo=""
 	while [[ $# -gt 0 ]]; do
@@ -1240,6 +1498,8 @@ _ensure_origin_labels_for_args() {
 	esac
 	if ensure_origin_labels_exist "$repo"; then
 		_ORIGIN_LABELS_ENSURED="${_ORIGIN_LABELS_ENSURED:+$_ORIGIN_LABELS_ENSURED,}$repo"
+	else
+		_ORIGIN_LABELS_FAILED="${_ORIGIN_LABELS_FAILED:+$_ORIGIN_LABELS_FAILED,}$repo"
 	fi
 	return 0
 }

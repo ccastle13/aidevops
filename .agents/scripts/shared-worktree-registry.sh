@@ -68,6 +68,14 @@ WORKTREE_REGISTRY_DB="${WORKTREE_REGISTRY_DB:-${WORKTREE_REGISTRY_DIR}/worktree-
 WORKTREE_OWNER_DEAD_COOLDOWN_MINUTES="${WORKTREE_OWNER_DEAD_COOLDOWN_MINUTES:-60}"
 _WORKTREE_REGISTRY_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 1
 
+_wt_sqlite3() {
+	local timeout_ms="${AIDEVOPS_WORKTREE_REGISTRY_BUSY_TIMEOUT_MS:-5000}"
+	[[ "$timeout_ms" =~ ^[0-9]+$ ]] || timeout_ms=5000
+	[[ "$timeout_ms" -le 60000 ]] || timeout_ms=60000
+	command sqlite3 -cmd ".timeout ${timeout_ms}" "$@"
+	return $?
+}
+
 # Get the command name (basename) for a given PID.
 # Returns empty string if the PID does not exist or info is unavailable.
 # Arguments:
@@ -203,6 +211,15 @@ _resolve_worktree_owner_pid() {
 		return 0
 	fi
 
+	# Re-registration by nested creation helpers must keep the same managed
+	# invocation leader as shared-worktree-create.sh, not admit a transient PPID.
+	# The Python observer still verifies cgroup, unit and invocation identity.
+	if [[ "${AIDEVOPS_MANAGED_WORKTREE_RUN:-0}" == 1 && -n "${AIDEVOPS_MANAGED_WORKTREE_RUN_UNIT:-}" &&
+		"${SYSTEMD_EXEC_PID:-}" =~ ^[1-9][0-9]*$ ]]; then
+		printf '%s' "$SYSTEMD_EXEC_PID"
+		return 0
+	fi
+
 	if [[ -n "${OPENCODE_PID:-}" ]]; then
 		printf '%s' "$OPENCODE_PID"
 		return 0
@@ -260,12 +277,8 @@ _wt_normalize_path() {
 
 	local normalized=""
 	if command -v python3 >/dev/null 2>&1; then
-		normalized=$(
-			python3 - "$raw_path" <<'PY' 2>/dev/null || true
-import os, sys
-print(os.path.realpath(sys.argv[1]))
-PY
-		)
+		normalized=$(python3 "${_WORKTREE_REGISTRY_SCRIPT_DIR}/shared-worktree-registry-platform.py" \
+			normalize "$raw_path" 2>/dev/null) || normalized=""
 	fi
 
 	if [[ -z "$normalized" ]]; then
@@ -282,33 +295,17 @@ PY
 
 _wt_registry_resolve_path_python() {
 	local requested_path="$1"
-	[[ -f "$WORKTREE_REGISTRY_DB" ]] || return 2
+	local output_mode="${2:-path}"
 	command -v python3 >/dev/null 2>&1 || return 2
 
-	python3 - "$WORKTREE_REGISTRY_DB" "$requested_path" <<'PY' 2>/dev/null
-import os
-import sqlite3
-import sys
-
-database_path, requested_path = sys.argv[1:]
-normalized = os.path.realpath(requested_path)
-try:
-    with sqlite3.connect(database_path) as connection:
-        rows = connection.execute("SELECT worktree_path FROM worktree_owners")
-        for (stored_path,) in rows:
-            if stored_path and os.path.realpath(stored_path) == normalized:
-                print(stored_path)
-                raise SystemExit(0)
-except sqlite3.Error:
-    raise SystemExit(2)
-print(normalized)
-PY
+	python3 "${_WORKTREE_REGISTRY_SCRIPT_DIR}/shared-worktree-registry.py" \
+		"$WORKTREE_REGISTRY_DB" "$requested_path" "$output_mode" 2>/dev/null
 	return $?
 }
 
-# Resolve the registry key for a worktree path. Resolve all legacy rows in one
-# Python process so a lookup remains O(rows) without spawning one interpreter
-# per row. If Python or SQLite access fails, retain the portable shell fallback.
+# Resolve the registry key for a worktree path. Indexed current keys avoid the
+# legacy alias scan. If Python or SQLite access fails, retain the portable shell
+# fallback for this path-only API; ownership snapshots never use that fallback.
 _wt_registry_lookup_path() {
 	local requested_path="$1"
 	local resolved_path=""
@@ -334,7 +331,7 @@ _wt_registry_lookup_path() {
 			printf '%s' "$stored_path"
 			return 0
 		fi
-	done < <(sqlite3 "$WORKTREE_REGISTRY_DB" "SELECT worktree_path FROM worktree_owners;" 2>/dev/null || true)
+	done < <(_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "SELECT worktree_path FROM worktree_owners;" 2>/dev/null || true)
 
 	printf '%s' "$normalized"
 	return 0
@@ -361,7 +358,7 @@ _wt_path_is_canonical() {
 _wt_delete_owner_row() {
 	local wt_path="$1"
 	[[ -f "$WORKTREE_REGISTRY_DB" ]] || return 0
-	sqlite3 "$WORKTREE_REGISTRY_DB" \
+	_wt_sqlite3 "$WORKTREE_REGISTRY_DB" \
 		"DELETE FROM worktree_owners WHERE worktree_path = '$(_wt_sql_escape "$wt_path")';" \
 		2>/dev/null || return 1
 	return 0
@@ -370,7 +367,7 @@ _wt_delete_owner_row() {
 # Initialize the registry database
 _init_registry_db() {
 	mkdir -p "$WORKTREE_REGISTRY_DIR" 2>/dev/null || true
-	sqlite3 "$WORKTREE_REGISTRY_DB" "
+	_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
         CREATE TABLE IF NOT EXISTS worktree_owners (
             worktree_path TEXT PRIMARY KEY,
             branch        TEXT,
@@ -386,41 +383,41 @@ _init_registry_db() {
     " 2>/dev/null || true
 
 	local has_dead_seen_column
-	has_dead_seen_column=$(sqlite3 "$WORKTREE_REGISTRY_DB" "
+	has_dead_seen_column=$(_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
         SELECT 1 FROM pragma_table_info('worktree_owners')
         WHERE name = 'owner_dead_seen_at';
     " 2>/dev/null || echo "")
 	if [[ -z "$has_dead_seen_column" ]]; then
-		sqlite3 "$WORKTREE_REGISTRY_DB" "
+		_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
             ALTER TABLE worktree_owners
             ADD COLUMN owner_dead_seen_at TEXT DEFAULT '';
         " 2>/dev/null || true
 	fi
 
 	local has_owner_comm_column
-	has_owner_comm_column=$(sqlite3 "$WORKTREE_REGISTRY_DB" "
+	has_owner_comm_column=$(_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
         SELECT 1 FROM pragma_table_info('worktree_owners')
         WHERE name = 'owner_comm';
     " 2>/dev/null || echo "")
 	if [[ -z "$has_owner_comm_column" ]]; then
-		sqlite3 "$WORKTREE_REGISTRY_DB" "
+		_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
             ALTER TABLE worktree_owners
             ADD COLUMN owner_comm TEXT DEFAULT '';
 		" 2>/dev/null || true
 	fi
 
 	local has_owner_process_start_column
-	has_owner_process_start_column=$(sqlite3 "$WORKTREE_REGISTRY_DB" "
+	has_owner_process_start_column=$(_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
         SELECT 1 FROM pragma_table_info('worktree_owners')
         WHERE name = 'owner_process_start';
     " 2>/dev/null || echo "")
 	if [[ -z "$has_owner_process_start_column" ]]; then
-		sqlite3 "$WORKTREE_REGISTRY_DB" "
+		_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
             ALTER TABLE worktree_owners
             ADD COLUMN owner_process_start TEXT DEFAULT '';
 		" 2>/dev/null || return 1
 	fi
-	has_owner_process_start_column=$(sqlite3 "$WORKTREE_REGISTRY_DB" "
+	has_owner_process_start_column=$(_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
         SELECT 1 FROM pragma_table_info('worktree_owners')
         WHERE name = 'owner_process_start';
     " 2>/dev/null) || return 1
@@ -489,23 +486,9 @@ register_worktree() {
 		return 1
 	fi
 
-	{
-		_wt_sqlite_set_owner_pid_param "$owner_pid"
-		printf '%s\n' "
-        INSERT OR REPLACE INTO worktree_owners
-			(worktree_path, branch, owner_pid, owner_session, owner_batch, task_id, owner_comm, owner_process_start, owner_dead_seen_at)
-        VALUES
-		 ('$(_wt_sql_escape "$wt_path")',
-		  '$(_wt_sql_escape "$branch")',
-		  :owner_pid,
-		  '$(_wt_sql_escape "$session_id")',
-		  '$(_wt_sql_escape "$batch_id")',
-		  '$(_wt_sql_escape "$task_id")',
-		  '$(_wt_sql_escape "$owner_comm")',
-		  '$(_wt_sql_escape "$owner_process_start")',
-		  '');
-    "
-	} | sqlite3 "$WORKTREE_REGISTRY_DB" 2>/dev/null || return 1
+	python3 "${_WORKTREE_REGISTRY_SCRIPT_DIR}/shared-worktree-registry-owner.py" register \
+		"$WORKTREE_REGISTRY_DB" "$wt_path" "$branch" "$owner_pid" "$session_id" \
+		"$batch_id" "$task_id" "$owner_comm" "$owner_process_start" 0 || return 1
 	return 0
 }
 
@@ -526,96 +509,10 @@ _wt_claim_owner_record() {
 	local task_id="$6"
 	local owner_comm="$7" owner_process_start="$8" trusted_opencode_session="$9"
 
-	python3 - "$WORKTREE_REGISTRY_DB" "$wt_path" "$branch" "$owner_pid" "$session_id" \
-		"$batch_id" "$task_id" "$owner_comm" "$owner_process_start" "$trusted_opencode_session" <<'PY' || return 1
-import os
-import sqlite3
-import sys
-
-(
-    db_path,
-    worktree_path,
-    branch,
-    owner_pid_text,
-    session_id,
-    batch_id,
-    task_id,
-    owner_comm,
-    owner_process_start,
-    trusted_session_text,
-) = sys.argv[1:]
-owner_pid = int(owner_pid_text)
-trusted_session = trusted_session_text == "1"
-
-connection = sqlite3.connect(db_path, isolation_level=None)
-try:
-    connection.execute("BEGIN IMMEDIATE")
-    existing_owner = connection.execute(
-        """SELECT owner_pid, COALESCE(owner_session, '')
-           FROM worktree_owners WHERE worktree_path = ?""",
-        (worktree_path,),
-    ).fetchone()
-    if (
-        existing_owner
-        and isinstance(existing_owner[0], int)
-        and existing_owner[0] != owner_pid
-    ):
-        try:
-            os.kill(existing_owner[0], 0)
-        except ProcessLookupError:
-            connection.execute(
-                """DELETE FROM worktree_owners
-                   WHERE worktree_path = ? AND owner_pid = ?
-                     AND COALESCE(owner_session, '') = ?""",
-                (worktree_path, existing_owner[0], existing_owner[1]),
-            )
-        except (PermissionError, OSError):
-            pass
-
-    connection.execute(
-        """UPDATE worktree_owners
-           SET branch = ?, owner_pid = ?, owner_session = ?, owner_batch = ?,
-               task_id = ?, owner_comm = ?, owner_process_start = ?, owner_dead_seen_at = ''
-           WHERE worktree_path = ?
-             AND (owner_pid = ? OR (? AND owner_session = ?))""",
-        (
-            branch,
-            owner_pid,
-            session_id,
-            batch_id,
-            task_id,
-            owner_comm,
-            owner_process_start,
-            worktree_path,
-            owner_pid,
-            trusted_session,
-            session_id,
-        ),
-    )
-    connection.execute(
-        """INSERT OR IGNORE INTO worktree_owners
-           (worktree_path, branch, owner_pid, owner_session, owner_batch,
-            task_id, owner_comm, owner_process_start, owner_dead_seen_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, '')""",
-        (worktree_path, branch, owner_pid, session_id, batch_id, task_id, owner_comm, owner_process_start),
-    )
-    final_owner = connection.execute(
-        """SELECT owner_pid, COALESCE(owner_session, '')
-           FROM worktree_owners WHERE worktree_path = ?""",
-        (worktree_path,),
-    ).fetchone()
-    connection.execute("COMMIT")
-except Exception:
-    if connection.in_transaction:
-        connection.execute('ROLLBACK')
-    raise
-finally:
-    connection.close()
-
-if final_owner:
-    print(f"{final_owner[0]}|{final_owner[1]}")
-PY
-	return 0
+	python3 "${_WORKTREE_REGISTRY_SCRIPT_DIR}/shared-worktree-registry-owner.py" claim \
+		"$WORKTREE_REGISTRY_DB" "$wt_path" "$branch" "$owner_pid" "$session_id" \
+		"$batch_id" "$task_id" "$owner_comm" "$owner_process_start" "$trusted_opencode_session"
+	return $?
 }
 
 # Claim ownership of a worktree without overwriting another live owner.
@@ -630,6 +527,8 @@ claim_worktree_ownership() {
 	local wt_path="$1"
 	local branch="$2"
 	shift 2
+	# A failure to inspect/write the registry is not proof of another live owner.
+	WORKTREE_CLAIM_STATUS="unavailable"
 
 	local task_id="" batch_id="" session_id="" owner_pid_override=""
 	while [[ $# -gt 0 ]]; do
@@ -675,10 +574,16 @@ claim_worktree_ownership() {
 	fi
 
 	local final_owner_info=""
+	local claim_exit=0
 	final_owner_info=$(_wt_claim_owner_record "$wt_path" "$branch" "$owner_pid" "$session_id" \
-		"$batch_id" "$task_id" "$owner_comm" "$owner_process_start" "$trusted_opencode_session") || return 1
+		"$batch_id" "$task_id" "$owner_comm" "$owner_process_start" "$trusted_opencode_session") || claim_exit=$?
+	if [[ "$claim_exit" -ne 0 ]]; then
+		[[ "$claim_exit" -eq 2 ]] && WORKTREE_CLAIM_STATUS="conflict"
+		return 1
+	fi
 
 	if [[ "${final_owner_info%%|*}" == "$owner_pid" ]]; then
+		WORKTREE_CLAIM_STATUS="owned"
 		return 0
 	fi
 
@@ -714,74 +619,11 @@ _wt_compare_and_swap_owner_record() {
 	shift
 	local expected_process_start="$1"
 
-	python3 - "$WORKTREE_REGISTRY_DB" "$wt_path" "$branch" "$owner_pid" \
+	python3 "${_WORKTREE_REGISTRY_SCRIPT_DIR}/shared-worktree-registry-owner.py" transfer \
+		"$WORKTREE_REGISTRY_DB" "$wt_path" "$branch" "$owner_pid" \
 		"$session_id" "$batch_id" "$task_id" "$owner_comm" "$owner_process_start" \
 		"$expected_owner_pid" "$expected_session_id" "$expected_batch_id" \
-		"$expected_task_id" "$expected_created_at" "$expected_process_start" <<'PY' || return 1
-import sqlite3
-import sys
-
-(
-    db_path,
-    worktree_path,
-    branch,
-    owner_pid_text,
-    session_id,
-    batch_id,
-    task_id,
-    owner_comm,
-    owner_process_start,
-    expected_owner_pid_text,
-    expected_session_id,
-    expected_batch_id,
-    expected_task_id,
-    expected_created_at,
-    expected_process_start,
-) = sys.argv[1:]
-
-connection = sqlite3.connect(db_path, isolation_level=None)
-try:
-    connection.execute("BEGIN IMMEDIATE")
-    cursor = connection.execute(
-        """UPDATE worktree_owners
-           SET branch = ?, owner_pid = ?, owner_session = ?, owner_batch = ?,
-               task_id = ?, owner_comm = ?, owner_process_start = ?, owner_dead_seen_at = '',
-               created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-           WHERE worktree_path = ?
-             AND owner_pid = ?
-             AND COALESCE(owner_session, '') = ?
-              AND COALESCE(owner_batch, '') = ?
-              AND COALESCE(task_id, '') = ?
-              AND COALESCE(created_at, '') = ?
-              AND COALESCE(owner_process_start, '') = ?""",
-        (
-            branch,
-            int(owner_pid_text),
-            session_id,
-            batch_id,
-            task_id,
-            owner_comm,
-            owner_process_start,
-            worktree_path,
-            int(expected_owner_pid_text),
-            expected_session_id,
-            expected_batch_id,
-            expected_task_id,
-            expected_created_at,
-            expected_process_start,
-        ),
-    )
-    if cursor.rowcount != 1:
-        connection.execute('ROLLBACK')
-        sys.exit(1)
-    connection.execute("COMMIT")
-except Exception:
-    if connection.in_transaction:
-        connection.execute("ROLLBACK")
-    raise
-finally:
-    connection.close()
-PY
+		"$expected_task_id" "$expected_created_at" "$expected_process_start" || return 1
 	return 0
 }
 
@@ -872,7 +714,7 @@ unregister_worktree() {
 	[[ ! -f "$WORKTREE_REGISTRY_DB" ]] && return 0
 	wt_path=$(_wt_registry_lookup_path "$wt_path")
 
-	sqlite3 "$WORKTREE_REGISTRY_DB" "
+	_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
         DELETE FROM worktree_owners
         WHERE worktree_path = '$(_wt_sql_escape "$wt_path")';
     " 2>/dev/null || true
@@ -931,7 +773,7 @@ unregister_worktree_if_owner_pid() {
 	wt_path=$(_wt_registry_lookup_path "$wt_path") || return 1
 
 	local changed="0"
-	changed=$(sqlite3 "$WORKTREE_REGISTRY_DB" "
+	changed=$(_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
 		DELETE FROM worktree_owners
 		WHERE worktree_path = '$(_wt_sql_escape "$wt_path")'
 		  AND owner_pid = ${expected_owner_pid};
@@ -958,7 +800,7 @@ unregister_worktree_if_owner_contract() {
 	command -v sqlite3 >/dev/null 2>&1 || return 1
 	[[ -f "$WORKTREE_REGISTRY_DB" ]] || return 1
 	wt_path=$(_wt_registry_lookup_path "$wt_path") || return 1
-	changed=$(sqlite3 "$WORKTREE_REGISTRY_DB" "
+	changed=$(_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
 		DELETE FROM worktree_owners
 		WHERE worktree_path = '$(_wt_sql_escape "$wt_path")'
 		  AND owner_pid = ${expected_owner_pid}
@@ -988,7 +830,7 @@ worktree_has_exact_owner_contract() {
 	command -v sqlite3 >/dev/null 2>&1 || return 1
 	[[ -f "$WORKTREE_REGISTRY_DB" ]] || return 1
 	wt_path=$(_wt_registry_lookup_path "$wt_path") || return 1
-	exact_match=$(sqlite3 "$WORKTREE_REGISTRY_DB" "
+	exact_match=$(_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
 		SELECT 1
 		FROM worktree_owners
 		WHERE worktree_path = '$(_wt_sql_escape "$wt_path")'
@@ -1002,31 +844,89 @@ worktree_has_exact_owner_contract() {
 	return 0
 }
 
+# GH#34224: Return success only when the registry row is the exact generation a
+# caller just registered and verified: PID, live process-start token, session,
+# batch, task and created_at all match. Session/task may be empty (interactive
+# add without --issue) because created_at plus the live process-start token pin
+# the generation; this is never an "any owner" check. Fails closed on missing,
+# replaced, recycled-PID, malformed or unreadable registry evidence.
+# Arguments: $1 path, $2 owner PID, $3 session, $4 batch, $5 task, $6 created_at
+worktree_has_exact_owner_generation() {
+	[[ $# -eq 6 ]] || return 1
+	local wt_path="$1"
+	local expected_owner_pid="$2"
+	local expected_owner_session="$3"
+	local expected_owner_batch="$4"
+	local expected_task_id="$5"
+	local expected_created_at="$6"
+	local expected_process_start=""
+	local exact_match=""
+
+	[[ "$expected_owner_pid" =~ ^[0-9]+$ && -n "$expected_created_at" ]] || return 1
+	expected_process_start=$(_wt_process_start_token_for_pid "$expected_owner_pid") || return 1
+	command -v sqlite3 >/dev/null 2>&1 || return 1
+	[[ -f "$WORKTREE_REGISTRY_DB" ]] || return 1
+	wt_path=$(_wt_registry_lookup_path "$wt_path") || return 1
+	exact_match=$(_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
+		SELECT 1
+		FROM worktree_owners
+		WHERE worktree_path = '$(_wt_sql_escape "$wt_path")'
+		  AND owner_pid = ${expected_owner_pid}
+		  AND COALESCE(owner_session, '') = '$(_wt_sql_escape "$expected_owner_session")'
+		  AND COALESCE(owner_batch, '') = '$(_wt_sql_escape "$expected_owner_batch")'
+		  AND COALESCE(task_id, '') = '$(_wt_sql_escape "$expected_task_id")'
+		  AND COALESCE(created_at, '') = '$(_wt_sql_escape "$expected_created_at")'
+		  AND COALESCE(owner_process_start, '') = '$(_wt_sql_escape "$expected_process_start")'
+		LIMIT 1;
+	" 2>/dev/null) || return 1
+	[[ "$exact_match" == "1" ]] || return 1
+	return 0
+}
+
+# GH#32528: Return success when the same live owner generation (PID, process
+# start and session) registered a different worktree after the given UTC
+# timestamp. Interactive runtimes run full-loops in sequence, so a newer claim
+# by the same session proves an older post-merge worktree is no longer its
+# working directory. Callers must not pass generic shared session names.
+# Arguments: $1 worktree path, $2 owner PID, $3 owner session, $4 UTC ISO time
+worktree_owner_session_has_newer_claim() {
+	local wt_path="$1"
+	local owner_pid="$2"
+	local owner_session="$3"
+	local since_utc="$4"
+	local process_start=""
+	local newer=""
+
+	[[ "$owner_pid" =~ ^[0-9]+$ && -n "$owner_session" ]] || return 1
+	[[ "$since_utc" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,6})?Z$ ]] || return 1
+	process_start=$(_wt_process_start_token_for_pid "$owner_pid") || return 1
+	command -v sqlite3 >/dev/null 2>&1 || return 1
+	[[ -f "$WORKTREE_REGISTRY_DB" ]] || return 1
+	wt_path=$(_wt_registry_lookup_path "$wt_path") || return 1
+	newer=$(_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
+		SELECT 1
+		FROM worktree_owners
+		WHERE worktree_path != '$(_wt_sql_escape "$wt_path")'
+		  AND owner_pid = ${owner_pid}
+		  AND owner_session = '$(_wt_sql_escape "$owner_session")'
+		  AND COALESCE(owner_process_start, '') = '$(_wt_sql_escape "$process_start")'
+		  AND rtrim(created_at, 'Z') > rtrim('$(_wt_sql_escape "$since_utc")', 'Z')
+		LIMIT 1;
+	" 2>/dev/null) || return 1
+	[[ "$newer" == "1" ]] || return 1
+	return 0
+}
+
 # Read the complete owner generation in one registry query.
 # Arguments:
 #   $1 - worktree path
 # Output: owner info (pid|session|batch|task|created_at|process_start) or empty
-# Returns: 0 if owned, 1 if not owned
+# Returns: 0 if owned, 1 if absent, 2 if unavailable (including legacy schema).
+# Read-only: schema migration belongs to registry mutation, never observation.
 check_worktree_owner_snapshot() {
 	local wt_path="$1"
-
-	[[ ! -f "$WORKTREE_REGISTRY_DB" ]] && return 1
-	_init_registry_db || return 1
-	wt_path=$(_wt_registry_lookup_path "$wt_path")
-
-	local owner_info
-	owner_info=$(sqlite3 -separator '|' "$WORKTREE_REGISTRY_DB" "
-        SELECT owner_pid, owner_session, owner_batch, task_id, created_at,
-               COALESCE(owner_process_start, '')
-        FROM worktree_owners
-        WHERE worktree_path = '$(_wt_sql_escape "$wt_path")';
-    " 2>/dev/null || printf '')
-
-	if [[ -n "$owner_info" ]]; then
-		printf '%s\n' "$owner_info"
-		return 0
-	fi
-	return 1
+	_wt_registry_resolve_path_python "$wt_path" snapshot
+	return $?
 }
 
 # Check who owns a worktree while preserving the historical five-field output.
@@ -1039,7 +939,7 @@ check_worktree_owner() {
 	local owner_info=""
 	local owner_pid="" owner_session="" owner_batch="" owner_task="" owner_created_at="" owner_process_start=""
 
-	owner_info=$(check_worktree_owner_snapshot "$wt_path") || return 1
+	owner_info=$(check_worktree_owner_snapshot "$wt_path") || return $?
 	IFS='|' read -r owner_pid owner_session owner_batch owner_task owner_created_at owner_process_start <<<"$owner_info"
 	printf '%s|%s|%s|%s|%s\n' "$owner_pid" "$owner_session" "$owner_batch" "$owner_task" "$owner_created_at"
 	return 0
@@ -1057,7 +957,7 @@ worktree_owner_dead_seen_at() {
 	wt_path=$(_wt_registry_lookup_path "$wt_path")
 
 	local dead_seen_at
-	dead_seen_at=$(sqlite3 "$WORKTREE_REGISTRY_DB" "
+	dead_seen_at=$(_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
         SELECT COALESCE(owner_dead_seen_at, '')
         FROM worktree_owners
         WHERE worktree_path = '$(_wt_sql_escape "$wt_path")';
@@ -1078,7 +978,7 @@ _wt_owner_dead_cooldown_minutes() {
 _wt_mark_owner_dead_seen() {
 	local wt_path="$1"
 
-	sqlite3 "$WORKTREE_REGISTRY_DB" "
+	_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
         UPDATE worktree_owners
         SET owner_dead_seen_at = CASE
             WHEN COALESCE(owner_dead_seen_at, '') = '' THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
@@ -1095,7 +995,7 @@ _wt_owner_dead_cooldown_expired() {
 	cooldown_minutes=$(_wt_owner_dead_cooldown_minutes)
 
 	local expired
-	expired=$(sqlite3 "$WORKTREE_REGISTRY_DB" "
+	expired=$(_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
         SELECT CASE
             WHEN COALESCE(owner_dead_seen_at, '') != ''
              AND datetime(replace(replace(owner_dead_seen_at, 'T', ' '), 'Z', ''), '+${cooldown_minutes} minutes') <= datetime('now')
@@ -1112,25 +1012,15 @@ _wt_owner_dead_cooldown_expired() {
 _wt_pid_is_definitely_absent() {
 	local owner_pid="$1"
 	[[ "$owner_pid" =~ ^[0-9]+$ ]] || return 1
-	python3 - "$owner_pid" <<'PY' >/dev/null 2>&1 || return 1
-import os
-import sys
-
-try:
-    os.kill(int(sys.argv[1]), 0)
-except ProcessLookupError:
-    raise SystemExit(0)
-except (PermissionError, OSError, ValueError):
-    raise SystemExit(1)
-raise SystemExit(1)
-PY
+	python3 "${_WORKTREE_REGISTRY_SCRIPT_DIR}/shared-worktree-registry-platform.py" \
+		pid-absent "$owner_pid" >/dev/null 2>&1 || return 1
 	return 0
 }
 
 _wt_owner_comm_for_path() {
 	local wt_path="$1"
 	local owner_comm
-	owner_comm=$(sqlite3 "$WORKTREE_REGISTRY_DB" "
+	owner_comm=$(_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
         SELECT COALESCE(owner_comm, '')
         FROM worktree_owners
         WHERE worktree_path = '$(_wt_sql_escape "$wt_path")';
@@ -1145,7 +1035,7 @@ _wt_owner_generation_contract_for_path() {
 	local wt_path="$1"
 	local separator=$'\x1f'
 	local owner_contract=""
-	owner_contract=$(sqlite3 -separator "$separator" "$WORKTREE_REGISTRY_DB" "
+	owner_contract=$(_wt_sqlite3 -separator "$separator" "$WORKTREE_REGISTRY_DB" "
         SELECT owner_pid, COALESCE(owner_process_start, ''), COALESCE(created_at, '')
         FROM worktree_owners
         WHERE worktree_path = '$(_wt_sql_escape "$wt_path")';
@@ -1164,7 +1054,7 @@ _wt_unregister_owner_if_generation_matches() {
 	local changed="0"
 
 	[[ "$expected_owner_pid" =~ ^[0-9]+$ && -n "$expected_created_at" ]] || return 1
-	changed=$(sqlite3 "$WORKTREE_REGISTRY_DB" "
+	changed=$(_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
         DELETE FROM worktree_owners
         WHERE worktree_path = '$(_wt_sql_escape "$wt_path")'
           AND owner_pid = ${expected_owner_pid}
@@ -1191,16 +1081,8 @@ _wt_live_process_started_after_registry_row() {
 	verified_process_start=$(_wt_process_start_token_for_pid "$owner_pid") || return 1
 	[[ "$verified_process_start" == "$expected_process_start" ]] || return 1
 
-	LC_ALL=C python3 - "$created_at" "$process_lstart" <<'PY' >/dev/null 2>&1 || return 1
-from datetime import datetime, timezone
-import sys
-
-created_at, process_lstart = sys.argv[1:]
-created = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-process_started = datetime.strptime(process_lstart.strip(), "%a %b %d %H:%M:%S %Y")
-process_started = process_started.astimezone(timezone.utc)
-raise SystemExit(0 if process_started > created else 1)
-PY
+	LC_ALL=C python3 "${_WORKTREE_REGISTRY_SCRIPT_DIR}/shared-worktree-registry-platform.py" \
+		started-after "$created_at" "$process_lstart" >/dev/null 2>&1 || return 1
 	return 0
 }
 
@@ -1236,7 +1118,7 @@ _wt_legacy_dispatch_precreate_systemd_owner_expired() {
 	registered_comm=$(_wt_owner_comm_for_path "$wt_path")
 	[[ "$current_comm" == "systemd" && "$registered_comm" == "systemd" ]] || return 1
 
-	expired=$(sqlite3 "$WORKTREE_REGISTRY_DB" "
+	expired=$(_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
         SELECT CASE
             WHEN owner_pid = ${owner_pid}
              AND COALESCE(owner_process_start, '') = ''
@@ -1284,6 +1166,13 @@ _wt_is_worktree_owned_by_others_for_resolved_pid() {
 	# window so cleanup never treats one failed PID probe as immediate abandon.
 	if ! kill -0 "$owner_pid" 2>/dev/null; then
 		_wt_pid_is_definitely_absent "$owner_pid" || return 0
+		# A closed managed invocation proves descendant completion, unlike a PID
+		# probe. Release only the exact lease under the same registry transaction.
+		if python3 "${_WORKTREE_REGISTRY_SCRIPT_DIR}/shared-worktree-registry-owner.py" \
+			release-completed "$WORKTREE_REGISTRY_DB" "$wt_path" "$owner_pid" \
+			"$registered_process_start" "$registered_created_at"; then
+			return 1
+		fi
 		_wt_mark_owner_dead_seen "$wt_path"
 		if _wt_owner_dead_cooldown_expired "$wt_path"; then
 			if _wt_unregister_owner_if_generation_matches "$wt_path" "$owner_pid" \
@@ -1317,7 +1206,7 @@ _wt_is_worktree_owned_by_others_for_resolved_pid() {
 		return 0
 	fi
 
-	sqlite3 "$WORKTREE_REGISTRY_DB" "
+	_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
         UPDATE worktree_owners
         SET owner_dead_seen_at = ''
         WHERE worktree_path = '$(_wt_sql_escape "$wt_path")'
@@ -1378,7 +1267,7 @@ _wt_registry_delete_paths_batch() {
 			printf "DELETE FROM worktree_owners WHERE worktree_path = '%s';\n" "$escaped_wt_path"
 		done <<<"$stale_entries"
 		printf 'COMMIT;\n'
-	} | sqlite3 "$WORKTREE_REGISTRY_DB" >/dev/null 2>&1 || return 1
+	} | _wt_sqlite3 "$WORKTREE_REGISTRY_DB" >/dev/null 2>&1 || return 1
 	return 0
 }
 
@@ -1423,21 +1312,53 @@ _wt_registry_entry_count() {
 	return 0
 }
 
-# Prune stale registry entries (dead PIDs, missing directories, corrupted paths)
+# Reconcile ownership rows whose worktree directories still exist. Missing
+# directories are handled by the batch path below; surviving worktrees need the
+# generation-aware owner checks so dead runtimes and recycled PIDs do not leave
+# permanent registry locks. This updates registry metadata only and never
+# removes a worktree directory or bypasses downstream cleanup gates.
+_wt_registry_reconcile_existing_owners() {
+	local reconcile_limit="${WORKTREE_REGISTRY_RECONCILE_LIMIT:-500}"
+	[[ "$reconcile_limit" =~ ^[1-9][0-9]*$ && "$reconcile_limit" -le 5000 ]] || reconcile_limit=500
+
+	local separator=$'\x1f'
+	local entries=""
+	entries=$(_wt_sqlite3 -separator "$separator" "$WORKTREE_REGISTRY_DB" "
+        SELECT worktree_path, owner_pid
+        FROM worktree_owners
+        ORDER BY CASE WHEN COALESCE(owner_dead_seen_at, '') = '' THEN 1 ELSE 0 END,
+                 owner_dead_seen_at, created_at
+        LIMIT ${reconcile_limit};
+    " 2>/dev/null) || return 1
+	[[ -z "$entries" ]] && return 0
+
+	local my_pid="$$"
+	local wt_path=""
+	local _owner_pid=""
+	while IFS="$separator" read -r wt_path _owner_pid; do
+		[[ -n "$wt_path" && -d "$wt_path" ]] || continue
+		_wt_is_worktree_owned_by_others_for_resolved_pid "$wt_path" "$my_pid" \
+			>/dev/null 2>&1 || true
+	done <<<"$entries"
+	return 0
+}
+
+# Prune stale registry entries and reconcile dead or recycled owners.
 # (t197) Enhanced to handle:
-#   - Dead PIDs with missing directories
+#   - Dead or recycled owner processes for surviving worktree directories
+#   - Missing worktree directories
 #   - Paths with ANSI escape codes (corrupted entries)
 #   - Test artifacts in /tmp or /var/folders
 prune_worktree_registry() {
 	[[ ! -f "$WORKTREE_REGISTRY_DB" ]] && return 0
-	_init_registry_db
+	_init_registry_db || return 1
 
 	local pruned_count=0
 
 	# First, delete entries with ANSI escape codes (corrupted entries)
 	# These often have newlines and break normal parsing
 	local ansi_count
-	ansi_count=$(sqlite3 "$WORKTREE_REGISTRY_DB" "
+	ansi_count=$(_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
         DELETE FROM worktree_owners 
         WHERE worktree_path LIKE '%'||char(27)||'%' 
            OR worktree_path LIKE '%[0;%'
@@ -1449,7 +1370,7 @@ prune_worktree_registry() {
 
 	# Next, delete test artifacts in temp directories
 	local temp_count
-	temp_count=$(sqlite3 "$WORKTREE_REGISTRY_DB" "
+	temp_count=$(_wt_sqlite3 "$WORKTREE_REGISTRY_DB" "
         DELETE FROM worktree_owners 
         WHERE worktree_path LIKE '/tmp/%' 
            OR worktree_path LIKE '/var/folders/%';
@@ -1462,7 +1383,7 @@ prune_worktree_registry() {
 	# one sqlite transaction; the old path called unregister_worktree once per row,
 	# which made large stale backlogs exceed common assistant/tool timeouts.
 	local entries
-	entries=$(sqlite3 -separator '|' "$WORKTREE_REGISTRY_DB" "
+	entries=$(_wt_sqlite3 -separator '|' "$WORKTREE_REGISTRY_DB" "
         SELECT worktree_path, owner_pid FROM worktree_owners;
     " 2>/dev/null || echo "")
 
@@ -1475,6 +1396,11 @@ prune_worktree_registry() {
 			[[ -n "${VERBOSE:-}" ]] && _wt_registry_print_pruned_entries "$stale_entries"
 		fi
 	fi
+
+	# Existing directories may still have abandoned ownership after runtime
+	# crashes. Reconcile those rows independently; deletion remains the normal
+	# guarded cleanup pipeline's responsibility.
+	_wt_registry_reconcile_existing_owners || return 1
 
 	[[ -n "${VERBOSE:-}" ]] && echo "Pruned $pruned_count entries total"
 	return 0

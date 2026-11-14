@@ -98,9 +98,15 @@ verify_remote_sync() {
 	fi
 
 	if [[ "$local_sha" != "$remote_sha" ]]; then
-		print_error "Release worktree HEAD differs from origin/$branch"
-		print_info "Discard it and create a fresh detached linked worktree from origin/$branch"
-		return 1
+		# A canonical snapshot or recovery-pinned aggregate (GH#34710) remains
+		# valid as main advances, never as it is rewritten. The pin must still
+		# identify this exact isolated checkout.
+		if [[ "${AIDEVOPS_RELEASE_SNAPSHOT_SHA:-}" != "$local_sha" &&
+			"${AIDEVOPS_RELEASE_PINNED_AGGREGATE_SHA:-}" != "$local_sha" ]] ||
+			! git merge-base --is-ancestor "$local_sha" "$remote_sha"; then
+			print_error "Release checkout is neither current main nor its pinned snapshot"
+			return 1
+		fi
 	fi
 
 	print_success "Release worktree is in sync with origin/$branch"
@@ -148,6 +154,17 @@ verify_release_source_pr() {
 	local resolver="${AIDEVOPS_RELEASE_SOURCE_RESOLVER:-${SCRIPT_DIR}/release-provenance-helper.sh}"
 	local source_json=""
 	local resolver_args=(resolve-source --source-pr "$source_pr" --repo "$repo_slug" --branch "$branch")
+	VERSION_MANAGER_AGGREGATE_PIN=""
+	if [[ -n "${AIDEVOPS_RELEASE_SNAPSHOT_SHA:-}" ]]; then
+		[[ -z "${AIDEVOPS_RELEASE_PINNED_AGGREGATE_SHA:-}" ]] || return 1
+		[[ "$(git -C "$REPO_ROOT" rev-parse HEAD)" == "$AIDEVOPS_RELEASE_SNAPSHOT_SHA" ]] || return 1
+		resolver_args+=(--snapshot)
+	elif [[ -n "${AIDEVOPS_RELEASE_PINNED_AGGREGATE_SHA:-}" ]]; then
+		[[ "$(git -C "$REPO_ROOT" rev-parse HEAD)" == "$AIDEVOPS_RELEASE_PINNED_AGGREGATE_SHA" ]] || return 1
+		resolver_args+=(--pinned-aggregate "$AIDEVOPS_RELEASE_PINNED_AGGREGATE_SHA")
+		VERSION_MANAGER_AGGREGATE_PIN="$AIDEVOPS_RELEASE_PINNED_AGGREGATE_SHA"
+	fi
+	export VERSION_MANAGER_AGGREGATE_PIN
 	[[ -x "$resolver" ]] || {
 		print_error "Release source provenance resolver is unavailable"
 		return 1
@@ -156,6 +173,8 @@ verify_release_source_pr() {
 	source_json=$(cd "$REPO_ROOT" && bash "$resolver" "${resolver_args[@]}") || return 1
 	VERSION_MANAGER_SOURCE_PR=$(jq -er '.source_pr' <<<"$source_json") || return 1
 	VERSION_MANAGER_SOURCE_MERGE_SHA=$(jq -er '.source_merge' <<<"$source_json") || return 1
+	VERSION_MANAGER_SNAPSHOT_BASE=$(jq -er '.snapshot_base // ""' <<<"$source_json") || return 1
+	export VERSION_MANAGER_SNAPSHOT_BASE
 	VERSION_MANAGER_AGGREGATED_SOURCES=$(jq -cr ".aggregated_sources // [] | .[] | ${_VERSION_MANAGER_SOURCE_ENTRY_JQ}" \
 		<<<"$source_json") || return 1
 	VERSION_MANAGER_EXPECTED_SOURCES=$(jq -er "
@@ -393,7 +412,7 @@ _mark_single_task_complete() {
 	escaped_id=$(task_identity_escape_ere "$task_id") || return 2
 
 	# Build regex patterns (avoids shellcheck SC1087 false positive with [[:space:]])
-	local unchecked_pattern="^[[:space:]]*- \\[ \\] ${escaped_id}[[:space:]]"
+	local unchecked_pattern="^[[:space:]]*- \\[[ >]\\] ${escaped_id}[[:space:]]"
 	local checked_pattern="^[[:space:]]*- \\[x\\] ${escaped_id}[[:space:]]"
 
 	if grep -qE "$unchecked_pattern" "$todo_file"; then
@@ -409,13 +428,13 @@ _mark_single_task_complete() {
 			proof_log=" verified:${today_short}"
 		fi
 
-		local sed_unchecked_pattern="^[[:space:]]*- \\[ \\] ${escaped_id}[[:space:]]"
+		local sed_unchecked_pattern="^[[:space:]]*- \\[[ >]\\] ${escaped_id}[[:space:]]"
 
 		# Check if line already has completed: field
 		if grep -E "$sed_unchecked_pattern" "$todo_file" | grep -q "completed:"; then
-			sed_inplace "s/^\\([[:space:]]*\\)- \\[ \\] \\(${escaped_id}[[:space:]].*\\)\$/\\1- [x] \\2${proof_log}/" "$todo_file"
+			sed_inplace "s/^\\([[:space:]]*\\)- \\[[ >]\\] \\(${escaped_id}[[:space:]].*\\)\$/\\1- [x] \\2${proof_log}/" "$todo_file"
 		else
-			sed_inplace "s/^\\([[:space:]]*\\)- \\[ \\] \\(${escaped_id}[[:space:]].*\\)\$/\\1- [x] \\2${proof_log} completed:$today_short/" "$todo_file"
+			sed_inplace "s/^\\([[:space:]]*\\)- \\[[ >]\\] \\(${escaped_id}[[:space:]].*\\)\$/\\1- [x] \\2${proof_log} completed:$today_short/" "$todo_file"
 		fi
 
 		_dedupe_completed_task_lines "$task_id" "$todo_file" || dedupe_rc=$?
@@ -536,7 +555,12 @@ _create_aggregate_recovery_bump_commit() {
 	[[ "$expected_parent" =~ ^[0-9a-f]{40}$ ]] || return 1
 	current_head=$(git rev-parse HEAD 2>/dev/null) || return 1
 	remote_head=$(git rev-parse origin/main 2>/dev/null) || return 1
-	[[ "$current_head" == "$expected_parent" && "$remote_head" == "$expected_parent" ]] || return 1
+	[[ "$current_head" == "$expected_parent" ]] || return 1
+	if [[ "$remote_head" != "$expected_parent" ]]; then
+		# GH#34710: only a verified recovery pin may trail protected main.
+		[[ "${VERSION_MANAGER_AGGREGATE_PIN:-}" == "$expected_parent" ]] || return 1
+		git merge-base --is-ancestor "$expected_parent" "$remote_head" || return 1
+	fi
 	git diff --quiet && git diff --cached --quiet || return 1
 	commit_subject=$(_bump_commit_subject "$version") || return 1
 	git commit --allow-empty --no-verify -m "$commit_subject" >/dev/null || return 1
@@ -649,8 +673,10 @@ push_changes() {
 		# Use --atomic to ensure commit and tag are pushed together (all-or-nothing).
 		# Capture stderr so permanent branch-policy rejection is classified after
 		# one attempt rather than retried as transient contention.
+		# GH#34434: release-tool push from a dependency-free release worktree;
+		# skip only repo-verify (rationale in version-manager-protected-main.sh).
 		_version_manager_require_aggregate_fence || return 1
-		if push_output=$(git push --atomic origin HEAD:refs/heads/main --tags 2>&1); then
+		if push_output=$(AIDEVOPS_PREPUSH_REPO_VERIFY=0 git push --atomic origin HEAD:refs/heads/main --tags 2>&1); then
 			print_success "Pushed changes and tags to remote"
 			return 0
 		fi
@@ -679,7 +705,8 @@ push_changes() {
 			return 1
 		fi
 		if [[ "$(git rev-parse origin/main 2>/dev/null)" != "$release_parent" ]]; then
-			if [[ -n "${AIDEVOPS_RELEASE_LANE_OPERATION_TOKEN:-}" ]]; then
+			if [[ -n "${AIDEVOPS_RELEASE_LANE_OPERATION_TOKEN:-}" ]] ||
+				_version_manager_is_signed_snapshot "$tag_name"; then
 				_version_manager_require_aggregate_fence || return 1
 				if _version_manager_queue_protected_main_release "$version"; then
 					case "$_VERSION_MANAGER_PROTECTED_RELEASE_RESULT" in

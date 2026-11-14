@@ -99,18 +99,19 @@ write_command "release" \
 Release type: $ARGUMENTS (valid: major, minor, patch)
 
 **Steps:**
-1. Run `git log v$(cat VERSION 2>/dev/null || echo "0.0.0")..HEAD --oneline` to see commits since last release
+1. Pick the baseline: if `VERSION` exists use `v$(cat VERSION)`, else the latest tag (`git describe --tags --abbrev=0`), else the root commit. Run `git log <baseline>..HEAD --oneline`
 2. If no release type provided, determine it from commits:
    - Any `feat:` or new feature -> minor
    - Only `fix:`, `docs:`, `chore:`, `perf:`, `refactor:` -> patch
    - Any `BREAKING CHANGE:` or `!` -> major
-3. Run the single release command:
+3. If `.agents/scripts/version-manager.sh` exists (the aidevops repository), run the single release command:
    ```bash
    .agents/scripts/version-manager.sh release [type] --skip-preflight --force
    ```
+   Otherwise (any other managed repository) do NOT run that script or pass `--skip-preflight --force` to project scripts. Follow the repository'"'"'s documented release process (`RELEASING.md`, `CONTRIBUTING.md` Releasing section, or `package.json` release scripts): bump versions in a linked worktree and PR, merge with `full-loop-helper.sh merge`, then tag. See `workflows/release.md` "Manual Release (Non-aidevops Repos)"
 4. Report the result with the GitHub release URL
 
-**CRITICAL**: Use only the single command above - it handles everything atomically.'
+**CRITICAL**: In the aidevops repository use only the single command above - it handles everything atomically.'
 
 # --- Version Bump ---
 write_command "version-bump" \
@@ -270,17 +271,6 @@ cd "$AIDEVOPS_REPO" && ./setup.sh || exit
 This deploys agents, updates commands, regenerates configs.
 Arguments: $ARGUMENTS'
 
-# --- Ralph Loop ---
-write_command "ralph-loop" \
-	"Start iterative AI development loop (Ralph Wiggum technique)" \
-	'Read ~/.aidevops/agents/workflows/ralph-loop.md and follow its instructions.
-
-Start a Ralph loop for iterative development.
-
-Arguments: $ARGUMENTS
-
-For end-to-end development, prefer `/full-loop` which handles the complete lifecycle.'
-
 # --- Full Loop ---
 write_command "full-loop" \
 	"Start end-to-end development loop (task -> preflight -> PR -> postflight -> deploy)" \
@@ -331,13 +321,6 @@ write_command "recall" \
 Search for: $ARGUMENTS
 
 **Usage:** `/recall authentication`, `/recall --recent`, `/recall --stats`'
-
-# --- Context ---
-write_command "context" \
-	"Build token-efficient AI context for complex tasks" \
-	'Read ~/.aidevops/agents/tools/context/context-builder.md and follow its instructions.
-
-Context request: $ARGUMENTS'
 
 # --- List Keys ---
 write_command "list-keys" \

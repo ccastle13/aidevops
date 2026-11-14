@@ -21,7 +21,12 @@ import {
 // CLI version detection (for User-Agent strings)
 // ---------------------------------------------------------------------------
 
-const FALLBACK_CLAUDE_VERSION = "2.1.80";
+// Anthropic gates newer models on the advertised Claude Code client version:
+// claude-opus-5-5 requires >= 2.1.280 and rejects older clients with
+// "Claude Code <ver> does not support this model". Hosts without the `claude`
+// CLI on PATH fall back to this constant, so it must stay at or above the
+// highest gate currently enforced by the API.
+const FALLBACK_CLAUDE_VERSION = "2.1.280";
 const FALLBACK_OPENCODE_VERSION = "1.2.27";
 
 function detectCliVersion(binaries, fallback) {
@@ -36,7 +41,9 @@ function detectCliVersion(binaries, fallback) {
 }
 
 const DETECTED_CLAUDE_VERSION = detectCliVersion(["claude"], FALLBACK_CLAUDE_VERSION);
-const DETECTED_OPENCODE_VERSION = detectCliVersion(["opencode", "oc"], FALLBACK_OPENCODE_VERSION);
+/** Detected OpenCode 1 CLI version, or null; user-facing text must not show the UA fallback. */
+export const DETECTED_OPENCODE_RUNTIME_VERSION = detectCliVersion(["opencode", "oc"], null);
+const DETECTED_OPENCODE_VERSION = DETECTED_OPENCODE_RUNTIME_VERSION || FALLBACK_OPENCODE_VERSION;
 
 /**
  * Auto-detect the @anthropic-ai/sdk package version embedded in the Claude CLI.

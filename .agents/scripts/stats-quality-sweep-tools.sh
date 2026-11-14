@@ -10,6 +10,7 @@
 # below the 1500-line gate.
 #
 # Usage: source "${SCRIPT_DIR}/stats-quality-sweep-tools.sh"
+# Read-only Codacy report: bash stats-quality-sweep-tools.sh codacy OWNER/REPO REPO_PATH
 #
 # Dependencies:
 #   - shared-constants.sh (print_error, print_info, _sanitize_markdown, etc.)
@@ -330,37 +331,360 @@ _sweep_sonarcloud_diagnostics() {
 	return 0
 }
 
+_CODACY_HEALTHY_STATE="HEALTHY"
+
+_codacy_telemetry_is_valid() {
+	local grade="$1"
+	local issue_count="$2"
+	local analysed_loc="$3"
+	local complex_files="$4"
+	local analysed_sha="$5"
+	local remote_sha="$6"
+
+	[[ "$grade" =~ ^[A-F]$ ]] && [[ "$issue_count" =~ ^[0-9]+$ ]] &&
+		[[ "$analysed_loc" =~ ^[1-9][0-9]*$ ]] && [[ "$complex_files" =~ ^[0-9]+$ ]] &&
+		[[ "$analysed_sha" =~ ^[0-9a-f]{40}$ ]] && [[ "$remote_sha" =~ ^[0-9a-f]{40}$ ]]
+}
+
+_codacy_summary_fields() {
+	local summary_response="$1"
+
+	# API v3.1.0: the repository summary is wrapped in data, not top-level.
+	jq -er '
+		def count: type == "number" and . >= 0 and . == floor;
+		def text: type == "string";
+		.data | select(type == "object") |
+		select(.gradeLetter | text and test("^[A-F]$")) |
+		select(.issuesCount | count) | select(.loc | count and . > 0) |
+		select(.complexFilesCount | count) |
+		select(.lastAnalysedCommit.sha | text and test("^[0-9a-f]{40}$")) |
+		select(.branch.name | text and length > 0) |
+		[.gradeLetter, .issuesCount, .loc, .complexFilesCount, .lastAnalysedCommit.sha] | @tsv
+	' <<<"$summary_response" 2>/dev/null
+}
+
+_codacy_read_healthy_state() {
+	local state_file="$1"
+	local previous_loc="" previous_sha=""
+
+	if [[ -f "$state_file" ]] && jq -e . "$state_file" >/dev/null 2>&1; then
+		previous_loc=$(jq -r '.healthy_loc // empty' "$state_file" 2>/dev/null || echo "")
+		previous_sha=$(jq -r '.healthy_sha // empty' "$state_file" 2>/dev/null || echo "")
+		[[ "$previous_loc" =~ ^[1-9][0-9]*$ ]] || previous_loc=""
+		[[ "$previous_sha" =~ ^[0-9a-fA-F]{7,40}$ ]] || previous_sha=""
+	fi
+	printf '%s|%s' "$previous_loc" "$previous_sha"
+	return 0
+}
+
+_codacy_policy_drift() {
+	local issues_response="$1"
+
+	# Only an aggregate overview can establish absence. An issue-search page
+	# (even one with pagination.total) cannot prove a policy rule is absent.
+	jq -e '
+		.data.counts.patterns | type == "array" and all(.[];
+			(.id | type == "string") and
+			(.total | type == "number" and . >= 0 and . == floor))
+	' <<<"$issues_response" >/dev/null 2>&1 || return 1
+	jq -r '
+		["ESLint8_es-x_no-modules",
+		 "ESLint8_es-x_no-block-scoped-variables", "ESLint8_es-x_no-trailing-commas"] as $rules |
+		.data.counts.patterns[] | select(.id as $id | $rules | index($id)) |
+		select(.total > 0) | "  - `\(.id)`: \(.total)"
+	' <<<"$issues_response"
+	return 0
+}
+
+_codacy_classify_health() {
+	local telemetry_valid="$1"
+	local analysed_sha="$2"
+	local remote_sha="$3"
+	local previous_loc="$4"
+	local previous_sha="$5"
+	local analysed_loc="$6"
+	local drift_output="$7"
+	local health_unknown="$8"
+
+	if [[ "$telemetry_valid" != true ]]; then
+		printf '%s' "$health_unknown"
+	elif [[ "$analysed_sha" != "$remote_sha" ]]; then
+		printf '%s' "STALE_ANALYSIS"
+	elif [[ -n "$previous_loc" && -n "$previous_sha" ]] && ((analysed_loc * 100 < previous_loc * 80)); then
+		printf '%s' "INDEX_DEGRADED"
+	elif [[ -n "$drift_output" ]]; then
+		printf '%s' "POLICY_DRIFT"
+	elif [[ -z "$previous_loc" || -z "$previous_sha" ]]; then
+		printf '%s' "BASELINE_UNKNOWN"
+	else
+		printf '%s' "$_CODACY_HEALTHY_STATE"
+	fi
+	return 0
+}
+
+_codacy_save_healthy_state() {
+	local state_file="$1"
+	local grade="$2"
+	local issue_count="$3"
+	local analysed_loc="$4"
+	local complex_files="$5"
+	local analysed_sha="$6"
+	local state_dir="${state_file%/*}"
+	local state_tmp=""
+
+	mkdir -p "$state_dir" || return 1
+	state_tmp=$(mktemp "${state_file%.json}.XXXXXX" 2>/dev/null || echo "")
+	if [[ -n "$state_tmp" ]] && jq -n \
+		--arg grade "$grade" --arg sha "$analysed_sha" \
+		--argjson issues "$issue_count" --argjson loc "$analysed_loc" --argjson complex "$complex_files" \
+		'{grade: $grade, issue_count: $issues, healthy_loc: $loc, complex_files: $complex, healthy_sha: $sha}' >"$state_tmp" &&
+		mv -f "$state_tmp" "$state_file"; then
+		return 0
+	fi
+	[[ -n "$state_tmp" ]] && rm -f "$state_tmp"
+	return 1
+}
+
+_codacy_grade_target() {
+	local grade="$1"
+	local health_state="$2"
+
+	case "$health_state" in
+	UNKNOWN | STALE_ANALYSIS) printf '%s' "UNVERIFIED" ;;
+	*)
+		if [[ "$grade" != "A" ]]; then
+			printf '%s' "BELOW_TARGET"
+		elif [[ "$health_state" == "$_CODACY_HEALTHY_STATE" ]]; then
+			printf '%s' "AT_TARGET"
+		else
+			printf '%s' "UNVERIFIED"
+		fi
+		;;
+	esac
+	return 0
+}
+
 #######################################
 # Run Codacy API check for a repo.
 #
 # Arguments:
 #   $1 - repo slug
-# Output: codacy_section markdown to stdout (empty if unavailable)
+#   $2 - local repository path (used to resolve the remote default SHA)
+# Output: codacy_section markdown to stdout (UNKNOWN if unavailable)
 #######################################
 _sweep_codacy() {
 	local repo_slug="$1"
-
+	local repo_path="$2"
 	local codacy_token=""
+	local health_unknown="UNKNOWN"
+
 	if command -v gopass &>/dev/null; then
 		codacy_token=$(gopass show -o "aidevops/CODACY_API_TOKEN" 2>/dev/null || echo "")
 	fi
-	[[ -z "$codacy_token" ]] && return 0
+	if [[ -z "$codacy_token" ]]; then
+		printf '### Codacy\n\n- **Analysis health**: UNKNOWN\n- **Grade target**: A / UNVERIFIED\n- Codacy API credentials unavailable; no analysis verified.\n'
+		return 0
+	fi
 
 	local codacy_org="${repo_slug%%/*}"
 	local codacy_repo="${repo_slug##*/}"
-	local codacy_response
-	codacy_response=$(curl -s -H "api-token: ${codacy_token}" \
-		"https://app.codacy.com/api/v3/organizations/gh/${codacy_org}/repositories/${codacy_repo}/issues/search" \
-		-X POST -H "Content-Type: application/json" -d '{"limit":1}' 2>/dev/null || echo "")
+	local summary_response issues_response summary_fields overview_body
+	summary_response=$(curl -sS --fail --connect-timeout 5 --max-time 20 -H "api-token: ${codacy_token}" \
+		"https://app.codacy.com/api/v3/analysis/organizations/gh/${codacy_org}/repositories/${codacy_repo}" 2>/dev/null || echo "")
+	local grade="" issue_count="" analysed_loc="" complex_files="" analysed_sha="" remote_sha
+	if summary_fields=$(_codacy_summary_fields "$summary_response"); then
+		IFS=$'\t' read -r grade issue_count analysed_loc complex_files analysed_sha <<<"$summary_fields"
+	fi
+	overview_body=$(jq -c '{branchName: .data.branch.name}' <<<"$summary_response" 2>/dev/null || echo '{}')
+	issues_response=$(curl -sS --fail --connect-timeout 5 --max-time 20 -H "api-token: ${codacy_token}" \
+		"https://app.codacy.com/api/v3/analysis/organizations/gh/${codacy_org}/repositories/${codacy_repo}/issues/overview" \
+		-X POST -H "Content-Type: application/json" -d "$overview_body" 2>/dev/null || echo "")
+	remote_sha=$(git -C "$repo_path" ls-remote origin HEAD 2>/dev/null | cut -f1) || remote_sha=""
 
-	if [[ -n "$codacy_response" ]] && echo "$codacy_response" | jq -e '.pagination' &>/dev/null; then
-		local codacy_total
-		codacy_total=$(echo "$codacy_response" | jq -r '.pagination.total // 0')
-		[[ "$codacy_total" =~ ^[0-9]+$ ]] || codacy_total=0
-		printf '### Codacy\n\n- **Open issues**: %s\n- **Dashboard**: https://app.codacy.com/gh/%s/%s/dashboard\n' \
-			"$codacy_total" "$codacy_org" "$codacy_repo"
+	local slug_safe="${repo_slug//\//-}"
+	local state_file="${QUALITY_SWEEP_STATE_DIR}/${slug_safe}.codacy-health.json"
+	local previous_state previous_loc previous_sha drift_output health_state
+	previous_state=$(_codacy_read_healthy_state "$state_file")
+	IFS='|' read -r previous_loc previous_sha <<<"$previous_state"
+	if drift_output=$(_codacy_policy_drift "$issues_response") &&
+		_codacy_telemetry_is_valid "$grade" "$issue_count" "$analysed_loc" "$complex_files" "$analysed_sha" "$remote_sha"; then
+		health_state=$(_codacy_classify_health true "$analysed_sha" "$remote_sha" "$previous_loc" "$previous_sha" "$analysed_loc" "$drift_output" "$health_unknown")
+	else
+		health_state="$health_unknown"
+	fi
+	if [[ "$health_state" == "BASELINE_UNKNOWN" || "$health_state" == "$_CODACY_HEALTHY_STATE" ]]; then
+		# Repeated small drops must not ratchet a healthy denominator downward.
+		# Retain the whole prior sample, not old LOC/SHA with new issue metrics.
+		if [[ -z "$previous_loc" || -z "$previous_sha" ]] || ((analysed_loc >= previous_loc)); then
+			_codacy_save_healthy_state "$state_file" "$grade" "$issue_count" "$analysed_loc" "$complex_files" "$analysed_sha" || health_state="$health_unknown"
+		fi
 	fi
 
+	printf '### Codacy\n\n- **Grade**: %s\n- **Open issues**: %s\n- **Analysed LOC**: %s\n- **Complex files**: %s\n- **Analysed SHA**: %s\n- **Analysis health**: %s\n' \
+		"${grade:-$health_unknown}" "${issue_count:-$health_unknown}" "${analysed_loc:-$health_unknown}" \
+		"${complex_files:-$health_unknown}" "${analysed_sha:-$health_unknown}" "$health_state"
+	printf -- '- **Grade target**: A / %s\n' "$(_codacy_grade_target "$grade" "$health_state")"
+	[[ -n "$drift_output" ]] && printf '\n**Policy drift:**\n%s\n' "$drift_output"
+	printf -- '- **Dashboard**: https://app.codacy.com/gh/%s/%s/dashboard\n' "$codacy_org" "$codacy_repo"
+	return 0
+}
+
+#######################################
+# Count merged PRs with a CodeRabbit review OR commit status on their head.
+# One bounded GraphQL search, paginated to GitHub's 1,000-result search cap;
+# no per-PR API calls. Partial, truncated or inconsistent data fails open.
+# Args: repository slug, inclusive UTC start and end
+# Output: merged|covered (nonzero exit means coverage is unknown)
+#######################################
+_coderabbit_coverage_counts() {
+	local repo_slug="$1"
+	local since="$2"
+	local until="$3"
+	# GraphQL variables are deliberately expanded by GitHub, not the shell.
+	# shellcheck disable=SC2016
+	local query='query($search: String!, $cursor: String) {
+		search(query: $search, type: ISSUE, first: 100, after: $cursor) {
+			issueCount pageInfo { hasNextPage endCursor }
+			nodes { ... on PullRequest {
+				number headRefOid
+				reviews(last: 100) { pageInfo { hasPreviousPage } nodes { author { login } } }
+				commits(last: 1) { nodes { commit { oid status { contexts { context } } } } }
+			} }
+		}
+	}'
+	local cursor="" response page rows='[]' total=0 next=""
+	# Repeated merged qualifiers are ORed by search; use a single range.
+	local search="repo:${repo_slug} is:pr is:merged merged:${since}..${until}"
+	for page in {1..10}; do
+		if ! response=$(gh api graphql -f query="$query" -f search="$search" -f cursor="$cursor" 2>/dev/null); then
+			printf '[stats] CodeRabbit coverage: GraphQL request failed on page %s\n' "$page" >>"${LOGFILE:-/dev/null}"
+			return 1
+		fi
+		if jq -e '(.errors // [] | length) > 0' <<<"$response" >/dev/null 2>&1; then
+			printf '[stats] CodeRabbit coverage: GraphQL response contains errors on page %s\n' "$page" >>"${LOGFILE:-/dev/null}"
+			return 1
+		fi
+		# A missing status means no status, not a failed query. Reviews are
+		# bounded too: an unobserved review must not silently lower coverage.
+		jq -e --arg array_type array --arg number_type number '
+			def number: type == $number_type;
+			(.errors // [] | length == 0) and
+			(.data.search | (.issueCount | number and . >= 0 and . <= 1000) and
+			 (.nodes | type == $array_type) and (.pageInfo.hasNextPage | type == "boolean") and
+			 all(.nodes[]; (.number | number) and
+			   (.reviews.pageInfo.hasPreviousPage == false) and
+			   (.reviews.nodes | type == $array_type) and
+			   (.headRefOid != null and .headRefOid == .commits.nodes[0].commit.oid)))
+		' <<<"$response" >/dev/null 2>&1 || {
+			printf '[stats] CodeRabbit coverage: invalid or incomplete page data on page %s (search limit, reviews or head commit)\n' "$page" >>"${LOGFILE:-/dev/null}"
+			return 1
+		}
+		total=$(jq -r '.data.search.issueCount' <<<"$response")
+		rows=$(jq -c --argjson previous "$rows" '$previous + .data.search.nodes' <<<"$response") || {
+			printf '[stats] CodeRabbit coverage: failed to accumulate page %s\n' "$page" >>"${LOGFILE:-/dev/null}"
+			return 1
+		}
+		next=$(jq -r '.data.search.pageInfo.hasNextPage' <<<"$response")
+		[[ "$next" == false ]] && break
+		local next_cursor
+		next_cursor=$(jq -r '.data.search.pageInfo.endCursor // empty' <<<"$response")
+		[[ -n "$next_cursor" && "$next_cursor" != "$cursor" ]] || {
+			printf '[stats] CodeRabbit coverage: missing or repeated pagination cursor on page %s\n' "$page" >>"${LOGFILE:-/dev/null}"
+			return 1
+		}
+		cursor="$next_cursor"
+	done
+	[[ "$next" == false ]] || {
+		printf '[stats] CodeRabbit coverage: pagination exceeded the 10-page search bound\n' >>"${LOGFILE:-/dev/null}"
+		return 1
+	}
+	jq -er --argjson total "$total" '
+		unique_by(.number) | select(length == $total) |
+		[.[] | select(
+			any(.reviews.nodes[]; .author.login == "coderabbitai" or .author.login == "coderabbitai[bot]") or
+			any(.commits.nodes[0].commit.status.contexts[]?; .context == "CodeRabbit"))] |
+		"\($total)|\(length)"
+	' <<<"$rows" || {
+		printf '[stats] CodeRabbit coverage: unique PR count does not match search total %s, or coverage aggregation failed\n' "$total" >>"${LOGFILE:-/dev/null}"
+		return 1
+	}
+	return 0
+}
+
+# Create at most one open worker-ready coverage incident per repository.
+# A failed dedup lookup never grants permission to create another issue.
+_ensure_coderabbit_coverage_issue() {
+	local repo_slug="$1"
+	local diagnostics="$2"
+	local title="quality: restore CodeRabbit merged PR review coverage"
+	local existing
+	if ! existing=$(gh issue list --repo "$repo_slug" --state open \
+		--search "in:title \"${title}\"" --limit 100 --json number,title 2>/dev/null) ||
+		! jq -e 'type == "array"' <<<"$existing" >/dev/null 2>&1; then
+		printf '[stats] CodeRabbit coverage: dedup lookup failed; skipping issue creation\n' >>"${LOGFILE:-/dev/null}"
+		return 0
+	fi
+	if jq -e --arg title "$title" 'any(.[]; .title == $title)' <<<"$existing" >/dev/null; then
+		return 0
+	fi
+	local body="## What
+Restore CodeRabbit review coverage of merged PRs. The daily sweep observed:
+
+${diagnostics}
+
+## Why
+Missing reviews starve the post-merge review scanner of quality feedback.
+
+## How
+Inspect \`.coderabbit.yaml\` and compare \`reviews.auto_review\` with the existing repository configuration and recent CodeRabbit reviews/statuses. Diagnose provider or GitHub App availability before changing configuration; do not weaken review or security gates. Required integration settings or credentials may need an administrator; do not guess them.
+
+### Files Scope
+- \`.coderabbit.yaml\`
+
+The exact configuration fix is not yet known; inspect the existing settings first. Any additional source path requires scope recovery before editing.
+
+## Verification
+Run the daily quality sweep through \`stats-wrapper.sh\`; confirm the seven-day CodeRabbit coverage recovers above the configured threshold. Verify a new PR receives a CodeRabbit review or a \`CodeRabbit\` commit status on its head. Reference: \`.agents/scripts/stats-quality-sweep-tools.sh\`, \`_sweep_coderabbit_coverage\`."
+	if ! gh_create_issue --repo "$repo_slug" --title "$title" --body "$body" \
+		--label "auto-dispatch" --label "tier:standard" --label "quality-debt" \
+		--label "source:quality-sweep" >/dev/null 2>&1; then
+		printf '[stats] CodeRabbit coverage: failed to create incident issue\n' >>"${LOGFILE:-/dev/null}"
+	fi
+	return 0
+}
+
+_sweep_coderabbit_coverage() {
+	local repo_slug="$1"
+	local threshold="${CODERABBIT_COVERAGE_THRESHOLD:-50}"
+	local minimum="${CODERABBIT_COVERAGE_MIN_PRS:-20}"
+	# Validate even when sourced without the orchestrator. Reject malformed
+	# arithmetic inputs rather than evaluating arbitrary environment strings.
+	if [[ ! "$threshold" =~ ^(0|[1-9][0-9]?)$ && "$threshold" != 100 ]] ||
+		[[ ! "$minimum" =~ ^[1-9][0-9]{0,5}$ ]]; then
+		printf '[stats] CodeRabbit coverage: invalid threshold/minimum; skipping alert\n' >>"${LOGFILE:-/dev/null}"
+		printf '\n**CodeRabbit coverage (last 7 days)**: unknown (invalid configuration; no alert).\n'
+		return 0
+	fi
+	local since until counts merged covered percent diagnostics
+	until=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+	since=$(date -u -d '7 days ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -v-7d '+%Y-%m-%dT%H:%M:%SZ')
+	if ! counts=$(_coderabbit_coverage_counts "$repo_slug" "$since" "$until"); then
+		printf '[stats] CodeRabbit coverage: query failed, incomplete or exceeded bounded search; skipping alert\n' >>"${LOGFILE:-/dev/null}"
+		printf '\n**CodeRabbit coverage (last 7 days)**: unknown (query failed or incomplete; no alert).\n'
+		return 0
+	fi
+	IFS='|' read -r merged covered <<<"$counts"
+	percent=0
+	((merged > 0)) && percent=$((covered * 100 / merged))
+	diagnostics="**CodeRabbit coverage (last 7 days)**: ${covered}/${merged} merged PRs (${percent}%; threshold ${threshold}%, minimum ${minimum} PRs; ${since} to ${until})."
+	printf '\n%s\n' "$diagnostics"
+	if ((merged >= minimum && covered * 100 < threshold * merged)); then
+		printf '\n**WARNING: CodeRabbit review coverage has collapsed.** Check .coderabbit.yaml and provider availability.\n'
+		printf '[stats] WARNING: %s\n' "$diagnostics" >>"${LOGFILE:-/dev/null}"
+		_ensure_coderabbit_coverage_issue "$repo_slug" "$diagnostics"
+	elif ((merged < minimum)); then
+		printf '_Below minimum sample; no coverage alert._\n'
+	fi
 	return 0
 }
 
@@ -378,6 +702,10 @@ _sweep_coderabbit() {
 	local sweep_gate_status="$2"
 	local sweep_total_issues="$3"
 
+	# Independent of the quality-delta baseline, including the first sweep.
+	printf '### CodeRabbit\n'
+	_sweep_coderabbit_coverage "$repo_slug"
+
 	local prev_state
 	prev_state=$(_load_sweep_state "$repo_slug")
 	local prev_gate prev_issues prev_high_critical
@@ -393,7 +721,7 @@ _sweep_coderabbit() {
 	# causing every first run (or run after state loss) to trigger a full review.
 	if [[ "$prev_gate" == "UNKNOWN" ]]; then
 		echo "[stats] CodeRabbit: first run for ${repo_slug} — saved baseline, skipping trigger" >>"$LOGFILE"
-		printf '### CodeRabbit\n\n_First sweep run — baseline saved (%s issues, gate %s). Review trigger will activate on next sweep if quality degrades._\n' \
+		printf '\n_First sweep run — baseline saved (%s issues, gate %s). Review trigger will activate on next sweep if quality degrades._\n' \
 			"$sweep_total_issues" "$sweep_gate_status"
 		return 0
 	fi
@@ -417,10 +745,10 @@ _sweep_coderabbit() {
 		printf -v trigger_reasons '%s, ' "${reasons[@]}"
 		trigger_reasons="${trigger_reasons%, }"
 		echo "[stats] CodeRabbit: active review triggered for ${repo_slug} (${trigger_reasons})" >>"$LOGFILE"
-		printf '### CodeRabbit\n\n**Trigger**: %s\n\n@coderabbitai Please run a full codebase review of this repository. Focus on:\n- Security vulnerabilities and credential exposure\n- Shell script quality (error handling, quoting, race conditions)\n- Code duplication and maintainability\n- Documentation accuracy\n' \
+		printf '\n**Trigger**: %s\n\n@coderabbitai Please run a full codebase review of this repository. Focus on:\n- Security vulnerabilities and credential exposure\n- Shell script quality (error handling, quoting, race conditions)\n- Code duplication and maintainability\n- Documentation accuracy\n' \
 			"$trigger_reasons"
 	else
-		printf '### CodeRabbit\n\n_Monitoring: %s issues (delta: %s), gate %s — no active review needed._\n' \
+		printf '\n_Monitoring: %s issues (delta: %s), gate %s — no active review needed._\n' \
 			"$sweep_total_issues" "$issue_delta" "$sweep_gate_status"
 	fi
 
@@ -564,6 +892,7 @@ _build_sweep_comment() {
 **Date**: ${now_iso}
 **Repository**: current repository
 **Tools run**: ${tool_count}
+**Skipped tools**: ${QUALITY_SWEEP_SKIPPED_TOOLS:-none}
 
 ---
 
@@ -579,3 +908,16 @@ _Auto-generated by stats-wrapper.sh daily quality sweep. The supervisor will rev
 COMMENT
 	return 0
 }
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+	if [[ "${1:-}" != "codacy" || "$#" -ne 3 ]]; then
+		printf 'Usage: bash stats-quality-sweep-tools.sh codacy OWNER/REPO REPO_PATH\n' >&2
+		exit 2
+	fi
+	if [[ ! "$2" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ || ! -d "$3" ]]; then
+		printf 'A repository slug and existing local repository directory are required\n' >&2
+		exit 2
+	fi
+	QUALITY_SWEEP_STATE_DIR="${QUALITY_SWEEP_STATE_DIR:-${HOME}/.aidevops/logs/quality-sweep-state}"
+	_sweep_codacy "$2" "$3"
+fi

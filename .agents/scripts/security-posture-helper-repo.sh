@@ -235,6 +235,27 @@ check_workflow_security() {
 		add_finding "$SEVERITY_PASS" "$CAT_WORKFLOWS" "No critical issues"
 	fi
 
+	_check_pull_request_target_policy "$repo_path"
+
+	return 0
+}
+
+# GitHub blocks pull_request_target by default in public repositories from
+# 2026-12-02 unless an Actions event policy allows it. Warn (read-only) when
+# actions-event-policy-helper.sh reports uncovered workflows (exit 1 only;
+# API/permission errors stay silent so the posture check never false-alarms).
+_check_pull_request_target_policy() {
+	local repo_path="$1"
+	local slug="" helper="" rc=0
+	command -v gh >/dev/null 2>&1 || return 0
+	slug=$(resolve_slug "$repo_path") || return 0
+	helper="${SCRIPT_DIR:-$(dirname "${BASH_SOURCE[0]}")}/actions-event-policy-helper.sh"
+	[[ -x "$helper" ]] || return 0
+	"$helper" status --repo "$slug" >/dev/null 2>&1 || rc=$?
+	if [[ "$rc" -eq 1 ]]; then
+		print_warn "pull_request_target workflows lack an Actions event policy (blocked by default from 2026-12-02; brownouts 2026-11-09/16). Fix: actions-event-policy-helper.sh apply --repo $slug"
+		add_finding "$SEVERITY_WARNING" "$CAT_WORKFLOWS" "pull_request_target not allowed by Actions event policy (blocked from 2026-12-02)"
+	fi
 	return 0
 }
 
@@ -452,6 +473,7 @@ check_branch_protection() {
 # Phase 3: Check review-bot-gate
 check_review_bot_gate() {
 	local repo_path="$1"
+	local ruleset_details="${2:-}"
 
 	print_header "Phase 3: Review Bot Gate"
 
@@ -476,14 +498,18 @@ check_review_bot_gate() {
 		return 0
 	fi
 
-	local default_branch
-	default_branch=$(git -C "$repo_path" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||') || true
-	default_branch="${default_branch:-main}"
+	local default_branch protection_json check_contexts
+	default_branch=$(_default_branch_for_repo "$repo_path")
+	protection_json=$(_classic_branch_protection_json "$slug" "$default_branch") || true
+	check_contexts="$(_classic_required_check_contexts "$protection_json")"
+	check_contexts+=$'\n'
+	if [[ "$#" -ge 2 ]]; then
+		check_contexts+="$(_rulesets_required_check_contexts "$slug" "$default_branch" "$ruleset_details")"
+	else
+		check_contexts+="$(_rulesets_required_check_contexts "$slug" "$default_branch")"
+	fi
 
-	local check_contexts
-	check_contexts=$(gh api "repos/$slug/branches/$default_branch/protection/required_status_checks" 2>/dev/null | jq -r '.contexts[]? // empty' 2>/dev/null) || true
-
-	if echo "$check_contexts" | grep -q "review-bot-gate" 2>/dev/null; then
+	if _required_check_present "$check_contexts" "review-bot-gate"; then
 		print_pass "review-bot-gate is a required status check"
 		add_finding "$SEVERITY_PASS" "$CAT_REVIEW_BOT_GATE" "Required status check configured"
 	else
@@ -899,6 +925,206 @@ check_collaborators() {
 	return 0
 }
 
+# --- Tracked secret-file classification (GH#33339) ---
+# Real env files, keys and credential files are critical by filename alone.
+# Env templates (.env.example, .env.production.sample, ...) are classified by
+# their committed content instead: comments, bare names and placeholder values
+# are safe; private keys, known token signatures, credential-bearing URLs and
+# secret-named assignments with real-looking values stay critical. Diagnostics
+# name only the path, reason class and line number, never the value.
+
+# Matches .env[.<stage>].example and <name>.example.env style template names.
+POSTURE_ENV_TEMPLATE_BASENAME_ERE='^(\.env(\.[a-z0-9_-]+)*\.(example|sample|template|tmpl|dist|defaults)|[a-z0-9_.-]*\.(example|sample|template|tmpl|dist|defaults)\.env)$'
+POSTURE_SECRET_KEY_NAME_ERE='(SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|API_KEY|ACCESS_KEY|_KEY$|^KEY$|_PAT$|_PASS$|^PASS$)'
+POSTURE_SECRET_VALUE_MIN_LENGTH=8
+_POSTURE_SECRET_REASON=""
+
+# Ensure the shared token-prefix set is available when sourced standalone.
+if [[ -z "${AIDEVOPS_CREDENTIAL_PREFIX_ERE:-}" && -f "${SCRIPT_DIR}/shared-constants.sh" ]]; then
+	# shellcheck source=./shared-constants.sh
+	source "${SCRIPT_DIR}/shared-constants.sh"
+fi
+
+# Return 0 when the path's basename is an env template.
+_posture_is_env_template_path() {
+	local path="$1"
+	local base_lc
+	base_lc=$(printf '%s' "${path##*/}" | tr '[:upper:]' '[:lower:]')
+	if [[ "$base_lc" =~ $POSTURE_ENV_TEMPLATE_BASENAME_ERE ]]; then
+		return 0
+	fi
+	return 1
+}
+
+# Return 0 when a value is an obvious placeholder, empty, or filler.
+_posture_is_placeholder_value() {
+	local value="$1"
+	local lc
+	lc=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+	[[ -z "$lc" ]] && return 0
+	case "$lc" in
+	\<*\> | \$\{*\} | \$[a-z_]* | \{\{*\}\}) return 0 ;;
+	*your* | *example* | *change*me* | *placeholder* | *replace* | *dummy* | *sample* | *redacted* | *todo* | *fixme* | *xxx* | *\*\*\** | *...*) return 0 ;;
+	esac
+	if [[ "$lc" =~ ^[x*.#0_-]+$ ]]; then
+		return 0
+	fi
+	return 1
+}
+
+# Return 0 when a value is clearly non-secret configuration (number/boolean).
+_posture_is_inert_value() {
+	local value="$1"
+	local lc
+	lc=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+	if [[ "$lc" =~ ^[0-9]+$ ]]; then
+		return 0
+	fi
+	case "$lc" in
+	true | false | yes | no | on | off | none | null) return 0 ;;
+	esac
+	return 1
+}
+
+# Strip quotes and unquoted inline comments from an assignment value.
+# Sets _POSTURE_PARSED_VALUE.
+_posture_parse_assignment_value() {
+	local raw="$1"
+	local quote="${raw:0:1}"
+	if [[ "$quote" == '"' || "$quote" == "'" ]]; then
+		raw="${raw:1}"
+		_POSTURE_PARSED_VALUE="${raw%%"$quote"*}"
+		return 0
+	fi
+	raw="${raw%%[[:space:]]#*}"
+	# Trim trailing whitespace.
+	raw="${raw%"${raw##*[![:space:]]}"}"
+	_POSTURE_PARSED_VALUE="$raw"
+	return 0
+}
+
+# Return 0 and set _POSTURE_SECRET_REASON when one template line carries a
+# secret. Returns 1 for safe lines. Never stores or prints the value.
+_posture_env_line_secret_reason() {
+	local line="$1"
+	local pem_re='-----BEGIN [A-Z ]*PRIVATE KEY-----'
+	# Shared scrub prefixes plus detection-only live-key prefixes (AWS, Stripe, Google).
+	local token_re="(^|[^A-Za-z0-9_-])(${AIDEVOPS_CREDENTIAL_PREFIX_ERE}|AKIA|ASIA|sk_live_|rk_live_|AIza)([A-Za-z0-9_-]{10,})"
+	local url_re='[A-Za-z][A-Za-z0-9+.-]*://[^/:@[:space:]]+:([^/@[:space:]]+)@([^/:?#[:space:]]+)'
+	local assign_re='^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_.]*)[[:space:]]*=[[:space:]]*(.*)$'
+
+	if [[ "$line" =~ $pem_re ]]; then
+		_POSTURE_SECRET_REASON="private-key"
+		return 0
+	fi
+	if [[ "$line" =~ $token_re ]] && ! _posture_is_placeholder_value "${BASH_REMATCH[3]}"; then
+		_POSTURE_SECRET_REASON="token-signature"
+		return 0
+	fi
+	if [[ "$line" =~ $url_re ]]; then
+		local url_pass="${BASH_REMATCH[1]}"
+		local url_host
+		url_host=$(printf '%s' "${BASH_REMATCH[2]}" | tr '[:upper:]' '[:lower:]')
+		case "$url_host" in
+		localhost | 127.0.0.1 | 0.0.0.0 | host.docker.internal) ;;
+		*)
+			if ! _posture_is_placeholder_value "$url_pass"; then
+				_POSTURE_SECRET_REASON="credential-url"
+				return 0
+			fi
+			;;
+		esac
+	fi
+
+	# Comments and bare variable names carry no assignment.
+	[[ "$line" =~ ^[[:space:]]*# ]] && return 1
+	[[ "$line" =~ $assign_re ]] || return 1
+
+	local key_uc
+	key_uc=$(printf '%s' "${BASH_REMATCH[2]}" | tr '[:lower:]' '[:upper:]')
+	_posture_parse_assignment_value "${BASH_REMATCH[3]}"
+	local value="$_POSTURE_PARSED_VALUE"
+	[[ "$key_uc" =~ $POSTURE_SECRET_KEY_NAME_ERE ]] || return 1
+	[[ ${#value} -ge $POSTURE_SECRET_VALUE_MIN_LENGTH ]] || return 1
+	_posture_is_placeholder_value "$value" && return 1
+	_posture_is_inert_value "$value" && return 1
+	_POSTURE_SECRET_REASON="secret-assignment"
+	return 0
+}
+
+# Classify a tracked env template from its committed (index) content.
+# Returns 0 and sets _POSTURE_SECRET_REASON ("<class>, line N") when the file
+# carries a secret; returns 1 when the template is safe. Unreadable blobs fail
+# closed as secret-bearing.
+_posture_env_template_secret_reason() {
+	local repo_path="$1"
+	local path="$2"
+	local content
+	_POSTURE_SECRET_REASON=""
+	if ! content=$(git -C "$repo_path" show ":./${path}" 2>/dev/null); then
+		_POSTURE_SECRET_REASON="unreadable"
+		return 0
+	fi
+
+	local line=""
+	local line_no=0
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		line_no=$((line_no + 1))
+		line="${line%$'\r'}"
+		if _posture_env_line_secret_reason "$line"; then
+			_POSTURE_SECRET_REASON="${_POSTURE_SECRET_REASON}, line ${line_no}"
+			return 0
+		fi
+	done <<<"$content"
+	return 1
+}
+
+# Report tracked secret files, classifying env templates by content.
+_check_tracked_secret_files() {
+	local repo_path="$1"
+	local tracked
+	tracked=$(git -C "$repo_path" ls-files '*.env' '*.pem' '*.key' 'credentials.json' '.env.*' '*/.env.*' 2>/dev/null) || true
+
+	local flagged=""
+	local flagged_count=0
+	local safe_templates=0
+	local path=""
+	while IFS= read -r path; do
+		[[ -z "$path" ]] && continue
+		if _posture_is_env_template_path "$path"; then
+			if ! _posture_env_template_secret_reason "$repo_path" "$path"; then
+				safe_templates=$((safe_templates + 1))
+				continue
+			fi
+			path="${path} (${_POSTURE_SECRET_REASON})"
+		fi
+		flagged_count=$((flagged_count + 1))
+		if [[ "$flagged_count" -le 3 ]]; then
+			flagged="${flagged:+${flagged}; }${path}"
+		fi
+	done <<<"$tracked"
+
+	if [[ "$flagged_count" -gt 0 ]]; then
+		print_crit "$flagged_count potential secret file(s) tracked by git: $flagged"
+		print_info "  Rotate any committed credential; removing the file does not remove it from git history."
+		print_info "  Store each value encrypted (gopass/GPG-backed) with: aidevops secret set <NAME>"
+		print_info "  Run aidevops secret init first if needed. Enter values only at the hidden terminal prompt, never in chat or files."
+		print_info "  Inject secrets at runtime with: aidevops secret run <cmd> or aidevops secret <NAME> -- <cmd>, instead of a plaintext .env."
+		print_info "  Stop tracking with: git rm --cached <path>; add the path to .gitignore. Keep .env.example with names or placeholders only."
+		print_info "  Full policy: reference/secret-handling.md."
+		add_finding "$SEVERITY_CRITICAL" "$CAT_REPO_SECURITY" "$flagged_count secret files tracked: $flagged"
+		return 0
+	fi
+
+	local pass_msg="No obvious secret files tracked by git"
+	if [[ "$safe_templates" -gt 0 ]]; then
+		pass_msg="${pass_msg} ($safe_templates env template(s) contain no secret values)"
+	fi
+	print_pass "$pass_msg"
+	add_finding "$SEVERITY_PASS" "$CAT_REPO_SECURITY" "No secret files tracked"
+	return 0
+}
+
 # Phase 6: General repo security checks
 check_repo_security() {
 	local repo_path="$1"
@@ -936,18 +1162,7 @@ check_repo_security() {
 	fi
 
 	# Check for committed secrets (quick scan of tracked files)
-	local secret_files
-	secret_files=$(git -C "$repo_path" ls-files '*.env' '*.pem' '*.key' 'credentials.json' '.env.*' 2>/dev/null) || true
-
-	if [[ -n "$secret_files" ]]; then
-		local secret_count
-		secret_count=$(echo "$secret_files" | wc -l | tr -d ' ')
-		print_crit "$secret_count potential secret file(s) tracked by git"
-		add_finding "$SEVERITY_CRITICAL" "$CAT_REPO_SECURITY" "$secret_count secret files tracked: $(echo "$secret_files" | head -3 | tr '\n' ', ')"
-	else
-		print_pass "No obvious secret files tracked by git"
-		add_finding "$SEVERITY_PASS" "$CAT_REPO_SECURITY" "No secret files tracked"
-	fi
+	_check_tracked_secret_files "$repo_path"
 
 	# Check for Dependabot or Renovate config
 	if [[ -f "$repo_path/.github/dependabot.yml" ]] || [[ -f "$repo_path/.github/dependabot.yaml" ]]; then
@@ -976,20 +1191,42 @@ _emit_sync_pat_advisory() {
 	local slug_sanitised="$2"
 	local advisory_file="$3"
 	local protection_desc="$4"
+	local health_reason="${5:-}"
 
 	local advisory_dir
 	advisory_dir="$(dirname "$advisory_file")"
 	mkdir -p "$advisory_dir"
 
+	if [[ -n "$health_reason" ]]; then
+		cat >"$advisory_file" <<ADVISORY_EOF
+[ADVISORY] SYNC_PAT may expire or need rotation for ${slug}
+
+${health_reason}
+Secret age is only a heuristic: the token may use a different expiration period.
+The secret value is never read by this check.
+
+Regenerating a token preserves its permissions and selected repositories but
+revokes the old value everywhere. Update every repository secret using it.
+In a separate terminal (interactive prompt, never paste the value into AI chat):
+   gh secret set SYNC_PAT --repo ${slug}
+Then rerun the affected run:
+   gh run rerun <id> --repo ${slug} --failed
+
+See reference/sync-pat-platforms.md, Rotation / expired token.
+ADVISORY_EOF
+		print_info "  Rotation advisory written to: $advisory_file"
+		return 0
+	fi
+
 	cat >"$advisory_file" <<ADVISORY_EOF
 [ADVISORY] SYNC_PAT not set for ${slug}
 
-This repo uses issue-sync.yml and has protection on the default branch
+This repo uses issue-sync or Repository Metrics and has protection on the default branch
 (${protection_desc}).
 Direct publication therefore routes through one deterministic pull request.
 This repository does not allow GitHub Actions to create pull requests, so the
-job-scoped token cannot open that fallback PR. Without SYNC_PAT, TODO.md
-auto-completion fails after publishing its protected-branch candidate.
+job-scoped token cannot open that fallback PR. Without SYNC_PAT, generated
+TODO.md or repository metrics updates cannot complete protected publication.
 
 For a guided fix across all affected repos, run \`/setup-git\` in
 your AI assistant (OpenCode or Claude Code). It walks you through
@@ -1011,7 +1248,7 @@ Verify:
 Dismiss once fixed:
    aidevops security dismiss sync-pat-${slug_sanitised}
 
-See AGENTS.md "Known limitation — issue-sync TODO auto-completion" for background.
+See reference/sync-pat-platforms.md and aidevops/badges.md for background.
 ADVISORY_EOF
 
 	print_info "  Advisory written to: $advisory_file"
@@ -1069,6 +1306,66 @@ _actions_can_create_pull_requests() {
 	return 1
 }
 
+# GH#34480: metrics callers can have arbitrary names (e.g. repo-metrics.yaml).
+# Inspect active uses: lines, not comments or filenames, without executing content.
+_repo_uses_metrics_workflow() {
+	local slug="$1"
+	local workflow_paths=""
+	local workflow_path=""
+	local content=""
+	workflow_paths=$(gh api "repos/${slug}/contents/.github/workflows" \
+		--jq '.[] | select(.type == "file" and (.name | test("\\.ya?ml$"))) | .path' 2>/dev/null) || return 1
+	while IFS= read -r workflow_path; do
+		case "$workflow_path" in
+		.github/workflows/*.yml | .github/workflows/*.yaml) ;;
+		*) continue ;;
+		esac
+		content=$(gh api "repos/${slug}/contents/${workflow_path}" --jq '.content' 2>/dev/null |
+			base64 --decode 2>/dev/null) || continue
+		if grep -Eq '^[[:space:]]*uses:[[:space:]]*[^#[:space:]]*/\.github/workflows/loc-badge-reusable\.yml@' <<<"$content"; then
+			return 0
+		fi
+	done <<<"$workflow_paths"
+	return 1
+}
+
+# Check metadata and the latest issue-sync failure without reading token values.
+_check_sync_pat_health() {
+	local slug="$1"
+	local advisory_file="$2"
+	local secret_check="$3"
+	local health_reason=""
+	if jq -e '(.updatedAt | fromdateiso8601) <= (now - 76 * 86400)' \
+		<<<"$secret_check" >/dev/null 2>&1; then
+		health_reason="SYNC_PAT was last updated at least 76 days ago and may expire soon (90-day default, 14-day warning)."
+	fi
+	local latest_run jobs
+	latest_run=$(gh api "repos/${slug}/actions/workflows/issue-sync.yml/runs?per_page=1" \
+		--jq '.workflow_runs[0] | select(.conclusion == "failure") | .id' 2>/dev/null) || true
+	if [[ "$latest_run" =~ ^[0-9]+$ ]]; then
+		jobs=$(gh api "repos/${slug}/actions/runs/${latest_run}/jobs?per_page=100" 2>/dev/null) || true
+		if jq -e 'any(.jobs[]?.steps[]?; .conclusion == "failure" and
+			(.name == "Checkout" or .name == "Checkout repo before closing-hygiene validation"))' \
+			<<<"$jobs" >/dev/null 2>&1; then
+			# Step names do not expose whether validation selected SYNC_PAT or
+			# GITHUB_TOKEN. Do not turn a checkout failure into rotation advice.
+			local checkout_reason="Latest issue-sync run ${latest_run} failed at checkout; the selected credential is unknown. Inspect the run logs for authentication, repository access, or network failures."
+			print_warn "$checkout_reason"
+			add_finding "$SEVERITY_WARNING" "$CAT_SYNC_PAT" "$checkout_reason"
+		fi
+	fi
+	if [[ -n "$health_reason" ]]; then
+		print_warn "SYNC_PAT may expire or need rotation for $slug"
+		add_finding "$SEVERITY_WARNING" "$CAT_SYNC_PAT" "$health_reason"
+		_emit_sync_pat_advisory "$slug" "${slug//\//-}" "$advisory_file" "" "$health_reason"
+	else
+		print_pass "SYNC_PAT is set for $slug"
+		add_finding "$SEVERITY_PASS" "$CAT_SYNC_PAT" "SYNC_PAT set for $slug"
+		[[ -f "$advisory_file" ]] && rm -f "$advisory_file"
+	fi
+	return 0
+}
+
 # Check whether a repo requires SYNC_PAT based on workflow + branch protection.
 # Writes result to global SYNC_PAT_NEED_RESULT: "needed:<desc>" | "not_needed".
 # Side effect: prints findings and cleans stale advisories.
@@ -1088,11 +1385,23 @@ _check_sync_pat_need() {
 
 	SYNC_PAT_NEED_RESULT=""
 
-	# Step 1: Does the repo use issue-sync.yml?
-	if ! gh api "repos/${slug}/contents/.github/workflows/issue-sync.yml" &>/dev/null 2>&1; then
-		print_pass "No issue-sync.yml — SYNC_PAT not needed for $slug"
-		add_finding "$SEVERITY_PASS" "$CAT_SYNC_PAT" "No issue-sync.yml in $slug"
+	# Step 1: Does any supported publisher need a protected-branch PR path?
+	if ! gh api "repos/${slug}/contents/.github/workflows/issue-sync.yml" &>/dev/null 2>&1 &&
+		! _repo_uses_metrics_workflow "$slug"; then
+		print_pass "No issue-sync.yml or metrics caller — SYNC_PAT not needed for $slug"
+		add_finding "$SEVERITY_PASS" "$CAT_SYNC_PAT" "No issue-sync.yml or metrics caller in $slug"
 		[[ -f "$advisory_file" ]] && rm -f "$advisory_file"
+		SYNC_PAT_NEED_RESULT="$SYNC_PAT_NEED_NOT_NEEDED"
+		return 0
+	fi
+
+	# Configured tokens need health checks even without branch protection or
+	# when Actions can create PRs. Secret metadata never contains the value.
+	local secret_check
+	secret_check=$(gh secret list --repo "$slug" --json name,updatedAt \
+		-q '.[] | select(.name == "SYNC_PAT")' 2>/dev/null) || true
+	if [[ -n "$secret_check" ]]; then
+		_check_sync_pat_health "$slug" "$advisory_file" "$secret_check"
 		SYNC_PAT_NEED_RESULT="$SYNC_PAT_NEED_NOT_NEEDED"
 		return 0
 	fi
@@ -1130,7 +1439,7 @@ _check_sync_pat_need() {
 	if [[ "$protected_kind" == "$SYNC_PAT_PROTECTION_CLASSIC" ]] &&
 		! jq -e '.required_pull_request_reviews != null or .required_status_checks != null' \
 			<<<"$protection_json" >/dev/null 2>&1; then
-		print_pass "Branch protection does not block direct issue-sync publication — SYNC_PAT not needed for $slug"
+		print_pass "Branch protection does not block direct publication — SYNC_PAT not needed for $slug"
 		add_finding "$SEVERITY_PASS" "$CAT_SYNC_PAT" "No publication-blocking protection in $slug"
 		[[ -f "$advisory_file" ]] && rm -f "$advisory_file"
 		SYNC_PAT_NEED_RESULT="$SYNC_PAT_NEED_NOT_NEEDED"
@@ -1140,7 +1449,7 @@ _check_sync_pat_need() {
 	# The job-scoped token is sufficient when Actions may create pull requests,
 	# even though direct publication is blocked by default-branch protection.
 	if _actions_can_create_pull_requests "$slug"; then
-		print_pass "Actions can create the issue-sync PR — SYNC_PAT not needed for $slug"
+		print_pass "Actions can create the protected-publication PR — SYNC_PAT not needed for $slug"
 		add_finding "$SEVERITY_PASS" "$CAT_SYNC_PAT" "Actions PR creation enabled in $slug"
 		[[ -f "$advisory_file" ]] && rm -f "$advisory_file"
 		SYNC_PAT_NEED_RESULT="$SYNC_PAT_NEED_NOT_NEEDED"
@@ -1163,18 +1472,6 @@ _check_sync_pat_need() {
 		protection_desc="${protection_desc} with Actions PR creation disabled"
 	fi
 
-	# Step 3: Is SYNC_PAT set?
-	local secret_check
-	secret_check=$(gh secret list --repo "$slug" --json name -q '.[] | select(.name == "SYNC_PAT") | .name' 2>/dev/null) || true
-
-	if [[ -n "$secret_check" ]]; then
-		print_pass "SYNC_PAT is set for $slug"
-		add_finding "$SEVERITY_PASS" "$CAT_SYNC_PAT" "SYNC_PAT set for $slug"
-		[[ -f "$advisory_file" ]] && rm -f "$advisory_file"
-		SYNC_PAT_NEED_RESULT="$SYNC_PAT_NEED_NOT_NEEDED"
-		return 0
-	fi
-
 	# Needs SYNC_PAT — return the protection description for the advisory
 	SYNC_PAT_NEED_RESULT="needed:${protection_desc}"
 	return 0
@@ -1187,7 +1484,7 @@ check_sync_pat() {
 	local repo_path="$1"
 	local ruleset_details="${2:-}"
 
-	print_header "Phase 7: SYNC_PAT Detection (issue-sync)"
+	print_header "Phase 7: SYNC_PAT Detection (issue-sync / Repository Metrics)"
 
 	# Need gh CLI
 	if ! command -v gh &>/dev/null; then
@@ -1243,7 +1540,7 @@ check_sync_pat() {
 	local protection_desc
 	protection_desc="${SYNC_PAT_NEED_RESULT#needed:}"
 
-	print_warn "SYNC_PAT not set for $slug — protected issue-sync cannot create its fallback PR"
+	print_warn "SYNC_PAT not set for $slug — protected publication cannot create its fallback PR"
 	add_finding "$SEVERITY_WARNING" "$CAT_SYNC_PAT" "SYNC_PAT not set for $slug"
 
 	_emit_sync_pat_advisory "$slug" "$slug_sanitised" "$advisory_file" "$protection_desc"
@@ -1555,7 +1852,7 @@ run_all_checks() {
 
 	check_workflow_security "$repo_path"
 	check_branch_protection "$repo_path" "$ruleset_details"
-	check_review_bot_gate "$repo_path"
+	check_review_bot_gate "$repo_path" "$ruleset_details"
 	check_maintainer_gate "$repo_path" "$ruleset_details"
 	check_linked_issue_gate "$repo_path" "$ruleset_details"
 	check_dependencies "$repo_path"

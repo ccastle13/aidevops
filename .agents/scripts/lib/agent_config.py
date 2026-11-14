@@ -29,6 +29,7 @@ _CS_DARWIN_USER_TEMP_DIR = 65537
 # If not in this map, derive from filename (e.g., build-agent.md -> Build-Agent)
 DISPLAY_NAMES = {
     "build-plus": "Build+",
+    "3d-modelling": "3D Modelling",
     "pr": "PR",
     "seo": "SEO",
     "social-media": "Social-Media",
@@ -144,11 +145,11 @@ AGENT_TEMPS = {
     "Research": 0.3,
 }
 
-# Custom system prompts
-# ALL primary agents use the custom prompt by default to ensure consistent identity
+# Legacy compatibility path retained for callers; primary prompts now load their
+# selected canonical source, with core delivered independently by instructions.
 DEFAULT_PROMPT = "~/.aidevops/agents/prompts/build.txt"
 
-# Agents that should NOT use the custom prompt (empty by default - all agents use it)
+# Agents that should NOT receive a canonical source prompt (empty by default).
 SKIP_CUSTOM_PROMPT = set()
 
 # Workload tiers are routing intent, not concrete runtime model IDs.
@@ -200,11 +201,11 @@ def get_agent_config(display_name, filename, subagents=None, model_tier=None):
         "tools": tools
     }
 
-    # Add custom system prompt for ALL primary agents (ensures consistent identity)
+    # Deliver the selected canonical source in the system prompt, not merely in
+    # description metadata. The shared build.txt is a compatibility placeholder;
+    # core guidance is independently delivered by the runtime instructions list.
     if display_name not in SKIP_CUSTOM_PROMPT:
-        prompt_file = os.path.expanduser(DEFAULT_PROMPT)
-        if os.path.exists(prompt_file):
-            config["prompt"] = "{file:" + DEFAULT_PROMPT + "}"
+        config["prompt"] = "{file:~/.aidevops/agents/" + filename + "}"
 
     # Canonical workload tiers inherit the runtime-selected model. Preserve only
     # explicit full provider/model IDs; those are operator overrides, not tiers.

@@ -35,7 +35,7 @@ tools:
 
 | Own | Hand off |
 |-----|----------|
-| Runtime lifecycle, version policy, process supervision, server health, dependency/runtime maintenance, CPU/RAM/latency diagnosis | JavaScript language/API design → `tools/programming/modern-javascript-skill.md` |
+| Runtime lifecycle, version policy, process supervision, server health, dependency/runtime maintenance, CPU/RAM/latency diagnosis | JavaScript language/API design → Build+ (current model knowledge) |
 | Node, Next.js SSR, API, worker, CLI, MCP, and build-tool processes | Next.js layouts/components/routing → `tools/ui/nextjs-layouts.md` |
 | npm, pnpm, Yarn, Bun compatibility and lockfile fidelity | Turborepo graph/filter/cache design → `tools/monorepo/turborepo.md` |
 | Local and production process evidence | Browser Core Web Vitals → `workflows/performance.md` |
@@ -78,7 +78,67 @@ Never read environment values or credential files. Use `reference/secret-handlin
 
 Use platform-appropriate read-only tools (`ps`, `lsof`, `top`, `vmmap`/`memory_pressure` on macOS; `free`, `vmstat`, `systemctl status`, or container stats on Linux). Sample before profiling. RSS is not heap; virtual memory is not physical use; development compiler memory is not production serving memory.
 
+### Local SSR blank-page incidents
+
+For a local SSR page that is blank or indefinitely loading, compare the repository-declared runtime with the listener's actual executable and runtime before changing application code or browser state. Record process uptime, RSS, listener ownership, bounded logs, and cold/warm request durations alongside the real-browser result; a health endpoint or isolated automation success alone does not prove the live development server is healthy.
+
+High uptime, RSS, or request duration is evidence to investigate, never a universal numeric restart rule. With interruption authority, gracefully restart only the verified project-owned supervisor or process group through the repository-supported launcher and declared runtime. Keep logs accessible, retain a documented stop path, and repeat both real-browser and isolated-browser verification. If runtime alignment and restart do not explain the symptom, hand browser-target disambiguation to `tools/browser/chromium-debug-use.md` before inspecting service-worker or origin state.
+
 Heap snapshots, CPU profiles, diagnostic reports, and traces can pause a process, increase memory pressure, consume disk, and capture sensitive application data. Require target confirmation, bounded duration, secure output handling, and production approval.
+
+### Proxied object storage
+
+For S3-compatible storage (including R2/B2) streamed through a Node route, suspect a wedged shared client's keep-alive socket pool when object requests stall for minutes before headers, unrelated routes remain fast, and a fresh client in the same container reaches the same bucket promptly. Compare those timings and inspect active sockets, queued requests, and unconsumed response streams before blaming the network or bucket. A restart clearing the symptom temporarily supports the hypothesis but is not a durable fix; do not create a new client per request.
+
+- Bound the long-lived SDK client's connection, time-to-headers, and socket-inactivity waits. For AWS SDK v3 / `@smithy/node-http-handler`, configure `requestHandler` with a `NodeHttpHandler`: example starting values are `connectionTimeout: 5_000`, `requestTimeout: 20_000`, `throwOnRequestTimeout: true`, and `socketTimeout: 30_000` (milliseconds). Verify the installed handler's options and semantics: unconfigured waits can be unbounded, and `requestTimeout` without `throwOnRequestTimeout` may only warn. These are workload-tuned bounds, not a total streamed-download deadline.
+- Set a finite, concurrency-appropriate `maxSockets` on the handler's `httpsAgent` (and `httpAgent` if used), with keep-alive enabled. Increase capacity only when measured concurrent demand warrants it; more sockets do not fix leaked streams. Consume or destroy every returned body, including cancellation and error paths, so sockets are released.
+- Forward the incoming request's cancellation signal: `client.send(new GetObjectCommand(input), { abortSignal: request.signal })`. Also propagate disconnect/cancellation through the response-stream pipeline and clean up the upstream body after headers; sending an SDK abort signal alone is not a complete streaming cleanup strategy.
+- Map upstream `TimeoutError` to HTTP 504 before downstream headers are sent. Treat client aborts separately; after headers, terminate the stream and record the timeout rather than attempting to replace the status. Verify prompt cancellation, bounded timeout failure, and a successful subsequent request through the same shared client.
+- Cache split: use `public, s-maxage=<seconds>` only for non-tenant, non-expiring, whole-object responses explicitly safe for shared caches; tenant objects, expiring-token responses, range responses, and anything else stay `private`. Avoid `immutable` when objects can be deleted; verify the edge cache status and cache-key isolation rather than assuming the header produced a hit.
+
+### Linked-worktree lint tooling
+
+A fresh linked worktree has no `node_modules/`, so a declared lint gate can fail to start (`eslint: command not found`, or `Cannot find package '<plugin>' imported from …/eslint.config.js`). `repo-verify-pre-push.sh` reports that as unavailable tooling, not a source defect; the gate stays blocked until the unchanged command runs and passes. A global `eslint` binary is insufficient when the flat config imports plugins.
+
+Default: a durable owner-approved install policy (below), so unchanged projects need no per-session approval. Without a policy, install with the project package manager and frozen lockfile, with download approval. As a one-off fallback, interactive sessions may reuse an existing install only on explicit user approval, after verifying: approved real paths inside the user's own project boundary; matching linter/plugin versions and byte-identical lint config; no existing worktree `node_modules/`; and `git check-ignore` coverage. Create a real `node_modules/` directory and symlink only the required read-only packages (`.bin`, linter, plugins, `globals`) into it. Never symlink `node_modules` itself, because a directory-only ignore such as `node_modules/` may not ignore a symlink. Never mutate the shared install, auto-link, alter config or lockfiles, bypass the hook, or treat a dirty-worktree skip as verification. Headless workers never cross project boundaries for tooling (GH#31880).
+
+### Durable worktree install policy
+
+`worktree-js-readiness-helper.sh approve <repo-or-worktree>` (interactive only; refused when any headless/worker marker is set) records the owner's decision once in the repo's `~/.config/aidevops/repos.json` entry, which stays local and private (GH#34200). The entry is written under the repos.json lock via temp file and `mv`, and the file mode is preserved:
+
+```json
+"js_dependency_policy": {"approved_at": "<UTC ISO-8601>", "lockfile_sha256": "<hex>", "package_manager": "npm|pnpm|yarn|yarn-berry|bun", "node_major": "<major>|none", "scope": "worktree-install"}
+```
+
+`status <repo-or-worktree>` prints the policy, its staleness (`current`, `stale-lockfile`, `stale-package-manager`, `stale-node-major`, `stale-scope`, `unsupported-package-manager`) and the current identity. `revoke` deletes the field. Without the field, behaviour is unchanged. Only tracked lockfiles count, so an untracked stale lockfile in a canonical checkout no longer blocks `approve`.
+
+`approve <repo> --track-default-branch` adds `"lockfile_source": "default-branch"`: a lockfile byte-identical to the one on `origin/HEAD` (or `origin/main`/`master`) also matches, so lockfile updates merged through the repository's review gates do not strand workers. A branch-modified or unfetched lockfile still reports `stale-lockfile`; package manager, Node major and scope checks are unchanged (GH#35788).
+
+`approve` records the Node major of the approving shell, so a policy approved in a terminal can report `stale-node-major` in an agent runtime that resolves a different Node. `approve` prints the resolved Node major and, when `AIDEVOPS_NODE_BIN` points at a different major, warns. Use `approve <repo> --node-major 24 --node-major 26` (repeatable) to store `node_majors`. Explicit `--node-major` values replace the approving shell's default major, so list every intended major, including the shell's when needed; `review` renewal preserves the existing list. The policy matches when the current major is in the list. A legacy scalar `node_major` policy still works. Package manager, lockfile and scope checks are not widened (GH#36427).
+
+`review [--report-only]` checks every `pulse: true` repo with a tracked lockfile against the lockfile new worktrees receive (remote default branch). Setup runs it: interactive setup offers a default-No renewal (with `--track-default-branch`) per stale repo; non-interactive setup/update only prints counts and the `approve` command. Headless or non-TTY runs never write.
+
+`worktree-helper.sh add` runs `prepare` for every non-aidevops project; for worker worktrees this happens on the controller, before launch. The aidevops repo keeps its built-in Bun bootstrap. `prepare` installs only when all of these hold:
+
+- Leaf A reports `preparation-needed:*` or a content/budget `blocked:snapshot-*` refusal. Ownership and structure refusals are never routed around.
+- The policy matches the worktree's single lockfile hash, the package manager (including a non-conflicting `packageManager`) and the active Node major.
+- `node_modules` is absent and Git-ignored, and the tree is tracked-clean.
+
+It then holds the restore lock and runs `npm ci --ignore-scripts`, `pnpm install --frozen-lockfile --ignore-scripts`, `yarn install --frozen-lockfile --ignore-scripts`, `YARN_ENABLE_SCRIPTS=false yarn install --immutable` (Berry) or `bun install --frozen-lockfile --ignore-scripts`. Every run sets `npm_config_ignore_scripts=true`, unsets `NODE_OPTIONS` and is bounded by `AIDEVOPS_JS_POLICY_INSTALL_TIMEOUT_S` (default 300 s). Afterwards it re-probes. A ready worktree is never reinstalled. If any Git-visible change appears, `node_modules` is removed, tracked files are restored, and the result is `blocked:install-mutated-tree`. On failure or timeout, the partial `node_modules` is removed. An interrupted install's own leftovers are removed before the next retry; foreign `node_modules` is never touched.
+
+### Linked-worktree tooling readiness
+
+`worktree-helper.sh add` and the first `pre-edit-check.sh` run of each session in a worktree print `JS_TOOL_READINESS=<state> (<tools>)` from `worktree-js-readiness-helper.sh` (GH#34199), so a missing tool surfaces at admission instead of at pre-push. The probe reads the declared format/lint/typecheck commands (`repo-verify-config-lib.sh`), requires each JavaScript tool at `<worktree>/node_modules/.bin/<tool>` (a PATH/global binary never counts), and for ESLint/`next lint` resolves every bare package imported by `eslint.config.*` from the worktree root. It never lints, installs, copies or reads the canonical checkout; results are cached in the worktree's git dir until manifests, lockfiles, config, installed package names or Node change.
+
+| State | Meaning |
+|-------|---------|
+| `ready` | Every declared JavaScript tool can start |
+| `preparation-needed:<reason>` | `node-modules-missing`, `tool-missing-<tool>`, `config-import-unresolved-<pkg>` or `restore-skipped-lock-contention` |
+| `preparing:lock-contention` | A concurrent restore held the lock within the last 120 s (`AIDEVOPS_JS_READINESS_CONTENTION_WINDOW_S`) |
+| `blocked:<reason>` | `snapshot-<reason>` (restore refused, such as `snapshot-controller-not-owner` or `snapshot-byte-budget-exceeded`), `node-missing`, `probe-timeout` or `probe-failed`; policy install: `policy-stale`, `unsupported-package-manager`, `package-manager-missing`, `existing-node-modules`, `node-modules-not-ignored`, `dirty-worktree`, `install-failed`, `install-timeout` or `install-mutated-tree` |
+| `not-applicable:<reason>` | No package.json, Yarn PnP, or no declared JavaScript verification tool (prints nothing) |
+
+Worktree creation still succeeds in every state; the unchanged pre-push gate remains authoritative. Non-ready reports name the exact install command and `approve <worktree>`. Resolve with the policy, the lockfile install or approved reuse above, then `worktree-js-readiness-helper.sh report <worktree>`.
 
 ## Maintenance and Update Actions
 

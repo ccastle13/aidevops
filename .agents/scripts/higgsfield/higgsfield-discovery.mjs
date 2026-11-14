@@ -3,8 +3,7 @@
 // Extracted from higgsfield-common.mjs (t2127 file-complexity decomposition).
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { resolveSecret } from '../secret-resolver.mjs';
 import {
   debugScreenshot,
   dismissAllModals,
@@ -17,22 +16,28 @@ import {
   ROUTES_CACHE,
   STATE_FILE,
 } from './higgsfield-common.mjs';
+import { categoriseRoutes, diffRoutesAgainstCache } from './higgsfield-routes.mjs';
+
+// Preserve discovery's public API for the common facade and direct importers.
+export {
+  ACCOUNT_PREFIXES,
+  FEATURE_PREFIXES,
+  ROUTE_PREFIXES,
+  categoriseRoutes,
+  diffRoutesAgainstCache,
+} from './higgsfield-routes.mjs';
 
 // ---------------------------------------------------------------------------
 // Credentials (only used by login)
 // ---------------------------------------------------------------------------
 
 export function loadCredentials() {
-  const credFile = join(homedir(), '.config', 'aidevops', 'credentials.sh');
-  if (!existsSync(credFile)) {
-    console.error('ERROR: Credentials file not found at', credFile);
-    process.exit(1);
-  }
-  const content = readFileSync(credFile, 'utf-8');
-  const user = content.match(/HIGGSFIELD_USER="([^"]+)"/)?.[1];
-  const pass = content.match(/HIGGSFIELD_PASS="([^"]+)"/)?.[1];
+  // env → credentials.sh → gopass aidevops/NAME (GH#34892)
+  const user = resolveSecret('HIGGSFIELD_USER');
+  const pass = resolveSecret('HIGGSFIELD_PASS');
   if (!user || !pass) {
-    console.error('ERROR: HIGGSFIELD_USER or HIGGSFIELD_PASS not found in credentials.sh');
+    console.error('ERROR: HIGGSFIELD_USER or HIGGSFIELD_PASS not configured');
+    console.error('Set with: aidevops secret set HIGGSFIELD_USER && aidevops secret set HIGGSFIELD_PASS');
     process.exit(1);
   }
   return { user, pass };
@@ -41,88 +46,6 @@ export function loadCredentials() {
 // ---------------------------------------------------------------------------
 // Discovery
 // ---------------------------------------------------------------------------
-
-export const ROUTE_PREFIXES = [
-  { prefix: '/image/',              bucket: 'image' },
-  { prefix: '/create/',             bucket: 'video' },
-  { prefix: '/edit',                bucket: 'edit' },
-  { prefix: '/app/',                bucket: 'apps' },
-  { prefix: '/motion/',             bucket: 'motions' },
-  { prefix: '/mixed-media-presets/',bucket: 'mixed_media' },
-];
-
-export const ACCOUNT_PREFIXES = ['/asset/all', '/library/image', '/profile', '/pricing', '/auth/'];
-export const FEATURE_PREFIXES = [
-  '/cinema-studio', '/vibe-motion', '/lipsync-studio', '/character',
-  '/ai-influencer-studio', '/upscale', '/fashion-factory', '/chat',
-  '/ugc-factory', '/photodump-studio', '/storyboard-generator',
-  '/nano-banana-pro', '/seedream-4-5', '/kling', '/sora', '/wan', '/veo', '/minimax',
-];
-
-export function categoriseRoutes(links) {
-  const routes = { image: {}, video: {}, edit: {}, apps: {}, features: {}, account: {}, motions: {}, mixed_media: {}, other: {} };
-  for (const [path, label] of Object.entries(links)) {
-    const match = ROUTE_PREFIXES.find(r => path.startsWith(r.prefix));
-    if (match) {
-      routes[match.bucket][path] = label;
-    } else if (ACCOUNT_PREFIXES.some(p => path.startsWith(p))) {
-      routes.account[path] = label;
-    } else if (FEATURE_PREFIXES.some(p => path.startsWith(p))) {
-      routes.features[path] = label;
-    } else {
-      routes.other[path] = label;
-    }
-  }
-  return routes;
-}
-
-const DIFF_BUCKETS = [
-  { key: 'apps', label: 'APP' },
-  { key: 'image', label: 'IMAGE MODEL' },
-  { key: 'features', label: 'FEATURE' },
-];
-
-function collectAddedPaths(label, currentBucket, prevKeys) {
-  const added = [];
-  for (const path of Object.keys(currentBucket)) {
-    if (!prevKeys.has(path)) added.push(`NEW ${label}: ${path} → ${currentBucket[path]}`);
-  }
-  return added;
-}
-
-function collectRemovedApps(currentApps, prevAppKeys) {
-  const removed = [];
-  for (const path of prevAppKeys) {
-    if (!currentApps[path]) removed.push(`REMOVED APP: ${path}`);
-  }
-  return removed;
-}
-
-function diffBucket(prev, routes, { key, label }) {
-  const prevKeys = new Set(Object.keys(prev[key] || {}));
-  const changes = collectAddedPaths(label, routes[key], prevKeys);
-  if (key === 'apps') changes.push(...collectRemovedApps(routes.apps, prevKeys));
-  return changes;
-}
-
-function loadPreviousRoutes() {
-  if (!existsSync(ROUTES_CACHE)) return null;
-  try {
-    return JSON.parse(readFileSync(ROUTES_CACHE, 'utf-8'));
-  } catch {
-    return null; // first run or corrupt cache
-  }
-}
-
-export function diffRoutesAgainstCache(routes) {
-  const prev = loadPreviousRoutes();
-  if (!prev) return [];
-  const changes = [];
-  for (const bucket of DIFF_BUCKETS) {
-    changes.push(...diffBucket(prev, routes, bucket));
-  }
-  return changes;
-}
 
 export function discoveryNeeded() {
   if (!existsSync(DISCOVERY_TIMESTAMP)) return true;

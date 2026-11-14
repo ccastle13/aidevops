@@ -24,6 +24,22 @@ print_info() { printf '%b[INFO]%b %s\n' "${YELLOW}" "${NC}" "$*"; return 0; }
 print_success() { printf '%b[OK]%b %s\n' "${GREEN}" "${NC}" "$*"; return 0; }
 print_error() { printf '%b[ERROR]%b %s\n' "${RED}" "${NC}" "$*" >&2; return 0; }
 
+# GH#34125: AIDEVOPS_RUNTIME_POLICY binding vocabulary (vault_runtime_policy_bound).
+# shellcheck source=vault-data-policy-helper.sh
+source "${SCRIPT_DIR}/vault-data-policy-helper.sh"
+
+# #aidevops:trust-boundary — stop host exporters before SDK initialization, not
+# just plugin enrichment after startup. Disable telemetry conservatively while
+# bound; shell hooks also stamp this protection into controlled subprocesses.
+if vault_runtime_policy_bound; then
+    export OTEL_SDK_DISABLED=true
+    export OTEL_TRACES_EXPORTER=none OTEL_METRICS_EXPORTER=none OTEL_LOGS_EXPORTER=none
+    unset OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+    unset OTEL_EXPORTER_OTLP_METRICS_ENDPOINT OTEL_EXPORTER_OTLP_LOGS_ENDPOINT
+    unset OTEL_EXPORTER_OTLP_HEADERS OTEL_EXPORTER_OTLP_TRACES_HEADERS
+    unset OTEL_EXPORTER_OTLP_METRICS_HEADERS OTEL_EXPORTER_OTLP_LOGS_HEADERS
+fi
+
 OPT_DESKTOP_SOURCE_BINARY="--source-binary"
 ERR_DIR_REQUIRES_PATH="--dir requires a path"
 ERR_SESSION_ID_REQUIRES_VALUE="--session-id requires a value"
@@ -33,6 +49,8 @@ SERVER_LOCK_DIR=""
 usage() {
     cat <<'EOF'
 Usage: aidevops opencode [options] [--] [opencode args...]
+       aidevops opencode service install|status|start|stop|enable|disable [options]
+       aidevops opencode managed --dir PATH [--session ses_...]
        aidevops opencode conversation --overlay FILE --dir PATH [--dry-run]
        aidevops opencode remote-interactive --overlay FILE --dir PATH --session-id ID [--dry-run]
        aidevops opencode server --dir PATH --port PORT [options]
@@ -44,6 +62,7 @@ Usage: aidevops opencode [options] [--] [opencode args...]
 Launch OpenCode with an isolated per-project SQLite DB by default.
 
 Options:
+  --direct             Retain the original per-project history instead of managed routing
   --shared-db          Use OpenCode's normal shared data directory
   --dir PATH           Working directory for OpenCode (default: current dir)
   --session-id ID      Explicit isolated DB name (default: stable per-project shard)
@@ -100,6 +119,7 @@ app does not write to the shared ~/.local/share/opencode/opencode.db hot spot.
 
 Launch options:
   --dir PATH             Working directory for Desktop (default: cwd; app bundle: HOME)
+  --connect-managed      Request managed server/project selection (requires --dir and a capable Desktop)
   --session-id ID        Explicit isolated DB name (default: desktop-default or per-project)
   --data-dir PATH        Explicit XDG_DATA_HOME for Desktop
   ${OPT_DESKTOP_SOURCE_BINARY} PATH   OpenCode.app executable path
@@ -217,17 +237,39 @@ resolve_tabby_recovery() {
     local resolver="${SCRIPT_DIR}/../plugins/opencode-aidevops/session-recovery-marker.mjs"
     local resolution=""
     local resolver_status=0
+    local stderr_file=""
 
     require_node_cli || return 1
-    if resolution=$(node "${resolver}" resolve --cwd "${recovered_cwd}" --work-dir "${work_dir}"); then
+    TABBY_RECOVERY_ERROR=""
+    stderr_file=$(mktemp) || stderr_file=""
+    if [[ -n "${stderr_file}" ]]; then
+        resolution=$(node "${resolver}" resolve --cwd "${recovered_cwd}" --work-dir "${work_dir}" 2>"${stderr_file}") && resolver_status=0 || resolver_status=$?
+        TABBY_RECOVERY_ERROR=$(head -c 400 "${stderr_file}" | tr '\r\n\t' '   ')
+        rm -f "${stderr_file}"
+    else
+        resolution=$(node "${resolver}" resolve --cwd "${recovered_cwd}" --work-dir "${work_dir}") && resolver_status=0 || resolver_status=$?
+    fi
+    if ((resolver_status == 0)); then
         IFS=$'\t' read -r TABBY_RECOVERY_LAUNCH_DIR TABBY_RECOVERY_DATA_DIR TABBY_RECOVERY_SESSION_ID <<<"${resolution}"
         if [[ -z "${TABBY_RECOVERY_LAUNCH_DIR}" || -z "${TABBY_RECOVERY_DATA_DIR}" || -z "${TABBY_RECOVERY_SESSION_ID}" ]]; then
             print_error "Tabby session recovery returned incomplete data"
             return 1
         fi
         return 0
-    else
-        resolver_status=$?
+    fi
+    if ((resolver_status == 3)); then
+        IFS=$'\t' read -r TABBY_RECOVERY_LAUNCH_DIR TABBY_RECOVERY_DATA_DIR TABBY_RECOVERY_SESSION_ID <<<"${resolution}"
+        if [[ -z "${TABBY_RECOVERY_LAUNCH_DIR}" || -z "${TABBY_RECOVERY_DATA_DIR}" || -z "${TABBY_RECOVERY_SESSION_ID}" ]]; then
+            print_error "Tabby session recovery returned incomplete data"
+            return 1
+        fi
+        return 3
+    fi
+    if ((resolver_status == 4)); then
+        # An OpenCode V2 marker: open its project directory without resuming.
+        TABBY_RECOVERY_LAUNCH_DIR="${resolution}"
+        [[ -n "${TABBY_RECOVERY_LAUNCH_DIR}" ]] || return 1
+        return 4
     fi
     ((resolver_status == 2)) && return 2
     print_error "Tabby session recovery marker validation failed"
@@ -995,11 +1037,47 @@ cmd_desktop_status() {
     return 0
 }
 
+managed_desktop_ready() {
+    # Avoid caching the wrong API protocol after an offline first probe.
+    # Desktop's private preferences and its separate local history stay untouched.
+    if [[ -f "${HOME}/.config/aidevops/opencode-service.json" ]]; then
+        python3 "${SCRIPT_DIR}/opencode-service-helper.py" desktop-ready || return 1
+    fi
+    return 0
+}
+
+execute_desktop_launch() {
+    local dry_run="$1"
+    local launch_dir="$2"
+    local data_dir="$3"
+    local desktop_binary="$4"
+    shift 4
+
+    if ((dry_run == 1)); then
+        printf 'cd %q && TMPDIR=%q TMP=%q TEMP=%q XDG_DATA_HOME=%q AIDEVOPS_OPENCODE_ISOLATED_DB=1 %q' "${launch_dir}" "${TMPDIR}" "${TMP}" "${TEMP}" "${data_dir}" "${desktop_binary}"
+        printf ' %q' "$@"
+        printf '\n'
+        return 0
+    fi
+
+    managed_desktop_ready || return 1
+    mkdir -p "${data_dir}/opencode" || return 1
+    copy_auth_json "${data_dir}" || true
+    prewarm_opencode_data_dir "${data_dir}"
+
+    cd "${launch_dir}" || return 1
+    export XDG_DATA_HOME="${data_dir}"
+    export AIDEVOPS_OPENCODE_ISOLATED_DB=1
+    exec "${desktop_binary}" "$@"
+    return 1
+}
+
 cmd_desktop_launch() {
     local dry_run=0
     local launch_dir="$PWD"
     local launch_dir_set=0
     local from_app=0
+    local connect_managed=0
     local session_id=""
     local data_dir="${AIDEVOPS_OPENCODE_DESKTOP_DATA_DIR:-}"
     local source_binary=""
@@ -1030,6 +1108,10 @@ cmd_desktop_launch() {
             ;;
         --from-app)
             from_app=1
+            shift
+            ;;
+        --connect-managed)
+            connect_managed=1
             shift
             ;;
         --dry-run)
@@ -1068,6 +1150,17 @@ cmd_desktop_launch() {
     fi
     validate_launch_directory "${launch_dir}" || return 1
 
+    if ((connect_managed == 1)); then
+        ((launch_dir_set == 1)) || { print_error "--connect-managed requires an explicit --dir"; return 1; }
+        local connection_link=""
+        local -a connection_args=(desktop-link --desktop-binary "${desktop_binary}" --dir "${launch_dir}")
+        if ((dry_run == 1)); then
+            connection_args+=(--dry-run)
+        fi
+        connection_link=$(python3 "${SCRIPT_DIR}/opencode-service-helper.py" "${connection_args[@]}") || return 1
+        desktop_args+=("${connection_link}")
+    fi
+
     if [[ -z "${data_dir}" ]]; then
         if ((launch_dir_set == 1)); then
             data_dir=$(build_desktop_data_dir "${session_id}" "${launch_dir}")
@@ -1076,22 +1169,8 @@ cmd_desktop_launch() {
         fi
     fi
 
-    if ((dry_run == 1)); then
-        printf 'cd %q && TMPDIR=%q TMP=%q TEMP=%q XDG_DATA_HOME=%q AIDEVOPS_OPENCODE_ISOLATED_DB=1 %q' "${launch_dir}" "${TMPDIR}" "${TMP}" "${TEMP}" "${data_dir}" "${desktop_binary}"
-        printf ' %q' "${desktop_args[@]}"
-        printf '\n'
-        return 0
-    fi
-
-    mkdir -p "${data_dir}/opencode" || return 1
-    copy_auth_json "${data_dir}" || true
-    prewarm_opencode_data_dir "${data_dir}"
-
-    cd "${launch_dir}" || return 1
-    export XDG_DATA_HOME="${data_dir}"
-    export AIDEVOPS_OPENCODE_ISOLATED_DB=1
-    exec "${desktop_binary}" "${desktop_args[@]}"
-    return 1
+    execute_desktop_launch "${dry_run}" "${launch_dir}" "${data_dir}" "${desktop_binary}" "${desktop_args[@]}"
+    return $?
 }
 
 cmd_desktop() {
@@ -1127,7 +1206,7 @@ run_server_owner() {
     local port_status=0
     local server_status=0
     local server_url="http://127.0.0.1:${port}"
-    local -a serve_args=(serve --pure --hostname 127.0.0.1 --port "${port}" --cors oc://renderer)
+    local -a serve_args=(serve --hostname 127.0.0.1 --port "${port}" --cors oc://renderer)
 
     if server_port_is_occupied "${port}"; then
         print_error "Port ${port} is already in use; refusing to start an unknown or duplicate owner"
@@ -1228,7 +1307,7 @@ cmd_server() {
         session_id=$(build_project_session_id "${launch_dir}")
     fi
     data_dir=$(build_server_data_dir "${session_id}")
-    serve_args=(serve --pure --hostname 127.0.0.1 --port "${port}" --cors oc://renderer)
+    serve_args=(serve --hostname 127.0.0.1 --port "${port}" --cors oc://renderer)
 
     if ((dry_run == 1)); then
         printf 'cd %q && TMPDIR=%q TMP=%q TEMP=%q XDG_DATA_HOME=%q AIDEVOPS_OPENCODE_ISOLATED_DB=1 AIDEVOPS_OPENCODE_SERVER_OWNER=1 opencode' "${launch_dir}" "${TMPDIR}" "${TMP}" "${TEMP}" "${data_dir}"
@@ -1308,19 +1387,149 @@ cmd_attach() {
     return 1
 }
 
+maybe_managed_tui() {
+    local direct="$1"
+    local shared="$2"
+    local tabby="$3"
+    local shard="$4"
+    local dry_run="$5"
+    local launch_dir="$6"
+    local arg_count="$7"
+    local route=""
+    local -a managed_args=(attach --dir "${launch_dir}")
+
+    # Explicit shards and Tabby recovery stay direct; unsupported flags must not
+    # silently create a conversation in a different database.
+    ((direct == 0 && shared == 0 && tabby == 0)) || return 0
+    # GH#34125: the shared server's plugin never sees this launch's local-only
+    # binding, so a bound launch stays direct (plugin runs in this environment).
+    vault_runtime_policy_bound && return 0
+    [[ -z "${shard}" && -f "${HOME}/.config/aidevops/opencode-service.json" ]] || return 0
+    route=$(python3 "${SCRIPT_DIR}/opencode-service-helper.py" route) || return 1
+    [[ "${route}" == "managed" ]] || return 0
+    if ((arg_count > 0)); then
+        print_error "Managed routing rejects raw flags. Use 'managed --session ID' or --direct for original history."
+        return 1
+    fi
+    ((dry_run == 0)) || managed_args+=(--dry-run)
+    exec python3 "${SCRIPT_DIR}/opencode-service-helper.py" "${managed_args[@]}"
+    return 1
+}
+
+run_shared_tui() {
+    local launch_dir="$1"
+    local dry_run="$2"
+    shift 2
+    if ((dry_run == 1)); then
+        printf 'cd %q && TMPDIR=%q TMP=%q TEMP=%q' "${launch_dir}" "${TMPDIR}" "${TMP}" "${TEMP}"
+        print_terminal_title_environment
+        printf ' opencode'
+        (($# == 0)) || printf ' %q' "$@"
+        printf '\n'
+        return 0
+    fi
+    cd "${launch_dir}" || return 1
+    exec opencode "$@"
+    return 1
+}
+
+apply_tabby_recovery() {
+    local invocation_dir="$1"
+    local tabby_shell="$2"
+    local launch_dir_var="$3"
+    local data_dir_var="$4"
+    shift 4
+    local recovery_status=0
+
+    if resolve_tabby_recovery \
+        "${invocation_dir}" \
+        "${AIDEVOPS_WORK_DIR:-${HOME}/.aidevops/.agent-workspace/work}"; then
+        if opencode_args_contain_session "$@"; then
+            print_error "Tabby recovery rejects an additional OpenCode --session argument"
+            return 1
+        fi
+        printf -v "${launch_dir_var}" '%s' "${TABBY_RECOVERY_LAUNCH_DIR}"
+        printf -v "${data_dir_var}" '%s' "${TABBY_RECOVERY_DATA_DIR}"
+        if ((tabby_shell == 1)); then
+            TABBY_RECOVERY_ARGS=(--session "${TABBY_RECOVERY_SESSION_ID}" "$@")
+        fi
+    else
+        recovery_status=$?
+        if ((recovery_status == 3)); then
+            printf -v "${launch_dir_var}" '%s' "${TABBY_RECOVERY_LAUNCH_DIR}"
+            printf -v "${data_dir_var}" '%s' "${TABBY_RECOVERY_DATA_DIR}"
+        elif ((recovery_status == 4)); then
+            printf -v "${launch_dir_var}" '%s' "${TABBY_RECOVERY_LAUNCH_DIR}"
+        else
+            ((recovery_status == 2)) || return 1
+        fi
+    fi
+    return 0
+}
+
+# A restored Tabby tab runs `exec aidevops opencode --tabby-shell`, so any
+# launcher failure ends the tab's process and Tabby removes the tab, losing
+# the user's handle on the saved session. Keep a login shell open instead,
+# with enough context to resume manually.
+print_tabby_resume_hints() {
+    local saved_session="$1"
+    local invocation_dir="$2"
+    local marker="${invocation_dir}/recovery.json"
+    local fields=""
+    local marker_directory=""
+    local marker_data_dir=""
+
+    print_error "Saved session: ${saved_session}"
+    [[ -z "${TABBY_RECOVERY_ERROR:-}" ]] || print_error "Recovery failed: ${TABBY_RECOVERY_ERROR}"
+    print_error "Retry with: cd $(printf '%q' "${invocation_dir}") && aidevops opencode --tabby-shell"
+    [[ -f "${marker}" ]] && command -v node >/dev/null 2>&1 || return 0
+    fields=$(node -e '
+const m = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+const ok = (v) => typeof v === "string" && v.startsWith("/") && !/[\x00-\x1f]/.test(v);
+if (ok(m.directory) && ok(m.data_dir)) process.stdout.write(m.directory + "\t" + m.data_dir);
+' "${marker}" 2>/dev/null) || return 0
+    IFS=$'\t' read -r marker_directory marker_data_dir <<<"${fields}"
+    [[ -n "${marker_directory}" && -n "${marker_data_dir}" ]] || return 0
+    print_error "Manual resume: cd $(printf '%q' "${marker_directory}") && XDG_DATA_HOME=$(printf '%q' "${marker_data_dir}") AIDEVOPS_OPENCODE_ISOLATED_DB=1 opencode --session ${saved_session}"
+    return 0
+}
+
+keep_tabby_tab_open() {
+    local tabby_shell="$1"
+    local dry_run="$2"
+    local invocation_dir="$3"
+    local login_shell=""
+    local saved_session=""
+
+    ((tabby_shell == 1 && dry_run == 0)) || return 1
+    login_shell=$(resolve_tabby_login_shell) || return 1
+    saved_session=$(basename "${invocation_dir}")
+    print_error "Tabby session restore failed; keeping this tab open."
+    if [[ "${saved_session}" == ses_* ]]; then
+        print_tabby_resume_hints "${saved_session}" "${invocation_dir}"
+    fi
+    cd "${HOME}" || return 1
+    exec "${login_shell}" -l
+    return 1
+}
+
 cmd_tui_launch() {
     local use_shared_db=0
+    local direct=0
     local tabby_shell=0
     local dry_run=0
     local launch_dir="$PWD"
     local invocation_dir="$PWD"
     local session_id=""
     local data_dir=""
-    local recovery_status=0
     local -a opencode_args=()
 
     while (($# > 0)); do
         case "$1" in
+        --direct)
+            direct=1
+            shift
+            ;;
         --shared-db)
             use_shared_db=1
             shift
@@ -1363,50 +1572,39 @@ cmd_tui_launch() {
     require_opencode_cli || return 1
     claim_terminal_title_ownership
     tabby_shell=$(tabby_shell_mode "${tabby_shell}" "${use_shared_db}")
+    maybe_managed_tui "${direct}" "${use_shared_db}" "${tabby_shell}" "${session_id}" \
+        "${dry_run}" "${launch_dir}" "${#opencode_args[@]}" || return 1
     if ((tabby_shell == 1 && use_shared_db == 1)); then
         print_error "--tabby-shell requires aidevops isolated OpenCode storage"
         return 1
     fi
-    if ((tabby_shell == 1)); then
-        if resolve_tabby_recovery \
-            "${invocation_dir}" \
-            "${AIDEVOPS_WORK_DIR:-${HOME}/.aidevops/.agent-workspace/work}"; then
-            if opencode_args_contain_session "${opencode_args[@]}"; then
-                print_error "Tabby recovery rejects an additional OpenCode --session argument"
-                return 1
-            fi
-            launch_dir="${TABBY_RECOVERY_LAUNCH_DIR}"
-            data_dir="${TABBY_RECOVERY_DATA_DIR}"
-            opencode_args=(--session "${TABBY_RECOVERY_SESSION_ID}" "${opencode_args[@]}")
-        else
-            recovery_status=$?
-            ((recovery_status == 2)) || return 1
+    # ${arr[@]+...}: bash 3.2 (macOS /bin/bash) treats an empty array as unbound.
+    if ((use_shared_db == 0)); then
+        TABBY_RECOVERY_ARGS=(${opencode_args[@]+"${opencode_args[@]}"})
+        if ! apply_tabby_recovery "${invocation_dir}" "${tabby_shell}" launch_dir data_dir ${opencode_args[@]+"${opencode_args[@]}"}; then
+            keep_tabby_tab_open "${tabby_shell}" "${dry_run}" "${invocation_dir}"
+            return 1
         fi
+        opencode_args=(${TABBY_RECOVERY_ARGS[@]+"${TABBY_RECOVERY_ARGS[@]}"})
     fi
-    validate_launch_directory "${launch_dir}" || return 1
+    if ! validate_launch_directory "${launch_dir}"; then
+        keep_tabby_tab_open "${tabby_shell}" "${dry_run}" "${invocation_dir}"
+        return 1
+    fi
     if [[ -z "${session_id}" ]]; then
         session_id=$(build_project_session_id "${launch_dir}")
     fi
 
     if ((use_shared_db == 1)); then
-        if ((dry_run == 1)); then
-            printf 'cd %q && TMPDIR=%q TMP=%q TEMP=%q' "${launch_dir}" "${TMPDIR}" "${TMP}" "${TEMP}"
-            print_terminal_title_environment
-            printf ' opencode'
-            ((${#opencode_args[@]} == 0)) || printf ' %q' "${opencode_args[@]}"
-            printf '\n'
-            return 0
-        fi
-        cd "${launch_dir}" || return 1
-        exec opencode "${opencode_args[@]}"
-        return 1
+        run_shared_tui "${launch_dir}" "${dry_run}" ${opencode_args[@]+"${opencode_args[@]}"}
+        return $?
     fi
 
     if [[ -z "${data_dir}" ]]; then
         data_dir=$(build_session_data_dir "${session_id}")
     fi
 
-    run_isolated_tui "${launch_dir}" "${data_dir}" "${tabby_shell}" "${dry_run}" "${opencode_args[@]}"
+    run_isolated_tui "${launch_dir}" "${data_dir}" "${tabby_shell}" "${dry_run}" ${opencode_args[@]+"${opencode_args[@]}"}
     return $?
 }
 
@@ -1464,6 +1662,11 @@ run_conversation_session() {
         "OPENCODE_DISABLE_PROJECT_CONFIG=1"
         "OPENCODE_DISABLE_SHARE=1"
     )
+    # env -i must not discard the operator binding or re-enable host telemetry.
+    if vault_runtime_policy_bound; then
+        runtime_environment+=("AIDEVOPS_RUNTIME_POLICY=local-only" "OTEL_SDK_DISABLED=true"
+            "OTEL_TRACES_EXPORTER=none" "OTEL_METRICS_EXPORTER=none" "OTEL_LOGS_EXPORTER=none")
+    fi
     [[ -n "${USER:-}" ]] && runtime_environment+=("USER=${USER}")
     [[ -n "${LOGNAME:-}" ]] && runtime_environment+=("LOGNAME=${LOGNAME}")
     [[ -n "${SHELL:-}" ]] && runtime_environment+=("SHELL=${SHELL}")
@@ -1681,7 +1884,34 @@ main() {
     TMP="${TMP:-$TMPDIR}"
     TEMP="${TEMP:-$TMPDIR}"
     export TMPDIR TMP TEMP
+    # GH#34125: attach/managed/desktop run the plugin in a server or app process
+    # that does not carry this launch's binding; refuse instead of silently
+    # running unbound.
+    local session_route="${1:-}"
+    if [[ "${session_route}" == "desktop" ]]; then
+        case "${2:-launch}" in
+        status | install | install-app | install-shortcut | help | --help | -h) session_route="" ;;
+        esac
+    fi
+    case "${session_route}" in
+    managed | attach | desktop)
+        if vault_runtime_policy_bound; then
+            print_error "VAULT_POLICY_DENIED: AIDEVOPS_RUNTIME_POLICY binds this launch to local AI, but '${1}' would run in a process without that binding. Launch a direct session instead: AIDEVOPS_RUNTIME_POLICY=local-only aidevops opencode --direct"
+            return 64
+        fi
+        ;;
+    esac
     case "${1:-}" in
+    service)
+        shift
+        python3 "${SCRIPT_DIR}/opencode-service-helper.py" "$@"
+        return $?
+        ;;
+    managed)
+        shift
+        exec python3 "${SCRIPT_DIR}/opencode-service-helper.py" attach "$@"
+        return 1
+        ;;
     conversation)
         shift || true
         cmd_conversation "$@"

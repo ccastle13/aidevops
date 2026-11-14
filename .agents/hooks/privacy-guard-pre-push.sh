@@ -46,6 +46,7 @@ _resolve_self() {
 		[[ "$src" != /* ]] && src="$dir/$src"
 	done
 	cd -P "$(dirname "$src")" && pwd
+	return $?
 }
 
 HOOK_DIR=$(_resolve_self)
@@ -79,6 +80,10 @@ if ! privacy_is_target_public "$remote_url"; then
 fi
 
 [[ "${PRIVACY_GUARD_DEBUG:-0}" == "1" ]] && privacy_log INFO "target public ($remote_url) — scanning diff"
+target_repo=""
+if [[ "$remote_url" =~ github\.com[:/]([^/]+/[^/]+) ]]; then
+	target_repo="${BASH_REMATCH[1]%.git}"
+fi
 
 # Enumerate private entity inventory once for the whole push.
 entities_file=$(mktemp 2>/dev/null) || {
@@ -114,9 +119,10 @@ done
 # Priority: remote/HEAD (repo-configured) → remote/main → remote/master.
 _default_remote_head=""
 if [[ -n "$remote_name" ]]; then
-	_default_remote_head=$(git symbolic-ref --short "refs/remotes/${remote_name}/HEAD" 2>/dev/null)
+	_default_remote_head=$(git symbolic-ref "refs/remotes/${remote_name}/HEAD" 2>/dev/null)
+	[[ "$_default_remote_head" == "refs/remotes/${remote_name}/"* ]] || _default_remote_head=""
 	if [[ -z "$_default_remote_head" ]]; then
-		for _candidate in "${remote_name}/main" "${remote_name}/master"; do
+		for _candidate in "refs/remotes/${remote_name}/main" "refs/remotes/${remote_name}/master"; do
 			git rev-parse --verify "$_candidate" >/dev/null 2>&1
 			_status=$?
 			if [[ $_status -eq 0 ]]; then
@@ -125,6 +131,24 @@ if [[ -n "$remote_name" ]]; then
 			fi
 		done
 	fi
+fi
+
+# Both scans diff from the remote tip. When that commit is absent locally (for
+# example GitHub's "Update branch" merged main into it), the diff cannot run
+# and the push is a non-fast-forward anyway. Fail closed with the actionable
+# cause instead of a generic scan failure (GH#34308).
+missing_remote_tip=0
+for _ref_entry in "${_all_refs[@]}"; do
+	read -r _lr _ls _rr _rs <<<"$_ref_entry"
+	[[ -z "$_ls" || "$_ls" =~ ^0+$ ]] && continue
+	[[ -z "$_rs" || "$_rs" =~ ^0+$ ]] && continue
+	if ! git cat-file -e "${_rs}^{commit}" 2>/dev/null; then
+		privacy_log ERROR "remote ref ${_rr} is at ${_rs}, which is not in this clone — run git fetch and merge or rebase, then push again"
+		missing_remote_tip=1
+	fi
+done
+if [[ "$missing_remote_tip" -ne 0 ]]; then
+	exit 1
 fi
 
 # Secret-material scan is global for public pushes. Unlike private-repo slug
@@ -142,7 +166,10 @@ for _ref_entry in "${_all_refs[@]}"; do
 	fi
 	secret_hits=$(privacy_scan_secret_material_diff "$_secret_base" "$_ls")
 	secret_rc=$?
-	if [[ "$secret_rc" -ne 0 ]]; then
+	if [[ "$secret_rc" -ne 0 && ("$secret_rc" -ne 1 || -z "$secret_hits") ]]; then
+		privacy_log ERROR "secret-material scan failed (rc=${secret_rc}, ref=${_rr}) — failing closed; no verified findings"
+		secret_exit_code=1
+	elif [[ "$secret_rc" -eq 1 ]]; then
 		printf '\n[privacy-guard][BLOCK] Push to %s contains secret/private-key material:\n\n' "$remote_name" >&2
 		printf '%s\n\n' "$secret_hits" >&2
 		printf '  Remove the secret material from committed content and amend/rewrite before pushing.\n' >&2
@@ -167,13 +194,21 @@ for _ref_entry in "${_all_refs[@]}"; do
 	fi
 
 	_scan_base="$remote_sha"
+	_public_head=""
 	if [[ -z "$_scan_base" || "$_scan_base" =~ ^0+$ ]]; then
 		_scan_base=$(git merge-base "$local_sha" "$_default_remote_head" 2>/dev/null || echo "")
 		[[ -z "$_scan_base" ]] && _scan_base="$remote_sha"
+	elif [[ -n "$_default_remote_head" ]]; then
+		# Existing branches may import already-public lines when merging main.
+		# Pin the default tip; an unknown tip retains the unfiltered scan.
+		_public_head=$(git rev-parse --verify "${_default_remote_head}^{commit}" 2>/dev/null) || _public_head=""
 	fi
-	hits_output=$(privacy_scan_public_diff "$_scan_base" "$local_sha" "$entities_file")
+	hits_output=$(privacy_scan_public_diff "$_scan_base" "$local_sha" "$entities_file" "$_public_head" "$target_repo")
 	scan_rc=$?
-	if [[ "$scan_rc" -ne 0 ]]; then
+	if [[ "$scan_rc" -ne 0 && ("$scan_rc" -ne 1 || -z "$hits_output") ]]; then
+		privacy_log ERROR "private-entity scan failed (rc=${scan_rc}, ref=${remote_ref}) — failing closed; no verified findings"
+		exit_code=1
+	elif [[ "$scan_rc" -eq 1 ]]; then
 		printf '\n[privacy-guard][BLOCK] Push to %s contains private references in public-repo content:\n\n' "$remote_name" >&2
 		printf '%s\n\n' "$hits_output" >&2
 		printf '  Remove the private material from the committed content and amend/rewrite the commit before pushing.\n' >&2

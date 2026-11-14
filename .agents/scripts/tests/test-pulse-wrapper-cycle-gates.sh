@@ -25,22 +25,37 @@ fail() {
 	return 0
 }
 
+export HOME="${TMP}/home"
 export SCRIPT_DIR="${TMP}/scripts"
 export WRAPPER_LOGFILE="${TMP}/wrapper.log"
 export AIDEVOPS_GH_API_EVIDENCE_COVERAGE_START_FILE="${TMP}/coverage-start"
 export PULSE_SCOPE_REPOS="owner/repo"
 unset GH_API_REPORT
-mkdir -p "$SCRIPT_DIR"
+mkdir -p "$SCRIPT_DIR" "$HOME"
 : >"$WRAPPER_LOGFILE"
 
 GH_QUERY_FILE="${TMP}/query.txt"
+GH_CONTEXT_FILE="${TMP}/context.txt"
+GH_CALL_COUNT_FILE="${TMP}/gh-call-count.txt"
 TIMEOUT_CALL_FILE="${TMP}/timeout.txt"
 export GH_QUERY_FILE
+export GH_CONTEXT_FILE
+export GH_CALL_COUNT_FILE
 export TIMEOUT_CALL_FILE
 export TIMEOUT_MODE="pass"
+export GH_OUTPUT='[]'
+export IDLE_DECISION="skip"
+printf '0\n' >"$GH_CALL_COUNT_FILE"
 gh() {
+	local call_count=""
+	call_count=$(<"$GH_CALL_COUNT_FILE")
+	printf '%s\n' "$((call_count + 1))" >"$GH_CALL_COUNT_FILE"
 	printf '%s\n' "$*" >"$GH_QUERY_FILE"
-	printf '0\n'
+	printf '%s|%s|%s|%s|%s|%s\n' \
+		"${AIDEVOPS_GH_COOLDOWN_METHOD:-}" "${AIDEVOPS_GH_COOLDOWN_ENDPOINT:-}" \
+		"${AIDEVOPS_GH_COOLDOWN_QUERY:-}" "${AIDEVOPS_GH_COOLDOWN_OPERATION:-}" \
+		"${AIDEVOPS_GH_COOLDOWN_WRAPPER:-}" "${AIDEVOPS_GH_COOLDOWN_STAGE:-}" >"$GH_CONTEXT_FILE"
+	printf '%s\n' "$GH_OUTPUT"
 	return 0
 }
 
@@ -51,6 +66,12 @@ timeout_sec() {
 	if [[ "$TIMEOUT_MODE" == "timeout" ]]; then
 		return 124
 	fi
+	if [[ "$TIMEOUT_MODE" == "deferred" ]]; then
+		return 75
+	fi
+	if [[ "$TIMEOUT_MODE" == "error" ]]; then
+		return 1
+	fi
 	"$@"
 	return $?
 }
@@ -58,7 +79,11 @@ timeout_sec() {
 cat >"${SCRIPT_DIR}/pulse-idle-backoff-helper.sh" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
-should-skip) exit 0 ;;
+should-skip)
+	[[ "${AIDEVOPS_PULSE_IDLE_AVAILABLE_WORK:-0}" != "1" ]] || exit 1
+	[[ "${IDLE_DECISION:-skip}" != "proceed" ]] || exit 1
+	exit 0
+	;;
 state)
 	printf '{"consecutive_idle":2,"current_effective_interval_s":120}\n'
 	exit 0
@@ -106,22 +131,16 @@ else
 	pass "zero eligible issues does not bypass idle backoff"
 fi
 
-if grep -q -- '-label:needs-maintainer-review' "$GH_QUERY_FILE"; then
-	pass "idle-work query excludes NMR-held issues"
+if [[ "$(<"$GH_QUERY_FILE")" == 'api -X GET repos/owner/repo/issues -f state=open -f labels=auto-dispatch,status:available -f assignee=none -f per_page=100' ]]; then
+	pass "idle-work query uses one bounded repository REST page, not Search"
 else
-	fail "idle-work query excludes NMR-held issues" "query=$(<"$GH_QUERY_FILE")"
+	fail "idle-work query uses one bounded repository REST page, not Search" "query=$(<"$GH_QUERY_FILE")"
 fi
 
-if grep -q -- '-label:infrastructure' "$GH_QUERY_FILE"; then
-	pass "idle-work query excludes infrastructure advisory issues"
+if [[ "$(<"$GH_CONTEXT_FILE")" == 'GET|/repos/owner/repo/issues|state=open&labels=auto-dispatch,status:available&assignee=none&per_page=100|idle_available_work|pulse-wrapper.sh|idle-backoff-availability' ]]; then
+	pass "idle-work query carries sanitized cooldown attribution context"
 else
-	fail "idle-work query excludes infrastructure advisory issues" "query=$(<"$GH_QUERY_FILE")"
-fi
-
-if grep -q -- '-label:publication:pending' "$GH_QUERY_FILE"; then
-	pass "idle-work query excludes unpublished planning issues"
-else
-	fail "idle-work query excludes unpublished planning issues" "query=$(<"$GH_QUERY_FILE")"
+	fail "idle-work query carries sanitized cooldown attribution context" "context=$(<"$GH_CONTEXT_FILE")"
 fi
 
 timeout_value=$(<"$TIMEOUT_CALL_FILE")
@@ -146,9 +165,9 @@ else
 fi
 
 if _pulse_check_idle_backoff_gate; then
-	pass "idle-work timeout bypasses idle backoff"
+	pass "idle-work timeout preserves unknown and fails open"
 else
-	fail "idle-work timeout bypasses idle backoff"
+	fail "idle-work timeout preserves unknown and fails open"
 fi
 
 if grep -q 'timed out after 30s' "$WRAPPER_LOGFILE"; then
@@ -156,6 +175,158 @@ if grep -q 'timed out after 30s' "$WRAPPER_LOGFILE"; then
 else
 	fail "idle-work timeout is logged"
 fi
+
+export TIMEOUT_MODE="deferred"
+if _pulse_available_auto_dispatch_work_exists; then
+	fail "idle-work transport deferral preserves status"
+else
+	query_rc=$?
+	if [[ "$query_rc" -eq 75 ]]; then
+		pass "idle-work transport deferral preserves status"
+	else
+		fail "idle-work transport deferral preserves status" "rc=${query_rc}"
+	fi
+fi
+
+export TIMEOUT_MODE="pass"
+export GH_OUTPUT="malformed"
+if _pulse_available_auto_dispatch_work_exists; then
+	fail "idle-work malformed response remains unknown"
+else
+	query_rc=$?
+	if [[ "$query_rc" -eq 2 ]]; then
+		pass "idle-work malformed response remains unknown"
+	else
+		fail "idle-work malformed response remains unknown" "rc=${query_rc}"
+	fi
+fi
+
+export TIMEOUT_MODE="error"
+if _pulse_available_auto_dispatch_work_exists; then
+	fail "attempted query failure maps to typed unknown"
+else
+	query_rc=$?
+	if [[ "$query_rc" -eq 2 ]]; then
+		pass "attempted query failure maps to typed unknown"
+	else
+		fail "attempted query failure maps to typed unknown" "rc=${query_rc}"
+	fi
+fi
+
+export GH_OUTPUT='[]'
+export IDLE_DECISION="proceed"
+printf '0\n' >"$GH_CALL_COUNT_FILE"
+if _pulse_check_idle_backoff_gate && [[ "$(<"$GH_CALL_COUNT_FILE")" -eq 0 ]]; then
+	pass "normal cycle avoids unnecessary pre-backoff Search"
+else
+	fail "normal cycle avoids unnecessary pre-backoff Search" "calls=$(<"$GH_CALL_COUNT_FILE")"
+fi
+
+export IDLE_DECISION="skip"
+printf '0\n' >"$GH_CALL_COUNT_FILE"
+_gh_secondary_read_ramp_phase() { printf 'cooldown-recovery\n'; }
+if _pulse_check_idle_backoff_gate; then
+	fail "recovery ramp keeps optional availability probe quiet"
+elif [[ "$(<"$GH_CALL_COUNT_FILE")" -eq 0 ]]; then
+	pass "recovery ramp keeps optional availability probe quiet"
+else
+	fail "recovery ramp keeps optional availability probe quiet" "calls=$(<"$GH_CALL_COUNT_FILE")"
+fi
+unset -f _gh_secondary_read_ramp_phase
+
+printf '0\n' >"$GH_CALL_COUNT_FILE"
+_gh_secondary_cooldown_active() { return 0; }
+if _pulse_check_idle_backoff_gate; then
+	fail "active cooldown keeps optional availability probe quiet"
+elif [[ "$(<"$GH_CALL_COUNT_FILE")" -eq 0 ]]; then
+	pass "active cooldown keeps optional availability probe quiet"
+else
+	fail "active cooldown keeps optional availability probe quiet" "calls=$(<"$GH_CALL_COUNT_FILE")"
+fi
+unset -f _gh_secondary_cooldown_active
+
+export TIMEOUT_MODE="deferred"
+if _pulse_check_idle_backoff_gate; then
+	fail "transport deferral retains prior local backoff decision"
+else
+	pass "transport deferral retains prior local backoff decision"
+fi
+export TIMEOUT_MODE="pass"
+
+export TIMEOUT_MODE="error"
+if _pulse_check_idle_backoff_gate; then
+	pass "attempted query failure preserves unknown and fails open"
+else
+	fail "attempted query failure preserves unknown and fails open"
+fi
+export TIMEOUT_MODE="pass"
+
+ELIGIBLE_ISSUE='{"state":"open","assignees":[],"labels":[{"name":"auto-dispatch"},{"name":"status:available"}]}'
+export GH_OUTPUT="[$ELIGIBLE_ISSUE]"
+if _pulse_check_idle_backoff_gate; then
+	pass "visible work still bypasses active idle backoff"
+else
+	fail "visible work still bypasses active idle backoff"
+fi
+for excluded_label in publication:pending needs-maintainer-review needs-maintainer-permissions status:needs-info infrastructure \
+	supervisor contributor persistent quality-review 'on hold' blocked parent-task meta consolidated status:done status:resolved; do
+	GH_OUTPUT=$(printf '%s' "$ELIGIBLE_ISSUE" | jq -c --arg label "$excluded_label" '[.labels += [{name:$label}]]')
+	query_rc=0
+	_pulse_available_auto_dispatch_work_exists || query_rc=$?
+	if [[ "$query_rc" -eq 1 ]]; then pass "idle-work excludes $excluded_label"; else fail "idle-work excludes $excluded_label"; fi
+done
+for mutation in '.pull_request = {}' '.assignees = [{login:"fixture"}]' '.state = "closed"' '.labels = [{name:"auto-dispatch"}]'; do
+	GH_OUTPUT=$(printf '%s' "$ELIGIBLE_ISSUE" | jq -c "[${mutation}]")
+	query_rc=0
+	_pulse_available_auto_dispatch_work_exists || query_rc=$?
+	if [[ "$query_rc" -eq 1 ]]; then pass "idle-work rejects ineligible row: $mutation"; else fail "idle-work rejects ineligible row: $mutation"; fi
+done
+GH_OUTPUT=$(printf '%s' "$ELIGIBLE_ISSUE" | jq -c '[range(100) as $i | .pull_request = {}]')
+query_rc=0
+_pulse_available_auto_dispatch_work_exists || query_rc=$?
+if [[ "$query_rc" -eq 2 ]]; then pass "full excluded page is unknown, not empty"; else fail "full excluded page is unknown, not empty"; fi
+
+test_repeated_recovery_windows() (
+	export AIDEVOPS_GH_SECONDARY_COOLDOWN_HOME="$HOME"
+	export AIDEVOPS_GH_SECONDARY_COOLDOWN_FILE="$TMP/window-cooldown.json"
+	export AIDEVOPS_GH_SECONDARY_COOLDOWN_EVENTS_FILE="$TMP/window-events.jsonl"
+	export AIDEVOPS_GH_READ_RAMP_STATE_FILE="$TMP/window-ramp.tsv"
+	export AIDEVOPS_GH_SECONDARY_COOLDOWN_SECS=300 AIDEVOPS_GH_READ_RAMP_RECOVERY_SECS=300 AIDEVOPS_GH_READ_RAMP_BOOT_SECS=0
+	# shellcheck source=../shared-gh-secondary-cooldown.sh
+	source "${SOURCE_SCRIPT%/*}/shared-gh-secondary-cooldown.sh"
+	local fixture_now=1000 window=0 expiry="" response=""
+	_gh_secondary_cooldown_now() { printf '%s\n' "$fixture_now"; }
+	_gh_secondary_system_boot_ts() { return 1; }
+	GH_OUTPUT="[$ELIGIBLE_ISSUE]"
+	printf '0\n' >"$GH_CALL_COUNT_FILE"
+	for window in 1000 2000 3000; do
+		fixture_now="$window"
+		response=$'HTTP/2 403\r\nx-ratelimit-resource: search\r\nx-ratelimit-remaining: 27\r\n\r\n{"message":"secondary rate limit"}\n'
+		AIDEVOPS_GH_COOLDOWN_NO_PROBE=1 _gh_secondary_cooldown_record_if_needed 1 "$response" GET /search/issues || return 1
+		expiry=$(_gh_secondary_cooldown_expires_at)
+		fixture_now=$((window + 100))
+		if _pulse_check_idle_backoff_gate; then return 1; fi
+		fixture_now=$((window + 400))
+		if _pulse_check_idle_backoff_gate; then return 1; fi
+		[[ "$(<"$GH_CALL_COUNT_FILE")" -eq $((window / 1000 - 1)) ]] || return 1
+		fixture_now=$((window + 601))
+		_pulse_check_idle_backoff_gate || return 1
+		[[ "$(<"$GH_CALL_COUNT_FILE")" -eq $((window / 1000)) && "$(<"$GH_QUERY_FILE")" != *search/issues* ]] || return 1
+		[[ "$(_gh_secondary_cooldown_expires_at)" == "$expiry" ]] || return 1
+	done
+	TIMEOUT_MODE=deferred
+	if _pulse_check_idle_backoff_gate; then return 1; fi
+	TIMEOUT_MODE=timeout
+	_pulse_check_idle_backoff_gate || return 1
+	[[ "$(<"$GH_CALL_COUNT_FILE")" -eq 3 && "$(_gh_secondary_cooldown_expires_at)" == "$expiry" ]] || return 1
+	return 0
+)
+if test_repeated_recovery_windows; then
+	pass "repeated cooldown/recovery windows resume useful REST discovery without Search or cooldown renewal"
+else
+	fail "repeated cooldown/recovery windows resume useful REST discovery without Search or cooldown renewal"
+fi
+export GH_OUTPUT='[]'
 
 : >"$EVIDENCE_FILE"
 : >"$EVIDENCE_TIMESTAMP_FILE"
@@ -344,6 +515,93 @@ if grep -q 'Do not run Bash tool calls with workdir set to managed repository pa
 	pass "supervisor prompt prevents external-workdir permission stalls"
 else
 	fail "supervisor prompt prevents external-workdir permission stalls"
+fi
+
+test_worker_lifecycle_reconciliation() {
+	local SCRIPT_DIR="${SOURCE_SCRIPT%/*}"
+	local canonical_tmp=""
+	canonical_tmp=$(cd "$TMP" && pwd -P) || return 1
+	local HOME="$canonical_tmp"
+	local AIDEVOPS_WORKSPACE_DIR="${canonical_tmp}/lifecycle-workspace"
+	local AIDEVOPS_LIFECYCLE_STATE_DIR=""
+	local AIDEVOPS_LIFECYCLE_DISABLED=0 AIDEVOPS_PRIVATE_WORKLOAD=0 PULSE_DRY_RUN=0 PULSE_CANARY_MODE=0
+	local state_dir="${AIDEVOPS_WORKSPACE_DIR}/worker-lifecycle"
+	local flag="" result=""
+	mkdir -p "$AIDEVOPS_WORKSPACE_DIR"
+	TIMEOUT_MODE="pass"
+	: >"$TIMEOUT_CALL_FILE"
+	_pulse_reconcile_worker_lifecycle
+	if [[ ! -e "$state_dir" && ! -s "$TIMEOUT_CALL_FILE" ]]; then
+		pass "lifecycle tick does not initialize absent state"
+	else
+		fail "lifecycle tick does not initialize absent state"
+	fi
+	if ! python3 -E -s -B "${SCRIPT_DIR}/../worker-lifecycle/worker-launch.py" --initialize \
+		--state-dir "$state_dir" --worktree "$canonical_tmp" -- python3 -c 'pass' >/dev/null 2>&1; then
+		fail "lifecycle native attempt fixture"
+		return 1
+	fi
+	local home_marker="~"
+	AIDEVOPS_WORKSPACE_DIR="${home_marker}/lifecycle-workspace"
+	for flag in AIDEVOPS_LIFECYCLE_DISABLED AIDEVOPS_PRIVATE_WORKLOAD PULSE_DRY_RUN PULSE_CANARY_MODE; do
+		printf -v "$flag" '%s' 1
+		_pulse_reconcile_worker_lifecycle
+		if [[ ! -s "$TIMEOUT_CALL_FILE" ]]; then
+			pass "lifecycle tick respects ${flag}"
+		else
+			fail "lifecycle tick respects ${flag}"
+		fi
+		printf -v "$flag" '%s' 0
+	done
+	TIMEOUT_MODE="timeout"
+	if _pulse_reconcile_worker_lifecycle && grep -q 'reconcile-gap exit=124' "$WRAPPER_LOGFILE" &&
+		[[ "$(<"$TIMEOUT_CALL_FILE")" == 10 ]]; then
+		pass "lifecycle timeout is bounded and cannot block the cycle"
+	else
+		fail "lifecycle timeout is bounded and cannot block the cycle"
+	fi
+	TIMEOUT_MODE="pass"
+	_pulse_reconcile_worker_lifecycle
+	result=$(PYTHONPATH="${SCRIPT_DIR}/../worker-lifecycle" python3 -B -m worker_lifecycle.registry --state-dir "$state_dir" status)
+	if jq -e '.runs == {"ended":1} and .events == 3 and .cleanup_authorized == false' <<<"$result" >/dev/null; then
+		pass "lifecycle cycle hook marks the exited native worker ended"
+	else
+		fail "lifecycle cycle hook marks the exited native worker ended" "$result"
+	fi
+	AIDEVOPS_LIFECYCLE_STATE_DIR="${home_marker}/lifecycle-workspace/worker-lifecycle"
+	: >"$TIMEOUT_CALL_FILE"
+	_pulse_reconcile_worker_lifecycle
+	result=$(PYTHONPATH="${SCRIPT_DIR}/../worker-lifecycle" python3 -B -m worker_lifecycle.registry --state-dir "$state_dir" status)
+	if [[ "$(<"$TIMEOUT_CALL_FILE")" == 10 ]] && jq -e '.events == 3' <<<"$result" >/dev/null; then
+		pass "lifecycle repeated ticks do not duplicate terminal observations"
+	else
+		fail "lifecycle repeated ticks do not duplicate terminal observations" "$result"
+	fi
+	AIDEVOPS_LIFECYCLE_STATE_DIR="${canonical_tmp}/unknown-state"
+	mkdir -m 700 "$AIDEVOPS_LIFECYCLE_STATE_DIR"
+	if _pulse_reconcile_worker_lifecycle && grep -q 'reconcile-gap exit=2' "$WRAPPER_LOGFILE" &&
+		[[ ! -e "${AIDEVOPS_LIFECYCLE_STATE_DIR}/registry.sqlite3" ]]; then
+		pass "lifecycle invalid state is reported without initialization or cycle failure"
+	else
+		fail "lifecycle invalid state is reported without initialization or cycle failure"
+	fi
+	return 0
+}
+
+test_worker_lifecycle_reconciliation
+if python3 - "${SOURCE_SCRIPT%/*}/pulse-wrapper.sh" <<'PY'
+from pathlib import Path
+import sys
+main = Path(sys.argv[1]).read_text().split('main() {', 1)[1]
+hook = main.index('_pulse_reconcile_worker_lifecycle || true')
+assert main.index('_pulse_setup_canary_mode "$@"') < hook
+for boundary in ('_pulse_setup_refill_only_mode', '_PULSE_BUSY_AT_BOOTSTRAP', '_pulse_check_idle_backoff_gate', 'local _rl_ts_file='):
+    assert hook < main.index(boundary), boundary
+PY
+then
+	pass "lifecycle hook precedes refill, busy, idle and cooldown exits after diagnostic mode setup"
+else
+	fail "lifecycle hook precedes refill, busy, idle and cooldown exits after diagnostic mode setup"
 fi
 
 printf '\nTests run: %s failed: %s\n' "$TESTS_RUN" "$TESTS_FAILED"

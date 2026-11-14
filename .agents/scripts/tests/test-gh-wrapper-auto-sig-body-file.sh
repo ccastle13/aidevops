@@ -46,6 +46,10 @@ MOCK_BIN_DIR="${TEST_ROOT}/mockbin"
 mkdir -p "$MOCK_BIN_DIR"
 cat >"${MOCK_BIN_DIR}/gh" <<'MOCK'
 #!/usr/bin/env bash
+if [[ "$*" == *'--json labels'* ]]; then
+	printf '%s\n' '["origin:worker"]'
+	exit 0
+fi
 for arg in "$@"; do
 	printf '<%s>\n' "$arg" >>"${GH_ARGV_RECORD_FILE}"
 done
@@ -94,6 +98,8 @@ _ensure_origin_labels_for_args() { return 0; }
 _gh_should_fallback_to_rest() { return 1; }
 _rest_should_fallback() { return 1; }
 _gh_auto_link_sub_issue() { return 0; }
+# Origin postconditions require live PR metadata and are outside this body-file test.
+_gh_create_pr_enforce_origin_postcondition() { return 0; }
 session_origin_label() {
 	printf '%s' "origin:worker"
 	return 0
@@ -117,7 +123,7 @@ count_captured_signatures() {
 assert_body_file_signed() {
 	local name="$1" command_name="$2"
 	local body_file="${TEST_ROOT}/${command_name}.md"
-	printf '## Summary\n\nBody\n' >"$body_file"
+	printf 'For #42\n\n## Summary\n\nBody\n' >"$body_file"
 	reset_capture
 	if [[ "$command_name" == "pr-create" ]]; then
 		gh_create_pr --repo o/r --title "Fix body-file signing" --body-file "$body_file" >/dev/null 2>&1
@@ -134,7 +140,7 @@ assert_body_file_signed() {
 
 assert_pr_edit_body_file_signed() {
 	local body_file="${TEST_ROOT}/pr-edit.md"
-	printf '## Edited summary\n\nBody\n' >"$body_file"
+	printf 'For #42\n\n## Edited summary\n\nBody\n' >"$body_file"
 	reset_capture
 	gh_pr_edit_safe 1 --repo o/r --body-file "$body_file" >/dev/null 2>&1
 	if [[ "$(count_captured_signatures)" == "1" ]] && ! grep -q '<!-- aidevops:sig -->' "$body_file"; then
@@ -164,7 +170,7 @@ assert_signed_relative_body_file_normalized() {
 	local body_name="already-signed-relative.md"
 	local body_file="${TEST_ROOT}/${rel_dir}/${body_name}"
 	mkdir -p "${TEST_ROOT}/${rel_dir}"
-	printf '## Summary\n\nBody\n\n<!-- aidevops:sig -->\n---\n[aidevops.sh](https://aidevops.sh) existing\n' >"$body_file"
+	printf 'For #42\n\n## Summary\n\nBody\n\n<!-- aidevops:sig -->\n---\n[aidevops.sh](https://aidevops.sh) existing\n' >"$body_file"
 	reset_capture
 	(
 		cd "$TEST_ROOT" || exit 1
@@ -293,11 +299,47 @@ assert_close_comment_signed_once() {
 	return 0
 }
 
+assert_home_body_file_normalized() {
+	local form="$1"
+	local body_file="${HOME}/.aidevops/body with spaces.md"
+	printf 'For #42\n\n## Summary\n\nHome body\n' >"$body_file"
+	reset_capture
+	local rc=0
+	if [[ "$form" == "equals" ]]; then
+		gh_create_pr --repo o/r --title "Fix home body-file" --body-file='~/.aidevops/body with spaces.md' >/dev/null 2>&1 || rc=$?
+	else
+		# shellcheck disable=SC2088 # Deliberately reproduce a literal home prefix from argv.
+		gh_create_pr --repo o/r --title "Fix home body-file" --body-file '~/.aidevops/body with spaces.md' >/dev/null 2>&1 || rc=$?
+	fi
+	if [[ "$rc" == "0" && "$(count_captured_signatures)" == "1" ]] &&
+		grep -q 'Home body' "$GH_BODY_CAPTURE_FILE" && ! grep -q '<!-- aidevops:sig -->' "$body_file"; then
+		print_result "home-prefixed ${form} body-file reaches transport without source mutation" 0
+	else
+		print_result "home-prefixed ${form} body-file reaches transport without source mutation" 1 "status=${rc}"
+	fi
+	return 0
+}
+
+assert_cli_rejection_names_operation() {
+	local rc=0
+	bash "${TEST_SCRIPTS_DIR}/gh-write-helper.sh" pr create --repo o/r --body-file "${TEST_ROOT}/missing.md" \
+		>/dev/null 2>"${TEST_ROOT}/cli-missing.err" || rc=$?
+	if [[ "$rc" != "0" ]] && grep -q '\[SAFETY\] gh pr create rejected:' "${TEST_ROOT}/cli-missing.err"; then
+		print_result "CLI body-file rejection names pr create" 0
+	else
+		print_result "CLI body-file rejection names pr create" 1 "status=${rc}"
+	fi
+	return 0
+}
+
 assert_body_file_signed "gh_create_pr --body-file signs temp body" "pr-create"
 assert_body_file_signed "gh_pr_comment --body-file signs temp body" "pr-comment"
 assert_pr_edit_body_file_signed
 assert_existing_signature_not_duplicated
 assert_signed_relative_body_file_normalized
+assert_home_body_file_normalized separate
+assert_home_body_file_normalized equals
+assert_cli_rejection_names_operation
 assert_missing_body_file_rejected_before_gh
 assert_signature_only_body_rejected_before_gh
 assert_signature_only_body_file_rejected_before_gh

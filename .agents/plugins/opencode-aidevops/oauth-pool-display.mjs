@@ -24,6 +24,23 @@ export {
 // Pool tool action handlers
 // ---------------------------------------------------------------------------
 
+const POOL_PROVIDERS = new Set(["anthropic", "openai", "cursor", "google"]);
+
+export function poolAccountAddCommand(provider) {
+  const selected = POOL_PROVIDERS.has(provider) ? provider : "anthropic";
+  if (process.env.AIDEVOPS_OPENCODE_PROFILE === "v2") {
+    if (selected !== "anthropic" && selected !== "openai") {
+      return `the V2 ${selected} pool is not connected to provider requests`;
+    }
+    const poolFile = process.env.AIDEVOPS_OAUTH_POOL_FILE;
+    if (!poolFile) return `the isolated V2 pool setup in .agents/tools/opencode/opencode.md`;
+    const quotedFile = `'${poolFile.replaceAll("'", "'\\''")}'`;
+    const mode = selected === "openai" ? "AIDEVOPS_OPENAI_ADD_MODE=callback " : "";
+    return `AIDEVOPS_OAUTH_POOL_FILE=${quotedFile} ${mode}aidevops model-accounts-pool add ${selected}`;
+  }
+  return `aidevops model-accounts-pool add ${selected}`;
+}
+
 export function poolActionList(provider, accounts, hint, now) {
   if (accounts.length === 0) return `No accounts in the ${provider} pool.\n\n${hint}`;
   const lines = accounts.map((a, i) => {
@@ -46,7 +63,11 @@ export function poolActionStatus(provider, accounts, hint, now) {
   const active = accounts.filter((a) => ["active", "idle"].includes(a.status)).length;
   const rl = accounts.filter((a) => a.status === "rate-limited" && a.cooldownUntil && a.cooldownUntil > now).length;
   const ae = accounts.filter((a) => a.status === "auth-error").length;
-  const avail = accounts.filter((a) => !a.cooldownUntil || a.cooldownUntil <= now).length;
+  // auth-error accounts are never dispatch-eligible, even after cooldown expiry
+  // (matches rotation, recovery and Pulse capacity predicates; GH#34377).
+  const avail = accounts.filter(
+    (a) => a.status !== "auth-error" && (!a.cooldownUntil || a.cooldownUntil <= now),
+  ).length;
   const epCd = getEndpointCooldownValue(provider);
   return [
     `${provider} pool status:`,
@@ -65,8 +86,7 @@ export function poolActionStatus(provider, accounts, hint, now) {
 
 export async function poolActionRotate(client, provider, accounts, resolveInjectFn) {
   if (accounts.length < 2) {
-    const pn = { anthropic: "Anthropic Pool", openai: "OpenAI Pool", cursor: "Cursor Pool", google: "Google Pool" };
-    return `Cannot rotate: only ${accounts.length} account(s). Add more via Ctrl+A -> ${pn[provider] || "Pool"}.`;
+    return `Cannot rotate: only ${accounts.length} account(s). Add more with \`${poolAccountAddCommand(provider)}\`.`;
   }
   const current = [...accounts].sort((a, b) => new Date(b.lastUsed || 0) - new Date(a.lastUsed || 0))[0];
   if (!(await resolveInjectFn(provider)(client, current?.email))) {

@@ -219,7 +219,9 @@ fi
 echo ""
 echo "Test 26: dispatch-intent label normalization"
 
+# Reset clears both the inventory value and its export attribute.
 _reset_log
+export STUB_MANAGED_LABELS=$'auto-dispatch\nno-auto-dispatch'
 "$SHIM_RUN" issue create --repo owner/repo --title "Dispatch intent conflict" \
 	--body "Capture the issue." --label "bug,auto-dispatch" --label no-auto-dispatch \
 	2>"$TMP/dispatch-create.err"
@@ -232,6 +234,7 @@ else
 fi
 
 _reset_log
+export STUB_MANAGED_LABELS=$'auto-dispatch\nno-auto-dispatch'
 "$SHIM_RUN" issue edit 42 --repo owner/repo --add-label no-auto-dispatch \
 	--remove-label no-auto-dispatch 2>/dev/null
 if _argv_has_pair "--add-label" "no-auto-dispatch" &&
@@ -243,6 +246,7 @@ else
 fi
 
 _reset_log
+export STUB_MANAGED_LABELS=$'auto-dispatch\nno-auto-dispatch'
 "$SHIM_RUN" issue edit 42 --repo owner/repo --add-label auto-dispatch \
 	--remove-label auto-dispatch 2>/dev/null
 if _argv_has_pair "--add-label" "auto-dispatch" &&
@@ -254,6 +258,30 @@ else
 fi
 
 _reset_log
+export STUB_MANAGED_LABELS='auto-dispatch'
+"$SHIM_RUN" issue edit 42 --repo owner/repo --add-label auto-dispatch \
+	2>/dev/null
+if _argv_has_pair "--add-label" "auto-dispatch" &&
+	! _argv_has_pair "--remove-label" "no-auto-dispatch"; then
+	_pass "adding auto-dispatch succeeds when the repository lacks no-auto-dispatch"
+else
+	_fail "missing opposite dispatch label" "argv: $(_read_argv)"
+fi
+
+_reset_log
+export STUB_MANAGED_LABELS='no-auto-dispatch'
+"$SHIM_RUN" issue edit 42 --repo owner/repo --add-label no-auto-dispatch \
+	--remove-label no-auto-dispatch 2>/dev/null
+if _argv_has_pair "--add-label" "no-auto-dispatch" &&
+	! _argv_has_pair "--remove-label" "no-auto-dispatch" &&
+	! _argv_has_pair "--remove-label" "auto-dispatch"; then
+	_pass "manual hold survives conflicting removal when the opposite label is absent"
+else
+	_fail "missing opposite label preserves manual hold" "argv: $(_read_argv)"
+fi
+
+_reset_log
+export STUB_MANAGED_LABELS=$'auto-dispatch\nno-auto-dispatch'
 "$SHIM_RUN" issue edit 42 --repo owner/repo --add-label auto-dispatch \
 	--add-label no-auto-dispatch 2>"$TMP/dispatch-edit.err"
 if _argv_has_pair "--add-label" "no-auto-dispatch" &&
@@ -276,3 +304,68 @@ if _argv_has_pair "-f" "labels[]=no-auto-dispatch" &&
 else
 	_fail "REST dispatch conflict normalization" "argv: $(_read_argv) err: $(cat "$TMP/dispatch-rest.err" 2>/dev/null || true)"
 fi
+
+# GH#36797: synthetic references only; all writes terminate at the stub.
+echo "Test: negated PR closing references across CLI body paths"
+for action in create edit merge; do
+	for unsafe in 'Do not close #987654' \
+		'This tooling PR does not publish, deploy, or close owner/repo#987654.' \
+		'This PR never fixes https://github.com/example/fixture/pull/987654' \
+		$'This PR must not publish, deploy, or\nresolve #987654'; do
+		printf '%s\n' "$unsafe" >"$TMP/unsafe-closing.md"
+		cp "$TMP/unsafe-closing.md" "$TMP/unsafe-closing.original"
+		for form in inline equals file file_equals short short_file; do
+			case "$form" in
+			inline) closing_args=(--body "$unsafe") ;;
+			equals) closing_args=("--body=$unsafe") ;;
+			file) closing_args=(--body-file "$TMP/unsafe-closing.md") ;;
+			file_equals) closing_args=("--body-file=$TMP/unsafe-closing.md") ;;
+			short) closing_args=(-b "$unsafe") ;;
+			short_file) closing_args=(-F "$TMP/unsafe-closing.md") ;;
+			esac
+			_reset_log
+			if "$SHIM_RUN" pr "$action" --repo owner/repo "${closing_args[@]}" 2>"$TMP/closing.err"; then
+				_fail "pr $action $form rejects negated closure" "unexpected success"
+			elif [[ ! -s "$STUB_GH_LOG" ]] &&
+				grep -q 'remains open' "$TMP/closing.err" &&
+				! grep -q '987654' "$TMP/closing.err" &&
+				cmp -s "$TMP/unsafe-closing.md" "$TMP/unsafe-closing.original"; then
+				_pass "pr $action $form blocks before transport without leaking or mutating body"
+			else
+				_fail "pr $action $form rejection evidence" "transport, guidance, privacy, or immutability mismatch"
+			fi
+		done
+	done
+	for safe in 'Resolves #987654' 'Ref #987654. The PR remains open.' \
+		'Not a deployment. Fixes #987654' 'Do not deploy; resolves #987654' \
+		"Example: \`Do not close #987654\`" $'```\nNever closes #987654\n```'; do
+		_reset_log
+		# Body edits inspect the target PR's origin labels before transport.
+		safe_target=()
+		[[ "$action" != edit ]] || safe_target=(42)
+		if "$SHIM_RUN" pr "$action" ${safe_target[@]+"${safe_target[@]}"} --repo owner/repo --body "$safe" 2>"$TMP/closing.err" &&
+			grep -Fxq "$action" "$STUB_GH_LOG"; then
+			_pass "pr $action preserves positive resolution or non-closing mention"
+		else
+			_fail "pr $action safe body" "$safe"
+		fi
+	done
+done
+
+_reset_log
+if "$SHIM_RUN" pr merge 987654 --repo owner/repo 2>"$TMP/closing.err" && [[ -s "$STUB_GH_LOG" ]]; then
+	_pass "default merge body remains native (not inspected by this guard)"
+else
+	_fail "default merge body remains native"
+fi
+
+for action in create edit merge; do
+	_reset_log
+	if "$SHIM_RUN" pr "$action" --repo owner/repo --body-file - <"$TMP/unsafe-closing.md" 2>"$TMP/closing.err"; then
+		_fail "pr $action rejects unchecked raw stdin" "unexpected success"
+	elif [[ ! -s "$STUB_GH_LOG" ]] && grep -q 'gh-write-helper.sh' "$TMP/closing.err"; then
+		_pass "pr $action rejects unchecked stdin with materialization guidance"
+	else
+		_fail "pr $action stdin rejection evidence"
+	fi
+done

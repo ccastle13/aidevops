@@ -31,7 +31,7 @@ tools:
 
 ## Supported Runtime Integrations
 
-Claude Code and OpenCode are supported runtimes. Canonical agents, workflows, and
+Claude Code, OpenCode and [Codex CLI](../tools/ai-assistants/codex-cli.md) support interactive workflows. Canonical agents, workflows, and
 workload tiers remain provider-agnostic; generated adapters and runtime
 configuration supply runtime-specific commands, tools, and concrete model mappings.
 
@@ -59,6 +59,16 @@ usage and output-token enforcement are reported as unavailable or advisory when
 the selected runtime does not expose them.
 
 ## Judgment and Deterministic Enforcement
+
+## Purpose and knowledge ownership
+
+`.agents/aidevops/purpose.md` owns the framework's compounding-value purpose,
+economic measures, cross-domain delegation, and repository/forge ownership
+contract. Apply it when changing architecture, task authority, or instruction
+delivery: repository knowledge owns tasks, plans, decisions, evidence, and
+progress, while forge issues and PRs remain linked execution conversations.
+Do not duplicate that policy here or claim that forge-loss recovery is already
+proven; `t18404` owns validation of that contract and implementation gaps.
 
 Use model judgment for open-ended decisions; use deterministic automation for
 mechanics whose correct outcome can be specified and tested.
@@ -95,6 +105,17 @@ shell execution. Regression coverage lives in
 `test-aidevops-update-transaction.sh`, `test-setup-source-access-broker.sh`,
 `test-source-access-helper.py`, and `test-source-access-approval.mjs`.
 
+Bundled issue/source approval establishes the linked worktree before signing;
+there is no transferable worktree handoff. Durable proposals are powerless.
+The human broker refreshes and displays current hashes before explicit consent,
+then rechecks native runtime/session and worktree identities before independent
+issue and source signatures. A private transaction journal serializes publication,
+cancellation and recovery; receipt and immutable snapshots publish through one
+atomic directory rename. Neither elapsed proposal age nor a retry renews consent.
+A replaced context, changed post-confirmation bytes, expired/cancelled grant or
+unsupported broker protocol requires genuinely new consent, never a guard bypass.
+Workflow, limits and recovery: `reference/source-access-bundles.md`.
+
 Examples: version bumping, file discovery, credential lookup, schema validation,
 and safety guards belong in tools; dispatch priority, diagnosis, decomposition,
 and trade-offs remain model judgment. See `reference/progressive-disclosure.md`
@@ -121,7 +142,7 @@ Implements proven patterns from Lance Martin (LangChain), validated across Claud
 | **Offload Context** | `.agent-workspace/work/[project]/` for persistent files |
 | **Cache Context** | Stable instruction prefixes, avoid reordering between calls |
 | **Isolate Context** | Subagent markdown files with specific tool permissions |
-| **Ralph Loop** | `workflows/ralph-loop.md`, `full-loop-helper.sh` |
+| **Development Lifecycle** | `workflows/full-loop.md`, `full-loop-helper.sh` |
 | **Evolve Context** | `/remember`, `/recall` with SQLite FTS5, `memory-helper.sh` |
 
 ### MCP Lifecycle Pattern
@@ -135,8 +156,15 @@ Implements proven patterns from Lance Martin (LangChain), validated across Claud
 
 **Two-tier MCP strategy** (all MCPs use `eager: false` and start disabled):
 
-1. **Explicit activation agents** (`activationAgent`): a bounded profile can use `aidevops_mcp` to connect its registry-approved MCP. Playwriter and Playwright are the initial browser implementations.
+1. **Explicit activation agents** (`activationAgent`): a bounded profile can use `aidevops_mcp` to connect its registry-approved MCP. Playwright is the preferred browser implementation; Playwriter remains explicit legacy compatibility.
 2. **Per-agent permission only** (`globallyEnabled: false`): tool patterns stay hidden globally and are exposed only on the owning agent profile.
+
+Stagehand v4 follows a different bounded route: `stagehand-v4-helper.sh` pins an
+isolated local SDK, not a globally registered MCP. It is not recommended; use it
+only when the user explicitly asks to try it, after model/data/cost consent. Headless Playwright stays the
+default. The v4 route does not inherit a user-selected tab's consent/profile
+boundary or replace legacy Playwriter. Decision evidence and versioned probes:
+`tools/browser/stagehand.md` and `tools/browser/browser-benchmark.md`.
 
 **How it works:** OpenCode treats `enabled: false` as disconnected, not automatic lazy loading. An explicit activation agent calls the registry-allowlisted `aidevops_mcp` tool, which uses OpenCode's MCP connect API and waits for the asynchronous status to report `connected`. An observed `failed` or `error` status gets one bounded disconnect/reconnect reset; direct API errors, authentication requirements, timeouts, and a second failed status remain terminal. The MCP tools appear on the following model step and can be disconnected when work is complete. There are no idle MCP processes or tool-schema cost in unrelated sessions. The plugin registry is authoritative; do not edit generated `opencode.json` MCP entries directly.
 
@@ -192,7 +220,7 @@ The repository root is a public contract, not a scratch space. New top-level fil
 - **Packaging surfaces:** distribution and package-manager assets such as `bin/`, `scripts/`, `homebrew/`, `package.json`, and lock/dependency files.
 - **Repo-local data planes:** underscore-prefixed local working areas such as `_knowledge/`, `_cases/`, `_campaigns/`, `_inbox/`, `_feedback/`, `_projects/`, `_performance/`, and `_reports/`.
 - **Docs and planning:** documentation and task surfaces such as `.wiki/`, `docs/`, `todo/`, `TODO.md`, and model/reference docs.
-- **Generated or ignored tooling surfaces:** intentionally tracked tool config and generated-input files such as `.github/`, `.qlty/`, lint configs, Repomix configs, and scanner config.
+- **Generated or ignored tooling surfaces:** intentionally tracked tool config and generated-input files such as `.github/`, `.qlty/`, lint configs, and scanner config.
 
 Run `.agents/scripts/repo-layout-audit-helper.sh --check` to audit tracked top-level drift. The audit is non-destructive: it reports unknown paths and recommends likely homes, but never moves files.
 

@@ -43,6 +43,8 @@ if [[ -z "${SCRIPT_DIR:-}" ]]; then
 	SCRIPT_DIR="$(cd "$_lib_path" && pwd)"
 	unset _lib_path
 fi
+# shellcheck source=./task-target-repo-lib.sh
+source "${BASH_SOURCE[0]%/*}/task-target-repo-lib.sh"
 
 # =============================================================================
 # Push Helpers
@@ -127,6 +129,13 @@ _push_lock_created_issue() {
 _push_create_issue() {
 	local task_id="$1" repo="$2" todo_file="$3" title="$4" body="$5" labels="$6" assignee="$7"
 	_PUSH_CREATED_NUM=""
+	# GH#32608: auto-dispatch is worker-owned unless an implementation session
+	# explicitly claims it later. Never carry a TODO assignee into creation: it
+	# would project status:claimed and permanently block Pulse after publication.
+	if [[ ",${labels}," == *",auto-dispatch,"* && -n "$assignee" ]]; then
+		print_info "Ignoring assignee for $task_id — auto-dispatch entry is worker-owned"
+		assignee=""
+	fi
 
 	_push_prepare_creation_labels "$labels" "$assignee" "$repo" || return 2
 	local publication_state="$_PUSH_CREATION_STATE"
@@ -204,8 +213,11 @@ _push_create_issue() {
 
 	# t1970/t1984/t2157: auto-assign interactive origin issues (not auto-dispatch).
 	# Worker issues follow status:claimed + pulse-managed assignment instead.
+	# GH#32703: decide from the TODO intent ($labels). The pending-publication
+	# projection strips auto-dispatch, so $all_labels would self-assign
+	# worker-owned tasks and strand them after publication.
 	[[ -n "$num" && -z "$assignee" && "$origin_label" == "origin:interactive" ]] &&
-		_push_auto_assign_interactive "$num" "$repo" "$all_labels"
+		_push_auto_assign_interactive "$num" "$repo" "$labels"
 
 	# Mapping validation above must precede this lock mutation.
 	[[ -n "$num" ]] && _push_lock_created_issue "$num" "$repo" "$origin_label"
@@ -227,10 +239,13 @@ _push_prepare_creation_labels() {
 	local status_label="$_PUSH_STATUS_AVAILABLE"
 	if [[ -n "$assignee" ]]; then
 		status_label="status:claimed"
-		gh_create_label "$repo" "$status_label" "D93F0B" "Task is claimed"
+		# Must match _status_label_contract (shared-gh-wrappers-status.sh).
+		gh_create_label "$repo" "$status_label" "F9D0C4" "Interactive implementation is actively claimed"
 	fi
 	_PUSH_CREATION_ORIGIN=$(session_origin_label)
-	gh_create_label "$repo" "$_PUSH_CREATION_ORIGIN" "C5DEF5" \
+	local _origin_color="C5DEF5"
+	[[ "$_PUSH_CREATION_ORIGIN" == "origin:interactive" ]] && _origin_color="BFD4F2"
+	gh_create_label "$repo" "$_PUSH_CREATION_ORIGIN" "$_origin_color" \
 		"Created from ${_PUSH_CREATION_ORIGIN#origin:} session"
 	_PUSH_CREATION_ALL_LABELS="${labels:+${labels},}${_PUSH_CREATION_ORIGIN}"
 	if [[ "$_PUSH_CREATION_STATE" == "$_PUSH_PUBLICATION_CANONICAL" ||
@@ -282,7 +297,10 @@ _push_verify_publication_pending() {
 _push_warn_if_task_id_collides() {
 	local repo="$1" task_id="$2"
 	local collision_pr
-	collision_pr=$(gh_find_merged_pr "$repo" "$task_id")
+	# Planning PRs publish the task, not its implementation. Filter before
+	# selecting evidence so a planning PR cannot hide a real ID collision.
+	collision_pr=$(gh pr list --repo "$repo" --state merged --search "$task_id in:title" \
+		--limit 100 --json number,url,title --jq "[.[] | select(.title | test(\"^${task_id}: plan([[:space:]]|$)\") | not)][0] | if . == null then empty else \"\(.number)|\(.url)\" end" 2>/dev/null) || collision_pr=""
 	if [[ -n "$collision_pr" ]]; then
 		local collision_num="${collision_pr%%|*}"
 		local collision_url="${collision_pr#*|}"
@@ -295,14 +313,26 @@ _push_warn_if_task_id_collides() {
 # cmd_push
 # =============================================================================
 
+_push_validate_targets() {
+	local repo="$1" project_root="$2"
+	shift 2
+	local task_id brief_file declared
+	for task_id in "$@"; do
+		brief_file="$project_root/todo/tasks/${task_id}-brief.md"
+		declared=$(task_brief_target_repo "$brief_file") || return 1
+		task_require_target_repo "$declared" "$repo" "$brief_file" || return 1
+	done
+	return 0
+}
+
 cmd_push() {
 	local target_task="${1:-}"
+	# GH#34232: issue-first. The created issue body is composed from the brief,
+	# so it leads and is dispatchable at creation; TODO.md/briefs are backups.
+	# Callers whose bodies are template stubs (new-task batch) pass
+	# AIDEVOPS_PLANNING_PUBLICATION_STATE=pending explicitly.
 	if [[ -z "${AIDEVOPS_PLANNING_PUBLICATION_STATE:-}" ]]; then
-		if [[ "${GITHUB_ACTIONS:-}" == "$_PUSH_BOOLEAN_TRUE" && -z "$target_task" ]]; then
-			AIDEVOPS_PLANNING_PUBLICATION_STATE="$_PUSH_PUBLICATION_CANONICAL"
-		else
-			AIDEVOPS_PLANNING_PUBLICATION_STATE="$_PUSH_PUBLICATION_PENDING"
-		fi
+		AIDEVOPS_PLANNING_PUBLICATION_STATE="$_PUSH_PUBLICATION_CANONICAL"
 	fi
 	_init_cmd || return 1
 	local repo="$_CMD_REPO" todo_file="$_CMD_TODO" project_root="$_CMD_ROOT"
@@ -337,6 +367,8 @@ cmd_push() {
 		print_info "No tasks to push"
 		return 0
 	}
+	# Validate every brief before any label, TODO, or issue mutation, even in bulk.
+	_push_validate_targets "$repo" "$project_root" "${tasks[@]}" || return 1
 
 	print_info "Processing ${#tasks[@]} task(s) for push to $repo"
 	gh_create_label "$repo" "$_PUSH_STATUS_AVAILABLE" "0E8A16" "Task is available for claiming"
@@ -352,6 +384,11 @@ cmd_push() {
 		[[ "$result" == *"RELATIONSHIPS_PENDING"* ]] && relationships_pending=$((relationships_pending + 1))
 	done
 	print_info "Push complete: $created created, $skipped skipped, $failed failed, $relationships_pending relationships pending"
+	if [[ "$created" -gt 0 ]]; then
+		# shellcheck source=./pulse-repo-dormancy.sh
+		source "${SCRIPT_DIR}/pulse-repo-dormancy.sh"
+		pulse_repo_wake "$repo" planning_publication || true
+	fi
 	if [[ $failed -gt 0 ]]; then
 		print_error "Issue creation failed for $failed task(s); TODO.md still contains active task(s) without GitHub refs"
 		return 1

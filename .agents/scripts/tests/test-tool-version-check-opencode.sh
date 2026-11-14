@@ -4,7 +4,7 @@
 #
 # Regression coverage for GH#24107: `aidevops update` must not route a
 # Homebrew-managed OpenCode binary through npm and collide with Homebrew's
-# managed symlink.
+# managed symlink. GH#34181 extends this to the aidevops daemon-safe shell shim.
 
 set -euo pipefail
 
@@ -51,6 +51,8 @@ extract_function() {
 		/^_opencode_upgrade_cmd\(\)/, /^}$/ { print; next }
 	' "$TOOL_VERSION_CHECK" >>"$SANDBOX/extract.sh"
 	awk '
+		/^_headless_opencode_profile_is_v2\(\)/, /^}/ { print; next }
+		/^_headless_opencode_binary_name\(\)/, /^}/ { print; next }
 		/^_validate_opencode_binary\(\)/, /^}/ { print; next }
 		/^_resolve_headless_opencode_install_binary\(\)/, /^}/ { print; next }
 		/^_provision_headless_opencode_runtime\(\)/, /^}/ { print; next }
@@ -59,6 +61,8 @@ extract_function() {
 	' "$HEADLESS_RUNTIME_LIB" >>"$SANDBOX/extract.sh"
 	if ! grep -q '^aidevops_opencode_pin_applies()' "$SANDBOX/extract.sh" ||
 		! grep -q '^_opencode_upgrade_cmd()' "$SANDBOX/extract.sh" ||
+		! grep -q '^_headless_opencode_profile_is_v2()' "$SANDBOX/extract.sh" ||
+		! grep -q '^_headless_opencode_binary_name()' "$SANDBOX/extract.sh" ||
 		! grep -q '^_validate_opencode_binary()' "$SANDBOX/extract.sh" ||
 		! grep -q '^_resolve_headless_opencode_install_binary()' "$SANDBOX/extract.sh" ||
 		! grep -q '^_provision_headless_opencode_runtime()' "$SANDBOX/extract.sh" ||
@@ -91,7 +95,10 @@ extract_function
 printf 'Test 0: OpenCode remains pinned to the last verified headless release\n'
 # shellcheck source=../shared-constants.sh
 source "$SHARED_CONSTANTS"
-assert_eq "OpenCode headless regression pin" "1.18.25" "$OPENCODE_PINNED_VERSION"
+assert_eq "OpenCode headless regression pin is a version" "valid" "$([[ "$OPENCODE_PINNED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && printf 'valid' || printf 'invalid')"
+IFS=. read -r pin_major pin_minor pin_patch <<<"$OPENCODE_PINNED_VERSION"
+newer_general_version="$pin_major.$pin_minor.$((pin_patch + 1))"
+export OPENCODE_PINNED_VERSION newer_general_version
 
 printf 'Test 0a: routine freshness tracks registry outside Linux headless dispatch\n'
 mkdir -p "$SANDBOX/routine-freshness/bin"
@@ -100,20 +107,33 @@ printf '1.18.9\n' >"$SANDBOX/routine-freshness/opencode-version"
 write_executable "$SANDBOX/routine-freshness/bin/opencode" '#!/usr/bin/env bash
 version=$(<"'"$SANDBOX"'/routine-freshness/opencode-version")
 printf "%s\n" "$version"'
-for cli in claude codex repomix dspyground mcp-local-wp beads-ui bdui chrome-devtools-mcp playwriter macos-automator-mcp claude-code-mcp gws; do
+for cli in claude codex mcp-local-wp chrome-devtools-mcp playwriter macos-automator-mcp claude-code-mcp gws cf; do
 	write_executable "$SANDBOX/routine-freshness/bin/$cli" '#!/usr/bin/env bash
 printf "9.99.9\n"'
 done
+printf '8.2.6\n' >"$SANDBOX/routine-freshness/cloudron-version"
+# shellcheck disable=SC2016 # Literal stub body; quoted SANDBOX segments are expanded by the outer script.
+write_executable "$SANDBOX/routine-freshness/bin/cloudron" '#!/usr/bin/env bash
+version=$(<"'"$SANDBOX"'/routine-freshness/cloudron-version")
+printf "%s\n" "$version"'
 # shellcheck disable=SC2016 # Literal stub body; quoted SANDBOX segments are expanded by the outer script.
 write_executable "$SANDBOX/routine-freshness/bin/npm" '#!/usr/bin/env bash
 case "${1:-}" in
 view) printf "9.99.9\n" ;;
-install) printf "%s\n" "$*" >>"'"$SANDBOX"'/routine-freshness/calls" ;;
+install)
+  case "$*" in
+  *cloudron@latest) printf "%s\n" "$*" >>"'"$SANDBOX"'/routine-freshness/cloudron-calls"
+    printf "9.99.9\n" >"'"$SANDBOX"'/routine-freshness/cloudron-version" ;;
+  *) printf "%s\n" "$*" >>"'"$SANDBOX"'/routine-freshness/calls"
+    printf "9.99.9\n" >"'"$SANDBOX"'/routine-freshness/opencode-version" ;;
+  esac ;;
 *) exit 1 ;;
 esac'
 routine_output=$(PATH="$SANDBOX/routine-freshness/bin:$SYSTEM_PATH" "$TOOL_VERSION_CHECK" --category npm --update --quiet)
 assert_eq "general tool update installs registry latest" "install -g opencode-ai@latest" "$(tr '\n' ';' <"$SANDBOX/routine-freshness/calls" | sed 's/;$//')"
+assert_eq "stale Cloudron CLI installs registry latest" "install -g cloudron@latest" "$(tr '\n' ';' <"$SANDBOX/routine-freshness/cloudron-calls" | sed 's/;$//')"
 
+printf '1.18.9\n' >"$SANDBOX/routine-freshness/opencode-version"
 routine_json=$(PATH="$SANDBOX/routine-freshness/bin:$SYSTEM_PATH" "$TOOL_VERSION_CHECK" --category npm --json)
 opencode_json=$(printf '%s\n' "$routine_json" | grep '"name": "OpenCode"')
 assert_eq "registry release is actionable outside pin scope" "1" "$([[ "$opencode_json" == *'"latest": "9.99.9", "status": "outdated"'* ]] && printf '1\n' || printf '0\n')"
@@ -125,7 +145,7 @@ assert_eq "general drift repair installs registry latest" "install -g opencode-a
 
 printf 'Test 0c: routine freshness restores versions newer than the safety pin\n'
 : >"$SANDBOX/routine-freshness/calls"
-printf '1.19.0\n' >"$SANDBOX/routine-freshness/opencode-version"
+printf '%s\n' "$newer_general_version" >"$SANDBOX/routine-freshness/opencode-version"
 PATH="$SANDBOX/routine-freshness/bin:$SYSTEM_PATH" "$TOOL_VERSION_CHECK" --category npm --update --quiet >/dev/null
 assert_eq "general newer release still tracks registry, not headless pin" "install -g opencode-ai@latest" "$(tr '\n' ';' <"$SANDBOX/routine-freshness/calls" | sed 's/;$//')"
 
@@ -209,10 +229,159 @@ printf "npm %s\n" "$*" >>"'"$SANDBOX"'/npm-case/calls"'
 )
 assert_eq "npm OpenCode upgrade command" "npm install -g opencode-ai@1.15.10" "$(tr '\n' ';' <"$SANDBOX/npm-case/calls" | sed 's/;$//')"
 
+# GH#34181: the aidevops daemon-safe shim is a regular script, not a symlink.
+write_managed_shim() {
+	local path="$1"
+	local target="$2"
+	# shellcheck disable=SC2016 # Shim body is literal; only $target expands.
+	write_executable "$path" '#!/usr/bin/env bash
+# Generated by aidevops setup: daemon-safe OpenCode shim.
+# aidevops:terminal-title-owner
+export PATH="/usr/bin${PATH:+:$PATH}"
+exec "'"$target"'" "$@"'
+	return 0
+}
+
+# GH#35461: exercise the normal maintenance CLI with distinct system/user npm
+# prefixes. No real package manager or host launcher is changed.
+printf 'Test 3a: npm prefix drift repairs only a validated managed launcher\n'
+prefix_case="$SANDBOX/prefix-case"
+mkdir -p "$prefix_case/home/.local/bin" "$prefix_case/user prefix/bin" "$prefix_case/system/bin" "$prefix_case/tools" "$prefix_case/user prefix/lib/node_modules/opencode-ai"
+write_executable "$prefix_case/system/bin/opencode" '#!/usr/bin/env bash
+printf "1.18.34\n"'
+# shellcheck disable=SC2016 # Stub arguments expand only when executed.
+write_executable "$prefix_case/user prefix/bin/opencode" '#!/usr/bin/env bash
+case "${1:-}" in
+--version) printf "1.19.4\n" ;;
+--help) printf "opencode run [message..]\n" ;;
+*) exit 1 ;;
+esac'
+cp "$prefix_case/user prefix/bin/opencode" "$prefix_case/valid-candidate"
+# shellcheck disable=SC2016 # Stub expands fixture variables only when executed.
+write_executable "$prefix_case/tools/npm" '#!/usr/bin/env bash
+case "${1:-}" in
+view) if [[ "${2:-}" == opencode-ai ]]; then printf "1.19.4\n"; else printf "9.99.9\n"; fi ;;
+prefix) printf "%s/user prefix\n" "$PREFIX_CASE" ;;
+root) printf "%s/user prefix/lib/node_modules\n" "$PREFIX_CASE" ;;
+install) printf "{\"version\":\"1.19.4\"}\n" >"$PREFIX_CASE/user prefix/lib/node_modules/opencode-ai/package.json" ;;
+*) exit 1 ;;
+esac'
+for cli in claude codex mcp-local-wp chrome-devtools-mcp playwriter macos-automator-mcp claude-code-mcp gws cf cloudron; do
+	write_executable "$prefix_case/tools/$cli" '#!/usr/bin/env bash
+printf "9.99.9\n"'
+done
+write_managed_shim "$prefix_case/home/.local/bin/opencode" "$prefix_case/system/bin/opencode"
+prefix_output=$(HOME="$prefix_case/home" PREFIX_CASE="$prefix_case" PATH="$prefix_case/home/.local/bin:$prefix_case/tools:$SYSTEM_PATH" "$TOOL_VERSION_CHECK" --category npm --update --quiet)
+assert_eq "prefix drift selects installed candidate" "1.19.4" "$("$prefix_case/home/.local/bin/opencode" --version)"
+assert_eq "system-prefix executable is untouched" "1.18.34" "$("$prefix_case/system/bin/opencode" --version)"
+assert_eq "maintenance verifies launcher update" "yes" "$([[ "$prefix_output" == *'Updated and verified (1.19.4)'* ]] && printf yes || printf no)"
+prefix_output=$(HOME="$prefix_case/home" PREFIX_CASE="$prefix_case" PATH="$prefix_case/home/.local/bin:$prefix_case/tools:$SYSTEM_PATH" "$TOOL_VERSION_CHECK" --category npm --update --quiet)
+assert_eq "second maintenance run does not repeat OpenCode update" "no" "$([[ "$prefix_output" == *'opencode-ai@latest'* ]] && printf yes || printf no)"
+
+write_managed_shim "$prefix_case/home/.local/bin/opencode" "$prefix_case/system/bin/opencode"
+for report_flags in '--quiet' '--json --update'; do
+	# shellcheck disable=SC2086 # Exercise the CLI's separate report flags.
+	prefix_output=$(HOME="$prefix_case/home" PREFIX_CASE="$prefix_case" PATH="$prefix_case/home/.local/bin:$prefix_case/tools:$SYSTEM_PATH" "$TOOL_VERSION_CHECK" --category npm $report_flags)
+	assert_eq "$report_flags leaves stale launcher untouched" "1.18.34" "$("$prefix_case/home/.local/bin/opencode" --version)"
+	if [[ "$report_flags" == *--json* ]]; then
+		assert_eq "JSON report stays valid during prefix drift" "yes" "$(printf '%s\n' "$prefix_output" | jq -e '.tools | length > 0' >/dev/null && printf yes || printf no)"
+	fi
+done
+prefix_output=$(HOME="$prefix_case/home" PREFIX_CASE="$prefix_case" PATH="$prefix_case/home/.local/bin:$prefix_case/tools:$SYSTEM_PATH" "$TOOL_VERSION_CHECK" --category npm --update --quiet)
+assert_eq "already-current npm package repairs stale launcher" "1.19.4" "$("$prefix_case/home/.local/bin/opencode" --version)"
+assert_eq "already-current package needs no reinstall" "no" "$([[ "$prefix_output" == *'opencode-ai@latest'* ]] && printf yes || printf no)"
+
+for invalid_kind in wrong-version wrong-identity missing unmanaged; do
+	write_managed_shim "$prefix_case/home/.local/bin/opencode" "$prefix_case/system/bin/opencode"
+	cp "$prefix_case/valid-candidate" "$prefix_case/user prefix/bin/opencode"
+	# shellcheck disable=SC2016 # Stub arguments expand only when executed.
+	case "$invalid_kind" in
+	wrong-version) write_executable "$prefix_case/user prefix/bin/opencode" '#!/usr/bin/env bash
+printf "1.19.3\n"' ;;
+	wrong-identity) write_executable "$prefix_case/user prefix/bin/opencode" '#!/usr/bin/env bash
+if [[ "${1:-}" == --version ]]; then printf "1.19.4\n"; else printf "unrelated CLI\n"; fi' ;;
+	missing) rm "$prefix_case/user prefix/bin/opencode" ;;
+	unmanaged) write_executable "$prefix_case/home/.local/bin/opencode" '#!/usr/bin/env bash
+printf "1.18.34\n"' ;;
+	esac
+	cp "$prefix_case/home/.local/bin/opencode" "$prefix_case/launcher-before"
+	prefix_output=$(HOME="$prefix_case/home" PREFIX_CASE="$prefix_case" PATH="$prefix_case/home/.local/bin:$prefix_case/tools:$SYSTEM_PATH" "$TOOL_VERSION_CHECK" --category npm --update --quiet)
+	assert_eq "$invalid_kind candidate preserves launcher" "unchanged" "$(cmp -s "$prefix_case/launcher-before" "$prefix_case/home/.local/bin/opencode" && printf unchanged || printf changed)"
+	assert_eq "$invalid_kind reports precise prefix mismatch" "yes" "$([[ "$prefix_output" == *"installed candidate $prefix_case/user prefix/bin/opencode (1.19.4)"* ]] && printf yes || printf no)"
+done
+
+printf 'Test 3b: managed shell shim over Homebrew OpenCode chooses brew\n'
+mkdir -p "$SANDBOX/shim-brew-case/local-bin"
+write_managed_shim "$SANDBOX/shim-brew-case/local-bin/opencode" "$SANDBOX/opt/homebrew/bin/opencode"
+: >"$SANDBOX/homebrew-case/calls"
+(
+	source_extracted
+	cmd="$(_opencode_upgrade_cmd 1.15.10)"
+	PATH="$SANDBOX/shim-brew-case/local-bin:$SANDBOX/opt/homebrew/bin:$SANDBOX/homebrew-case:$SYSTEM_PATH" bash -c "$cmd"
+)
+assert_eq "managed shim over Homebrew upgrade command" "upgrade opencode" "$(tr '\n' ';' <"$SANDBOX/homebrew-case/calls" | sed 's/;$//')"
+
+printf 'Test 3c: nested managed shims over bun OpenCode choose bun\n'
+mkdir -p "$SANDBOX/shim-bun-case/outer" "$SANDBOX/shim-bun-case/inner"
+: >"$SANDBOX/bun-case/calls"
+write_managed_shim "$SANDBOX/shim-bun-case/inner/opencode" "$SANDBOX/home/.bun/bin/opencode"
+write_managed_shim "$SANDBOX/shim-bun-case/outer/opencode" "$SANDBOX/shim-bun-case/inner/opencode"
+(
+	source_extracted
+	cmd="$(_opencode_upgrade_cmd 1.15.10)"
+	PATH="$SANDBOX/shim-bun-case/outer:$SANDBOX/bun-case:$SYSTEM_PATH" bash -c "$cmd"
+)
+assert_eq "nested managed shim over bun upgrade command" "bun install -g opencode-ai@1.15.10" "$(tr '\n' ';' <"$SANDBOX/bun-case/calls" | sed 's/;$//')"
+
+printf 'Test 3d: cyclic, relative or unmarked shims keep the original path\n'
+mkdir -p "$SANDBOX/shim-cycle-case/a" "$SANDBOX/shim-cycle-case/b" "$SANDBOX/shim-rel-case" "$SANDBOX/shim-unmarked-case"
+: >"$SANDBOX/npm-case/calls"
+write_managed_shim "$SANDBOX/shim-cycle-case/a/opencode" "$SANDBOX/shim-cycle-case/b/opencode"
+write_managed_shim "$SANDBOX/shim-cycle-case/b/opencode" "$SANDBOX/shim-cycle-case/a/opencode"
+write_managed_shim "$SANDBOX/shim-rel-case/opencode" "../opt/homebrew/bin/opencode"
+write_executable "$SANDBOX/shim-unmarked-case/opencode" '#!/usr/bin/env bash
+exec "'"$SANDBOX"'/opt/homebrew/bin/opencode" "$@"'
+for shim_dir in shim-cycle-case/a shim-rel-case shim-unmarked-case; do
+	(
+		source_extracted
+		cmd="$(_opencode_upgrade_cmd 1.15.10)"
+		PATH="$SANDBOX/$shim_dir:$SANDBOX/npm-case:$SYSTEM_PATH" bash -c "$cmd"
+	)
+done
+assert_eq "unresolvable shims fall back without brew" "npm install -g opencode-ai@1.15.10;npm install -g opencode-ai@1.15.10;npm install -g opencode-ai@1.15.10" "$(tr '\n' ';' <"$SANDBOX/npm-case/calls" | sed 's/;$//')"
+
+printf 'Test 3e: Homebrew-owned OpenCode is checked against its tap formula, not npm (GH#34252)\n'
+tap_root="$SANDBOX/tap-brew"
+mkdir -p "$tap_root/Cellar/opencode/1.18.35/bin" "$tap_root/opt" "$tap_root/brew-bin" "$tap_root/local-bin"
+write_executable "$tap_root/Cellar/opencode/1.18.35/bin/opencode" '#!/usr/bin/env bash
+printf "1.18.35\n"'
+ln -s "../Cellar/opencode/1.18.35" "$tap_root/opt/opencode"
+write_managed_shim "$tap_root/local-bin/opencode" "$tap_root/Cellar/opencode/1.18.35/bin/opencode"
+# shellcheck disable=SC2016 # Literal stub body; quoted SANDBOX segments are expanded by the outer script.
+write_executable "$tap_root/brew-bin/brew" '#!/usr/bin/env bash
+printf "brew %s\n" "$*" >>"'"$tap_root"'/calls"
+case "$*" in
+"list --versions opencode") printf "opencode 1.18.35\n" ;;
+"--prefix opencode") printf "%s\n" "'"$tap_root"'/opt/opencode" ;;
+"list --formula --full-name") printf "jq\nanomalyco/tap/opencode\nripgrep\n" ;;
+"info --json=v2 anomalyco/tap/opencode") printf "{\"formulae\":[{\"versions\":{\"stable\":\"1.18.35\"}}]}\n" ;;
+*) exit 1 ;;
+esac'
+: >"$SANDBOX/routine-freshness/calls"
+tap_path="$tap_root/local-bin:$tap_root/brew-bin:$SANDBOX/routine-freshness/bin:$SYSTEM_PATH"
+tap_brew_json=$(PATH="$tap_path" "$TOOL_VERSION_CHECK" --category brew --json)
+tap_opencode_json=$(printf '%s\n' "$tap_brew_json" | grep '"name": "OpenCode"' || true)
+assert_eq "brew-owned OpenCode listed under brew and current with its formula" "1" "$([[ "$tap_opencode_json" == *'"category": "brew", "installed": "1.18.35", "latest": "1.18.35", "status": "up_to_date"'* ]] && printf '1\n' || printf '0\n')"
+assert_eq "brew candidate queried with tap-qualified formula" "1" "$(grep -c '^brew info --json=v2 anomalyco/tap/opencode$' "$tap_root/calls" || true)"
+tap_npm_json=$(PATH="$tap_path" "$TOOL_VERSION_CHECK" --category npm --json)
+assert_eq "brew-owned OpenCode excluded from npm category" "0" "$(printf '%s\n' "$tap_npm_json" | grep -c '"name": "OpenCode"' || true)"
+assert_eq "brew-owned OpenCode triggers no npm install" "" "$(cat "$SANDBOX/routine-freshness/calls")"
+
 printf 'Test 4: headless guard provisions an isolated pin without changing newer general install\n'
 mkdir -p "$SANDBOX/version-guard/runtime" "$SANDBOX/version-guard/bin" "$SANDBOX/version-guard/state"
+# shellcheck disable=SC2016 # Fixture receives the exported newer_general_version.
 write_executable "$SANDBOX/version-guard/runtime/opencode" '#!/usr/bin/env bash
-printf "1.18.26\n"'
+printf "%s\n" "$newer_general_version"'
 # shellcheck disable=SC2016 # Literal stub body; quoted SANDBOX segments are expanded by the outer script.
 write_executable "$SANDBOX/version-guard/bin/npm" '#!/usr/bin/env bash
 printf "%s\n" "$*" >>"'"$SANDBOX"'/version-guard/calls"
@@ -224,7 +393,7 @@ done
 mkdir -p "$prefix/node_modules/opencode-linux-x64/bin"
 cat >"$prefix/node_modules/opencode-linux-x64/bin/opencode" <<"BIN"
 #!/usr/bin/env bash
-printf "1.18.25\n"
+printf "%s\n" "$OPENCODE_PINNED_VERSION"
 BIN
 chmod +x "$prefix/node_modules/opencode-linux-x64/bin/opencode"'
 guard_rc=0
@@ -244,10 +413,10 @@ headless_bin=""
 ) || guard_rc=$?
 assert_eq "headless pin repair status" "0" "$guard_rc"
 headless_bin=$(<"$SANDBOX/version-guard/headless-bin")
-assert_eq "general install remains newer" "1.18.26" "$("$SANDBOX/version-guard/runtime/opencode")"
-assert_eq "isolated headless runtime is pinned" "1.18.25" "$("$headless_bin")"
+assert_eq "general install remains newer" "$newer_general_version" "$("$SANDBOX/version-guard/runtime/opencode")"
+assert_eq "isolated headless runtime is pinned" "$OPENCODE_PINNED_VERSION" "$("$headless_bin")"
 install_call=$(<"$SANDBOX/version-guard/calls")
-[[ "$install_call" == "install --ignore-scripts --no-audit --no-fund --prefix "*"/opencode-runtimes/.1.18.25.install."*"/prefix opencode-ai@1.18.25" ]] && install_shape="valid" || install_shape="invalid"
+[[ "$install_call" == "install --ignore-scripts --no-audit --no-fund --prefix "*"/opencode-runtimes/.$OPENCODE_PINNED_VERSION.install."*"/prefix opencode-ai@$OPENCODE_PINNED_VERSION" ]] && install_shape="valid" || install_shape="invalid"
 assert_eq "isolated install requests exact pin" "valid" "$install_shape"
 
 printf 'Test 4b: existing isolated pin is reused without package-manager mutation\n'
@@ -267,10 +436,53 @@ reuse_rc=0
 assert_eq "existing isolated runtime reuse status" "0" "$reuse_rc"
 assert_eq "existing isolated runtime avoids second install" "1" "$(wc -l <"$SANDBOX/version-guard/calls" | tr -d ' ')"
 
-printf 'Test 4c: stale pin repair locks are cleared after the bounded wait\n'
+printf 'Test 4c: V2 isolated provisioning allows its required postinstall\n'
+mkdir -p "$SANDBOX/version-v2/runtime" "$SANDBOX/version-v2/bin" "$SANDBOX/version-v2/state"
+write_executable "$SANDBOX/version-v2/runtime/opencode2" '#!/usr/bin/env bash
+printf "opencode v2.0.4\n"'
+# shellcheck disable=SC2016 # Literal stub body; quoted SANDBOX segments are expanded by the outer script.
+write_executable "$SANDBOX/version-v2/bin/npm" '#!/usr/bin/env bash
+printf "%s\n" "$*" >>"'"$SANDBOX"'/version-v2/calls"
+prefix=""
+while [[ "$#" -gt 0 ]]; do
+  if [[ "$1" == "--prefix" ]]; then prefix="$2"; shift 2; continue; fi
+  shift
+done
+mkdir -p "$prefix/node_modules/.bin"
+cat >"$prefix/node_modules/.bin/opencode2" <<"BIN"
+#!/usr/bin/env bash
+printf "opencode v2.0.3\n"
+BIN
+chmod +x "$prefix/node_modules/.bin/opencode2"'
+v2_guard_rc=0
+v2_headless_bin=""
+(
+	source_extracted
+	AIDEVOPS_OPENCODE_PROFILE="v2"
+	OPENCODE_BIN_DEFAULT="$SANDBOX/version-v2/runtime/opencode2"
+	HEADLESS_OPENCODE_BIN="$OPENCODE_BIN_DEFAULT"
+	STATE_DIR="$SANDBOX/version-v2/state"
+	AIDEVOPS_OPENCODE_PIN_PLATFORM_OVERRIDE="Linux"
+	print_warning() { return 0; }
+	print_info() { return 0; }
+	print_error() { return 0; }
+	PATH="$SANDBOX/version-v2/bin:$SYSTEM_PATH"
+	_provision_headless_opencode_runtime "2.0.3" || exit $?
+	printf '%s\n' "$HEADLESS_OPENCODE_BIN" >"$SANDBOX/version-v2/headless-bin"
+) || v2_guard_rc=$?
+assert_eq "V2 headless pin repair status" "0" "$v2_guard_rc"
+v2_headless_bin=$(<"$SANDBOX/version-v2/headless-bin")
+assert_eq "V2 isolated headless runtime is pinned" "opencode v2.0.3" "$("$v2_headless_bin")"
+v2_install_call=$(<"$SANDBOX/version-v2/calls")
+[[ "$v2_install_call" == "install --no-audit --no-fund --prefix "*"/opencode-runtimes/.2.0.3.install."*"/prefix @opencode/cli@2.0.3" &&
+	"$v2_install_call" != *"--ignore-scripts"* ]] && v2_install_shape="valid" || v2_install_shape="invalid"
+assert_eq "V2 isolated install runs required postinstall" "valid" "$v2_install_shape"
+
+printf 'Test 4d: stale pin repair locks are cleared after the bounded wait\n'
 mkdir -p "$SANDBOX/version-stale-lock/state/opencode-runtimes" "$SANDBOX/version-stale-lock/bin"
+# shellcheck disable=SC2016 # Fixture receives the exported newer_general_version.
 write_executable "$SANDBOX/version-stale-lock/runtime-opencode" '#!/usr/bin/env bash
-printf "1.18.26\n"'
+printf "%s\n" "$newer_general_version"'
 # shellcheck disable=SC2016 # Literal stub body; quoted SANDBOX segments are expanded by the outer script.
 write_executable "$SANDBOX/version-stale-lock/bin/npm" '#!/usr/bin/env bash
 prefix=""
@@ -281,14 +493,14 @@ done
 mkdir -p "$prefix/node_modules/opencode-linux-x64/bin"
 cat >"$prefix/node_modules/opencode-linux-x64/bin/opencode" <<"BIN"
 #!/usr/bin/env bash
-printf "1.18.25\n"
+printf "%s\n" "$OPENCODE_PINNED_VERSION"
 BIN
 chmod +x "$prefix/node_modules/opencode-linux-x64/bin/opencode"'
 (:) &
 dead_installer_pid=$!
 wait "$dead_installer_pid" || true
 mkdir -p "$SANDBOX/version-stale-lock/state/opencode-pin-repair.lock"
-mkdir -p "$SANDBOX/version-stale-lock/state/opencode-runtimes/.1.18.25.install.$dead_installer_pid"
+mkdir -p "$SANDBOX/version-stale-lock/state/opencode-runtimes/.$OPENCODE_PINNED_VERSION.install.$dead_installer_pid"
 stale_lock_rc=0
 (
 	source_extracted
@@ -306,14 +518,15 @@ stale_lock_rc=0
 ) || stale_lock_rc=$?
 assert_eq "stale lock repair status" "0" "$stale_lock_rc"
 assert_eq "stale lock is removed" "0" "$([[ -e "$SANDBOX/version-stale-lock/state/opencode-pin-repair.lock" ]] && printf '1\n' || printf '0\n')"
-assert_eq "dead install temp is removed" "0" "$([[ -e "$SANDBOX/version-stale-lock/state/opencode-runtimes/.1.18.25.install.$dead_installer_pid" ]] && printf '1\n' || printf '0\n')"
+assert_eq "dead install temp is removed" "0" "$([[ -e "$SANDBOX/version-stale-lock/state/opencode-runtimes/.$OPENCODE_PINNED_VERSION.install.$dead_installer_pid" ]] && printf '1\n' || printf '0\n')"
 stale_headless_bin=$(<"$SANDBOX/version-stale-lock/headless-bin")
-assert_eq "stale lock path provisions pinned runtime" "1.18.25" "$("$stale_headless_bin")"
+assert_eq "stale lock path provisions pinned runtime" "$OPENCODE_PINNED_VERSION" "$("$stale_headless_bin")"
 
 printf 'Test 5: headless version guard fails closed when isolated provisioning fails\n'
 mkdir -p "$SANDBOX/version-install-failure/state"
+# shellcheck disable=SC2016 # Fixture receives the exported newer_general_version.
 write_executable "$SANDBOX/version-install-failure/opencode" '#!/usr/bin/env bash
-printf "1.18.26\n"'
+printf "%s\n" "$newer_general_version"'
 write_executable "$SANDBOX/version-install-failure/npm" '#!/usr/bin/env bash
 exit 42'
 guard_rc=0

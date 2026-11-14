@@ -14,6 +14,7 @@ readonly TEST_RESET='\033[0m'
 TESTS_RUN=0
 TESTS_FAILED=0
 PS_MOCK_OUTPUT=""
+PS_MOCK_UID_AWARE=0
 GH_ISSUE_LIST_JSON="[]"
 GH_ISSUE_LIST_EXIT=0
 GH_ISSUE_LIST_ERR=""
@@ -88,7 +89,11 @@ teardown_test_env() {
 }
 
 ps() {
-	printf '%s\n' "$PS_MOCK_OUTPUT"
+	if [[ "${2:-}" == "uid,pid,stat,etime,command" && "$PS_MOCK_UID_AWARE" -eq 0 ]]; then
+		printf '%s\n' "$PS_MOCK_OUTPUT" | awk -v uid="$(command id -u)" '{ print uid, $0 }'
+	else
+		printf '%s\n' "$PS_MOCK_OUTPUT"
+	fi
 	return 0
 }
 
@@ -114,8 +119,28 @@ gh() {
 
 run_count() {
 	local mock_output="$1"
+	PS_MOCK_UID_AWARE=0
 	PS_MOCK_OUTPUT="$mock_output"
 	count_active_workers
+	return 0
+}
+
+test_foreign_workers_leave_runner_capacity_free() {
+	local own_uid foreign_uid output
+	own_uid=$(command id -u)
+	foreign_uid=$((own_uid + 1))
+	PS_MOCK_UID_AWARE=1
+	PS_MOCK_OUTPUT="${foreign_uid} 501 S 00:30 /opt/bin/.opencode run --session-key issue-6001 --dir /repo-a /full-loop
+${foreign_uid} 502 S 00:20 /opt/bin/.opencode run --session-key issue-6002 --dir /repo-b /full-loop"
+	output=$(count_active_workers)
+	PS_MOCK_UID_AWARE=0
+
+	if [[ "$output" == "0" ]]; then
+		print_result "foreign workers do not consume runner-local capacity" 0
+		return 0
+	fi
+	print_result "foreign workers do not consume runner-local capacity" 1 \
+		"Expected zero owned workers, got '${output}'"
 	return 0
 }
 
@@ -268,6 +293,135 @@ test_counts_review_issue_pr_workers() {
 	return 0
 }
 
+test_policy_compatible_command_router() {
+	local output=""
+	output=$(
+		get_max_workers_target() { printf '8\n'; }
+		count_active_workers() { printf '3\n'; }
+		_pulse_wrapper_run_command capacity
+	)
+	if [[ "$output" == "8|3|5" ]]; then
+		print_result "command router exposes capacity without source-and-function shell control" 0
+	else
+		print_result "command router exposes capacity without source-and-function shell control" 1 "Expected 8|3|5, got '${output}'"
+	fi
+
+	output=$(
+		list_dispatchable_issue_candidates() { printf '%s|%s\n' "$1" "$2"; }
+		_pulse_wrapper_run_command list-candidates owner/repo 25
+	)
+	if [[ "$output" == "owner/repo|25" ]]; then
+		print_result "command router delegates candidate listing to existing guarded implementation" 0
+	else
+		print_result "command router delegates candidate listing to existing guarded implementation" 1 "Unexpected output: '${output}'"
+	fi
+
+	if (_pulse_wrapper_run_command dispatch-foss not-a-number >/dev/null 2>&1); then
+		print_result "command router rejects invalid FOSS capacity" 1
+	else
+		print_result "command router rejects invalid FOSS capacity" 0
+	fi
+
+	# GH#34323/GH#34329: conditional callers retain status and delegate output,
+	# with exactly one machine-readable result appended.
+	local expected_rc="" actual_rc="" stub_rc="" outcome="" expected_output=""
+	for expected_rc in 0 1 3; do
+		outcome="deferred"
+		[[ "$expected_rc" -eq 0 ]] && outcome="launched"
+		expected_output=$(printf 'dispatch:7\nPULSE_COMMAND_RESULT command=dispatch rc=%s outcome=%s' "$expected_rc" "$outcome")
+		actual_rc=0
+		output=$(
+			_pulse_wrapper_list_scope() { printf 'owner/repo|%s\n' "$SCRIPT_DIR"; return 0; }
+			dispatch_with_dedup() {
+				printf 'dispatch:%s\n' "$#"
+				return "$stub_rc"
+			}
+			stub_rc="$expected_rc"
+			_pulse_wrapper_run_command dispatch 1 owner/repo "title" "Issue #1" gpt "$SCRIPT_DIR" "prompt"
+		) || actual_rc=$?
+		if [[ "$actual_rc" == "$expected_rc" && "$output" == "$expected_output" ]]; then
+			print_result "command router propagates dispatch status ${expected_rc} in conditional context (GH#34323)" 0
+		else
+			print_result "command router propagates dispatch status ${expected_rc} in conditional context (GH#34323)" 1 \
+				"Expected rc=${expected_rc} output='${expected_output}', got rc=${actual_rc} output='${output}'"
+		fi
+	done
+
+	return 0
+}
+
+test_command_router_outcomes_under_errexit() {
+	local output="" expected_rc="" actual_rc="" outcome="" expected_output=""
+	# Fresh bash processes exercise the CLI's set -euo pipefail even though this
+	# test captures their status with ||. Command substitutions alone disable -e.
+	local command_name=""
+	for command_name in dispatch repo-cap; do
+		for expected_rc in 0 1 3 7; do
+			outcome="failed"
+			case "${command_name}:${expected_rc}" in
+			dispatch:0) outcome="launched" ;;
+			dispatch:1 | dispatch:3) outcome="deferred" ;;
+			repo-cap:0) outcome="at-cap" ;;
+			repo-cap:1) outcome="below-cap" ;;
+			esac
+			actual_rc=0
+			output=$(bash -euo pipefail -c '
+				source "$1/pulse-wrapper-commands.sh"
+				_pulse_wrapper_list_scope() { printf "owner/repo|%s\n" "$SCRIPT_DIR"; return 0; }
+				stub_rc="$3"
+				dispatch_with_dedup() { return "$stub_rc"; }
+				check_repo_worker_cap() { return "$stub_rc"; }
+				if [[ "$2" == dispatch ]]; then
+					_pulse_wrapper_run_command dispatch 1 owner/repo title issue user "$SCRIPT_DIR" prompt
+				else
+					_pulse_wrapper_run_command repo-cap /tmp/repo
+				fi
+			' bash "$SCRIPT_DIR" "$command_name" "$expected_rc") || actual_rc=$?
+			expected_output="PULSE_COMMAND_RESULT command=${command_name} rc=${expected_rc} outcome=${outcome}"
+			if [[ "$actual_rc" == "$expected_rc" && "$output" == "$expected_output" ]]; then
+				print_result "command router reports ${command_name} status ${expected_rc} under errexit (GH#34329)" 0
+			else
+				print_result "command router reports ${command_name} status ${expected_rc} under errexit (GH#34329)" 1 \
+					"Expected rc=${expected_rc} output='${expected_output}', got rc=${actual_rc} output='${output}'"
+			fi
+		done
+	done
+
+	actual_rc=0
+	output=$(bash -euo pipefail -c '
+		source "$1/pulse-wrapper-commands.sh"
+		_pulse_wrapper_list_scope() { printf "owner/repo|%s\n" "$SCRIPT_DIR"; return 0; }
+		dispatch_with_dedup() { false; printf "unsafe continuation\n"; return 0; }
+		_pulse_wrapper_run_command dispatch 1 owner/repo title issue user "$SCRIPT_DIR" prompt
+	' bash "$SCRIPT_DIR") || actual_rc=$?
+	if [[ "$actual_rc" == 1 && "$output" == 'PULSE_COMMAND_RESULT command=dispatch rc=1 outcome=deferred' ]]; then
+		print_result "command router preserves fail-closed internal errexit (GH#34329)" 0
+	else
+		print_result "command router preserves fail-closed internal errexit (GH#34329)" 1 "rc=${actual_rc} output='${output}'"
+	fi
+
+	actual_rc=0
+	output=$(_pulse_wrapper_run_command repo-cap 2>/dev/null) || actual_rc=$?
+	if [[ "$actual_rc" == "2" && -z "$output" ]]; then
+		print_result "command router keeps usage exit 2 (GH#34323)" 0
+	else
+		print_result "command router keeps usage exit 2 (GH#34323)" 1 "Expected rc=2, got rc=${actual_rc}"
+	fi
+
+	for command_name in dispatch repo-cap; do
+		actual_rc=0
+		output=$(_pulse_wrapper_run_command "$command_name" 2>&1 >/dev/null) || actual_rc=$?
+		if [[ "$actual_rc" == 2 && "$output" == 'usage: pulse-wrapper.sh --command '* && "$output" != *PULSE_COMMAND_RESULT* ]]; then
+			print_result "command router keeps ${command_name} usage stderr-only without outcome (GH#34329)" 0
+		else
+			print_result "command router keeps ${command_name} usage stderr-only without outcome (GH#34329)" 1 \
+				"rc=${actual_rc} stderr='${output}'"
+		fi
+	done
+
+	return 0
+}
+
 test_list_dispatchable_candidates_default_open_except_needs_labels() {
 	GH_ISSUE_LIST_EXIT=0
 	GH_ISSUE_LIST_ERR=""
@@ -288,7 +442,8 @@ test_list_dispatchable_candidates_default_open_except_needs_labels() {
 	  {"number":9,"title":"in progress but runnable","updatedAt":"2026-03-31T00:08:00Z","assignees":[{"login":"owner"}],"labels":[{"name":"status:in-progress"}]},
 	  {"number":10,"title":"Infrastructure outage: 2 checks affected","updatedAt":"2026-03-31T00:09:00Z","assignees":[],"labels":[{"name":"infrastructure"},{"name":"source:ci-failure-miner"},{"name":"status:available"}]},
 	  {"number":11,"title":"auto dispatch in review","updatedAt":"2026-03-31T00:10:00Z","assignees":[{"login":"owner"}],"labels":[{"name":"status:in-review"},{"name":"auto-dispatch"}]},
-	  {"number":12,"title":"Implement infrastructure code","updatedAt":"2026-03-31T00:11:00Z","assignees":[],"labels":[{"name":"infrastructure"},{"name":"status:available"},{"name":"auto-dispatch"},{"name":"tier:standard"}]}
+	  {"number":12,"title":"Implement infrastructure code","updatedAt":"2026-03-31T00:11:00Z","assignees":[],"labels":[{"name":"infrastructure"},{"name":"status:available"},{"name":"auto-dispatch"},{"name":"tier:standard"}]},
+	  {"number":13,"title":"waiting for contributor evidence","updatedAt":"2026-03-31T00:12:00Z","assignees":[],"labels":[{"name":"status:needs-info"},{"name":"status:available"},{"name":"auto-dispatch"},{"name":"tier:standard"}]}
 	]'
 	GH_PR_LIST_JSON='[]'
 
@@ -299,7 +454,7 @@ test_list_dispatchable_candidates_default_open_except_needs_labels() {
 	# re-evaluating always-blocked candidates every pulse cycle. auto-dispatch is
 	# the exception: it must reach Layer 6 so stale assignment recovery can unstick
 	# worker-intended issues left with status:in-review.
-	if [[ "$output" == *$'1|unassigned'* && "$output" == *$'2|owner assigned'* && "$output" == *$'3|maintainer assigned'* && "$output" == *$'4|runner assigned'* && "$output" == *$'5|owner queued'* && "$output" == *$'11|auto dispatch in review'* && "$output" == *$'12|Implement infrastructure code'* && "$output" != *$'6|needs review'* && "$output" != *$'7|needs docs'* && "$output" != *$'8|supervisor telemetry'* && "$output" != *$'9|in progress but runnable'* && "$output" != *$'10|Infrastructure outage: 2 checks affected'* ]]; then
+	if [[ "$output" == *$'1|unassigned'* && "$output" == *$'2|owner assigned'* && "$output" == *$'3|maintainer assigned'* && "$output" == *$'4|runner assigned'* && "$output" == *$'5|owner queued'* && "$output" == *$'11|auto dispatch in review'* && "$output" == *$'12|Implement infrastructure code'* && "$output" != *$'6|needs review'* && "$output" != *$'7|needs docs'* && "$output" != *$'8|supervisor telemetry'* && "$output" != *$'9|in progress but runnable'* && "$output" != *$'10|Infrastructure outage: 2 checks affected'* && "$output" != *$'13|waiting for contributor evidence'* ]]; then
 		print_result "list_dispatchable_issue_candidates lets auto-dispatch active-status issues reach dedup" 0
 		return 0
 	fi
@@ -423,6 +578,8 @@ test_count_queued_without_worker_keeps_stdout_numeric_with_debug() {
 }
 
 test_queue_governor_enters_merge_heavy_at_critical_backlog() {
+	# Isolate the seeded target from the host's auto cap (cores/2) (GH#32686).
+	local MAX_WORKERS_CAP=64
 	STATE_FILE="${HOME}/.aidevops/logs/pulse-state.txt"
 	QUEUE_METRICS_FILE="${HOME}/.aidevops/logs/pulse-queue-metrics"
 	: >"$STATE_FILE"
@@ -445,6 +602,7 @@ test_queue_governor_enters_merge_heavy_at_critical_backlog() {
 }
 
 test_queue_governor_enters_pr_heavy_at_heavy_backlog() {
+	local MAX_WORKERS_CAP=64
 	STATE_FILE="${HOME}/.aidevops/logs/pulse-state.txt"
 	QUEUE_METRICS_FILE="${HOME}/.aidevops/logs/pulse-queue-metrics"
 	: >"$STATE_FILE"
@@ -466,6 +624,7 @@ test_queue_governor_enters_pr_heavy_at_heavy_backlog() {
 }
 
 test_queue_governor_reports_drain_rate_telemetry() {
+	local MAX_WORKERS_CAP=64
 	STATE_FILE="${HOME}/.aidevops/logs/pulse-state.txt"
 	QUEUE_METRICS_FILE="${HOME}/.aidevops/logs/pulse-queue-metrics"
 	: >"$STATE_FILE"
@@ -525,12 +684,17 @@ _setup_dispatch_stub() {
 		local issue_num="$1"
 		local repo_slug="$2"
 		local repo_path="$3"
+		local result_var="${4:-}"
 		local artifact_dir="${TEST_ROOT}/prompt-artifacts-${issue_num}"
 		local prompt_file="${artifact_dir}/prompt-${repo_slug//\//-}-${repo_path##*/}.md"
 		mkdir -p "$artifact_dir"
 		printf 'test prompt for %s\n' "$issue_num" >"$prompt_file"
-		printf '%s|test-content-%s|%s\n' \
-			"$prompt_file" "$issue_num" "$TRIAGE_TEST_PROMPT_METADATA"
+		local result="${prompt_file}|test-content-${issue_num}|${TRIAGE_TEST_PROMPT_METADATA}"
+		if [[ -n "$result_var" ]]; then
+			printf -v "$result_var" '%s' "$result"
+		else
+			printf '%s\n' "$result"
+		fi
 		return 0
 	}
 
@@ -900,6 +1064,32 @@ test_dispatch_triage_reviews_types_infrastructure_failures() {
 	return 0
 }
 
+test_dispatch_triage_reviews_counts_prefetch_infrastructure_failures() {
+	local repos_json="" state_file="" outcome="" original_builder=""
+	repos_json=$(_make_repos_json "owner/repo" "/tmp/repo")
+	state_file=$(_make_state_file "## owner/repo
+
+- Issue #801: Prefetch fails [status: **needs-review**] [created: 2026-01-01T00:00:00Z]
+")
+	STATE_FILE="$state_file"
+	TRIAGE_STATE_FILE="$state_file"
+	original_builder=$(declare -f _build_triage_review_prompt)
+	_build_triage_review_prompt() {
+		_PAD_TRIAGE_LAST_BUILD_OUTCOME="$_PAD_TRIAGE_OUTCOME_INFRASTRUCTURE_FAILED"
+		return 1
+	}
+	outcome=$(dispatch_triage_reviews 1 "$repos_json" 2>/dev/null)
+	eval "$original_builder"
+	if [[ "$(printf '%s' "$outcome" | jq -r '.attempted')" == "0" && \
+		"$(printf '%s' "$outcome" | jq -r '.infrastructure_failed')" == "1" ]]; then
+		print_result "dispatch_triage_reviews counts prompt-build infrastructure failures" 0
+		return 0
+	fi
+	print_result "dispatch_triage_reviews counts prompt-build infrastructure failures" 1 \
+		"Unexpected outcome '${outcome}'"
+	return 0
+}
+
 test_triage_prepass_has_independent_once_per_cycle_budget() {
 	local repos_json="" state_file="" first="" second="" dispatch_count=""
 	local enrichment_definition=""
@@ -1140,6 +1330,7 @@ main() {
 	_setup_dispatch_stub
 
 	test_counts_workers_and_ignores_supervisor_session
+	test_foreign_workers_leave_runner_capacity_free
 	test_returns_zero_when_no_full_loop_workers
 	test_does_not_exclude_non_supervisor_role_pulse_commands
 	test_prefetch_active_workers_excludes_supervisor
@@ -1147,6 +1338,8 @@ main() {
 	test_has_worker_exact_dir_match_no_sibling_false_positive
 	test_has_worker_exact_dir_match_accepts_correct_path
 	test_counts_review_issue_pr_workers
+	test_policy_compatible_command_router
+	test_command_router_outcomes_under_errexit
 	test_list_dispatchable_candidates_default_open_except_needs_labels
 	test_list_dispatchable_candidates_logs_cooldown_skip_not_failure
 	test_count_runnable_candidates_counts_default_open_backlog
@@ -1165,6 +1358,7 @@ main() {
 	test_dispatch_triage_reviews_returns_zero_when_no_state_file
 	test_dispatch_triage_reviews_rejects_malformed_metadata
 	test_dispatch_triage_reviews_types_infrastructure_failures
+	test_dispatch_triage_reviews_counts_prefetch_infrastructure_failures
 	test_triage_prepass_has_independent_once_per_cycle_budget
 	test_triage_prepass_rest_gate_blocks_before_review_api
 	test_triage_fallback_outcome_is_valid

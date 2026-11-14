@@ -126,12 +126,21 @@
     "draft_responses": true,
 
     // Hard ceiling for pulse worker pool size after RAM-based calculation.
-    // Default 8 preserves current behavior.
+    // 0 = auto: (total RAM - reserve) / per-worker RAM (min 2, max 64).
+    // Worker admission is RAM-only: CPU load and core counts never limit it
+    // (GH#35537; reference/configuration.md "Worker resource policy").
+    // Set a positive number only when a machine needs a fixed ceiling.
     // Env override: AIDEVOPS_MAX_WORKERS_CAP
-    "max_workers_cap": 8,
+    "max_workers_cap": 0,
+
+    // DEPRECATED (GH#35537): CPU load never gates worker admission. These
+    // fields are ignored; remove them from config.
+    "max_load_per_core": 4.0,
+    "cpu_idle_admit_percent": 25,
 
     // Minimum active implementation-worker floor. Pulse will try to refill to
-    // this target while provider/account health and host load are acceptable.
+    // this target while provider/account health and RAM headroom allow.
+    // Never exceeds the resolved max_workers_cap or RAM headroom.
     // Set to 0 to disable. Env override: AIDEVOPS_MIN_WORKER_CONCURRENCY
     "min_worker_concurrency": 6,
 
@@ -142,7 +151,7 @@
 
     // Worker slots allowed per available provider OAuth account.
     // Default 24 lets a single healthy provider account use the configured
-    // max worker cap; RAM, load, health/rate-limit, auth, and explicit user
+    // max worker cap; RAM, health/rate-limit, auth, and explicit user
     // overrides still reduce capacity.
     // Env override: PULSE_PROVIDER_ACCOUNT_SLOT_MULTIPLIER
     "provider_account_slot_multiplier": 24,
@@ -199,6 +208,32 @@
   },
 
   // ---------------------------------------------------------------------------
+  // keywords — context/keywords.md search-targets data (seo/keywords-standard.md)
+  // ---------------------------------------------------------------------------
+  "keywords": {
+    // Default paid-provider spend cap per property per calendar month (USD).
+    // Per-repo override: repos.json keywords.budget_usd_month or the
+    // budget_usd_month front matter in context/keywords.md.
+    // Env override: AIDEVOPS_KEYWORDS_MONTHLY_BUDGET_USD
+    "monthly_budget_usd": 1,
+
+    // Private team hub repository (owner/repo) that stores registries,
+    // history and spend for every property. Local only — never committed.
+    // Empty keeps data in ~/.aidevops/.agent-workspace/keywords/local.
+    // Env override: AIDEVOPS_KEYWORDS_HUB_SLUG
+    "hub_slug": "",
+
+    // Optional explicit hub checkout path. Empty uses the workspace clone.
+    // Env override: AIDEVOPS_KEYWORDS_HUB_PATH
+    "hub_path": "",
+
+    // Conservative pre-call estimate for one DataForSEO ranked-keywords call.
+    // The ledger records the provider-reported cost when the response has one.
+    // Env override: AIDEVOPS_KEYWORDS_DATAFORSEO_ESTIMATE_USD
+    "dataforseo_estimate_usd": 0.05
+  },
+
+  // ---------------------------------------------------------------------------
   // safety — Security hooks, verification, and protective measures
   // ---------------------------------------------------------------------------
   "safety": {
@@ -212,6 +247,10 @@
 
     // Model tier used for verification checks (cheapest sufficient tier).
     "verification_tier": "simple",
+
+    // GitHub blocks pull_request_target by default from 2026-12-02.
+    // True allows Pulse to mutate public repository Actions event policies.
+    "actions_event_policy_auto_apply": false,
 
     // Maximum number of concurrent interactive AI sessions before warning.
     // Counts processes matching known AI coding assistants (opencode, claude, etc.).
@@ -245,16 +284,16 @@
     // The first available model in the list is used.
     "tiers": {
       "simple": {
-        "models": ["openai/gpt-5.6-terra", "anthropic/claude-haiku-4-5"],
-        "reasoning": { "openai": "medium" }
+        "models": ["openai/gpt-6-luna", "anthropic/claude-haiku-5-5"],
+        "reasoning": { "openai/gpt-6-luna": "high", "anthropic/claude-haiku-5-5": "high" }
       },
       "standard": {
-        "models": ["openai/gpt-5.6-luna", "anthropic/claude-sonnet-4-6"],
-        "reasoning": { "openai": "max" }
+        "models": ["anthropic/claude-sonnet-5-5", "openai/gpt-6.1-sol", "openai/gpt-6.1-terra", "opencode-go/deepseek-v4.1-flash"],
+        "reasoning": { "anthropic/claude-sonnet-5-5": "medium", "openai/gpt-6.1-sol": "medium", "openai/gpt-6.1-terra": "medium", "opencode-go/deepseek-v4.1-flash": "high" }
       },
       "thinking": {
-        "models": ["openai/gpt-5.6-sol", "anthropic/claude-opus-4-6"],
-        "reasoning": { "openai": "high" }
+        "models": ["anthropic/claude-opus-5-5", "openai/gpt-6.1-sol"],
+        "reasoning": { "anthropic/claude-opus-5-5": "high", "openai/gpt-6.1-sol": "medium" }
       }
     },
 
@@ -279,10 +318,10 @@
 
     // Fallback chain configuration for model-level failover.
     "fallback_chains": {
-      "simple":   ["openai/gpt-5.6-terra", "anthropic/claude-haiku-4-5"],
-      "standard": ["openai/gpt-5.6-luna", "anthropic/claude-sonnet-4-6"],
-      "thinking": ["openai/gpt-5.6-sol", "anthropic/claude-opus-4-6"],
-      "default":  ["openai/gpt-5.6-luna", "anthropic/claude-sonnet-4-6"]
+      "simple":   ["openai/gpt-6-luna", "anthropic/claude-haiku-5-5"],
+      "standard": ["anthropic/claude-sonnet-5-5", "openai/gpt-6.1-sol", "openai/gpt-6.1-terra", "opencode-go/deepseek-v4.1-flash"],
+      "thinking": ["anthropic/claude-opus-5-5", "openai/gpt-6.1-sol"],
+      "default":  ["anthropic/claude-sonnet-5-5", "openai/gpt-6.1-sol", "openai/gpt-6.1-terra", "opencode-go/deepseek-v4.1-flash"]
     },
 
     // Fallback trigger configuration.
@@ -296,6 +335,7 @@
 
     // General model routing settings.
     "settings": {
+      "minimum_reasoning": "medium",
       "probe_timeout_seconds": 10,
       "cache_ttl_seconds": 300,
       "max_chain_depth": 5,
@@ -405,6 +445,33 @@
       "financial":                  { "risk_level": "high",     "gate": "warn" },
       "infrastructure_destruction": { "risk_level": "critical", "gate": "block" }
     }
+  },
+
+  // ---------------------------------------------------------------------------
+  // storage — Worktree archive candidacy and compact-archive retention
+  // ---------------------------------------------------------------------------
+  // Thresholds are hours of boot-scoped, registry-confirmed idle before guarded
+  // Pulse cleanup may restore-verify a self-contained archive and remove the
+  // full worktree. Git metadata age alone is not authority. They never bypass
+  // owner, open-PR, process, lock, preservation-marker or archive-verification
+  // guards. Minimum 24; smaller or malformed values use the shipped default.
+  "storage": {
+    // Compact-archive expiry: "dry-run" reports only, "apply" deletes expired
+    // archives, "off" disables the pass.
+    // Env override: AIDEVOPS_WORKTREE_ARCHIVE_RETENTION_MODE
+    "worktree_archive_retention_mode": "dry-run",
+
+    // Abandoned worktrees with local commits (7 days).
+    // Env override (seconds): ORPHAN_LOCAL_COMMIT_ARCHIVE_SECS
+    "worktree_local_commit_archive_hours": 168,
+
+    // Dirty generated auto/review worktrees (7 days).
+    // Env override (seconds): ORPHAN_GENERATED_DIRTY_ARCHIVE_SECS
+    "worktree_generated_dirty_archive_hours": 168,
+
+    // Unattributed worktrees with no open head PR (14 days).
+    // Env override (days): WORKTREE_UNATTRIBUTED_RETENTION_DAYS
+    "worktree_unattributed_archive_hours": 336
   },
 
   // ---------------------------------------------------------------------------

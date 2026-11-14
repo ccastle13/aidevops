@@ -66,6 +66,18 @@ fi
 cat >"${stub_dir}/interactive-session-helper.sh" <<'STUB'
 #!/usr/bin/env bash
 printf 'claim cwd=%s marker=%s args=%s\n' "$(pwd -P)" "${AIDEVOPS_INTERACTIVE_ISSUE_IMPLEMENTATION:-0}" "$*" >>"$CALL_LOG"
+if [[ "${STUB_CLAIM_FAILS:-0}" == "1" && "$1" == "claim" ]]; then
+	exit 1
+fi
+if [[ "${STUB_CLAIM_DEFERRED:-0}" == "1" ]]; then
+	exit 75
+fi
+if [[ "${STUB_CLAIM_DEFERRED:-0}" == "initial" && "$*" == *--defer-comment* ]]; then
+	exit 75
+fi
+if [[ "${STUB_CLAIM_DEFERRED:-0}" == "refresh" && "$*" == *--worktree* ]]; then
+	exit 75
+fi
 exit 0
 STUB
 
@@ -135,7 +147,7 @@ assert_help_only "help after options" --issue 42 --repo owner/repo --help --task
 ) || fail "canonical-rooted issue start failed"
 
 assert_log_line "claim cwd=${canonical_root} marker=1 args=claim 42 owner/repo --implementing --defer-comment"
-assert_log_line "pre-edit cwd=${canonical_root} args=--loop-mode --task local fix"
+assert_log_line "pre-edit cwd=${canonical_root} args=--loop-mode --issue 42 --task local fix"
 assert_log_line "claim cwd=${canonical_root} marker=1 args=claim 42 owner/repo --implementing --worktree ${linked_worktree}"
 assert_log_line "full-loop cwd=${linked_worktree} marker=1 args=start GH#42 local fix"
 
@@ -149,6 +161,41 @@ assert_log_line "claim cwd=${linked_worktree} marker=1 args=claim 43 owner/repo 
 assert_log_line "claim cwd=${linked_worktree} marker=1 args=claim 43 owner/repo --implementing --worktree ${linked_worktree}"
 assert_log_line "full-loop cwd=${linked_worktree} marker=1 args=start GH#43 queued fix --background"
 
+# Transient claim failures must be visible but must not prevent local startup;
+# after an initial deferral the worktree claim is still attempted a second time.
+for deferred_phase in initial refresh 1; do
+	: >"$call_log"
+	deferred_output=$(
+		cd "$linked_worktree" || exit 1
+		STUB_CLAIM_DEFERRED="$deferred_phase" PRE_EDIT_MODE=linked-current PATH="${stub_dir}:$PATH" \
+			"$helper" --issue 47 --repo owner/repo --task "offline fix" 2>&1
+	) || fail "deferred $deferred_phase claim blocked offline startup"
+	[[ "$deferred_output" == *"claim NOT applied for #47 in owner/repo"* ]] ||
+		fail "deferred $deferred_phase claim was not surfaced"
+	assert_log_line "claim cwd=${linked_worktree} marker=1 args=claim 47 owner/repo --implementing --defer-comment"
+	assert_log_line "claim cwd=${linked_worktree} marker=1 args=claim 47 owner/repo --implementing --worktree ${linked_worktree}"
+	assert_log_line "full-loop cwd=${linked_worktree} marker=1 args=start GH#47 offline fix"
+done
+
+: >"$call_log"
+(
+	cd "$linked_worktree" || exit 1
+	PRE_EDIT_MODE=linked-current PATH="${stub_dir}:$PATH" \
+		"$helper" --issue 46 --repo owner/repo --task "replace abandoned work" \
+		--replace-pr 77 --replacement-reason "The existing implementation cannot satisfy the current API contract." </dev/null
+) || fail "explicit replacement issue start failed"
+assert_log_line "claim cwd=${linked_worktree} marker=1 args=claim 46 owner/repo --implementing --defer-comment --replace-pr 77 --replacement-reason The existing implementation cannot satisfy the current API contract."
+assert_log_line "claim cwd=${linked_worktree} marker=1 args=claim 46 owner/repo --implementing --worktree ${linked_worktree} --replace-pr 77 --replacement-reason The existing implementation cannot satisfy the current API contract."
+
+: >"$call_log"
+if STUB_CLAIM_FAILS=1 PATH="${stub_dir}:$PATH" \
+	"$helper" --issue 31317 --repo owner/repo --task "failed claim" </dev/null >/dev/null 2>&1; then
+	fail "failed initial claim reached success"
+fi
+if grep -q '^pre-edit \|^full-loop ' "$call_log"; then
+	fail "failed initial claim reached pre-edit or full-loop startup"
+fi
+
 for invalid_mode in missing malformed unsafe-canonical unregistered duplicate failure; do
 	: >"$call_log"
 	if PRE_EDIT_MODE="$invalid_mode" PATH="${stub_dir}:$PATH" \
@@ -160,5 +207,42 @@ for invalid_mode in missing malformed unsafe-canonical unregistered duplicate fa
 	fi
 done
 
-printf 'PASS interactive issue start enters only the verified linked worktree\n'
+# Reuse the existing isolated helper directory to test the source-preflight
+# branch without executing a real broker, contacting GitHub or invoking sudo.
+cp "$helper" "${stub_dir}/interactive-start-helper.sh" || fail "could not copy fixture helper"
+export SOURCE_POLICY_HELPER="${scripts_dir}/canonical-write-policy-helper.py"
+cat >"${stub_dir}/canonical-write-policy-helper.py" <<'STUB'
+import os, runpy, sys
+sys.path.insert(0, os.path.dirname(os.environ["SOURCE_POLICY_HELPER"]))
+runpy.run_path(os.environ["SOURCE_POLICY_HELPER"], run_name="__main__")
+STUB
+cat >"${stub_dir}/source-access-helper.sh" <<'STUB'
+#!/usr/bin/env bash
+printf 'proposal args=%s\n' "$*" >>"$CALL_LOG"
+printf '%064d\n' 0
+STUB
+chmod +x "${stub_dir}/source-access-helper.sh"
+: >"$call_log"
+proposal_output=$(
+	cd "$canonical_root" || exit 1
+	PRE_EDIT_MODE=valid PATH="${stub_dir}:$PATH" \
+		AIDEVOPS_OPENCODE_SESSION_ID=ses_fixture_123456 AIDEVOPS_SOURCE_CONTEXT_SOCKET=/fixture/socket \
+		"${stub_dir}/interactive-start-helper.sh" --issue 45 --repo owner/repo --task "prepare source" \
+		--source-path src/example.sh --source-path tests/test-example.sh </dev/null
+) || fail "source preflight failed"
+[[ "$proposal_output" == *"SOURCE_PROPOSAL_READY="* && "$proposal_output" == *"--source-proposal"* ]] ||
+	fail "source preflight omitted stable proposal/ceremony command"
+assert_log_line "proposal args=propose --session ses_fixture_123456 --repo owner/repo --issue 45 --reason secret-bearing basename --context-socket /fixture/socket --path ${linked_worktree}/src/example.sh --path ${linked_worktree}/tests/test-example.sh"
+if grep -q '^claim \|^full-loop ' "$call_log"; then
+	fail "powerless source preflight claimed or started implementation"
+fi
+: >"$call_log"
+if AIDEVOPS_OPENCODE_SESSION_ID="" OPENCODE_SESSION_ID="" AIDEVOPS_SOURCE_CONTEXT_SOCKET="" PATH="${stub_dir}:$PATH" \
+	"${stub_dir}/interactive-start-helper.sh" --issue 45 --repo owner/repo --task "missing context" \
+	--source-path src/example.sh </dev/null >/dev/null 2>&1; then
+	fail "source preflight accepted missing runtime context"
+fi
+[[ ! -s "$call_log" ]] || fail "missing-context preflight invoked lifecycle helpers"
+
+printf 'PASS interactive issue start enters only the verified linked worktree; source preflight remains powerless\n'
 exit 0

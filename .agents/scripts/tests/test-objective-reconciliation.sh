@@ -37,7 +37,9 @@ cat >"$fixture" <<'JSON'
     {"number":15,"repo":"owner/repo","updatedAt":9900},
     {"number":16,"repo":"owner/repo","updatedAt":9900,"recovery_comment_at":9000,"subsequent_action_at":8000,"recovery_attempt":5},
     {"number":17,"repo":"owner/repo","updatedAt":9900,"recovery_comment_at":9000,"subsequent_action_at":8000,"recovery_attempt":6},
-    {"number":18,"repo":"owner/repo","updatedAt":9900,"labels":["status:done"]}
+    {"number":18,"repo":"owner/repo","updatedAt":9900,"labels":["status:done"]},
+    {"number":19,"repo":"owner/repo","updatedAt":1000,"labels":[{"name":"persistent"},{"name":"quality-review"}]},
+    {"number":20,"repo":"owner/repo","updatedAt":1000,"labels":["routine-tracking","status:available"]}
   ],
   "prs": [],
   "merged_lookup": "|15=150|"
@@ -49,6 +51,7 @@ AIDEVOPS_OBJECTIVE_EVIDENCE_FILE="$TMP_DIR/missing-evidence.jsonl" \
 	"$HELPER" derive --repo owner/repo --input "$fixture" --now 10000 --ttl 3600 >"$derived"
 
 jq -e 'length == 18' "$derived" >/dev/null || fail "all objective fixtures must be derived"
+jq -e '[.[] | select(.number == 19 or .number == 20)] | length == 0' "$derived" >/dev/null || fail "GH#34589: persistent monitoring issues are not objectives"
 jq -e '.[] | select(.number == 1 and .objective_state == "actionable" and .next_action == "dispatch_objective" and .assumption_expired == true)' "$derived" >/dev/null || fail "queued objective classification"
 jq -e '.[] | select(.number == 2 and .objective_state == "actively owned" and .next_action == "monitor_worker")' "$derived" >/dev/null || fail "active ownership classification"
 jq -e '.[] | select(.number == 3 and .objective_state == "under review" and .next_action == "monitor_pr")' "$derived" >/dev/null || fail "review classification"
@@ -84,6 +87,7 @@ HOME="$TMP_DIR" WORKER_ISSUE_NUMBER=1 GITHUB_REPOSITORY=owner/repo \
 	AIDEVOPS_WORKER_ID=worker:test AIDEVOPS_OBJECTIVE_EVIDENCE_FILE="$evidence_file" \
 	bash -c 'source "$1"; _emit_worker_runtime_event worker.failed failed runtime_error' _ "$LIFECYCLE"
 jq -e 'select(.event_type == "worker.failed" and .issue_number == 1 and .next_action == "retry_infrastructure" and .commits_preserved == true)' "$evidence_file" >/dev/null || fail "terminal lifecycle evidence"
+[[ ! -e "${evidence_file}.lockdir" ]] || fail "lifecycle evidence append must release the shared ledger lock"
 AIDEVOPS_OBJECTIVE_EVIDENCE_FILE="$evidence_file" \
 	"$HELPER" derive --repo owner/repo --input "$fixture" --now 10000 --ttl 3600 >"$derived"
 jq -e '.[] | select(.number == 1 and .execution_path_state == "recovery" and .preservation.commits == true)' "$derived" >/dev/null || fail "durable lifecycle evidence merge"
@@ -162,6 +166,14 @@ jq -e '.attempt_id == "attempt-new" and .effective_outcome == "failed" and
 	.suppress_retry == false' "$disposition" >/dev/null ||
 	fail "issue-level disposition must sort by logical attempt chronology"
 
+# GH#32938: one torn concurrent append must not blank every disposition.
+printf '%s\n' '{"repo":"owner/repo","issue_number":42,"event_type":"worker.fa{"repo":"owner/repo","issue_number":42' >>"$chronology_file"
+AIDEVOPS_OBJECTIVE_EVIDENCE_FILE="$chronology_file" \
+	"$HELPER" disposition --repo owner/repo --issue 42 \
+	--state-file "$state_file" >"$disposition"
+jq -e '.attempt_id == "attempt-new" and .effective_outcome == "failed"' "$disposition" >/dev/null ||
+	fail "torn evidence line must not hide valid attempt outcomes"
+
 # Concurrent terminal writers for one attempt must produce one valid record.
 concurrent_file="$TMP_DIR/concurrent.jsonl"
 concurrent_pids=()
@@ -188,5 +200,32 @@ AIDEVOPS_OBJECTIVE_EVIDENCE_FILE="$TMP_DIR/missing-legacy-evidence.jsonl" \
 jq -e '.source == "objective_state" and .effective_outcome == "success" and
 	.suppress_retry == true and .suppress_failure_mining == true' \
 	"$disposition" >/dev/null || fail "legacy objective state remains readable"
+
+large_evidence_file="$TMP_DIR/large-evidence.jsonl"
+large_payload=$(printf '%0200000d' 0)
+for large_index in 1 2 3 4 5 6 7 8 9 10; do
+	printf '{"repo":"owner/repo","issue_number":%s,"event_type":"worker.failed","payload":"%s"}\n' \
+		"$large_index" "$large_payload" >>"$large_evidence_file"
+done
+AIDEVOPS_OBJECTIVE_EVIDENCE_FILE="$large_evidence_file" \
+	"$HELPER" record-outcome --repo owner/repo --issue 88 \
+	--attempt-id attempt-large --run-id run-large --raw-result recovered \
+	--outcome success --status recovered --classification stale_cleanup \
+	--next-action monitor_pr --timestamp 10400
+AIDEVOPS_OBJECTIVE_EVIDENCE_FILE="$large_evidence_file" \
+	"$HELPER" disposition --repo owner/repo --issue 88 --attempt-id attempt-large \
+	--state-file "$state_file" >"$disposition"
+jq -e '.source == "attempt_outcome" and .effective_outcome == "success" and
+	.raw_result == "recovered"' "$disposition" >/dev/null ||
+	fail "large evidence disposition must avoid argv limits"
+
+# GH#34589: derive/reconcile stream evidence too, and drop stale non-task rows.
+large_state="$TMP_DIR/large-state.json"
+printf '%s\n' '{"objectives":[{"repo":"owner/repo","number":19,"objective_state":"actionable","next_action":"dispatch_objective","assumption_expired":true}]}' >"$large_state"
+AIDEVOPS_OBJECTIVE_EVIDENCE_FILE="$large_evidence_file" \
+	"$HELPER" reconcile --repo owner/repo --input "$fixture" --state-file "$large_state" \
+	--now 10000 --ttl 3600 >/dev/null || fail "large evidence reconcile must avoid argv limits"
+jq -e '(.objectives | length) == 18 and ([.objectives[] | select(.number == 19)] | length) == 0' \
+	"$large_state" >/dev/null || fail "reconcile must drop stale persistent objectives"
 
 printf 'PASS objective-reconciliation\n'

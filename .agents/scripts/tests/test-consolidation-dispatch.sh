@@ -63,17 +63,19 @@ _write_gh_stub_binary() {
 # bash 3.2 compatible — no ;;& fall-through.
 printf '%s\n' "$*" >>"${GH_LOG:-/dev/null}"
 
-# _stub_parse_args: scan argv for `--jq <filter>` and `--state <state>`,
-# emit them on stdout as `JQ=<f>;STATE=<s>` so the caller can eval. Empty
-# values when absent. Used by the issue-list and pr-list branches.
+# _stub_parse_args: scan argv for `--jq <filter>` and `--state <state>` and
+# set the globals JQ and STATE (empty JQ / "open" STATE when absent). Sets
+# globals directly rather than emitting text for eval: real jq filters contain
+# quotes, pipes and parentheses that break an eval round-trip.
 _stub_parse_args() {
-	local prev="" jq="" state="open" arg
+	local prev="" arg
+	JQ=""
+	STATE="open"
 	for arg in "$@"; do
-		[[ "$prev" == "--jq" ]] && jq="$arg"
-		[[ "$prev" == "--state" ]] && state="$arg"
+		[[ "$prev" == "--jq" ]] && JQ="$arg"
+		[[ "$prev" == "--state" ]] && STATE="$arg"
 		prev="$arg"
 	done
-	printf 'JQ=%s\nSTATE=%s\n' "$jq" "$state"
 	return 0
 }
 
@@ -99,6 +101,7 @@ issue-view)
 	body) printf '%s\n' "${GH_ISSUE_VIEW_BODY:-Parent body}" ;;
 	labels) printf '%s\n' "${GH_ISSUE_VIEW_LABELS:-bug,tier:standard}" ;;
 	state,labels,assignees)
+		[[ "${GH_ISSUE_META_FAIL:-0}" == "1" ]] && exit 1
 		if [[ -n "${GH_ISSUE_META_JSON:-}" ]]; then
 			printf '%s\n' "$GH_ISSUE_META_JSON"
 		else
@@ -122,7 +125,7 @@ issue-list)
 	fi
 	# t2144: --state dispatch so tests can fixture open and closed child
 	# lists independently (grace-window regression tests).
-	eval "$(_stub_parse_args "$@")"
+	_stub_parse_args "$@"
 	list_json="${GH_ISSUE_LIST_CHILD_JSON:-[]}"
 	[[ "$STATE" == "closed" ]] && list_json="${GH_ISSUE_LIST_CHILD_CLOSED_JSON:-[]}"
 	_stub_emit "$list_json" "$JQ"
@@ -130,12 +133,37 @@ issue-list)
 pr-list)
 	# t2161: drives off GH_PR_LIST_RESOLVING_JSON. Honours --jq if used
 	# (current production caller does NOT — it pipes raw JSON through jq).
-	eval "$(_stub_parse_args "$@")"
+	_stub_parse_args "$@"
 	_stub_emit "${GH_PR_LIST_RESOLVING_JSON:-[]}" "$JQ"
 	;;
-issue-create) printf '%s\n' "${GH_ISSUE_CREATE_URL:-https://github.com/owner/repo/issues/999}" ;;
-api-*) printf '%s\n' "${GH_API_COMMENTS_JSON:-[]}" ;;
-issue-edit | issue-comment | label-create) ;;
+issue-create)
+	if [[ -n "${GH_ISSUE_CREATE_ERROR:-}" ]]; then
+		printf '%s\n' "$GH_ISSUE_CREATE_ERROR" >&2
+		exit 1
+	fi
+	printf '%s\n' "${GH_ISSUE_CREATE_URL:-https://github.com/owner/repo/issues/999}"
+	;;
+api-user) printf '%s\n' "${GH_SELF_LOGIN:-testuser}" ;;
+api-*)
+	# Lock-marker reads carry a jq filter naming the consolidation-lock
+	# marker; they must see no competing runner rather than the comments.
+	_stub_parse_args "$@"
+	if [[ "$JQ" == *consolidation-lock* ]]; then
+		_stub_emit "${GH_LOCK_MARKERS_JSON:-[]}" "$JQ"
+	else
+		printf '%s\n' "${GH_API_COMMENTS_JSON:-[]}"
+	fi
+	;;
+issue-comment)
+	while [[ $# -gt 0 ]]; do
+		if [[ "$1" == --body ]]; then
+			printf '%s' "$2" >"${GH_LOG}.receipt"
+			break
+		fi
+		shift
+	done
+	;;
+issue-edit | label-create) ;;
 *) printf 'gh stub: unhandled: %s\n' "$*" >&2 ;;
 esac
 exit 0
@@ -163,6 +191,8 @@ _setup_gh_stub_globals() {
 	export ISSUE_CONSOLIDATION_COMMENT_THRESHOLD=2
 	export REPOS_JSON="${TEST_ROOT}/repos.json"
 	printf '{"initialized_repos": []}\n' >"$REPOS_JSON"
+	# Tests never sleep during the lock tiebreak re-check.
+	export CONSOLIDATION_LOCK_TIEBREAK_WAIT_SEC=0
 
 	# Source pulse-triage.sh in isolation — it's intended to be sourced
 	# from pulse-wrapper.sh but the consolidation helpers are self-contained.
@@ -227,7 +257,9 @@ teardown_gh_stub() {
 	unset GH_ISSUE_VIEW_TITLE GH_ISSUE_VIEW_BODY GH_ISSUE_VIEW_LABELS GH_ISSUE_VIEW_STATE_JSON GH_ISSUE_VIEW_STATE_FAIL GH_ISSUE_META_JSON
 	unset GH_API_COMMENTS_JSON GH_ISSUE_LIST_CHILD_JSON GH_ISSUE_LIST_CHILD_CLOSED_JSON GH_ISSUE_CREATE_URL
 	unset GH_ISSUE_LIST_FAIL
+	unset GH_ISSUE_META_FAIL
 	unset GH_PR_LIST_RESOLVING_JSON
+	unset GH_ISSUE_CREATE_ERROR _CONSOLIDATION_SOURCE_FINGERPRINT
 	unset CONSOLIDATION_RECENT_CLOSE_GRACE_MIN
 	return 0
 }
@@ -307,13 +339,30 @@ test_child_body_contains_parent_content_and_authors() {
 		failures=$((failures + 1))
 		failmsg="${failmsg} | @bob not mentioned"
 	fi
-	if ! printf '%s' "$body" | grep -q 'You do \*\*NOT\*\* need to read'; then
+	if ! grep -qF 'Fetch omitted references before consolidating' <<<"$body"; then
 		failures=$((failures + 1))
-		failmsg="${failmsg} | missing self-contained warning"
+		failmsg="${failmsg} | missing omitted-source instructions"
 	fi
-	if ! printf '%s' "$body" | grep -qF -- '--label "consolidated,origin:worker,auto-dispatch,<copy relevant labels from parent, excluding needs-consolidation, consolidation-task, and origin:interactive>"'; then
+	if ! printf '%s' "$body" | grep -qF -- '--label "consolidated,origin:worker,auto-dispatch,status:available,<copy relevant labels from parent, excluding all status:* labels, needs-consolidation, consolidation-task, and origin:interactive>"'; then
 		failures=$((failures + 1))
-		failmsg="${failmsg} | consolidated successor instructions omit auto-dispatch handoff"
+		failmsg="${failmsg} | consolidated successor instructions omit available handoff or parent status exclusion"
+	fi
+	if ! printf '%s' "$body" | grep -qF -- 'gh-write-helper.sh issue create --repo "owner/repo"' ||
+		! printf '%s' "$body" | grep -qF -- '--body-file "<file containing the merged body from step 2>"'; then
+		failures=$((failures + 1))
+		failmsg="${failmsg} | successor creation omits signed wrapper or body-file"
+	fi
+	if ! printf '%s' "$body" | grep -qF -- "Use \`EDIT:\` when the path already exists on the default branch" ||
+		! printf '%s' "$body" | grep -qF -- 'A stale checkout or failed API lookup is not proof of absence.'; then
+		failures=$((failures + 1))
+		failmsg="${failmsg} | scope instructions omit default-branch existence verification"
+	fi
+	if ! printf '%s' "$body" | grep -qF -- "copy verbatim every line matching \`^requires-secrets:\`" ||
+		! printf '%s' "$body" | grep -qF -- 'Preserve every wildcard scope entry verbatim from every superseded issue' ||
+		! printf '%s' "$body" | grep -qF -- 'consolidation-contract-validator.py' ||
+		! printf '%s' "$body" | grep -qF -- 'Repeat --source for each additional superseded issue body.'; then
+		failures=$((failures + 1))
+		failmsg="${failmsg} | successor contract preservation or pre-publication validation missing"
 	fi
 	if printf '%s' "$body" | grep -q 'github-actions'; then
 		failures=$((failures + 1))
@@ -327,6 +376,30 @@ test_child_body_contains_parent_content_and_authors() {
 	fi
 
 	teardown_gh_stub
+	return 0
+}
+
+# GH#37809: a blocked parent hands status:blocked (not status:available) to its
+# consolidated successor; ownership statuses are still never copied.
+test_child_body_carries_blocked_status_to_successor() {
+	local body
+	body=$(_compose_consolidation_child_body \
+		124 "owner/repo" "test: blocked parent" "Waiting on upstream schema." \
+		"[]" "@alice" "bug,auto-dispatch,status:blocked")
+
+	local failmsg=""
+	grep -qF -- '--label "consolidated,origin:worker,auto-dispatch,status:blocked,<copy relevant labels from parent, excluding all status:* labels' <<<"$body" ||
+		failmsg="${failmsg} | successor label list omits carried status:blocked"
+	grep -qF -- 'auto-dispatch,status:available,' <<<"$body" &&
+		failmsg="${failmsg} | blocked parent still hands off status:available"
+	grep -qF -- 'Keep the blocker text in the merged body.' <<<"$body" ||
+		failmsg="${failmsg} | blocked handoff omits blocker-text retention"
+
+	if [[ -z "$failmsg" ]]; then
+		print_result "blocked parent hands status:blocked to consolidated successor" 0
+	else
+		print_result "blocked parent hands status:blocked to consolidated successor" 1 "$failmsg"
+	fi
 	return 0
 }
 
@@ -483,6 +556,27 @@ test_needs_consolidation_skips_with_child() {
 		print_result "_issue_needs_consolidation skips when child exists" 0
 	fi
 
+	# #35605: a labeled parent with an in-flight child reports it, so the
+	# dispatch scope gate keeps implementation workers off the parent.
+	GH_ISSUE_VIEW_LABELS="bug,tier:standard,needs-consolidation"
+	export GH_ISSUE_VIEW_LABELS
+	if ! _issue_needs_consolidation 123 "owner/repo" &&
+		[[ "${_CONSOLIDATION_CHILD_PENDING:-0}" == 1 ]]; then
+		print_result "in-flight consolidation child is reported to dispatch" 0
+	else
+		print_result "in-flight consolidation child is reported to dispatch" 1 \
+			"pending=${_CONSOLIDATION_CHILD_PENDING:-unset}"
+	fi
+	GH_ISSUE_LIST_CHILD_JSON='[]'
+	GH_ISSUE_LIST_CHILD_CLOSED_JSON='[]'
+	export GH_ISSUE_LIST_CHILD_JSON GH_ISSUE_LIST_CHILD_CLOSED_JSON
+	_issue_needs_consolidation 123 "owner/repo" || true
+	if [[ "${_CONSOLIDATION_CHILD_PENDING:-0}" == 0 ]]; then
+		print_result "no consolidation child clears the pending report" 0
+	else
+		print_result "no consolidation child clears the pending report" 1
+	fi
+
 	teardown_gh_stub
 	return 0
 }
@@ -536,6 +630,18 @@ fixture_cost_circuit_breaker_comments() {
 [
   {"user": {"login": "marcusquinn", "type": "User"}, "created_at": "2026-05-02T19:27:10Z", "body": "<!-- cost-circuit-breaker:fired tier=standard spent=248726 budget=100000 -->\nCost circuit breaker fired. This diagnostic comment is intentionally long enough to clear the consolidation min-char threshold."},
   {"user": {"login": "marcusquinn", "type": "User"}, "created_at": "2026-05-02T19:42:10Z", "body": "<!-- cost-circuit-breaker:fired tier=standard spent=350000 budget=100000 -->\nCost circuit breaker fired again. This diagnostic comment is intentionally long enough to clear the consolidation min-char threshold."}
+]
+JSON
+	return 0
+}
+
+# GH#32905: a missing-scope brief hold followed by its repair note (shapes from
+# GH#32849) is operational lifecycle, not scope discussion.
+fixture_brief_hold_and_repair_comments() {
+	cat <<'JSON'
+[
+  {"user": {"login": "maintainer-one", "type": "User"}, "created_at": "2026-09-28T18:50:00Z", "body": "<!-- aidevops:brief-hold reason=missing_files_scope body=f92f02a1d7ecbc037cccab11 -->\nBrief hold: reason=missing_files_scope. This operational body is intentionally long enough to clear the consolidation threshold."},
+  {"user": {"login": "maintainer-one", "type": "User"}, "created_at": "2026-09-28T21:01:00Z", "body": "Brief repaired: added a canonical Files Scope so the pre-claim scope gate passes. This operational body is intentionally long enough to clear the consolidation threshold."}
 ]
 JSON
 	return 0
@@ -691,6 +797,51 @@ test_cost_circuit_breaker_comments_are_filtered() {
 	else
 		print_result "cost-circuit-breaker comments are excluded from consolidation body input" 1 \
 			"(substantive_json=$substantive_json)"
+	fi
+
+	teardown_gh_stub
+	return 0
+}
+
+# New automated comment kinds need no per-shape regex. Exercise the production
+# 500-character gate and both classification and child composition paths.
+test_structural_ops_marker_filters_unknown_comment_kind() {
+	setup_gh_stub
+	export ISSUE_CONSOLIDATION_COMMENT_MIN_CHARS=500
+	local comments_json substantive_json section
+	comments_json=$(jq -n --arg pad "$(printf '%0600d' 0)" '[range(2) | {user:{login:"maintainer",type:"User"},created_at:"2026-09-29T00:00:00Z",body:("Unrecognized lifecycle note " + $pad + "\n<!-- aidevops:ops kind=future-workflow -->")}]')
+	GH_API_COMMENTS_JSON="$comments_json"
+	export GH_API_COMMENTS_JSON
+	if _issue_needs_consolidation 32924 "marcusquinn/aidevops"; then
+		print_result "structural ops marker blocks consolidation classification" 1
+	else
+		print_result "structural ops marker blocks consolidation classification" 0
+	fi
+	substantive_json=$(_consolidation_substantive_comments 32924 "marcusquinn/aidevops")
+	section=$(_format_consolidation_comments_section "$substantive_json")
+	if [[ "$substantive_json" == "[]" && "$section" != *"Unrecognized lifecycle note"* ]]; then
+		print_result "structural ops marker excludes child composition" 0
+	else
+		print_result "structural ops marker excludes child composition" 1
+	fi
+	teardown_gh_stub
+	return 0
+}
+
+test_brief_hold_and_repair_comments_are_filtered() {
+	setup_gh_stub
+	GH_ISSUE_VIEW_LABELS="bug,tier:standard"
+	GH_API_COMMENTS_JSON=$(fixture_brief_hold_and_repair_comments)
+	GH_ISSUE_LIST_CHILD_JSON="[]"
+	GH_ISSUE_LIST_CHILD_CLOSED_JSON="[]"
+	export GH_ISSUE_VIEW_LABELS GH_API_COMMENTS_JSON
+	export GH_ISSUE_LIST_CHILD_JSON GH_ISSUE_LIST_CHILD_CLOSED_JSON
+
+	if _issue_needs_consolidation 32849 "marcusquinn/aidevops"; then
+		print_result "GH#32905: brief hold and repair comments are filtered" 1 \
+			"_issue_needs_consolidation returned 0 despite only brief-hold lifecycle noise"
+	else
+		print_result "GH#32905: brief hold and repair comments are filtered" 0
 	fi
 
 	teardown_gh_stub
@@ -993,15 +1144,30 @@ fixture_open_pr_resolving() {
 	'
 }
 
-# Helper: PR list payload with one open PR that REFERENCES the parent
-# but does NOT use a closing keyword (e.g. "For #N", "Ref #N", bare `#N`).
+# Helper: PR list payload with one open PR that only MENTIONS the parent
+# (bare `#N`, or a keyword pointing at a longer issue number).
 fixture_open_pr_non_closing() {
 	local parent_num="$1"
 	jq -n --arg n "$parent_num" '
 		[
 			{
 				"number": 19467,
-				"body": ("## Summary\n\nDocs-only follow-up that mentions #" + $n + " for context.\n\nFor #" + $n + "\n\n## Testing\n...")
+				"body": ("## Summary\n\nDocs-only follow-up that mentions #" + $n + " for context.\n\nFor #" + $n + "1\n\n## Testing\n...")
+			}
+		]
+	'
+}
+
+# Helper: PR list payload with one open PR that references the parent with a
+# non-closing in-flight keyword (GH#33284: `For #N` / `Ref #N`).
+fixture_open_pr_inflight_keyword() {
+	local parent_num="$1"
+	local keyword="$2"
+	jq -n --arg n "$parent_num" --arg k "$keyword" '
+		[
+			{
+				"number": 19468,
+				"body": ("## Summary\n\nData for a held parent.\n\n" + $k + " #" + $n + "\n\n## Testing\n...")
 			}
 		]
 	'
@@ -1024,21 +1190,35 @@ test_resolving_pr_helper_detects_closing_keyword() {
 	return 0
 }
 
-# t2161 A1 regression: helper returns 1 when only non-closing references exist.
-# `For #N`, `Ref #N`, and bare `#N` mentions must NOT be treated as resolving.
+# t2161 A1 regression: helper returns 1 when only bare mentions exist.
+# Bare `#N` and `For #N1` (a different issue) must NOT count as in-flight.
 test_resolving_pr_helper_ignores_non_closing_reference() {
 	setup_gh_stub
 	GH_PR_LIST_RESOLVING_JSON=$(fixture_open_pr_non_closing 19448)
 	export GH_PR_LIST_RESOLVING_JSON
 
 	if _consolidation_resolving_pr_exists 19448 "marcusquinn/aidevops"; then
-		print_result "t2161: helper ignores 'For #N' / bare '#N' references" 1 \
-			"_consolidation_resolving_pr_exists returned 0 for non-closing reference"
+		print_result "t2161: helper ignores bare '#N' and 'For #N1' references" 1 \
+			"_consolidation_resolving_pr_exists returned 0 for a bare mention"
 	else
-		print_result "t2161: helper ignores 'For #N' / bare '#N' references" 0
+		print_result "t2161: helper ignores bare '#N' and 'For #N1' references" 0
 	fi
 
 	teardown_gh_stub
+	return 0
+}
+
+# GH#33284: `For #N` / `Ref #N` open PRs are in-flight work on a held parent.
+test_resolving_pr_helper_detects_for_ref_keywords() {
+	local keyword="" result=0
+	for keyword in "For" "Ref" "for"; do
+		setup_gh_stub
+		GH_PR_LIST_RESOLVING_JSON=$(fixture_open_pr_inflight_keyword 19448 "$keyword")
+		export GH_PR_LIST_RESOLVING_JSON
+		_consolidation_resolving_pr_exists 19448 "marcusquinn/aidevops" || result=1
+		teardown_gh_stub
+	done
+	print_result "GH#33284: helper treats open 'For #N' / 'Ref #N' PRs as in-flight" "$result"
 	return 0
 }
 
@@ -1114,15 +1294,14 @@ test_single_bot_comment_does_not_trigger_consolidation() {
 	return 0
 }
 
-# GH#27853: terminal retry breakers must delegate to the existing dispatcher
-# rather than creating labels, comments, or child issues through a parallel
-# path. Existing child/lock tests above provide the idempotency coverage.
+# GH#27853: terminal retry breakers with a substantive comment must delegate
+# to the existing dispatcher. Existing child/lock tests cover idempotency.
 test_terminal_breaker_bridge_delegates_to_dispatcher() {
 	setup_gh_stub
 	GH_ISSUE_VIEW_TITLE="test: terminal breaker parent"
 	GH_ISSUE_VIEW_BODY="Original terminal breaker parent body."
 	GH_ISSUE_VIEW_LABELS="bug,tier:standard,needs-maintainer-review"
-	GH_API_COMMENTS_JSON="[]"
+	GH_API_COMMENTS_JSON=$(fixture_two_substantive_comments | jq '[.[0]]')
 	GH_ISSUE_LIST_CHILD_JSON="[]"
 	GH_ISSUE_LIST_CHILD_CLOSED_JSON="[]"
 	GH_PR_LIST_RESOLVING_JSON="[]"
@@ -1142,6 +1321,93 @@ test_terminal_breaker_bridge_delegates_to_dispatcher() {
 			"rc=${rc}; expected gh issue create through _dispatch_issue_consolidation"
 	fi
 
+	teardown_gh_stub
+	return 0
+}
+
+test_terminal_breaker_skips_automation_only_thread() {
+	setup_gh_stub
+	GH_API_COMMENTS_JSON=$(jq -n --arg body '<!-- triage-escalation --> Automated terminal breaker notice with lots of details and no scope discussion.' \
+		'[{user:{login:"maintainer",type:"User"},body:$body}]')
+	export GH_API_COMMENTS_JSON
+
+	local rc=0
+	_route_terminal_breaker_to_consolidation 123 owner/repo fast-fail-hard-stop || rc=$?
+	if [[ "$rc" -eq 0 ]] && ! grep -q 'issue create\|issue edit\|issue comment' "$GH_LOG" &&
+		grep -q 'terminal breaker consolidation skipped: no substantive comments' "$LOGFILE"; then
+		print_result "GH#33255: automation-only breaker preserves blocked issue without child" 0
+	else
+		print_result "GH#33255: automation-only breaker preserves blocked issue without child" 1 \
+			"rc=${rc}; unexpected issue write or missing skip log"
+	fi
+	teardown_gh_stub
+	return 0
+}
+
+test_terminal_breaker_skips_permission_boundary() {
+	setup_gh_stub
+	GH_API_COMMENTS_JSON=$(fixture_two_substantive_comments | jq '[.[0]]')
+	export GH_API_COMMENTS_JSON
+
+	local rc=0
+	_route_terminal_breaker_to_consolidation 123 owner/repo fast-fail-hard-stop "reason=permission_required count=3" || rc=$?
+	if [[ "$rc" -eq 0 ]] && ! grep -q 'issue create\|issue edit\|issue comment' "$GH_LOG" &&
+		grep -q 'human-owned boundary (permission_required)' "$LOGFILE"; then
+		print_result "GH#33940: permission_required breaker never consolidates" 0
+	else
+		print_result "GH#33940: permission_required breaker never consolidates" 1 \
+			"rc=${rc}; unexpected issue write or missing skip log"
+	fi
+	teardown_gh_stub
+	return 0
+}
+
+test_worker_checkpoint_not_substantive() {
+	local checkpoint_body="Implementation checkpoint: updated the helper, pushed a branch and verified the focused cases. Remaining work is the final regression run and PR handoff for this issue. <!-- aidevops:origin:worker -->"
+	local comments count
+	comments=$(jq -n --arg body "$checkpoint_body" '[{user:{login:"maintainer",type:"User"},created_at:"2026-01-01T00:00:00Z",body:$body}]')
+	count=$(_consolidation_filter_substantive_comments "$comments" | jq 'length')
+	if [[ "$count" -eq 0 ]]; then
+		print_result "GH#33940: worker checkpoint comment is not substantive" 0
+	else
+		print_result "GH#33940: worker checkpoint comment is not substantive" 1 "count=${count}"
+	fi
+	return 0
+}
+
+# GH#34851: operational notices must not turn one scope comment into two.
+test_checkpoint_variants_preserve_scope_threshold() {
+	setup_gh_stub
+	local prefix comments count
+	for prefix in 'Implementation checkpoint:' '## Implementation checkpoint — verification blocked' \
+		'# Implementation checkpoint' '###### Implementation checkpoint:' 'Brief repaired:'; do
+		comments=$(fixture_two_substantive_comments | jq --arg prefix "$prefix" \
+			'.[1].body = ($prefix + "\nUpdated the helper and synced the implementation details into the issue body. Verification and handoff remain operational progress, not a new scope requirement.")')
+		count=$(_consolidation_filter_substantive_comments "$comments" | jq 'length')
+		GH_API_COMMENTS_JSON="$comments"
+		export GH_API_COMMENTS_JSON
+		if [[ "$count" -eq 1 ]] && ! _issue_needs_consolidation 123 owner/repo; then
+			print_result "GH#34851: one scope comment plus $prefix stays below threshold" 0
+		else
+			print_result "GH#34851: one scope comment plus $prefix stays below threshold" 1 "count=${count}"
+		fi
+	done
+
+	GH_API_COMMENTS_JSON=$(fixture_two_substantive_comments)
+	export GH_API_COMMENTS_JSON
+	if _issue_needs_consolidation 123 owner/repo; then
+		print_result "GH#34851: two genuine scope comments still trigger consolidation" 0
+	else
+		print_result "GH#34851: two genuine scope comments still trigger consolidation" 1
+	fi
+	# A longer word sharing the prefix is not an operational checkpoint.
+	comments=$(fixture_two_substantive_comments | jq '.[1].body = ("Implementation checkpoints need a new persistence format and recovery contract. " + .[1].body)')
+	count=$(_consolidation_filter_substantive_comments "$comments" | jq 'length')
+	if [[ "$count" -eq 2 ]]; then
+		print_result "GH#34851: checkpoint word boundary preserves genuine discussion" 0
+	else
+		print_result "GH#34851: checkpoint word boundary preserves genuine discussion" 1 "count=${count}"
+	fi
 	teardown_gh_stub
 	return 0
 }
@@ -1191,7 +1457,7 @@ fixture_live_interactive_claim() {
 test_live_interactive_claim_blocks_classification_and_clears_stale_label() {
 	setup_gh_stub
 	GH_ISSUE_VIEW_LABELS="bug,needs-consolidation,status:in-review"
-	GH_ISSUE_META_JSON=$(jq -n '{state: "OPEN", labels: [{name: "status:in-review"}], assignees: [{login: "interactive-owner"}]}')
+	GH_ISSUE_META_JSON=$(jq -n '{state: "OPEN", labels: [{name: "status:claimed"}], assignees: [{login: "interactive-owner"}]}')
 	GH_API_COMMENTS_JSON=$(fixture_live_interactive_claim)
 	GH_ISSUE_LIST_CHILD_JSON="[]"
 	export GH_ISSUE_VIEW_LABELS GH_ISSUE_META_JSON GH_API_COMMENTS_JSON GH_ISSUE_LIST_CHILD_JSON
@@ -1203,6 +1469,136 @@ test_live_interactive_claim_blocks_classification_and_clears_stale_label() {
 	else
 		print_result "live interactive claim blocks consolidation classification and clears stale label" 1 \
 			"expected stale needs-consolidation cleanup"
+	fi
+
+	teardown_gh_stub
+	return 0
+}
+
+test_active_headless_ownership_blocks_classification_and_clears_stale_label() {
+	setup_gh_stub
+	GH_ISSUE_VIEW_LABELS="bug,needs-consolidation,status:in-progress"
+	GH_ISSUE_META_JSON=$(jq -n '{state:"OPEN",labels:[{name:"status:in-progress"}],assignees:[{login:"worker-owner"}]}')
+	GH_API_COMMENTS_JSON=$(fixture_two_substantive_comments)
+	GH_ISSUE_LIST_CHILD_JSON="[]"
+	export GH_ISSUE_VIEW_LABELS GH_ISSUE_META_JSON GH_API_COMMENTS_JSON GH_ISSUE_LIST_CHILD_JSON
+
+	if _issue_needs_consolidation 31838 "marcusquinn/aidevops"; then
+		print_result "GH#31844: active headless ownership blocks consolidation classification" 1
+	elif grep -qE 'issue edit .* --remove-label needs-consolidation' "$GH_LOG" 2>/dev/null; then
+		print_result "GH#31844: active headless ownership clears stale consolidation label" 0
+	else
+		print_result "GH#31844: active headless ownership clears stale consolidation label" 1
+	fi
+
+	teardown_gh_stub
+	return 0
+}
+
+test_active_label_without_assignee_does_not_hold_consolidation() {
+	setup_gh_stub
+	local metadata
+	metadata=$(jq -n '{state:"OPEN",labels:[{name:"status:in-progress"}],assignees:[]}')
+	if _consolidation_metadata_has_active_ownership "$metadata"; then
+		print_result "GH#31844: active label without assignee is not ownership" 1
+	else
+		print_result "GH#31844: active label without assignee is not ownership" 0
+	fi
+	teardown_gh_stub
+	return 0
+}
+
+test_unreadable_ownership_blocks_classification() {
+	setup_gh_stub
+	GH_ISSUE_META_JSON=$(jq -n '{state:"OPEN",labels:null,assignees:[]}')
+	GH_API_COMMENTS_JSON=$(fixture_two_substantive_comments)
+	GH_ISSUE_LIST_CHILD_JSON="[]"
+	export GH_ISSUE_META_JSON GH_API_COMMENTS_JSON GH_ISSUE_LIST_CHILD_JSON
+
+	if _issue_needs_consolidation 31838 "marcusquinn/aidevops"; then
+		print_result "GH#31844: unreadable ownership fails closed during classification" 1
+	else
+		print_result "GH#31844: unreadable ownership fails closed during classification" 0
+	fi
+
+	teardown_gh_stub
+	return 0
+}
+
+test_live_interactive_claim_uses_newest_paginated_record() {
+	setup_gh_stub
+	local stale_time claim_time stale_page current_page
+	stale_time="2020-01-01T00:00:00Z"
+	claim_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+	stale_page=$(jq -nc --arg timestamp "$stale_time" '[{
+		created_at:$timestamp,user:{login:"former-owner",type:"User"},
+		body:"<!-- aidevops-interactive-claim/v1 --> old"
+	}]')
+	current_page=$(jq -nc --arg timestamp "$claim_time" '[{
+		created_at:$timestamp,user:{login:"interactive-owner",type:"User"},
+		body:"<!-- aidevops-interactive-claim/v1 --> current"
+	}]')
+	GH_API_COMMENTS_JSON="${stale_page}
+${current_page}"
+	GH_ISSUE_META_JSON=$(jq -n '{state:"OPEN",labels:[{name:"status:claimed"}],assignees:[{login:"interactive-owner"}]}')
+	export GH_API_COMMENTS_JSON GH_ISSUE_META_JSON
+
+	if _consolidation_live_interactive_claim 31690 "marcusquinn/aidevops"; then
+		print_result "GH#31705: newest claim is selected across paginated comments" 0
+	else
+		print_result "GH#31705: newest claim is selected across paginated comments" 1
+	fi
+
+	teardown_gh_stub
+	return 0
+}
+
+test_claim_comment_is_not_substantive_without_live_metadata() {
+	setup_gh_stub
+	local scope_body claim_body
+	scope_body=$(printf 'One genuine contextual clarification. %.0s' {1..3})
+	claim_body=$(printf '<!-- aidevops-interactive-claim/v1 -->\n<!-- ops:start -->\n> Interactive session claimed by @interactive-owner. %.0s' {1..4})
+	GH_ISSUE_VIEW_LABELS="bug,tier:standard"
+	GH_ISSUE_META_JSON=$(jq -n '{state:"OPEN",labels:[],assignees:[]}')
+	GH_API_COMMENTS_JSON=$(jq -n --arg scope "$scope_body" --arg claim "$claim_body" '[
+		{user:{login:"reporter",type:"User"},created_at:"2026-09-09T22:07:47Z",body:$scope},
+		{user:{login:"interactive-owner",type:"User"},created_at:"2026-09-09T23:59:09Z",body:$claim}
+	]')
+	GH_ISSUE_LIST_CHILD_JSON="[]"
+	export GH_ISSUE_VIEW_LABELS GH_ISSUE_META_JSON GH_API_COMMENTS_JSON GH_ISSUE_LIST_CHILD_JSON
+
+	local filtered_count=0
+	filtered_count=$(_consolidation_substantive_comments 31690 "marcusquinn/aidevops" | jq -r 'length') || filtered_count=0
+	if _issue_needs_consolidation 31690 "marcusquinn/aidevops"; then
+		print_result "GH#31705: one contextual comment plus an operational claim does not trigger consolidation" 1
+	elif [[ "$filtered_count" -ne 1 ]]; then
+		print_result "GH#31705: shared significance filter excludes operational claim" 1 \
+			"expected one retained comment, got ${filtered_count}"
+	else
+		print_result "GH#31705: claim is excluded consistently from classification and child content" 0
+	fi
+
+	teardown_gh_stub
+	return 0
+}
+
+test_signature_footer_does_not_make_short_comment_substantive() {
+	setup_gh_stub
+	local body
+	body="Short clarification.
+<!-- aidevops:origin:interactive -->
+<!-- aidevops:sig -->
+$(printf 'audit metadata %.0s' {1..12})"
+	GH_API_COMMENTS_JSON=$(jq -n --arg body "$body" '[{user:{login:"reporter",type:"User"},body:$body}]')
+	export GH_API_COMMENTS_JSON
+
+	local filtered_count=0
+	filtered_count=$(_consolidation_substantive_comments 31690 "marcusquinn/aidevops" | jq -r 'length') || filtered_count=0
+	if [[ "$filtered_count" -eq 0 ]]; then
+		print_result "GH#31705: provenance footer length is excluded from significance" 0
+	else
+		print_result "GH#31705: provenance footer length is excluded from significance" 1 \
+			"expected zero retained comments, got ${filtered_count}"
 	fi
 
 	teardown_gh_stub
@@ -1229,9 +1625,252 @@ test_live_interactive_claim_appearing_after_classification_blocks_dispatch() {
 	return 0
 }
 
+test_active_headless_ownership_appearing_after_classification_blocks_dispatch() {
+	setup_gh_stub
+	GH_ISSUE_META_JSON=$(jq -n '{state:"OPEN",labels:[{name:"status:in-progress"}],assignees:[{login:"worker-owner"}]}')
+	GH_API_COMMENTS_JSON=$(fixture_two_substantive_comments)
+	GH_ISSUE_LIST_CHILD_JSON="[]"
+	export GH_ISSUE_META_JSON GH_API_COMMENTS_JSON GH_ISSUE_LIST_CHILD_JSON
+
+	_dispatch_issue_consolidation 31838 "marcusquinn/aidevops" "/tmp/fake-path" || true
+
+	if grep -qE 'issue (create|edit|comment)' "$GH_LOG" 2>/dev/null; then
+		print_result "GH#31844: late headless ownership blocks dispatch without mutation" 1
+	else
+		print_result "GH#31844: late headless ownership blocks dispatch without mutation" 0
+	fi
+
+	teardown_gh_stub
+	return 0
+}
+
+test_active_headless_ownership_appearing_before_lock_blocks_lock_mutation() {
+	setup_gh_stub
+	GH_ISSUE_META_JSON=$(jq -n '{state:"OPEN",labels:[],assignees:[]}')
+	GH_API_COMMENTS_JSON=$(fixture_two_substantive_comments)
+	GH_ISSUE_LIST_CHILD_JSON="[]"
+	export GH_ISSUE_META_JSON GH_API_COMMENTS_JSON GH_ISSUE_LIST_CHILD_JSON
+
+	(
+		_consolidation_child_exists() {
+			export GH_ISSUE_META_JSON='{"state":"OPEN","labels":[{"name":"status:in-progress"}],"assignees":[{"login":"worker-owner"}]}'
+			return 1
+		}
+		_consolidation_lock_acquire() {
+			printf 'lock-acquired\n' >>"$GH_LOG"
+			return 0
+		}
+		_dispatch_issue_consolidation 31838 "marcusquinn/aidevops" "/tmp/fake-path"
+	)
+
+	if grep -q 'lock-acquired' "$GH_LOG" 2>/dev/null; then
+		print_result "GH#31844: headless ownership before lock blocks lock mutation" 1
+	else
+		print_result "GH#31844: headless ownership before lock blocks lock mutation" 0
+	fi
+
+	teardown_gh_stub
+	return 0
+}
+
+test_manual_hold_blocks_direct_consolidation() {
+	local label=""
+	for label in no-auto-dispatch hold-for-review no-takeover 'on hold'; do
+		setup_gh_stub
+		GH_ISSUE_META_JSON=$(jq -nc --arg label "$label" '{state:"OPEN",labels:[{name:$label}]}')
+		export GH_ISSUE_META_JSON
+		_route_terminal_breaker_to_consolidation 31359 owner/repo test held || true
+		if grep -qE 'issue (create|edit|comment)|label create' "$GH_LOG"; then
+			print_result "manual $label blocks direct breaker consolidation without mutation" 1
+		else
+			print_result "manual $label blocks direct breaker consolidation without mutation" 0
+		fi
+		teardown_gh_stub
+	done
+	return 0
+}
+
+test_consolidation_hold_reads_fail_closed() {
+	local metadata=""
+	for metadata in null '{"state":"OPEN","labels":null}' '{"state":"CLOSED","labels":[]}'; do
+		setup_gh_stub
+		export GH_ISSUE_META_JSON="$metadata"
+		_dispatch_issue_consolidation 31359 owner/repo '' || true
+		if grep -qE 'issue (create|edit|comment)|label create' "$GH_LOG"; then
+			print_result "invalid or closed parent fails closed: $metadata" 1
+		else
+			print_result "invalid or closed parent fails closed: $metadata" 0
+		fi
+		teardown_gh_stub
+	done
+	setup_gh_stub
+	export GH_ISSUE_META_FAIL=1
+	_dispatch_issue_consolidation 31359 owner/repo '' || true
+	if grep -qE 'issue (create|edit|comment)|label create' "$GH_LOG"; then
+		print_result "parent API failure blocks consolidation without mutation" 1
+	else
+		print_result "parent API failure blocks consolidation without mutation" 0
+	fi
+	teardown_gh_stub
+	return 0
+}
+
+test_hold_after_lock_prevents_successor() {
+	local mode=""
+	for mode in manual interactive headless; do
+		setup_gh_stub
+		(
+			_consolidation_lock_acquire() {
+				if [[ "$mode" == manual ]]; then
+					export GH_ISSUE_META_JSON='{"state":"OPEN","labels":[{"name":"hold-for-review"}]}'
+				elif [[ "$mode" == interactive ]]; then
+					export GH_ISSUE_META_JSON='{"state":"OPEN","labels":[{"name":"status:in-review"}],"assignees":[{"login":"interactive-owner"}]}'
+					GH_API_COMMENTS_JSON=$(fixture_live_interactive_claim)
+					export GH_API_COMMENTS_JSON
+				else
+					export GH_ISSUE_META_JSON='{"state":"OPEN","labels":[{"name":"status:in-progress"}],"assignees":[{"login":"worker-owner"}]}'
+				fi
+				return 0
+			}
+			_consolidation_lock_self_login() {
+				printf 'fixture\n'
+				return 0
+			}
+			_consolidation_lock_release() {
+				printf 'lock-released\n' >>"$GH_LOG"
+				return 0
+			}
+			_dispatch_issue_consolidation 31359 owner/repo ''
+		)
+		if ! grep -q 'issue create' "$GH_LOG" && grep -q 'lock-released' "$GH_LOG"; then
+			print_result "$mode hold arriving after lock blocks child and releases own lock" 0
+		else
+			print_result "$mode hold arriving after lock blocks child and releases own lock" 1
+		fi
+		teardown_gh_stub
+	done
+	return 0
+}
+
+test_non_consolidating_comment_call_budget() {
+	setup_gh_stub
+	GH_API_COMMENTS_JSON='[]'
+	export GH_API_COMMENTS_JSON
+	local rc=0 calls=0
+	_issue_needs_consolidation 123 owner/repo '{"labels":[]}' || rc=$?
+	# BSD wc pads the count with spaces; strip them so macOS matches GNU (GH#34861).
+	calls=$(wc -l <"$GH_LOG" | tr -d '[:space:]')
+	if [[ "$rc" == 1 && "$calls" == 1 ]] &&
+		grep -q '^api repos/owner/repo/issues/123/comments ' "$GH_LOG"; then
+		print_result "ordinary empty thread uses one live comment read, no child/ownership/PR ceremony" 0
+	else
+		print_result "ordinary empty thread uses one live comment read, no child/ownership/PR ceremony" 1 "rc=$rc calls=$calls"
+	fi
+	teardown_gh_stub
+	return 0
+}
+
+test_oversized_consolidation_packet() {
+	setup_gh_stub
+	local comments body huge_parent filtered authors
+	comments=$(jq -n '[range(1; 5) | {id: ., html_url: ("https://github.com/owner/repo/issues/123#issuecomment-" + tostring), user: {login: "alice", type: "User"}, created_at: "2026-10-23T00:00:00Z", body: (if . == 1 then "界" * 40000 else "x" * 20000 end)}]')
+	filtered=$(_consolidation_filter_substantive_comments "$comments")
+	body=$(_compose_consolidation_child_body 123 owner/repo title VERBATIM_PARENT_BODY_MARKER "$filtered" @alice bug)
+	if [[ ${#body} -le 64000 && "$body" == *VERBATIM_PARENT_BODY_MARKER* &&
+		"$body" == *"Omitted comments"* && "$body" == *"Comment ID 1: https://github.com/owner/repo/issues/123#issuecomment-1"* &&
+		"$body" == *"## What to do"* ]]; then
+		print_result "100k-character thread fits packet budget with parent, instructions and omitted IDs/URLs" 0
+	else
+		print_result "100k-character thread fits packet budget with parent, instructions and omitted IDs/URLs" 1 "characters=${#body}"
+	fi
+	huge_parent=$(jq -nr '"界" * 65000')
+	body=$(_compose_consolidation_child_body 123 owner/repo title "$huge_parent" '[]' @alice bug)
+	if [[ ${#body} -le 64000 && "$body" == *"Parent body omitted (size limit)"* && "$body" == *"## What to do"* ]]; then
+		print_result "near-limit parent uses an explicit verbatim-fetch reference rather than overflow" 0
+	else
+		print_result "near-limit parent uses an explicit verbatim-fetch reference rather than overflow" 1
+	fi
+	authors=$(jq -nr '"@contributor " * 6000')
+	body=$(_compose_consolidation_child_body 123 owner/repo title parent '[]' "$authors" bug)
+	if [[ ${#body} -le 64000 && "$body" == *"Contributor list omitted (size limit)"* ]]; then
+		print_result "oversized contributor list uses a fetch reference without overflowing instructions" 0
+	else
+		print_result "oversized contributor list uses a fetch reference without overflowing instructions" 1
+	fi
+	teardown_gh_stub
+	return 0
+}
+
+test_creation_failure_retry_receipt() {
+	setup_gh_stub
+	local original_comments receipt body initial_fingerprint error
+	original_comments='[{"id":1,"user":{"login":"alice","type":"User"},"body":"Original source comment with substantive scope constraints that must be preserved in the merged brief."}]'
+	export GH_API_COMMENTS_JSON="$original_comments"
+	_consolidation_creation_retry_allowed 123 owner/repo
+	initial_fingerprint="$_CONSOLIDATION_SOURCE_FINGERPRINT"
+	for error in 'GraphQL: Body is too long (maximum is 65536 characters) PRIVATE_DETAIL' 'HTTP 422: Validation Failed PRIVATE_DETAIL'; do
+		GH_ISSUE_CREATE_ERROR="$error"
+		export GH_ISSUE_CREATE_ERROR
+		body=$(_create_consolidation_child_issue owner/repo 123 packet)
+		receipt=$(<"${GH_LOG}.receipt")
+		if [[ -z "$body" && "$receipt" == *"consolidation-create-failure:${initial_fingerprint}"* ]] &&
+			grep -Eq 'body is too long|validation error' "$LOGFILE" && ! grep -q PRIVATE_DETAIL "$LOGFILE"; then
+			print_result "deterministic error produces sanitized log and fingerprinted receipt: ${error%% PRIVATE*}" 0
+		else
+			print_result "deterministic error produces sanitized log and fingerprinted receipt" 1
+		fi
+	done
+	# Model a second runner observing the receipt plus an ephemeral lock on a
+	# later API page. Neither automation comment must invalidate the fingerprint.
+	GH_API_COMMENTS_JSON=$(printf '%s' "$original_comments" | jq --arg receipt "$receipt" '. + [{id:2,body:$receipt},{id:3,body:"<!-- consolidation-lock:runner=other ts=now -->"},{id:4,body:"<!-- aidevops:ops --> Routine automated status with a long signature that is not a source change."}]')
+	export GH_API_COMMENTS_JSON
+	: >"$GH_LOG"
+	if ! _consolidation_lock_acquire 123 owner/repo && ! grep -Eq 'issue (edit|comment|create)' "$GH_LOG"; then
+		print_result "second runner suppresses unchanged failure before any lock writes" 0
+	else
+		print_result "second runner suppresses unchanged failure before any lock writes" 1
+	fi
+	body=$(_create_consolidation_child_issue owner/repo 123 packet)
+	if ! grep -q 'issue comment' "$GH_LOG"; then
+		print_result "repeated deterministic creation failure does not duplicate its receipt" 0
+	else
+		print_result "repeated deterministic creation failure does not duplicate its receipt" 1
+	fi
+	GH_ISSUE_VIEW_BODY="changed parent body"
+	export GH_ISSUE_VIEW_BODY
+	if _consolidation_creation_retry_allowed 123 owner/repo; then
+		print_result "parent body edit re-arms deterministic creation failure" 0
+	else
+		print_result "parent body edit re-arms deterministic creation failure" 1
+	fi
+	unset GH_ISSUE_VIEW_BODY
+	GH_API_COMMENTS_JSON=$(printf '%s' "$GH_API_COMMENTS_JSON" | jq '.[0].body += " Edited source constraint."')
+	export GH_API_COMMENTS_JSON
+	if _consolidation_creation_retry_allowed 123 owner/repo; then
+		print_result "source comment edit re-arms deterministic creation failure" 0
+	else
+		print_result "source comment edit re-arms deterministic creation failure" 1
+	fi
+	: >"${GH_LOG}.receipt"
+	GH_ISSUE_CREATE_ERROR='HTTP 503: temporarily unavailable PRIVATE_DETAIL'
+	export GH_ISSUE_CREATE_ERROR
+	body=$(_create_consolidation_child_issue owner/repo 123 packet)
+	if [[ -z "$body" && ! -s "${GH_LOG}.receipt" ]] && ! grep -q PRIVATE_DETAIL "$LOGFILE"; then
+		print_result "transient failure is sanitized without a permanent suppression receipt" 0
+	else
+		print_result "transient failure is sanitized without a permanent suppression receipt" 1
+	fi
+	teardown_gh_stub
+	return 0
+}
+
 main() {
+	test_oversized_consolidation_packet
+	test_creation_failure_retry_receipt
+	test_non_consolidating_comment_call_budget
 	test_dispatch_creates_child_issue
 	test_child_body_contains_parent_content_and_authors
+	test_child_body_carries_blocked_status_to_successor
 	test_dedup_skips_when_child_exists
 	test_consolidation_child_exists_detects_existing
 	test_consolidation_child_exists_detects_parent_dispatch_comment_on_later_page
@@ -1245,6 +1884,8 @@ main() {
 	test_worker_superseded_comments_are_filtered
 	test_stale_recovery_tick_comments_are_filtered
 	test_cost_circuit_breaker_comments_are_filtered
+	test_structural_ops_marker_filters_unknown_comment_kind
+	test_brief_hold_and_repair_comments_are_filtered
 	test_operational_review_comments_are_filtered
 	test_review_feedback_markers_are_filtered
 	test_expired_dispatch_comment_releases_parent
@@ -1258,14 +1899,30 @@ main() {
 	# t2152 regression (GH#19415): single bot comment must not trigger
 	test_single_bot_comment_does_not_trigger_consolidation
 	test_terminal_breaker_bridge_delegates_to_dispatcher
+	test_terminal_breaker_skips_automation_only_thread
+	test_terminal_breaker_skips_permission_boundary
+	test_worker_checkpoint_not_substantive
+	test_checkpoint_variants_preserve_scope_threshold
 
 	# t2161 regression suite
 	test_resolving_pr_helper_detects_closing_keyword
 	test_resolving_pr_helper_ignores_non_closing_reference
+	test_resolving_pr_helper_detects_for_ref_keywords
 	test_needs_consolidation_skips_with_inflight_resolving_pr
 	test_dispatch_skips_with_inflight_resolving_pr
 	test_live_interactive_claim_blocks_classification_and_clears_stale_label
+	test_active_headless_ownership_blocks_classification_and_clears_stale_label
+	test_active_label_without_assignee_does_not_hold_consolidation
+	test_unreadable_ownership_blocks_classification
+	test_live_interactive_claim_uses_newest_paginated_record
+	test_claim_comment_is_not_substantive_without_live_metadata
+	test_signature_footer_does_not_make_short_comment_substantive
 	test_live_interactive_claim_appearing_after_classification_blocks_dispatch
+	test_active_headless_ownership_appearing_after_classification_blocks_dispatch
+	test_active_headless_ownership_appearing_before_lock_blocks_lock_mutation
+	test_manual_hold_blocks_direct_consolidation
+	test_consolidation_hold_reads_fail_closed
+	test_hold_after_lock_prevents_successor
 
 	echo
 	echo "============================================"

@@ -11,6 +11,10 @@ _PULSE_EVENT_REFILL_LOADED=1
 _pulse_event_refill_source_dir="${BASH_SOURCE[0]%/*}"
 _PULSE_EVENT_REFILL_SCRIPT_DIR=$(cd "$_pulse_event_refill_source_dir" 2>/dev/null && pwd) || _PULSE_EVENT_REFILL_SCRIPT_DIR="$_pulse_event_refill_source_dir"
 unset _pulse_event_refill_source_dir
+# GH#36122: the refill gate requires the shared breaker definitions; source
+# them here so a missing module fails loudly instead of dispatching open.
+# shellcheck source=./pulse-wrapper-dispatch-gates.sh
+source "${_PULSE_EVENT_REFILL_SCRIPT_DIR}/pulse-wrapper-dispatch-gates.sh"
 
 pulse_event_refill_is_enabled() {
 	local enabled_value="${AIDEVOPS_PULSE_EVENT_REFILL_ENABLED:-1}"
@@ -120,6 +124,21 @@ _pulse_event_refill_wrapper_supports_mode() {
 	return $?
 }
 
+_pulse_event_refill_wrapper_is_active() {
+	local wrapper="$1"
+	local active_agents_link="${AIDEVOPS_ACTIVE_AGENTS_LINK:-${HOME}/.aidevops/agents}"
+	local wrapper_agents_root=""
+	local active_agents_root=""
+
+	wrapper_agents_root=$(cd "${wrapper%/*}/.." 2>/dev/null && pwd -P) || return 0
+	# Only bundle-backed wrappers can become stale across activation. Leave
+	# standalone/test wrappers alone so mixed-version compatibility remains safe.
+	[[ -r "${wrapper_agents_root}/.bundle-manifest" ]] || return 0
+	active_agents_root=$(cd "$active_agents_link" 2>/dev/null && pwd -P) || return 0
+	[[ "$wrapper_agents_root" == "$active_agents_root" ]]
+	return $?
+}
+
 pulse_event_refill_signal() {
 	local issue_number="$1"
 	local worker_pid="$2"
@@ -139,6 +158,10 @@ pulse_event_refill_signal() {
 	fi
 	if ! _pulse_event_refill_wrapper_supports_mode "$wrapper"; then
 		pulse_event_refill_log "action=wrapper_unsupported trigger=retained wrapper=${wrapper}"
+		return 0
+	fi
+	if ! _pulse_event_refill_wrapper_is_active "$wrapper"; then
+		pulse_event_refill_log "action=wake_skipped reason=inactive-bundle trigger=retained wrapper=${wrapper}"
 		return 0
 	fi
 	if ! _pulse_event_refill_acquire_wake_lock "$wake_lock"; then
@@ -252,22 +275,27 @@ _pulse_event_refill_dispatch_gate() {
 			return 1
 		fi
 	fi
-	if declare -F is_no_work_rate_acceptable >/dev/null 2>&1; then
-		local no_work_rc=0
-		is_no_work_rate_acceptable || no_work_rc=$?
-		if [[ "$no_work_rc" -eq 1 ]]; then
-			pulse_event_refill_log "action=blocked reason=no_work_circuit trigger=retained"
-			pulse_event_refill_counter "pulse_event_refill_blocked_no_work"
-			return 1
-		fi
+	# GH#36122: shared runner-local breaker gate (no_work, permission-block,
+	# runner-health); apply_dispatch_max re-checks it for every other caller.
+	local breakers_rc=0
+	pulse_dispatch_breakers_allow "event_refill" || breakers_rc=$?
+	if [[ "$breakers_rc" -eq 0 ]]; then
+		return 0
 	fi
-	local runner_health_helper="${SCRIPT_DIR:-${_PULSE_EVENT_REFILL_SCRIPT_DIR}}/pulse-runner-health-helper.sh"
-	if [[ -x "$runner_health_helper" ]] && "$runner_health_helper" is-paused >/dev/null 2>&1; then
+	case "$PULSE_DISPATCH_BREAKER_TRIPPED" in
+	no_work)
+		pulse_event_refill_log "action=blocked reason=no_work_circuit trigger=retained"
+		pulse_event_refill_counter "pulse_event_refill_blocked_no_work"
+		;;
+	permission_block)
+		pulse_event_refill_log "action=blocked reason=permission_block_circuit trigger=retained"
+		;;
+	*)
 		pulse_event_refill_log "action=blocked reason=runner_health trigger=retained"
 		pulse_event_refill_counter "pulse_event_refill_blocked_runner_health"
-		return 1
-	fi
-	return 0
+		;;
+	esac
+	return 1
 }
 
 _pulse_event_refill_restore_processing() {
@@ -278,6 +306,156 @@ _pulse_event_refill_restore_processing() {
 	else
 		mv -f "$processing_file" "$trigger_file" 2>/dev/null || true
 	fi
+	return 0
+}
+
+# Outcome of the latest pulse_event_refill_drain call in this process:
+# completed, failed, budget_exhausted, or empty when no dispatch pass ran.
+_PULSE_EVENT_REFILL_LAST_OUTCOME=""
+# Epoch after which a refill-only run admits no new dispatch pass (GH#35349).
+_PULSE_EVENT_REFILL_ADMIT_DEADLINE=""
+
+#######################################
+# Bound how long a refill-only run may hold the Pulse instance lock (GH#35349).
+#
+# Dispatch admission reads the existing cycle-budget variables through
+# _pulse_cycle_remaining_seconds (start + min(stale, lock_max) - now - reserve).
+# A round needs floor + pre-stage margin (GH#36603) + enumeration seconds
+# before enumeration, and every stage timeout is clamped to the same remaining
+# budget. A budget of max + enumeration + floor + margin + reserve therefore
+# admits rounds only during the first PULSE_EVENT_REFILL_MAX_SECONDS.
+# Candidates start only while a full floor remains and their stages are
+# clamped to the remaining budget, so the lock is released within that window
+# plus one enumeration, the margin, one candidate stage timeout and the
+# finalise reserve (about 22.5 minutes by default).
+# Never raises the budget above the full-cycle ceiling.
+#
+# Env: PULSE_EVENT_REFILL_MAX_SECONDS (default 300) sets the admission window;
+# PULSE_EVENT_REFILL_FAILED_COOLDOWN_SECONDS (default 600, 0 disables) sets the
+# failed-drain cooldown read by _pulse_event_refill_cooldown_remaining.
+#######################################
+_pulse_event_refill_apply_budget() {
+	local max_seconds="${PULSE_EVENT_REFILL_MAX_SECONDS:-300}"
+	local floor_seconds="${DISPATCH_PER_CANDIDATE_TIMEOUT_FLOOR:-600}"
+	local reserve_seconds="${AIDEVOPS_PULSE_CYCLE_FINALISE_RESERVE_S:-90}"
+	local lock_max="${PULSE_LOCK_MAX_AGE_S:-1800}"
+	local ceiling="${PULSE_STALE_THRESHOLD:-3600}"
+	local enumeration_seconds=300
+	local margin_seconds=0
+	local budget_seconds=0
+	local now_epoch=""
+	[[ "$max_seconds" =~ ^[1-9][0-9]*$ ]] || max_seconds=300
+	[[ "$floor_seconds" =~ ^[1-9][0-9]*$ ]] || floor_seconds=600
+	[[ "$reserve_seconds" =~ ^[0-9]+$ ]] || reserve_seconds=90
+	[[ "$lock_max" =~ ^[1-9][0-9]*$ ]] || lock_max=1800
+	[[ "$ceiling" =~ ^[1-9][0-9]*$ ]] || ceiling=3600
+	((lock_max >= ceiling)) || ceiling="$lock_max"
+	if declare -F _dispatch_enumeration_expected_seconds >/dev/null 2>&1; then
+		enumeration_seconds=$(_dispatch_enumeration_expected_seconds 2>/dev/null) || enumeration_seconds=300
+	fi
+	[[ "$enumeration_seconds" =~ ^[0-9]+$ ]] || enumeration_seconds=300
+	if declare -F _dispatch_prestage_margin_seconds >/dev/null 2>&1; then
+		margin_seconds=$(_dispatch_prestage_margin_seconds 2>/dev/null) || margin_seconds=0
+	fi
+	[[ "$margin_seconds" =~ ^[0-9]+$ ]] || margin_seconds=0
+	now_epoch=$(date +%s 2>/dev/null) || return 0
+	[[ "$now_epoch" =~ ^[0-9]+$ ]] || return 0
+	budget_seconds=$((max_seconds + enumeration_seconds + floor_seconds + margin_seconds + reserve_seconds))
+	((budget_seconds <= ceiling)) || budget_seconds="$ceiling"
+	PULSE_START_EPOCH="$now_epoch"
+	PULSE_STALE_THRESHOLD="$budget_seconds"
+	_PULSE_EVENT_REFILL_ADMIT_DEADLINE=$((now_epoch + max_seconds))
+	pulse_event_refill_log "action=budget_set max_seconds=${max_seconds} cycle_budget=${budget_seconds}s enumeration=${enumeration_seconds}s floor=${floor_seconds}s prestage_margin=${margin_seconds}s"
+	return 0
+}
+
+# Return 0 once a refill-only run's admission window has elapsed.
+_pulse_event_refill_budget_spent() {
+	local deadline="${_PULSE_EVENT_REFILL_ADMIT_DEADLINE:-}"
+	local now_epoch=""
+	[[ "$deadline" =~ ^[0-9]+$ ]] || return 1
+	now_epoch=$(date +%s 2>/dev/null) || return 1
+	[[ "$now_epoch" =~ ^[0-9]+$ ]] || return 1
+	((now_epoch >= deadline))
+	return $?
+}
+
+_pulse_event_refill_cooldown_file() {
+	local trigger_file="${PULSE_EVENT_REFILL_TRIGGER_FILE:-${HOME}/.aidevops/cache/pulse-event-refill.trigger}"
+	printf '%s\n' "${trigger_file}.failed-cooldown"
+	return 0
+}
+
+#######################################
+# Record a failed-drain cooldown beside the trigger (GH#35349). A refill-only
+# drain that failed or spent its budget leaves the trigger for the next full
+# cycle's cycle-final drain; the cooldown stops the next worker-exit wake from
+# taking the instance lock straight back and starving that cycle.
+#######################################
+_pulse_event_refill_record_cooldown() {
+	local reason="$1"
+	local cooldown_file=""
+	local temporary_file=""
+	local now_epoch=""
+	cooldown_file=$(_pulse_event_refill_cooldown_file)
+	now_epoch=$(date +%s 2>/dev/null) || return 0
+	mkdir -p "${cooldown_file%/*}" 2>/dev/null || return 0
+	temporary_file="${cooldown_file}.tmp.$$"
+	if ! printf '%s %s\n' "$now_epoch" "$reason" >"$temporary_file" 2>/dev/null; then
+		rm -f "$temporary_file" 2>/dev/null || true
+		return 0
+	fi
+	mv -f "$temporary_file" "$cooldown_file" 2>/dev/null || rm -f "$temporary_file" 2>/dev/null || true
+	return 0
+}
+
+_pulse_event_refill_clear_cooldown() {
+	local cooldown_file=""
+	cooldown_file=$(_pulse_event_refill_cooldown_file)
+	rm -f "$cooldown_file" 2>/dev/null || true
+	return 0
+}
+
+#######################################
+# Print the remaining failed-drain cooldown seconds and return 0 while it is
+# active. Invalid, expired or future-dated markers are treated as inactive.
+#######################################
+_pulse_event_refill_cooldown_remaining() {
+	local cooldown_seconds="${PULSE_EVENT_REFILL_FAILED_COOLDOWN_SECONDS:-600}"
+	local cooldown_file=""
+	local recorded_epoch=""
+	local recorded_reason=""
+	local now_epoch=""
+	local remaining=0
+	[[ "$cooldown_seconds" =~ ^[0-9]+$ ]] || cooldown_seconds=600
+	((cooldown_seconds > 0)) || return 1
+	cooldown_file=$(_pulse_event_refill_cooldown_file)
+	[[ -f "$cooldown_file" ]] || return 1
+	read -r recorded_epoch recorded_reason <"$cooldown_file" 2>/dev/null || true
+	: "$recorded_reason"
+	[[ "$recorded_epoch" =~ ^[0-9]+$ ]] || return 1
+	now_epoch=$(date +%s 2>/dev/null) || return 1
+	[[ "$now_epoch" =~ ^[0-9]+$ ]] || return 1
+	remaining=$((recorded_epoch + cooldown_seconds - now_epoch))
+	((remaining > 0 && remaining <= cooldown_seconds)) || return 1
+	printf '%s\n' "$remaining"
+	return 0
+}
+
+#######################################
+# Evaluate due routines before waiting when another live process holds the
+# Pulse instance lock (GH#35349). The wrapper owns the routines-only pass;
+# standalone sourcing without it is a no-op.
+#######################################
+_pulse_event_refill_run_routines_if_busy() {
+	local source_name="$1"
+	local lock_pid=""
+	declare -F _pulse_run_routines_while_busy >/dev/null 2>&1 || return 0
+	[[ -n "${LOCKDIR:-}" && -f "${LOCKDIR}/pid" ]] || return 0
+	read -r lock_pid <"${LOCKDIR}/pid" 2>/dev/null || lock_pid=""
+	[[ "$lock_pid" =~ ^[0-9]+$ && "$lock_pid" != "$$" ]] || return 0
+	kill -0 "$lock_pid" 2>/dev/null || return 0
+	_pulse_run_routines_while_busy "refill-only:${source_name}"
 	return 0
 }
 
@@ -297,11 +475,29 @@ pulse_event_refill_drain() {
 	[[ "$max_passes" =~ ^[0-9]+$ ]] || max_passes=2
 	((max_passes > 0)) || max_passes=1
 	pulse_event_refill_recover_processing
+	# The normal cycle runs preflight and its own dispatch rounds. Running the
+	# full, potentially multi-candidate apply_dispatch_max here can consume the
+	# entire cycle before preflight. Leave the signal for cycle-final (or an
+	# independent worker-exit refill); never claim that dispatch ran at entry.
+	if [[ "$source_name" == "cycle-entry" ]]; then
+		if [[ -f "$trigger_file" ]]; then
+			pulse_event_refill_log "action=drain_completed source=cycle-entry pass=0 dispatch=deferred trigger=retained"
+		fi
+		return 0
+	fi
 	if ! declare -F apply_dispatch_max >/dev/null 2>&1; then
 		pulse_event_refill_log "action=blocked reason=dispatch_unavailable trigger=retained source=${source_name}"
 		return 0
 	fi
 	while [[ -f "$trigger_file" && "$pass" -lt "$max_passes" ]]; do
+		# GH#35349: a spent refill-only budget admits no further pass; the
+		# retained trigger belongs to the next full cycle's cycle-final drain.
+		if _pulse_event_refill_budget_spent; then
+			pulse_event_refill_log "action=drain_budget_exhausted source=${source_name} pass=${pass} trigger=retained"
+			pulse_event_refill_counter "pulse_event_refill_budget_exhausted"
+			_PULSE_EVENT_REFILL_LAST_OUTCOME="budget_exhausted"
+			return 0
+		fi
 		if ! _pulse_event_refill_dispatch_gate; then
 			return 0
 		fi
@@ -317,13 +513,24 @@ pulse_event_refill_drain() {
 		pulse_event_refill_log "action=drain_started source=${source_name} pass=${pass}"
 		if ! apply_dispatch_max; then
 			_pulse_event_refill_restore_processing "$processing_file" "$trigger_file"
-			pulse_event_refill_log "action=drain_failed source=${source_name} pass=${pass} trigger=retained"
-			pulse_event_refill_counter "pulse_event_refill_failed"
+			# apply_dispatch_max fails only on a cycle-budget deferral; after the
+			# refill admission window that is the expected budget stop.
+			if _pulse_event_refill_budget_spent; then
+				pulse_event_refill_log "action=drain_budget_exhausted source=${source_name} pass=${pass} trigger=retained"
+				pulse_event_refill_counter "pulse_event_refill_budget_exhausted"
+				_PULSE_EVENT_REFILL_LAST_OUTCOME="budget_exhausted"
+			else
+				pulse_event_refill_log "action=drain_failed source=${source_name} pass=${pass} trigger=retained"
+				pulse_event_refill_counter "pulse_event_refill_failed"
+				_PULSE_EVENT_REFILL_LAST_OUTCOME="failed"
+			fi
 			return 0
 		fi
 		rm -f "$processing_file" 2>/dev/null || true
 		pulse_event_refill_log "action=drain_completed source=${source_name} pass=${pass}"
 		pulse_event_refill_counter "pulse_event_refill_completed"
+		_PULSE_EVENT_REFILL_LAST_OUTCOME="completed"
+		_pulse_event_refill_clear_cooldown
 	done
 	if [[ -f "$trigger_file" ]]; then
 		pulse_event_refill_log "action=pass_limit trigger=retained source=${source_name} passes=${pass}"
@@ -339,6 +546,15 @@ _pulse_run_refill_only() {
 		pulse_event_refill_log "action=disabled trigger=retained source=${source_name}"
 		return 0
 	fi
+	# GH#35349: after a failed or budget-exhausted drain, leave the lock to the
+	# next full cycle, whose cycle-final drain consumes the retained trigger.
+	local cooldown_remaining=""
+	if cooldown_remaining=$(_pulse_event_refill_cooldown_remaining); then
+		pulse_event_refill_log "action=deferred reason=failed_drain_cooldown trigger=retained source=${source_name} remaining=${cooldown_remaining}s"
+		pulse_event_refill_counter "pulse_event_refill_deferred_cooldown"
+		return 0
+	fi
+	_pulse_event_refill_run_routines_if_busy "$source_name"
 	if ! _pulse_event_refill_wait_for_instance_lock; then
 		[[ -f "$trigger_file" ]] && pulse_event_refill_log "action=lock_busy trigger=retained source=${source_name}"
 		pulse_event_refill_counter "pulse_event_refill_lock_busy"
@@ -359,7 +575,14 @@ _pulse_run_refill_only() {
 	if declare -F _dispatch_invalidate_candidate_snapshot >/dev/null 2>&1; then
 		_dispatch_invalidate_candidate_snapshot "event_refill" || true
 	fi
+	_pulse_event_refill_apply_budget
+	_PULSE_EVENT_REFILL_LAST_OUTCOME=""
 	pulse_event_refill_drain "$source_name"
+	case "$_PULSE_EVENT_REFILL_LAST_OUTCOME" in
+	failed | budget_exhausted)
+		_pulse_event_refill_record_cooldown "$_PULSE_EVENT_REFILL_LAST_OUTCOME"
+		;;
+	esac
 	release_instance_lock
 	return 0
 }

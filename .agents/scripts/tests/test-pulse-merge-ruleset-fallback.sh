@@ -175,6 +175,10 @@ define_function_under_test() {
 	src_normalize_pr_state=$(awk '
 		/^_pmp_normalize_pr_lifecycle_state_into\(\) \{/,/^\}$/ { print }
 	' "$MERGE_PROCESS_SCRIPT")
+	local src_issue_sync
+	src_issue_sync=$(awk '
+		/^_pmp_approve_issue_sync_action_required_runs\(\) \{/,/^\}$/ { print }
+	' "$MERGE_PROCESS_SCRIPT")
 	src_terminal=$(awk '
 		/^_pulse_merge_failure_is_terminal\(\) \{/,/^\}$/ { print }
 	' "$MERGE_SCRIPT")
@@ -184,6 +188,9 @@ define_function_under_test() {
 		/^_pmp_stage_review_and_gates\(\) \{/,/^\}$/ { print }
 		/^_pmp_stage_required_checks\(\) \{/,/^\}$/ { print }
 		/^_pmp_stage_pre_merge\(\) \{/,/^\}$/ { print }
+		/^_pmp_route_preflight_ci_failures\(\) \{/,/^\}$/ { print }
+		/^_pmp_active_checks_allow_native_defer\(\) \{/,/^\}$/ { print }
+		/^_pmp_admin_final_gate_or_route\(\) \{/,/^\}$/ { print }
 		/^_pmp_stage_admin_merge\(\) \{/,/^\}$/ { print }
 		/^_pmp_stage_ruleset_fallback\(\) \{/,/^\}$/ { print }
 		/^_pmp_stage_finalize_merge\(\) \{/,/^\}$/ { print }
@@ -192,7 +199,7 @@ define_function_under_test() {
 	src_webhook_process=$(awk '
 		/^process_pr\(\) \{/,/^\}$/ { print }
 	' "$MERGE_SCRIPT")
-	if [[ -z "$src_invalidate" || -z "$src_normalize_pr_state" || -z "$src_terminal" || -z "$src_process" || -z "$src_webhook_process" ]]; then
+	if [[ -z "$src_invalidate" || -z "$src_normalize_pr_state" || -z "$src_issue_sync" || -z "$src_terminal" || -z "$src_process" || -z "$src_webhook_process" ]]; then
 		printf 'ERROR: could not extract merge helpers from %s and %s\n' "$MERGE_SCRIPT" "$MERGE_PROCESS_SCRIPT" >&2
 		return 1
 	fi
@@ -202,6 +209,8 @@ define_function_under_test() {
 	eval "$src_invalidate"
 	# shellcheck disable=SC1090
 	eval "$src_normalize_pr_state"
+	# shellcheck disable=SC1090
+	eval "$src_issue_sync"
 	# shellcheck disable=SC1090
 	eval "$src_terminal"
 	# shellcheck disable=SC1090
@@ -241,7 +250,13 @@ _resolve_pr_mergeable_status() { return 0; }
 _extract_linked_issue() { printf '123'; return 0; }
 _check_pr_merge_gates() { return 0; }
 _pr_required_checks_pass() { return 0; }
+_check_required_checks_passing() { return 0; }
 approve_collaborator_pr() { return 0; }
+manual_release_hold_check() { return 0; }
+cloudron_release_merge_guard() { return 0; }
+# These fixtures are not Issue Sync PRs; the extracted approval helper must
+# take its non-trusted, no-write path.
+_pulse_is_trusted_issue_sync_pr() { return 1; }
 _check_ruleset_required_reviews_passing() {
 	local repo_slug="$1"
 	local pr_number="$2"
@@ -317,6 +332,8 @@ _ruleset_required_review_policy_for_default_branch() {
 define_ruleset_review_function_under_test() {
 	local helper_src=""
 	helper_src=$(awk '
+		/^_pmrc_ruleset_review_summary_valid\(\) \{/,/^\}$/ { print }
+		/^_pmrc_ruleset_review_summary\(\) \{/,/^\}$/ { print }
 		/^_check_ruleset_required_reviews_passing\(\) \{/,/^\}$/ { print }
 	' "$REQUIRED_CHECKS_SCRIPT")
 	if [[ -z "$helper_src" ]]; then
@@ -511,7 +528,7 @@ test_green_behind_update_defers_before_merge_attempts() {
 	setup_test_env
 	define_function_under_test || { teardown_test_env; unset GREEN_BEHIND_UPDATE_RC; return 0; }
 
-	local pr_obj='{"number":77,"state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"APPROVED","author":{"login":"owner"},"title":"test"}'
+	local pr_obj='{"number":77,"state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"APPROVED","author":{"login":"owner"},"title":"test","headRefOid":"head-current"}'
 	local result=0
 	_process_single_ready_pr "owner/repo" "$pr_obj" || result=$?
 
@@ -660,7 +677,7 @@ test_expected_required_check_updates_branch_and_defers() {
 	setup_test_env
 	define_function_under_test || { teardown_test_env; unset GH_STUB_MODE; return 0; }
 
-	local pr_obj='{"number":77,"state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"APPROVED","author":{"login":"owner"},"title":"test"}'
+	local pr_obj='{"number":77,"state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"APPROVED","author":{"login":"owner"},"title":"test","headRefOid":"head-current"}'
 	local result=0
 	_process_single_ready_pr "owner/repo" "$pr_obj" || result=$?
 
@@ -696,7 +713,7 @@ test_pending_required_check_updates_branch_and_defers() {
 	setup_test_env
 	define_function_under_test || { teardown_test_env; unset GH_STUB_MODE; return 0; }
 
-	local pr_obj='{"number":77,"state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"APPROVED","author":{"login":"owner"},"title":"test"}'
+	local pr_obj='{"number":77,"state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"APPROVED","author":{"login":"owner"},"title":"test","headRefOid":"head-current"}'
 	local result=0
 	_process_single_ready_pr "owner/repo" "$pr_obj" || result=$?
 
@@ -726,7 +743,7 @@ test_stale_cache_401_retries_admin_merge_once() {
 	prepare_stale_cache_fixture
 	define_function_under_test || { teardown_test_env; unset GH_STUB_MODE; return 0; }
 
-	local pr_obj='{"number":77,"state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"APPROVED","author":{"login":"owner"},"title":"test"}'
+	local pr_obj='{"number":77,"state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"APPROVED","author":{"login":"owner"},"title":"test","headRefOid":"head-current"}'
 	local result=0
 	_process_single_ready_pr "owner/repo" "$pr_obj" || result=$?
 
@@ -765,8 +782,12 @@ test_stale_cache_401_retries_admin_merge_once() {
 	fi
 	print_result "successful merge invalidates repository PR-list caches" 0
 
-	if [[ -f "${HOME}/.cache/gh/graphql-401.cache" ]] || \
-		! find "${HOME}/.cache/gh" -path '*/aidevops-quarantine-*/*graphql-401.cache*' -type f | grep -q .; then
+	# Capture, then test: `find | grep -q .` under pipefail can report a
+	# SIGPIPE false negative (GH#35943).
+	local quarantined_401=""
+	quarantined_401=$(find "${HOME}/.cache/gh" -path '*/aidevops-quarantine-*/*graphql-401.cache*' -type f) ||
+		quarantined_401=""
+	if [[ -f "${HOME}/.cache/gh/graphql-401.cache" ]] || [[ -z "$quarantined_401" ]]; then
 		print_result "stale cache 401 quarantines only matching cache file" 1 "cache remediation did not quarantine stale 401 file"
 		teardown_test_env
 		unset GH_STUB_MODE
@@ -830,7 +851,7 @@ test_ruleset_fallback_failure_preserves_admin_conversation_context() {
 	setup_test_env
 	define_function_under_test || { teardown_test_env; unset GH_STUB_MODE; return 0; }
 
-	local pr_obj='{"number":77,"state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"APPROVED","author":{"login":"owner"},"title":"test"}'
+	local pr_obj='{"number":77,"state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"APPROVED","author":{"login":"owner"},"title":"test","headRefOid":"head-current"}'
 	local result=0
 	_process_single_ready_pr "owner/repo" "$pr_obj" || result=$?
 

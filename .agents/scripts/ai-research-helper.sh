@@ -22,19 +22,32 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit
 # shellcheck source=shared-constants.sh
 source "${SCRIPT_DIR}/shared-constants.sh"
+# shellcheck source=vault-data-policy-helper.sh
+source "${SCRIPT_DIR}/vault-data-policy-helper.sh"
+# Reuse the runtime's static/OpenCode auth and pool-health checks without loading
+# the headless launcher (which initializes signing and worker state).
+# shellcheck source=headless-runtime-provider.sh
+source "${SCRIPT_DIR}/headless-runtime-provider.sh"
 
 set -euo pipefail
 
+# Provider helpers expect these runtime constants; default them when the
+# headless launcher is not loaded (nounset-safe).
+OPENCODE_AUTH_FILE="${OPENCODE_AUTH_FILE:-${HOME}/.local/share/opencode/auth.json}"
+OPENCODE_BIN_DEFAULT="${OPENCODE_BIN_DEFAULT:-${OPENCODE_BIN:-opencode}}"
+
 LOG_PREFIX="AI-RESEARCH"
+HAIKU_MODEL_ID="claude-haiku-5-5"
+TEXT_BLOCK_TYPE="text"
 
 resolve_model_id() {
 	local name="${1:-simple}"
 	case "$name" in
-	simple) echo "claude-haiku-4-5-20251001" ;;
-	standard) echo "claude-sonnet-4-6" ;;
+	simple) echo "$HAIKU_MODEL_ID" ;;
+	standard) echo "claude-sonnet-5-5" ;;
 	thinking) echo "claude-opus-4-6" ;;
 	anthropic/*) echo "${name#anthropic/}" ;;
-	*) echo "claude-haiku-4-5-20251001" ;;
+	*) echo "$HAIKU_MODEL_ID" ;;
 	esac
 	return 0
 }
@@ -42,10 +55,8 @@ resolve_model_id() {
 resolve_opencode_model_id() {
 	local name="${1:-simple}"
 	case "$name" in
-	simple) echo "openai/gpt-5.6-luna" ;;
+	simple | standard | thinking) model_tier_candidate_for_provider "$name" openai || return 1 ;;
 	local) echo "openai/gpt-5.4-mini" ;;
-	standard) echo "openai/gpt-5.6-sol" ;;
-	thinking) echo "openai/gpt-5.6-sol" ;;
 	openai/* | anthropic/* | google/*) echo "$name" ;;
 	*) echo "$name" ;;
 	esac
@@ -54,13 +65,65 @@ resolve_opencode_model_id() {
 
 resolve_opencode_variant() {
 	local name="${1:-simple}"
+	local model="${2:-}"
+	[[ -n "$model" ]] || model=$(resolve_opencode_model_id "$name") || return 1
 	case "$name" in
-	simple) echo "max" ;;
-	standard) echo "high" ;;
-	thinking) echo "max" ;;
+	simple | standard | thinking) model_tier_variant "$name" "$model" || true ;;
 	*) echo "" ;;
 	esac
 	return 0
+}
+
+research_auth_backoff_active() {
+	local provider="$1"
+	local model="$2"
+	local backoffs="${3:-}"
+	local key="" reason="" retry_after="" updated_at="" stored_sig="" current_sig="" now=""
+	if [[ $# -lt 3 ]]; then
+		backoffs=$("${SCRIPT_DIR}/headless-runtime-helper.sh" backoff status 2>/dev/null) || backoffs=""
+	fi
+	now=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+	while IFS='|' read -r key reason retry_after updated_at stored_sig; do
+		if [[ ( "$key" == "$provider" || "$key" == "$model" ) && "$reason" == "auth_error" ]] &&
+			[[ -z "$retry_after" || "$retry_after" > "$now" ]]; then
+			# Credentials changed since the backoff was recorded: treat as recovered.
+			if [[ -n "$stored_sig" ]]; then
+				current_sig=$(get_auth_signature "$provider" 2>/dev/null) || current_sig=""
+				if [[ -n "$current_sig" && "$current_sig" != "$stored_sig" ]]; then
+					continue
+				fi
+			fi
+			return 0
+		fi
+	done <<<"$backoffs"
+	return 1
+}
+
+# Auto tiers follow routing-table order, but only among usable providers.
+# Explicit models/overrides retain their requested identity; explicit runtime
+# providers continue to use resolve_opencode_model_id without auto selection.
+resolve_auto_opencode_model_id() {
+	local name="${1:-simple}"
+	if [[ -n "${AIDEVOPS_AI_RESEARCH_OPENCODE_MODEL:-}" ]]; then
+		printf '%s\n' "$AIDEVOPS_AI_RESEARCH_OPENCODE_MODEL"
+		return 0
+	fi
+	case "$name" in
+	simple | standard | thinking) ;;
+	*) resolve_opencode_model_id "$name"; return $? ;;
+	esac
+	local backoffs="" candidate="" provider=""
+	backoffs=$("${SCRIPT_DIR}/headless-runtime-helper.sh" backoff status 2>/dev/null) || backoffs=""
+	while IFS= read -r candidate; do
+		provider="${candidate%%/*}"
+		research_auth_backoff_active "$provider" "$candidate" "$backoffs" && continue
+		provider_oauth_pool_available "$provider" || continue
+		if provider_auth_available "$provider" || resolve_oauth_pool_token "$provider" >/dev/null; then
+			model_tier_candidate_for_provider "$name" "$provider"
+			return $?
+		fi
+	done < <(model_tier_candidates "$name")
+	return 1
 }
 
 provider_key_var() {
@@ -195,17 +258,26 @@ json_payload() {
 	local prompt="$2"
 	local model_id="$3"
 	local max_tokens="$4"
-	PROVIDER="$provider" PROMPT_TEXT="$prompt" MODEL_ID="$model_id" MAX_TOKENS="$max_tokens" python3 - <<'PY'
+	HAIKU_MODEL_ID="$HAIKU_MODEL_ID" PROVIDER="$provider" PROMPT_TEXT="$prompt" MODEL_ID="$model_id" MAX_TOKENS="$max_tokens" python3 - <<'PY'
 import json, os
 provider = os.environ["PROVIDER"]
 prompt = os.environ["PROMPT_TEXT"]
 model = os.environ["MODEL_ID"]
 max_tokens = int(os.environ["MAX_TOKENS"])
-print(json.dumps({
+payload = {
     "model": model,
     "max_tokens": max_tokens,
     "messages": [{"role": "user", "content": prompt}],
-}))
+}
+# Haiku 5.5 uses adaptive thinking by default and thinking tokens count toward
+# max_tokens. This helper runs short classifications, so use effort "low"
+# (an intentional exception to the "medium" background floor) and keep a
+# 1024 token floor so thinking cannot consume the whole budget.
+# Never send temperature/top_p/top_k or assistant prefill: they return 400.
+if model.startswith(os.environ["HAIKU_MODEL_ID"]):
+    payload["output_config"] = {"effort": "low"}
+    payload["max_tokens"] = max(max_tokens, 1024)
+print(json.dumps(payload))
 PY
 	return $?
 }
@@ -213,10 +285,10 @@ PY
 extract_anthropic_text() {
 	local response="$1"
 	if command -v jq &>/dev/null; then
-		printf '%s' "$response" | jq -r '.content[0].text // empty' 2>/dev/null
+		printf '%s' "$response" | jq -r --arg t "$TEXT_BLOCK_TYPE" '[.content[]? | select(.type == $t) | .text] | first // empty' 2>/dev/null
 		return $?
 	fi
-	printf '%s' "$response" | python3 -c 'import sys,json; data=json.load(sys.stdin); print(data["content"][0]["text"])' 2>/dev/null
+	printf '%s' "$response" | python3 -c 'import sys,json; t=sys.argv[1]; data=json.load(sys.stdin); print(next(b[t] for b in data["content"] if t in b))' "$TEXT_BLOCK_TYPE" 2>/dev/null
 	return $?
 }
 
@@ -267,6 +339,75 @@ elif filtered:
 	return $?
 }
 
+# Print the provider error from `opencode run --format json` output on one line.
+# Precedence: last JSON error event message, last plain line mentioning an
+# error, then the last plain line.
+extract_opencode_error() {
+	local raw_output="$1"
+	printf '%s' "$raw_output" | strip_ansi | python3 -c '
+import json, sys
+error_key = "error"
+error_detail = ""
+plain_error = ""
+plain_detail = ""
+for line in sys.stdin.read().splitlines():
+    line = line.strip()
+    if not line or line.startswith("> "):
+        continue
+    try:
+        event = json.loads(line)
+    except Exception:
+        event = None
+    if isinstance(event, dict):
+        if event.get("type") == error_key:
+            error = event.get(error_key)
+            detail = ""
+            if isinstance(error, dict):
+                data = error.get("data") if isinstance(error.get("data"), dict) else {}
+                detail = data.get("message") or error.get("message") or error.get("name") or ""
+            elif error:
+                detail = error
+            if detail:
+                error_detail = str(detail)
+        continue
+    plain_detail = line
+    if error_key in line.lower():
+        plain_error = line
+print(" ".join((error_detail or plain_error or plain_detail).split()))
+'
+	return $?
+}
+
+# Log an OpenCode failure with the resolved model and a bounded,
+# credential-scrubbed provider error so stderr consumers can attribute it.
+_log_opencode_failure() {
+	local summary="$1"
+	local model_id="$2"
+	local raw_output="$3"
+	local detail=""
+	detail=$(extract_opencode_error "$raw_output" 2>/dev/null) || detail=""
+	detail=$(scrub_credentials "$detail")
+	detail="${detail:0:120}"
+	if [[ -n "$detail" ]]; then
+		log_error "${summary} (model=${model_id}): ${detail}"
+	else
+		log_error "${summary} (model=${model_id})"
+	fi
+	return 0
+}
+
+# Only credential failures authorize auto's one direct-API retry. In particular,
+# vault denials, timeouts, rate limits and general runtime errors do not.
+opencode_auth_failure() {
+	local raw_output="$1"
+	local detail=""
+	detail=$(extract_opencode_error "$raw_output" | tr '[:upper:]' '[:lower:]') || return 1
+	case "$detail" in
+	*"api key is missing"* | *"missing api key"* | *"no api key"* | *"invalid api key"* | *"invalid x-api-key"* | *"authenticationerror"* | *"authentication_error"* | *"unauthorized"* | *"invalid access token"* | *"token expired"* | *"token has expired"* | *"providerautherror"*) return 0 ;;
+	esac
+	return 1
+}
+
 call_anthropic() {
 	local prompt="$1"
 	local model_name="${2:-simple}"
@@ -275,6 +416,8 @@ call_anthropic() {
 	local credential_kind=""
 	local credential_value=""
 	local -a auth_headers=()
+	# GH#34125: direct API egress bypasses the plugin's chat.params gate.
+	vault_runtime_policy_check "anthropic/$(resolve_model_id "$model_name")" || return 1
 	if ! resolve_provider_credential_typed anthropic; then
 		log_error "No Anthropic API key found (env, gopass, credentials.sh, or OAuth pool)"
 		return 2
@@ -335,9 +478,11 @@ call_opencode() {
 	local run_dir="${AIDEVOPS_AI_RESEARCH_OPENCODE_DIR:-/tmp/opencode}"
 	model_id="${AIDEVOPS_AI_RESEARCH_OPENCODE_MODEL:-}"
 	if [[ -z "$model_id" ]]; then
-		model_id=$(resolve_opencode_model_id "$model_name")
+		model_id=$(resolve_opencode_model_id "$model_name") || return 2
 	fi
-	variant_id=$(resolve_opencode_variant "$model_name")
+	# GH#34125: deny before spawning; the nested plugin gate is defence in depth.
+	vault_runtime_policy_check "$model_id" || return 1
+	variant_id=$(resolve_opencode_variant "$model_name" "$model_id")
 	if [[ -n "$variant_id" ]]; then
 		variant_args=(--variant "$variant_id")
 	fi
@@ -352,19 +497,22 @@ call_opencode() {
 
 	if [[ -n "$timeout_cmd" ]]; then
 		raw=$(cd "$run_dir" && AIDEVOPS_HEADLESS=1 $timeout_cmd opencode run --format json -m "$model_id" "${variant_args[@]}" "$wrapped_prompt" 2>&1) || {
-			log_error "OpenCode AI research call failed"
+			_log_opencode_failure "OpenCode AI research call failed" "$model_id" "$raw"
+			opencode_auth_failure "$raw" && return 2
 			return 1
 		}
 	else
 		raw=$(cd "$run_dir" && AIDEVOPS_HEADLESS=1 opencode run --format json -m "$model_id" "${variant_args[@]}" "$wrapped_prompt" 2>&1) || {
-			log_error "OpenCode AI research call failed"
+			_log_opencode_failure "OpenCode AI research call failed" "$model_id" "$raw"
+			opencode_auth_failure "$raw" && return 2
 			return 1
 		}
 	fi
 
 	text=$(extract_opencode_text "$raw") || text=""
 	if [[ -z "$text" ]]; then
-		log_error "Empty response from OpenCode AI research provider"
+		_log_opencode_failure "Empty response from OpenCode AI research provider" "$model_id" "$raw"
+		opencode_auth_failure "$raw" && return 2
 		return 1
 	fi
 
@@ -389,8 +537,16 @@ call_ai() {
 		;;
 	auto)
 		if command -v opencode &>/dev/null; then
-			call_opencode "$prompt" "$model" "$max_tokens"
-			return $?
+			local auto_model="" rc=0
+			if auto_model=$(resolve_auto_opencode_model_id "$model"); then
+				AIDEVOPS_AI_RESEARCH_OPENCODE_MODEL="$auto_model" call_opencode "$prompt" "$model" "$max_tokens" || rc=$?
+				[[ "$rc" -eq 0 ]] && return 0
+				[[ "$rc" -eq 2 ]] || return "$rc"
+			fi
+		fi
+		if research_auth_backoff_active anthropic "anthropic/$(resolve_model_id "$model")"; then
+			log_error "Anthropic research fallback is in auth-error backoff"
+			return 2
 		fi
 		call_anthropic "$prompt" "$model" "$max_tokens"
 		return $?

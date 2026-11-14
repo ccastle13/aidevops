@@ -9,6 +9,9 @@
 _SHARED_GH_COLLABORATOR_PERMISSION_LOADED=1
 
 _AIDEVOPS_GH_PERMISSION_UNKNOWN_VALUE="unknown"
+_AIDEVOPS_GH_COLLAB_APP_PREFERRED_ROUTE="app-preferred"
+_AIDEVOPS_GH_COLLAB_GH_FALLBACK_ROUTE="gh-fallback"
+_AIDEVOPS_GH_COLLAB_API_FAILURE_REASON="api-failure"
 
 #######################################
 # Decide whether an issue actor has maintainer-equivalent repository authority.
@@ -16,10 +19,16 @@ _AIDEVOPS_GH_PERMISSION_UNKNOWN_VALUE="unknown"
 # OWNER and MEMBER are authoritative webhook associations. COLLABORATOR is
 # ambiguous because GitHub also emits it for read/triage collaborators, so it
 # must be backed by the authenticated per-repository permission endpoint.
+# CONTRIBUTOR and NONE are ambiguous in the other direction: GitHub reports a
+# private organization member (even an org admin with repository admin) as
+# CONTRIBUTOR or NONE (GH#24546, GH#34644). Those associations therefore use
+# the same permission lookup; only admin/maintain/write grants trust, and a
+# lookup failure stays unknown (rc=2) so callers fail closed without mutation.
 # Installation-authenticated REST may report a user-repository owner as
 # COLLABORATOR with permission=none; that anomaly receives a second, canonical
-# repository-identity check. Other associations are confirmed non-maintainer
-# inputs and do not spend an additional API request.
+# repository-identity check. Remaining associations (FIRST_TIMER,
+# FIRST_TIME_CONTRIBUTOR, MANNEQUIN, unknown values) are confirmed
+# non-maintainer inputs and do not spend an additional API request.
 #
 # Globals written:
 #   AIDEVOPS_GH_ACTOR_AUTHORITY_LEVEL
@@ -40,6 +49,8 @@ _gh_actor_has_repo_write_authority() {
 	export AIDEVOPS_GH_ACTOR_AUTHORITY_LEVEL AIDEVOPS_GH_ACTOR_AUTHORITY_REASON
 
 	#aidevops:trust-boundary -- bare COLLABORATOR must never authorize worker input.
+	# CONTRIBUTOR/NONE never authorize by association either; they are trusted
+	# only when the authenticated per-repository permission is write or higher.
 	case "$association" in
 	OWNER | MEMBER)
 		AIDEVOPS_GH_ACTOR_AUTHORITY_LEVEL="$association"
@@ -47,8 +58,15 @@ _gh_actor_has_repo_write_authority() {
 		export AIDEVOPS_GH_ACTOR_AUTHORITY_LEVEL AIDEVOPS_GH_ACTOR_AUTHORITY_REASON
 		return 0
 		;;
-	COLLABORATOR)
+	COLLABORATOR | CONTRIBUTOR | NONE)
 		if [[ -z "$repo_slug" || -z "$user" ]]; then
+			if [[ "$association" != "COLLABORATOR" ]]; then
+				# Without an identity there is nothing to elevate: the
+				# association alone remains a confirmed untrusted input.
+				AIDEVOPS_GH_ACTOR_AUTHORITY_REASON="untrusted-association:${association}"
+				export AIDEVOPS_GH_ACTOR_AUTHORITY_REASON
+				return 1
+			fi
 			AIDEVOPS_GH_ACTOR_AUTHORITY_REASON="missing-collaborator-identity"
 			export AIDEVOPS_GH_ACTOR_AUTHORITY_REASON
 			return 2
@@ -69,11 +87,11 @@ _gh_actor_has_repo_write_authority() {
 		*)
 			#aidevops:trust-boundary -- login/slug text alone is not authority.
 			# Require canonical repository metadata before repairing the known
-			# installation-auth owner anomaly.
+			# installation-auth owner anomaly (reported as COLLABORATOR only).
 			local user_lower="" repo_owner_lower=""
 			user_lower=$(printf '%s' "$user" | tr '[:upper:]' '[:lower:]')
 			repo_owner_lower=$(printf '%s' "$repo_owner" | tr '[:upper:]' '[:lower:]')
-			if [[ "$user_lower" == "$repo_owner_lower" ]]; then
+			if [[ "$association" == "COLLABORATOR" && "$user_lower" == "$repo_owner_lower" ]]; then
 				local repository_owner_rc=0
 				_gh_repository_owner_matches_actor "$repo_slug" "$user" || repository_owner_rc=$?
 				if [[ "$repository_owner_rc" -eq 0 ]]; then
@@ -101,6 +119,49 @@ _gh_actor_has_repo_write_authority() {
 		;;
 	esac
 
+	return 1
+}
+
+#######################################
+# Decide whether a comment that contains a key was written by an account with
+# repository write authority (GH#38021).
+#
+# Keyed audit comments are deduplicated by reading them back. Read through a
+# GitHub App installation, a private organization member's comment reports
+# CONTRIBUTOR, so an association-only test never finds the runner's own comment
+# and the comment is posted again. Each distinct author is resolved once through
+# _gh_actor_has_repo_write_authority.
+#
+# Args: $1=repo_slug owner/repo, $2=comments JSON (one array or concatenated
+#       pages), $3=key text
+# Returns: 0=an author with write authority posted the key, 1=no comment has the
+#          key or every author is confirmed without write authority,
+#          2=unreadable input, or a lookup failed and no author was confirmed.
+#######################################
+_gh_keyed_comment_has_write_author() {
+	local repo_slug="$1"
+	local comments_json="$2"
+	local key="$3"
+	local authors="" association="" login="" authority_rc=0 unknown=0
+
+	[[ -n "$repo_slug" && -n "$key" ]] || return 2
+	# Association first: it is never empty, so a deleted author (no login) cannot
+	# shift fields when read splits on the tab.
+	authors=$(printf '%s' "$comments_json" | jq -rs --arg key "$key" '
+		flatten | map(select(type == "object" and ((.body // "") | contains($key)))
+			| [(.author_association // "NONE"), (.user.login // "")])
+		| unique | .[] | @tsv' 2>/dev/null) || return 2
+	[[ -n "$authors" ]] || return 1
+	#aidevops:trust-boundary -- a comment suppresses a repeat only when its author
+	# is confirmed to hold write authority; an unconfirmed author never does.
+	# The list is read on fd 3 so a lookup that reads stdin cannot consume it.
+	while IFS=$'\t' read -r association login <&3; do
+		authority_rc=0
+		_gh_actor_has_repo_write_authority "$repo_slug" "$login" "$association" || authority_rc=$?
+		[[ "$authority_rc" -ne 0 ]] || return 0
+		[[ "$authority_rc" -eq 1 ]] || unknown=1
+	done 3<<<"$authors"
+	[[ "$unknown" -eq 0 ]] || return 2
 	return 1
 }
 
@@ -178,10 +239,57 @@ _gh_repository_owner_matches_actor() {
 }
 
 #######################################
+# Request collaborator permission with the requested authentication route.
+#
+# Args: $1=route, $2=permission endpoint path
+# Returns: status from the selected API call.
+#######################################
+_gh_collaborator_permission_request() {
+	local auth_route="$1"
+	local perm_url="$2"
+
+	if [[ "$auth_route" == "$_AIDEVOPS_GH_COLLAB_GH_FALLBACK_ROUTE" ]]; then
+		if declare -F _gh_with_timeout >/dev/null 2>&1; then
+			AIDEVOPS_GH_QUOTA_COST=1 \
+				AIDEVOPS_GH_ROUTE_DECISION="collaborator-permission-gh-fallback" \
+				_gh_with_timeout read gh api -i "$perm_url"
+			return $?
+		fi
+		AIDEVOPS_GH_QUOTA_COST=1 \
+			AIDEVOPS_GH_ROUTE_DECISION="collaborator-permission-gh-fallback" \
+			gh api -i "$perm_url"
+		return $?
+	fi
+
+	AIDEVOPS_GH_QUOTA_COST=1 \
+		AIDEVOPS_GH_ROUTE_DECISION="collaborator-permission-rest" \
+		_rest_api_call read gh api -i "$perm_url"
+	return $?
+}
+
+# Emit the confirmed non-collaborator verdict (HTTP 404 maps to "none").
+# Args: $1=optional output variable
+_gh_collaborator_permission_not_collaborator() {
+	local out_var="${1:-}"
+
+	AIDEVOPS_GH_COLLAB_PERMISSION_REASON="not-collaborator"
+	export AIDEVOPS_GH_COLLAB_PERMISSION_REASON
+	if [[ -n "$out_var" ]]; then
+		printf -v "$out_var" '%s' "none"
+	else
+		printf '%s\n' "none"
+	fi
+	return 0
+}
+
+#######################################
 # Look up a repository collaborator permission through App-aware REST routing.
 #
-# Auth selection stays in _rest_api_call/github_app_api_call: GitHub App
-# installation auth is preferred when configured, with normal gh/PAT fallback.
+# GitHub App installation auth is preferred when configured. If that route
+# cannot produce a trustworthy verdict, retry once with the authenticated gh
+# credential; a confirmed 404 remains a final non-collaborator verdict.
+# Without App routing, retry transient API/HTTP failures once on the same route
+# after a short backoff; parsed verdicts and malformed responses are not retried.
 # Callers can inspect the status globals after a non-zero return to distinguish
 # transient lookup failures from confirmed non-collaborators.
 #
@@ -189,21 +297,20 @@ _gh_repository_owner_matches_actor() {
 #   AIDEVOPS_GH_COLLAB_PERMISSION_HTTP
 #   AIDEVOPS_GH_COLLAB_PERMISSION_REASON
 #
-# Args: $1=repo_slug owner/repo, $2=user login, $3=optional output variable
+# Args: $1=repo_slug owner/repo, $2=user login, $3=optional output variable,
+#       $4=internal auth route (app-preferred|gh-fallback), $5=same-route retry used
 # Output: permission value (admin|maintain|write|triage|read|none) on lookup success.
-# Returns: 0=lookup succeeded (404 maps to none), 2=lookup/API/parse failure.
+# Returns: 0=lookup succeeded (404 maps to none), 2=lookup/API/parse failure,
+#          75=transport admission deferred (no permission verdict).
 #######################################
 _gh_collaborator_permission_lookup() {
 	local repo_slug="$1"
 	local user="$2"
 	local out_var="${3:-}"
 	local perm_url="/repos/${repo_slug}/collaborators/${user}/permission"
-	local api_response=""
-	local rc=0
-	local http_status=""
-	local line=""
-	local body=""
-	local in_body=0
+	local api_response="" rc=0 http_status="" line="" body="" in_body=0
+	local auth_route="${4:-$_AIDEVOPS_GH_COLLAB_APP_PREFERRED_ROUTE}"
+	local same_route_retry_used="${5:-0}"
 	# Keep the internal value distinct from caller-selected output names. Bash
 	# uses dynamic scope, so a local named permission_value would shadow the
 	# common caller output variable and silently return an empty permission.
@@ -219,9 +326,9 @@ _gh_collaborator_permission_lookup() {
 		return 2
 	fi
 
-	api_response=$(AIDEVOPS_GH_QUOTA_COST=1 \
-		AIDEVOPS_GH_ROUTE_DECISION="collaborator-permission-rest" \
-		_rest_api_call read gh api -i "$perm_url" 2>&1)
+	# stdout only: stderr diagnostics (e.g. "[gh-cooldown] ...") start with "["
+	# and would be parsed as body, turning a 200 into malformed-response.
+	api_response=$(_gh_collaborator_permission_request "$auth_route" "$perm_url" 2>/dev/null)
 	rc=$?
 	while IFS= read -r line; do
 		line="${line%$'\r'}"
@@ -249,26 +356,26 @@ _gh_collaborator_permission_lookup() {
 	export AIDEVOPS_GH_COLLAB_PERMISSION_HTTP
 
 	if [[ "$http_status" == "404" ]]; then
-		AIDEVOPS_GH_COLLAB_PERMISSION_REASON="not-collaborator"
-		export AIDEVOPS_GH_COLLAB_PERMISSION_REASON
-		if [[ -n "$out_var" ]]; then
-			printf -v "$out_var" '%s' "none"
-		else
-			printf '%s\n' "none"
-		fi
+		_gh_collaborator_permission_not_collaborator "$out_var"
 		return 0
 	fi
 
-	if [[ "$rc" -ne 0 ]]; then
-		AIDEVOPS_GH_COLLAB_PERMISSION_REASON="api-failure"
+	# No HTTP permission verdict exists when admission has deferred the read.
+	# Preserve the transport status; auth fallback/retry must not bypass pacing.
+	if [[ "$rc" -eq 75 ]]; then
+		AIDEVOPS_GH_COLLAB_PERMISSION_REASON="github-api-read-deferred"
 		export AIDEVOPS_GH_COLLAB_PERMISSION_REASON
-		return 2
+		return 75
+	fi
+
+	if [[ "$rc" -ne 0 ]]; then
+		_gh_collaborator_permission_resolve_failure "$auth_route" "$repo_slug" "$user" "$out_var" "$_AIDEVOPS_GH_COLLAB_API_FAILURE_REASON" "$same_route_retry_used"
+		return $?
 	fi
 
 	if [[ "$http_status" != "200" ]]; then
-		AIDEVOPS_GH_COLLAB_PERMISSION_REASON="unexpected-http"
-		export AIDEVOPS_GH_COLLAB_PERMISSION_REASON
-		return 2
+		_gh_collaborator_permission_resolve_failure "$auth_route" "$repo_slug" "$user" "$out_var" "unexpected-http" "$same_route_retry_used"
+		return $?
 	fi
 
 	resolved_permission=$(printf '%s' "$body" | jq -r '.permission // .role_name // ""' 2>/dev/null) || resolved_permission=""
@@ -277,7 +384,11 @@ _gh_collaborator_permission_lookup() {
 	fi
 	case "$resolved_permission" in
 	admin | maintain | write | triage | read | none)
-		AIDEVOPS_GH_COLLAB_PERMISSION_REASON="ok"
+		if [[ "$auth_route" == "$_AIDEVOPS_GH_COLLAB_GH_FALLBACK_ROUTE" ]]; then
+			AIDEVOPS_GH_COLLAB_PERMISSION_REASON="gh-fallback-ok"
+		else
+			AIDEVOPS_GH_COLLAB_PERMISSION_REASON="ok"
+		fi
 		export AIDEVOPS_GH_COLLAB_PERMISSION_REASON
 		if [[ -n "$out_var" ]]; then
 			printf -v "$out_var" '%s' "$resolved_permission"
@@ -287,11 +398,72 @@ _gh_collaborator_permission_lookup() {
 		return 0
 		;;
 	*)
-		AIDEVOPS_GH_COLLAB_PERMISSION_REASON="malformed-response"
-		export AIDEVOPS_GH_COLLAB_PERMISSION_REASON
-		return 2
+		_gh_collaborator_permission_resolve_failure "$auth_route" "$repo_slug" "$user" "$out_var" "malformed-response" "$same_route_retry_used"
+		return $?
 		;;
 	esac
+}
+
+#######################################
+# Retry an uncertain App-routed permission read with authenticated gh auth.
+#
+# Args: $1=repo_slug, $2=user login, $3=output variable
+# Returns: 0=retry produced a verdict, 2=both routes were uncertain,
+#          3=GitHub App routing was not configured, 75=retry admission deferred.
+#######################################
+_gh_collaborator_permission_retry_with_gh() {
+	local repo_slug="$1"
+	local user="$2"
+	local out_var="${3:-}"
+	local retry_rc=0
+
+	if ! declare -F github_app_is_configured >/dev/null 2>&1 || ! github_app_is_configured; then
+		return 3
+	fi
+
+	_gh_collaborator_permission_lookup "$repo_slug" "$user" "$out_var" "$_AIDEVOPS_GH_COLLAB_GH_FALLBACK_ROUTE" || retry_rc=$?
+	if [[ "$retry_rc" -eq 0 ]]; then
+		return 0
+	fi
+	[[ "$retry_rc" -ne 75 ]] || return 75
+
+	AIDEVOPS_GH_COLLAB_PERMISSION_REASON="app-and-gh-${AIDEVOPS_GH_COLLAB_PERMISSION_REASON:-api-failure}"
+	export AIDEVOPS_GH_COLLAB_PERMISSION_REASON
+	return 2
+}
+
+#######################################
+# Resolve an uncertain permission read without weakening the fail-closed guard.
+#
+# Args: $1=route, $2=repo_slug, $3=user, $4=output variable, $5=failure reason,
+#       $6=same-route retry used
+# Returns: 0=confirmed retry verdict, 2=uncertain, 75=admission deferred.
+#######################################
+_gh_collaborator_permission_resolve_failure() {
+	local auth_route="$1"
+	local repo_slug="$2"
+	local user="$3"
+	local out_var="$4"
+	local failure_reason="$5"
+	local same_route_retry_used="${6:-0}"
+	local retry_rc=3
+
+	if [[ "$auth_route" == "$_AIDEVOPS_GH_COLLAB_APP_PREFERRED_ROUTE" && "$same_route_retry_used" == "0" ]]; then
+		retry_rc=0
+		_gh_collaborator_permission_retry_with_gh "$repo_slug" "$user" "$out_var" || retry_rc=$?
+		# 75 = admission deferred: propagate without a permission verdict.
+		[[ "$retry_rc" -eq 0 || "$retry_rc" -eq 2 || "$retry_rc" -eq 75 ]] && return "$retry_rc"
+		if [[ "$retry_rc" -eq 3 && ( "$failure_reason" == "$_AIDEVOPS_GH_COLLAB_API_FAILURE_REASON" || "$failure_reason" == "unexpected-http" ) ]]; then
+			#aidevops:trust-boundary -- retry uncertainty only, never a parsed verdict.
+			sleep 1
+			_gh_collaborator_permission_lookup "$repo_slug" "$user" "$out_var" "$auth_route" 1
+			return $?
+		fi
+	fi
+
+	AIDEVOPS_GH_COLLAB_PERMISSION_REASON="$failure_reason"
+	export AIDEVOPS_GH_COLLAB_PERMISSION_REASON
+	return 2
 }
 
 #######################################
@@ -310,10 +482,24 @@ _gh_collaborator_permission_lookup() {
 # Args: $1=repo_slug owner/repo
 # Returns: 0=admin/maintain/write, 1=read/triage/none/unknown/failure.
 #######################################
+_gh_active_credential_into() {
+	local destination="$1" auth_host="${2:-${GH_HOST:-github.com}}" resolved_auth_token=""
+	case "$auth_host" in
+	github.com|*.ghe.com) resolved_auth_token="${GH_TOKEN:-${GITHUB_TOKEN:-}}" ;;
+	*) resolved_auth_token="${GH_ENTERPRISE_TOKEN:-${GITHUB_ENTERPRISE_TOKEN:-}}" ;;
+	esac
+	[[ -n "$resolved_auth_token" ]] || resolved_auth_token=$(gh auth token --hostname "$auth_host" 2>/dev/null) || resolved_auth_token=""
+	printf -v "$destination" '%s' "$resolved_auth_token"
+	[[ -n "$resolved_auth_token" ]] || return 1
+	return 0
+}
+
 _gh_current_user_allows_repo_write() {
 	local repo_slug="$1"
 	local current_user=""
 	local current_permission=""
+	local host="${GH_HOST:-github.com}" credential=""
+	local fingerprint="" user_key="" permission_key=""
 
 	AIDEVOPS_GH_WRITE_PERMISSION_USER=""
 	AIDEVOPS_GH_WRITE_PERMISSION_LEVEL="$_AIDEVOPS_GH_PERMISSION_UNKNOWN_VALUE"
@@ -326,10 +512,26 @@ _gh_current_user_allows_repo_write() {
 		return 1
 	fi
 
-	# #aidevops:trust-boundary — do not cache this lookup. Long-running pulse
-	# sessions can rotate GH_TOKEN/OAuth accounts between writes; a stale owner
-	# login would authorize a later non-collaborator token.
-	current_user=$(gh api user --jq '.login // ""') || current_user=""
+	# #aidevops:trust-boundary — key only by the actual credential, never login.
+	# Resolve keychain auth again on every guard and pin the exact same credential
+	# for both reads. Rotation therefore cannot reuse another token's authority.
+	_gh_active_credential_into credential "$host" || true
+	if [[ -n "$credential" ]]; then
+		fingerprint=$(printf '%s\0%s' "$host" "$credential" | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())') || fingerprint=""
+	fi
+	if [[ "$fingerprint" =~ ^[a-f0-9]{64}$ ]]; then
+		user_key="_GH_WRITE_USER_${fingerprint}"
+		current_user="${!user_key:-}"
+		permission_key=$(printf '%s\0%s' "$fingerprint" "$repo_slug" | python3 -c 'import hashlib,sys; print("_GH_WRITE_PERMISSION_" + hashlib.sha256(sys.stdin.buffer.read()).hexdigest())') || permission_key=""
+	fi
+	if [[ -z "$current_user" ]]; then
+		if [[ -n "$credential" ]]; then
+			current_user=$(GH_HOST="$host" GH_TOKEN="$credential" GH_ENTERPRISE_TOKEN="$credential" gh api user --jq '.login // ""') || current_user=""
+		else
+			current_user=$(gh api user --jq '.login // ""') || current_user=""
+		fi
+		[[ -z "$user_key" || -z "$current_user" ]] || printf -v "$user_key" '%s' "$current_user"
+	fi
 	AIDEVOPS_GH_WRITE_PERMISSION_USER="$current_user"
 	export AIDEVOPS_GH_WRITE_PERMISSION_USER
 	if [[ -z "$current_user" ]]; then
@@ -338,12 +540,14 @@ _gh_current_user_allows_repo_write() {
 		return 1
 	fi
 
-	if ! _gh_collaborator_permission_lookup "$repo_slug" "$current_user" current_permission; then
+	[[ -z "$permission_key" ]] || current_permission="${!permission_key:-}"
+	if [[ -z "$current_permission" ]] && ! GH_HOST="$host" GH_TOKEN="$credential" GH_ENTERPRISE_TOKEN="$credential" _gh_collaborator_permission_lookup "$repo_slug" "$current_user" current_permission; then
 		AIDEVOPS_GH_WRITE_PERMISSION_LEVEL="$_AIDEVOPS_GH_PERMISSION_UNKNOWN_VALUE"
 		AIDEVOPS_GH_WRITE_PERMISSION_REASON="permission-lookup-failed:${AIDEVOPS_GH_COLLAB_PERMISSION_REASON:-$_AIDEVOPS_GH_PERMISSION_UNKNOWN_VALUE}"
 		export AIDEVOPS_GH_WRITE_PERMISSION_LEVEL AIDEVOPS_GH_WRITE_PERMISSION_REASON
 		return 1
 	fi
+	[[ -z "$permission_key" ]] || printf -v "$permission_key" '%s' "$current_permission"
 
 	AIDEVOPS_GH_WRITE_PERMISSION_LEVEL="$current_permission"
 	export AIDEVOPS_GH_WRITE_PERMISSION_LEVEL

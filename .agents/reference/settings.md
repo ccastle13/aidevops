@@ -35,11 +35,11 @@
 | `supervisor.stale_threshold_seconds` | number | `1800` | -- | Seconds before a worker is considered stuck. |
 | `supervisor.circuit_breaker_max_failures` | number | `3` | -- | Consecutive failures before dispatch pauses. |
 | `supervisor.strategic_review_hours` | number | `4` | -- | Hours between thinking-tier queue health reviews. |
-| `supervisor.peak_hours_enabled` | boolean | `false` | `AIDEVOPS_PEAK_HOURS_ENABLED` | Cap workers during peak window. **Disabled by default.** |
-| `supervisor.peak_hours_start` | number | `5` | `AIDEVOPS_PEAK_HOURS_START` | Peak window start hour (0–23, local time). Overnight: set start > end. |
-| `supervisor.peak_hours_end` | number | `11` | `AIDEVOPS_PEAK_HOURS_END` | Peak window end hour (0–23, exclusive). |
-| `supervisor.peak_hours_tz` | string | `"America/Los_Angeles"` | `AIDEVOPS_PEAK_HOURS_TZ` | Documentation label — pulse uses system `date +%H`. |
-| `supervisor.peak_hours_worker_fraction` | number | `0.2` | `AIDEVOPS_PEAK_HOURS_WORKER_FRACTION` | Fraction of off-peak workers allowed during peak (min 1, rounded up). `calculate_max_workers()` applies this after the RAM-based clamp — cap can only reduce, never increase. |
+| `supervisor.peak_hours_enabled` | boolean | `false` | `AIDEVOPS_PEAK_HOURS_ENABLED` | Deprecated, ignored. The legacy global cap is retired. |
+| `supervisor.peak_hours_start` | number | `5` | `AIDEVOPS_PEAK_HOURS_START` | Deprecated, ignored. |
+| `supervisor.peak_hours_end` | number | `11` | `AIDEVOPS_PEAK_HOURS_END` | Deprecated, ignored. |
+| `supervisor.peak_hours_tz` | string | `"America/Los_Angeles"` | `AIDEVOPS_PEAK_HOURS_TZ` | Deprecated, ignored. |
+| `supervisor.peak_hours_worker_fraction` | number | `0.2` | `AIDEVOPS_PEAK_HOURS_WORKER_FRACTION` | Deprecated, ignored. |
 
 ### repo_sync
 
@@ -56,13 +56,44 @@
 | `quality.sonarcloud_enabled` | boolean | `true` | -- | Run SonarCloud analysis. |
 | `quality.write_time_linting` | boolean | `true` | -- | Lint after each edit, not just at commit. |
 
-### model_routing
+### runtime.opencode
 
 | Key | Type | Default | Env Var | Description |
 |-----|------|---------|---------|-------------|
-| `model_routing.default_tier` | string | `"standard"` | -- | Default tier for untagged tasks (`simple`, `standard`, `thinking`). |
-| `model_routing.budget_tracking_enabled` | boolean | `true` | -- | Track per-provider API spend. |
-| `model_routing.prefer_subscription` | boolean | `true` | -- | Prefer subscription over API billing when both available. |
+| `runtime.opencode.astra_context_cap` | boolean | `true` | -- | Manage Astra limits; `false` leaves provider/user metadata untouched. |
+| `runtime.opencode.astra_compaction_target` | number | `240000` | -- | Usable input target matching GPT-5.6; `400000` opts into an extended Astra budget and other values fall back to `240000`. |
+| `runtime.opencode.gpt6_context_cap` | boolean | `true` | -- | Default GPT-6 Sol/Luna and their Fast variants to ~240K usable input; explicit model limits are preserved unless this is set to `true`. `false` leaves native metadata untouched. |
+| `runtime.opencode.v2_compaction_target` | number/false | `240000` | -- | OpenCode 2 usable-input compaction target on models with larger windows; `false` (or any value other than `240000`) keeps native limits. |
+
+All models target 240K usable input unless their native window is smaller
+(GH#32807). xAI Grok targets 190K, below xAI's 200K long-context price band
+(GH#34538). There is no setting for it; an explicit
+`provider.<name>.models.<id>.limit.input` overrides it in OpenCode 1, and
+`v2_compaction_target` opts OpenCode 2 out of both targets. The next `aidevops update` after that release resets raised values
+of these keys (`astra_compaction_target: 400000`, `astra_context_cap`/`gpt6_context_cap`/
+`gpt56_context_cap: false`, non-240K `v2_compaction_target`) to the defaults
+once, with a backup under `~/.aidevops/config-backups/migrations/`. Opt-outs set
+after that are kept.
+
+Use `aidevops astra-context enable` to select the default 240K target and enable
+the managed cap. `disable` selects the extended 400K target without clearing an existing native-metadata
+opt-out. `status` distinguishes the saved selection from fresh-process config
+evidence. Restart OpenCode after changes. These are file-only preferences, read
+at startup and retained by normal updates; no environment override is defined.
+The CLI/plugin support `AIDEVOPS_SETTINGS_FILE` for isolated probes and tests.
+Earlier compaction is not a guarantee of subscription savings.
+
+GPT-6 Sol, Sol Fast, Luna, and Luna Fast default to a ~240K usable-input
+compaction budget unless model context/input limits were explicitly set.
+Use `aidevops gpt6-context enable` to force the cap over explicit limits;
+`disable` restores native provider metadata on the next OpenCode start.
+`status` reports the saved setting
+and validates nonce-bound fresh-process config evidence without changing global
+compaction settings or unrelated models.
+
+Model routing is configured separately through
+`configs/model-routing-table.json`; the obsolete `settings.json`
+`model_routing` section is removed automatically during updates.
 
 ### onboarding
 
@@ -74,12 +105,32 @@ Tracks onboarding state. Written by `/onboarding`, readable by scripts.
 | `onboarding.work_type` | string | `""` | -- | Primary work type (e.g., `"web"`, `"devops"`, `"seo"`, `"wordpress"`). |
 | `onboarding.familiarity` | array | `[]` | -- | Concepts the user knows (e.g., `["git", "terminal", "api_keys"]`). |
 
+### wordpress.plugin_defaults
+
+The maker's details for new WordPress plugins (`tools/wordpress/wp-plugin-new.md`).
+Empty until the user gives their own: each user is asked once, never handed
+another user's details. Saved with `wp-plugin-new-helper.sh save-defaults`.
+
+| Key | Type | Default | Env Var | Description |
+|-----|------|---------|---------|-------------|
+| `wordpress.plugin_defaults.author` | string | `""` | -- | Author header. |
+| `wordpress.plugin_defaults.author_uri` | string | `""` | -- | Author URI and the settings screen's website button. |
+| `wordpress.plugin_defaults.contributors` | string | `""` | -- | readme.txt Contributors (WordPress.org usernames). |
+| `wordpress.plugin_defaults.donate` | string | `""` | -- | Donate link, or `none`; empty means none. |
+| `wordpress.plugin_defaults.github_owner` | string | `""` | -- | GitHub owner for new plugin repos; empty means your login. |
+
 ### ui
 
 | Key | Type | Default | Env Var | Description |
 |-----|------|---------|---------|-------------|
 | `ui.color_output` | boolean | `true` | -- | Colored terminal output. |
 | `ui.verbose` | boolean | `false` | -- | Verbose/debug output in scripts. |
+
+### browser
+
+| Key | Type | Default | Env Var | Description |
+|-----|------|---------|---------|-------------|
+| `browser.playwright_executable` | string | `""` | `AIDEVOPS_PLAYWRIGHT_EXECUTABLE` | Standalone browser for managed Playwright, Playwright MCP and `playwright-runtime.mjs`; replaces bundled Chromium. Read by non-interactive processes (launchd, auto-update, pulse, GUI-launched MCP clients). |
 
 ## Usage
 
@@ -106,13 +157,10 @@ Edit directly: `${EDITOR:-vi} ~/.config/aidevops/settings.json`
 
 Env vars continue to work as overrides — no migration required. To consolidate, remove `AIDEVOPS_*` exports from your shell config and set values in `settings.json` instead. The `Env Var` column in each table above shows the mapping.
 
-## Peak Hours Configuration
+## Retired Peak Hours Policy
 
-Enable to cap workers during Anthropic's session-limit window (weekday 5–11 AM PT):
-
-```bash
-settings-helper.sh set supervisor.peak_hours_enabled true
-settings-helper.sh set supervisor.peak_hours_start 5
-settings-helper.sh set supervisor.peak_hours_end 11
-settings-helper.sh set supervisor.peak_hours_worker_fraction 0.2
-```
+The global clock-based cap originated with Anthropic peak-window assumptions,
+not an OpenAI capacity contract. All `supervisor.peak_hours_*` settings and their
+environment overrides are now inert, including previously enabled configurations.
+Existing files need no migration. Resource limits, provider availability, actual
+rate-limit signals, and explicit per-repository scheduling remain in force.

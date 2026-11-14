@@ -19,9 +19,9 @@ tools:
 
 ## Quick Reference
 
-- **Purpose**: Detect session completion, suggest new sessions, spawn parallel work
-- **Triggers**: PR merge, release, topic shift, context limits
-- **Actions**: Continue active work in-session through its linked worktree; suggest @agent-review or spawn only for a completed task, explicit parallel request, topic shift, or context limit. Loop agents (`/preflight-loop`, `/pr-loop`, `/postflight-loop`) detect completion and offer spawning.
+- **Purpose**: Detect session completion, preserve active continuation, suggest new sessions, spawn parallel work
+- **Triggers**: PR merge, release, topic shift; context pressure triggers checkpoint and compaction within the active objective
+- **Actions**: Continue active work in-session through its linked worktree; suggest @agent-review or spawn only for a completed task, explicit parallel request, or topic shift. Context pressure is not a handoff or completion signal. Loop agents (`/preflight-loop`, `/pr-loop`, `/postflight-loop`) detect completion and offer spawning.
 
 <!-- AI-CONTEXT-END -->
 
@@ -35,7 +35,7 @@ tools:
 | User gratitude | "thanks", "done", "that's all", "finished" | Medium |
 | Topic shift | New unrelated task requested | Medium |
 
-**Trigger prefixes:** PR merge+release: `[x] {PR title} (PR #{number} merged), v{version} released`. Topic shift: `Topic shift: {new topic} differs from {current focus} — new session recommended`. Context window: `Long session with significant context — risk of degradation`.
+**Trigger prefixes:** PR merge+release: `[x] {PR title} (PR #{number} merged), v{version} released`. Topic shift: `Topic shift: {new topic} differs from {current focus} — new session recommended`. Context pressure: `Checkpoint, compact, revalidate, and resume the active objective`.
 
 ## Spawning New Sessions
 
@@ -92,7 +92,7 @@ Context compaction in 1h+ sessions can lose task state. Checkpoint to disk after
 
 ```bash
 session-checkpoint-helper.sh save \
-  --task "t135.9" --next "t135.11,t014,t025" \
+  --task "t135.9" --next "t135.11,t14,t25" \
   --worktree "/path/to/worktree" --batch "batch2-quality" \
   --note "Completed trap cleanup for 29 scripts" \
   --elapsed "90" --target "240"
@@ -112,6 +112,5 @@ State sources: git (branch, uncommitted changes, commits, worktrees), GitHub (op
 
 - `AGENTS.md` — Root agent instructions (authoritative)
 - `workflows/worktree.md` — Parallel branch development
-- `workflows/ralph-loop.md` — Iterative development loops
 - `tools/build-agent/agent-review.md` — Session review process
 - `tools/opencode/opencode.md` — OpenCode CLI reference

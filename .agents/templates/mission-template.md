@@ -59,7 +59,7 @@ preferences:
 
 ## Milestones
 
-Milestones are sequential; features within each milestone are parallelisable. Each feature becomes a TODO entry tagged `mission:{id}` (Full mode). Example: `- [ ] t042 Implement user auth #mission:m001 ~3h`
+Milestones are sequential; features within each milestone are parallelisable. Each feature becomes a TODO entry tagged `mission:{id}` (Full mode). Example: `- [ ] t42 Implement user auth #mission:m001 ~3h`
 
 ### Milestone 1: {Name}
 
@@ -153,10 +153,7 @@ _Completed after mission finishes._
 
 ### Skill Learning
 
-<!-- Auto-populated: mission-skill-learner.sh scan {mission-dir}
-     Promote: mission-skill-learner.sh promote <path> [draft|custom]
-     Patterns: mission-skill-learner.sh patterns --mission {mission_id}
-     See: workflows/mission-skill-learning.md -->
+<!-- Memory graduation covers artifact promotion: workflows/graduate-memories.md -->
 
 | Artifact | Type | Score | Promoted To | Notes |
 |----------|------|-------|-------------|-------|

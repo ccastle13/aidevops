@@ -29,8 +29,10 @@ print_result() {
 
 run_candidate_list_for_platform() {
 	local platform="$1"
+	local profile="${2:-v1}"
 	(
 		export AIDEVOPS_TEST_UNAME_S="$platform"
+		export AIDEVOPS_OPENCODE_PROFILE="$profile"
 		# shellcheck disable=SC1091
 		source "$TEST_REPO_ROOT/.agents/scripts/headless-runtime-lib.sh"
 		_opencode_fixed_candidate_paths
@@ -47,6 +49,29 @@ run_warning_dirs_for_platform() {
 		_opencode_fixed_candidate_dirs_for_warning
 	)
 	return 0
+}
+
+write_version_binary() {
+	local path="$1"
+	local output="$2"
+	mkdir -p "$(dirname "$path")"
+	printf '#!/usr/bin/env bash\nprintf '\''%%s\\n'\'' '\''%s'\''\n' "$output" >"$path"
+	chmod +x "$path"
+	return 0
+}
+
+resolve_fixture_binary() {
+	local fixture_root="$1"
+	local expected_version="$2"
+	local fixture_path="${3:-$PATH}"
+	(
+		export AIDEVOPS_TEST_UNAME_M="x86_64"
+		export AIDEVOPS_OPENCODE_PROFILE="v1"
+		export PATH="$fixture_path"
+		# shellcheck disable=SC1091
+		source "$TEST_REPO_ROOT/.agents/scripts/headless-runtime-lib.sh"
+		_resolve_headless_opencode_install_binary "$fixture_root" "$expected_version"
+	)
 }
 
 # Darwin must not include Linux-only Snap paths.
@@ -77,6 +102,50 @@ if [[ "$linux_warning" == *"/snap/bin"* ]]; then
 	print_result "Linux warning text includes /snap/bin" 0
 else
 	print_result "Linux warning text includes /snap/bin" 1 "$linux_warning"
+fi
+
+v2_linux_candidates=$(run_candidate_list_for_platform "Linux" "v2")
+if [[ "$v2_linux_candidates" == *"/snap/bin/opencode2"* ]] && \
+	[[ "$v2_linux_candidates" == *"/.local/bin/opencode2"* ]] && \
+	[[ "$v2_linux_candidates" != *"/snap/bin/opencode"$'\n'* ]] && \
+	[[ "$v2_linux_candidates" != *"/.local/bin/opencode"$'\n'* ]]; then
+	print_result "V2 candidate list selects opencode2" 0
+else
+	print_result "V2 candidate list selects opencode2" 1 "$v2_linux_candidates"
+fi
+
+fixture_root=$(mktemp -d "${TMPDIR:-/tmp}/opencode-candidates.XXXXXX")
+trap 'rm -rf "$fixture_root"' EXIT INT TERM
+write_version_binary "$fixture_root/node_modules/.bin/opencode" "Error: opencode-ai's postinstall script was not run."
+write_version_binary "$fixture_root/node_modules/opencode-linux-x64/bin/opencode" "1.18.29"
+resolved_fixture=$(resolve_fixture_binary "$fixture_root" "1.18.29" || true)
+if [[ "$resolved_fixture" == "$fixture_root/node_modules/opencode-linux-x64/bin/opencode" ]]; then
+	print_result "failing npm placeholder falls back to exact-version native binary" 0
+else
+	print_result "failing npm placeholder falls back to exact-version native binary" 1 "$resolved_fixture"
+fi
+
+write_version_binary "$fixture_root/node_modules/opencode-linux-x64/bin/opencode" "1.18.28"
+resolved_fixture=$(resolve_fixture_binary "$fixture_root" "1.18.29" || true)
+if [[ -z "$resolved_fixture" ]]; then
+	print_result "resolver rejects placeholder and wrong-version native binary" 0
+else
+	print_result "resolver rejects placeholder and wrong-version native binary" 1 "$resolved_fixture"
+fi
+
+mkdir -p "$fixture_root/tools"
+# shellcheck disable=SC2016 # The generated stub must inspect its own positional parameters.
+printf '#!/usr/bin/env bash\nif [[ "${*: -1}" == "/proc/cpuinfo" ]]; then exit 1; fi\nexec /usr/bin/grep "$@"\n' \
+	>"$fixture_root/tools/grep"
+printf '#!/usr/bin/env bash\nprintf "musl libc\\n"\n' >"$fixture_root/tools/ldd"
+chmod +x "$fixture_root/tools/grep" "$fixture_root/tools/ldd"
+write_version_binary "$fixture_root/node_modules/opencode-linux-x64-musl/bin/opencode" "1.18.29"
+write_version_binary "$fixture_root/node_modules/opencode-linux-x64-baseline-musl/bin/opencode" "1.18.29"
+resolved_fixture=$(resolve_fixture_binary "$fixture_root" "1.18.29" "$fixture_root/tools:$PATH" || true)
+if [[ "$resolved_fixture" == "$fixture_root/node_modules/opencode-linux-x64-baseline-musl/bin/opencode" ]]; then
+	print_result "non-AVX2 musl resolution prefers baseline native binary" 0
+else
+	print_result "non-AVX2 musl resolution prefers baseline native binary" 1 "$resolved_fixture"
 fi
 
 echo ""

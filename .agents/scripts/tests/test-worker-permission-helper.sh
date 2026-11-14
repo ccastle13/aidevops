@@ -87,6 +87,23 @@ if [[ "$rendered_capabilities" != *'Routine tool discovery should use `command -
 	printf 'known tool-bin read omitted command-based recovery guidance\n' >&2
 	exit 1
 fi
+if [[ "$rendered_capabilities" != *'no unsigned supersession path'* ]]; then
+	printf 'dependency read omitted owned recovery and signed-hold limitation\n' >&2
+	exit 1
+fi
+executing_envelope="${test_root}/executing-envelope.json"
+jq '.capabilities |= map(.tool = "bash" | .patterns = ["~/**"])' "$envelope_file" >"$executing_envelope"
+if [[ "$(permission_render_capabilities "$executing_envelope")" == *'Owned recovery:'* ]]; then
+	printf 'broad external bash was misclassified as a dependency read\n' >&2
+	exit 1
+fi
+# Existing request IDs own unchanged recovery; do not create another comment.
+(
+	gh_issue_view() { printf '{"labels":[]}\n'; return 0; }
+	permission_request_already_posted() { return 0; }
+	gh_issue_comment() { printf 'duplicate request comment\n' >&2; return 1; }
+	permission_post_request "$single_capture" 123 owner/repo issue-123 "$PWD" >/dev/null
+)
 printf '{invalid-json\n' >"${test_root}/invalid-envelope.json"
 if permission_render_capabilities "${test_root}/invalid-envelope.json" >/dev/null 2>&1; then
 	printf 'permission capability rendering hid a jq failure\n' >&2
@@ -117,11 +134,21 @@ gh_issue_comment() {
 	return $?
 }
 gh_issue_edit_safe() {
+	printf '%s\n' "$*" >>"$gh_call_log"
 	return 0
 }
+cmd_block --issue 123 --repo owner/repo
+if ! grep -q -- '--add-label needs-maintainer-permissions --add-label status:blocked' "$gh_call_log"; then
+	printf 'terminal permission block omitted maintainer labels\n' >&2
+	exit 1
+fi
+if cmd_block --issue invalid --repo owner/repo >/dev/null 2>&1; then
+	printf 'terminal permission block accepted an invalid issue number\n' >&2
+	exit 1
+fi
 (
 	cd "$test_root"
-	cmd_request --file "$capture_file" --issue 123 --repo owner/repo --session issue-123 --work-dir "$repo_dir"
+	cmd_request --file "$single_capture" --issue 123 --repo owner/repo --session issue-123 --work-dir "$repo_dir"
 )
 if grep -q -- '--slurp' "$gh_call_log"; then
 	printf 'permission comment lookup combined unsupported --slurp with --jq\n' >&2
@@ -159,9 +186,86 @@ if ! jq -e 'select(.issue == 123 and .session == "issue-123" and (.request_id | 
 fi
 jq -e 'select(.event == "permission_awaiting_approval" and .reason == "needs_maintainer_permissions" and .blocking == true
   and .issue_number == 123 and .repo_slug == "owner/repo" and .session_key == "issue-123"
-  and .permission == "external_directory×2" and .tool == "read×2"
-  and .risk_level == "high" and .grantable == false)' \
+  and .permission == "external_directory" and .tool == "read"
+  and .risk_level == "medium" and .grantable == true)' \
 	"$AIDEVOPS_WORKER_BLOCKER_LOG_FILE" >/dev/null
+# Unsupported permission kinds must never invite an unusable signature, even
+# when the capture's risk classifier incorrectly claims they are grantable.
+for unsupported_permission in task read unknown; do
+	unsupported_capture="${test_root}/unsupported.json"
+	jq --arg permission "$unsupported_permission" \
+		'.requests = [.requests[0] | .permission = $permission | .tool = "task" | .patterns = ["playwright"] | .risk.grantable = true]' \
+		"$capture_file" >"$unsupported_capture"
+	: >"$gh_call_log"
+	rm -f "$posted_comment" "${git_dir}/aidevops-permission-pending"
+	unsupported_rc=0
+	cmd_request --file "$unsupported_capture" --issue 123 --repo owner/repo --session issue-123 \
+		--work-dir "$repo_dir" || unsupported_rc=$?
+	[[ "$unsupported_rc" -eq 1 ]]
+	grep -q 'permission_non_grantable' "$posted_comment"
+	grep -q 'static subagent allowlist/routing' "$posted_comment"
+	# GH#35676: the only offered signature is a withdrawal, which grants nothing.
+	grep -q -- '--request perm-[0-9a-f]* --withdraw$' "$posted_comment"
+	if awk '/sudo aidevops approve permissions/ && !/--withdraw$/ { found = 1 } END { exit !found }' "$posted_comment" ||
+		grep -q 'needs-maintainer-permissions' "$gh_call_log" ||
+		[[ -f "${git_dir}/aidevops-permission-pending" ]]; then
+		printf 'unsupported permission invited approval or persisted an approval hold\n' >&2
+		exit 1
+	fi
+	jq -e --arg permission "$unsupported_permission" \
+		'select(.reason == "permission_non_grantable" and .permission == $permission and .grantable == false)' \
+		"$AIDEVOPS_WORKER_BLOCKER_LOG_FILE" >/dev/null
+done
+mixed_capture="${test_root}/mixed.json"
+jq --slurpfile unsupported "$unsupported_capture" '.requests += $unsupported[0].requests' "$single_capture" >"$mixed_capture"
+jq -e '.grantable == false' <<<"$(permission_blocker_capability_json "$mixed_capture")" >/dev/null
+# GH#35128: temp/scratch writes are owned recovery; other external writes are not.
+temp_capture="${test_root}/temp-capture.json"
+jq '.requests = [.requests[0] | .permission = "external_directory" | .tool = "write" | .patterns = ["~/.aidevops-private/tmp/*"]]' \
+	"$capture_file" >"$temp_capture"
+permission_capture_is_temp_write_recovery "$temp_capture"
+: >"$gh_call_log"
+temp_rc=0
+temp_out=$(cmd_request --file "$temp_capture" --issue 123 --repo owner/repo --session issue-123 --work-dir "$repo_dir") || temp_rc=$?
+if [[ "$temp_rc" -ne "$PERMISSION_OWNED_RECOVERY_RC" || "$temp_out" != *'AIDEVOPS_TEMP_DIR'* ]]; then
+	printf 'temp-path write was not classified as owned recovery\n' >&2
+	exit 1
+fi
+if grep -q -- 'needs-maintainer-permissions' "$gh_call_log"; then
+	printf 'temp-path write applied the maintainer permission hold\n' >&2
+	exit 1
+fi
+# shellcheck disable=SC2088 # Literal tilde patterns mirror captured requests.
+for unsafe_pattern in '~/projects/app/src/**' '~/.ssh/**' '~/.cache/../.ssh/id' '~/.aws/tmp/credentials'; do
+	jq --arg p "$unsafe_pattern" '.requests[0].patterns = [$p]' "$temp_capture" >"${temp_capture}.n"
+	if permission_capture_is_temp_write_recovery "${temp_capture}.n"; then
+		printf 'non-temp external write misclassified as recovery: %s\n' "$unsafe_pattern" >&2
+		exit 1
+	fi
+done
+# GH#35676: scratch-path bash/read are owned recovery too; unsafe paths and
+# other tools still are not.
+for temp_tool in read bash; do
+	jq --arg t "$temp_tool" '.requests[0].tool = $t' "$temp_capture" >"${temp_capture}.n"
+	if ! permission_capture_is_temp_write_recovery "${temp_capture}.n"; then
+		printf 'scratch-path %s was not classified as owned recovery\n' "$temp_tool" >&2
+		exit 1
+	fi
+	# shellcheck disable=SC2088 # Literal tilde patterns mirror captured requests.
+	for unsafe_pattern in '~/projects/app/src/**' '~/.ssh/**' '~/.cache/../.ssh/id' '~/.aws/tmp/credentials' \
+		'~/.cache/opencode/node_modules/@opencode-ai/sdk/**' '~/tmp/app/node_modules/pkg/**'; do
+		jq --arg p "$unsafe_pattern" '.requests[0].patterns = [$p]' "${temp_capture}.n" >"${temp_capture}.u"
+		if permission_capture_is_temp_write_recovery "${temp_capture}.u"; then
+			printf 'non-temp %s misclassified as recovery: %s\n' "$temp_tool" "$unsafe_pattern" >&2
+			exit 1
+		fi
+	done
+done
+jq '.requests[0].tool = "task"' "$temp_capture" >"${temp_capture}.n"
+if permission_capture_is_temp_write_recovery "${temp_capture}.n"; then
+	printf 'task request misclassified as temp recovery\n' >&2
+	exit 1
+fi
 permission_record_blocker "permission_capability_true_fixture" "blocked" "permission_required" "true" \
 	123 "owner/repo" "issue-123" "perm-true" "Boolean transport fixture" \
 	"external_directory" "read" "medium" "true"
@@ -174,10 +278,38 @@ activity_summary=$(WAH_BLOCKER_LOG_FILE="$AIDEVOPS_WORKER_BLOCKER_LOG_FILE" \
 	"${SCRIPT_DIR}/worker-activity-helper.sh" summary --since 24h --json --no-pr-check)
 jq -e '.progress_blockers.active_blockers[] | select(
   .event == "permission_awaiting_approval"
-  and .permission == "external_directory×2"
-  and .tool == "read×2"
-  and .risk_level == "high"
-  and .grantable == false
+  and .permission == "external_directory"
+  and .tool == "read"
+  and .risk_level == "medium"
+  and .grantable == true
 )' <<<"$activity_summary" >/dev/null
+
+# Canonical-checkout requests get an owned redirect and no request record (GH#35139).
+canonical_repos="${test_root}/canonical-repos.json"
+printf '{"initialized_repos":[{"path":"%s/checkouts/example-repo","slug":"owner/repo"}]}\n' "$HOME" >"$canonical_repos"
+canonical_capture="${test_root}/canonical-capture.json"
+jq '.requests = [.requests[0] | .patterns = ["~/checkouts/example-repo/.agents/**"]]' "$capture_file" >"$canonical_capture"
+: >"$gh_call_log"
+rm -f "$posted_comment"
+redirect_rc=0
+redirect_out=$(AIDEVOPS_REPOS_FILE="$canonical_repos" cmd_request --file "$canonical_capture" --issue 123 \
+	--repo owner/repo --session issue-123 --work-dir "$repo_dir") || redirect_rc=$?
+if [[ "$redirect_rc" -ne "$PERMISSION_CANONICAL_REDIRECT_RC" || "$redirect_out" != *"own worktree"* ]]; then
+	printf 'canonical-checkout request did not return the owned redirect\n' >&2
+	exit 1
+fi
+if [[ -f "$posted_comment" ]] || grep -q -- 'needs-maintainer-permissions' "$gh_call_log"; then
+	printf 'canonical-checkout request created a maintainer request record\n' >&2
+	exit 1
+fi
+jq -e 'select(.event == "permission_request_redirected" and .blocking == false)' \
+	"$AIDEVOPS_WORKER_BLOCKER_LOG_FILE" >/dev/null
+# A sibling path that merely shares the canonical prefix is not canonical.
+sibling_capture="${test_root}/sibling-capture.json"
+jq '.requests[0].patterns = ["~/checkouts/example-repo-other/**"]' "$canonical_capture" >"$sibling_capture"
+if AIDEVOPS_REPOS_FILE="$canonical_repos" permission_targets_canonical_checkout "$sibling_capture"; then
+	printf 'prefix-sharing path was misclassified as a canonical checkout\n' >&2
+	exit 1
+fi
 
 printf 'worker permission helper tests passed\n'

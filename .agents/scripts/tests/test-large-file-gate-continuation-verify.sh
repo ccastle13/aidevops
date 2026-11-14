@@ -48,6 +48,10 @@
 #      → returns "(existing)"
 #   9. Pulse orchestration sees a stale local default branch
 #      → blocks for the cycle without measuring or mutating issue state
+#  10. Lagging mirror verifies absent NEW targets against the remote tree,
+#      but defers when a target was added upstream
+#  11. Changed targets use pinned blob counts in both threshold directions,
+#      without modifying canonical files, index or refs
 #
 # Cross-references: GH#19415 / t2152 (the blocked investigation that
 # surfaced this bug), GH#18960 (the dedup the bug exists inside),
@@ -309,6 +313,11 @@ assert_contains \
 	"reopened canonical issue removes already-fixed label" \
 	"--remove-label already-fixed" \
 	"$(cat "$GH_CALLS_LOG")"
+# GH#33071: a stale solved:* label misattributes the reopened lifecycle.
+assert_contains \
+	"reopened canonical issue removes stale solved labels" \
+	"--remove-label solved:worker --remove-label solved:interactive" \
+	"$(cat "$GH_CALLS_LOG")"
 assert_contains \
 	"reopened canonical issue restores active lifecycle labels" \
 	"--add-label file-size-debt --add-label auto-dispatch" \
@@ -324,6 +333,14 @@ assert_eq \
 	"normalization avoids ad hoc issue-edit mutations" \
 	"0" \
 	"$(grep -cF 'gh issue edit' "$GH_CALLS_LOG" || true)"
+issue_brief_hold_blocks_auto_release() { return 0; }
+: >"$GH_CALLS_LOG"
+_large_file_gate_normalize_debt_issue "18706" "owner/repo"
+assert_eq \
+	"active brief hold prevents large-file normalization from flipping status" \
+	"0" \
+	"$(grep -cF 'set_issue_status' "$GH_CALLS_LOG" || true)"
+unset -f issue_brief_hold_blocks_auto_release
 assert_contains \
 	"validator closure text describes durable canonical issue reuse" \
 	"next pulse cycle may reopen the canonical issue" \
@@ -404,9 +421,151 @@ assert_eq \
 	"#55555 (existing)" \
 	"$out"
 
+# ---- Target freshness uses real Git objects without requiring mirror sync ----
+fixture_repo="${TMP}/objects.git"
+command git init --bare --quiet "$fixture_repo" || exit 1
+cp "$UNDER_FILE" "${TMP}/target.sh"
+fixture_blob=$(command git -C "$fixture_repo" hash-object -w "${TMP}/target.sh") || exit 1
+fixture_tree=$(printf '100644 blob %s\ttarget.sh\n' "$fixture_blob" | command git -C "$fixture_repo" mktree) || exit 1
+fixture_remote=$(printf 'target freshness fixture\n' | env \
+	GIT_AUTHOR_NAME=Test GIT_AUTHOR_EMAIL=test@example.invalid \
+	GIT_COMMITTER_NAME=Test GIT_COMMITTER_EMAIL=test@example.invalid \
+	git -C "$fixture_repo" commit-tree "$fixture_tree") || exit 1
+fixture_base="$fixture_remote"
+fixture_local=1111111111111111111111111111111111111111
+fixture_branch=main
+git() {
+	shift 2 # production calls supply -C repo_path
+	case "$1" in
+	symbolic-ref)
+		if [[ "$*" == *refs/remotes/origin/HEAD* ]]; then
+			printf 'origin/main\n'
+		else
+			printf '%s\n' "$fixture_branch"
+		fi
+		;;
+	rev-parse) printf '%s\n' "$fixture_local" ;;
+	ls-remote) printf '%s\trefs/heads/main\n' "$fixture_remote" ;;
+	*) command git -C "$fixture_repo" "$@" ;;
+	esac
+}
+rc=0
+_large_file_gate_repo_matches_remote_default "$TMP" "target.sh:1-3000" || rc=$?
+assert_eq "lagging mirror with exact target bytes is usable" "0" "$rc"
+rc=0
+_large_file_gate_repo_matches_remote_default "$TMP" $'target.sh\nmissing.sh' || rc=$?
+assert_eq "lagging mirror admits unchanged and verified-absent targets" "0" "$rc"
+rc=0
+_large_file_gate_repo_matches_remote_default "$TMP" "missing.sh" || rc=$?
+assert_eq "lagging mirror admits a verified-absent NEW target alone" "0" "$rc"
+fixture_agents_tree=$(printf '100644 blob %s\tupstream-agent.sh\n' "$fixture_blob" | command git -C "$fixture_repo" mktree) || exit 1
+fixture_upstream_tree=$(printf '040000 tree %s\t.agents\n100644 blob %s\t.upstream-dot.sh\n100644 blob %s\ttarget.sh\n100644 blob %s\tupstream-new.sh\n' \
+	"$fixture_agents_tree" "$fixture_blob" "$fixture_blob" "$fixture_blob" | command git -C "$fixture_repo" mktree) || exit 1
+fixture_remote=$(printf 'upstream addition fixture\n' | env \
+	GIT_AUTHOR_NAME=Test GIT_AUTHOR_EMAIL=test@example.invalid \
+	GIT_COMMITTER_NAME=Test GIT_COMMITTER_EMAIL=test@example.invalid \
+	git -C "$fixture_repo" commit-tree "$fixture_upstream_tree" -p "$fixture_remote") || exit 1
+rc=0
+_large_file_gate_repo_matches_remote_default "$TMP" "upstream-new.sh" || rc=$?
+assert_eq "target added upstream but missing locally still defers" "1" "$rc"
+rc=0
+_large_file_gate_repo_matches_remote_default "$TMP" "upstream-new.sh:1-3000" || rc=$?
+assert_eq "upstream addition with a line range still defers" "1" "$rc"
+rc=0
+_large_file_gate_repo_matches_remote_default "$TMP" "upstream-agent.sh" || rc=$?
+assert_eq "target added upstream under .agents still defers" "1" "$rc"
+rc=0
+_large_file_gate_repo_matches_remote_default "$TMP" "upstream-dot.sh" || rc=$?
+assert_eq "target added upstream with dot prefix still defers" "1" "$rc"
+printf 'changed target\n' >>"${TMP}/target.sh"
+rc=0
+_large_file_gate_repo_matches_remote_default "$TMP" "target.sh" || rc=$?
+assert_eq "changed target bytes admit pinned remote measurement" "0" "$rc"
+assert_eq "lagging measurement records the pinned commit" "$fixture_remote" "$_LFG_REMOTE_MEASUREMENT_SHA"
+cp "$OVER_FILE" "${TMP}/target.sh"
+_large_file_gate_collect_large_files "target.sh" "$TMP" "9994" "$_LFG_REMOTE_MEASUREMENT_SHA"
+assert_eq "local over + pinned remote under does not gate" "false" "$_LFG_FOUND_LARGE"
+fixture_over_blob=$(command git -C "$fixture_repo" hash-object -w "$OVER_FILE") || exit 1
+fixture_over_tree=$(printf '100644 blob %s\ttarget.sh\n' "$fixture_over_blob" | command git -C "$fixture_repo" mktree) || exit 1
+fixture_remote=$(printf 'large remote target fixture\n' | env \
+	GIT_AUTHOR_NAME=Test GIT_AUTHOR_EMAIL=test@example.invalid \
+	GIT_COMMITTER_NAME=Test GIT_COMMITTER_EMAIL=test@example.invalid \
+	git -C "$fixture_repo" commit-tree "$fixture_over_tree" -p "$fixture_remote") || exit 1
+cp "$UNDER_FILE" "${TMP}/target.sh"
+rc=0
+_large_file_gate_repo_matches_remote_default "$TMP" "target.sh:1-3000" || rc=$?
+assert_eq "large pinned remote target passes freshness verification" "0" "$rc"
+SCOPED_RANGE_THRESHOLD=100
+_large_file_gate_collect_large_files "target.sh:1-3000" "$TMP" "9994" "$_LFG_REMOTE_MEASUREMENT_SHA"
+assert_eq "local under + pinned remote over gates" "true" "$_LFG_FOUND_LARGE"
+assert_eq "remote blob line count is authoritative" "target.sh (2050 lines), " "$_LFG_LARGE_FILES"
+rc=0
+_large_file_gate_repo_matches_remote_default "$TMP" "over.sh" || rc=$?
+assert_eq "locally present target absent from pinned remote still defers" "1" "$rc"
+rc=0
+_large_file_gate_collect_large_files "target.sh" "$TMP" "9994" "2222222222222222222222222222222222222222" || rc=$?
+assert_eq "unavailable blob measurement fails closed" "1" "$rc"
+saved_remote="$fixture_remote"
+fixture_remote=2222222222222222222222222222222222222222
+rc=0
+_large_file_gate_repo_matches_remote_default "$TMP" "target.sh" || rc=$?
+assert_eq "unavailable pinned remote object still defers" "1" "$rc"
+assert_eq "failed verification clears pinned measurement state" "" "$_LFG_REMOTE_MEASUREMENT_SHA"
+fixture_remote="$saved_remote"
+fixture_branch=feature
+rc=0
+_large_file_gate_repo_matches_remote_default "$TMP" "target.sh" || rc=$?
+assert_eq "non-default checkout still defers" "1" "$rc"
+fixture_branch=main
+fixture_local="$fixture_remote"
+rc=0
+_large_file_gate_repo_matches_remote_default "$TMP" || rc=$?
+assert_eq "exact default commit preserves legacy admission" "0" "$rc"
+assert_eq "exact default commit does not retain prior remote source" "" "$_LFG_REMOTE_MEASUREMENT_SHA"
+unset -f git
+
+# Real clean canonical mirror: remote commits are available after fetch, but the
+# checked-out branch remains behind. Snapshot all mutable Git state before use.
+command git -C "$fixture_repo" update-ref refs/heads/main "$fixture_base" || exit 1
+command git -C "$fixture_repo" symbolic-ref HEAD refs/heads/main || exit 1
+canonical_repo="${TMP}/canonical"
+command git clone --quiet "$fixture_repo" "$canonical_repo" || exit 1
+command git -C "$fixture_repo" update-ref refs/heads/main "$saved_remote" || exit 1
+command git -C "$canonical_repo" fetch --quiet origin || exit 1
+canonical_head=$(command git -C "$canonical_repo" rev-parse HEAD)
+canonical_refs=$(command git -C "$canonical_repo" show-ref)
+canonical_index=$(command git hash-object "${canonical_repo}/.git/index")
+canonical_bytes=$(command git hash-object "${canonical_repo}/target.sh")
+_pulse_refresh_repo() { return 0; }
+GH_LABELS_RESPONSE=""
+GH_OPEN_RESPONSE=""
+GH_CLOSED_RESPONSE=""
+_large_file_gate_apply() {
+	local issue_number="$1" repo_slug="$2" large_files="$3"
+	printf '%s %s %s\n' "$issue_number" "$repo_slug" "$large_files" >"${TMP}/gate-applied"
+	return 0
+}
+: >"$LOGFILE"
+rc=0
+_issue_targets_large_files "9994" "owner/repo" \
+	"## How"$'\n'"- EDIT: \`target.sh\`" "$canonical_repo" "false" || rc=$?
+assert_eq "clean lagging canonical applies large-file gate rather than deferring" "0" "$rc"
+assert_contains "gate application uses remote count" "target.sh (2050 lines)" "$(<"${TMP}/gate-applied")"
+assert_contains "remote measurement diagnostic identifies pinned commit" \
+	"measured #9994 targets from pinned remote blob ${saved_remote} (canonical lagging)" "$(<"$LOGFILE")"
+assert_eq "verified remote measurements do not log deferral" "0" "$(grep -c 'deferring' "$LOGFILE" || true)"
+assert_eq "canonical HEAD is unchanged" "$canonical_head" "$(command git -C "$canonical_repo" rev-parse HEAD)"
+assert_eq "canonical refs are unchanged" "$canonical_refs" "$(command git -C "$canonical_repo" show-ref)"
+assert_eq "canonical index is unchanged" "$canonical_index" "$(command git hash-object "${canonical_repo}/.git/index")"
+assert_eq "canonical working bytes are unchanged" "$canonical_bytes" "$(command git hash-object "${canonical_repo}/target.sh")"
+assert_eq "canonical remains clean" "" "$(command git -C "$canonical_repo" status --porcelain)"
+
 # ---- Test 9 — stale pulse checkout → defer before local measurement ----
 _pulse_refresh_repo() { return 0; }
-_large_file_gate_repo_matches_remote_default() { return 1; }
+_large_file_gate_repo_matches_remote_default() {
+	assert_eq "gate passes extracted target paths for freshness proof" "over.sh" "${2:-}"
+	return 1
+}
 GH_OPEN_RESPONSE=""
 GH_CLOSED_RESPONSE="18706"
 GH_REMOTE_CONTENT_RESPONSE=$(_remote_content_json "$UNDER_FILE")

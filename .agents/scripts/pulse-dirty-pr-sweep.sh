@@ -79,6 +79,10 @@ source "${SCRIPT_DIR}/pulse-repo-meta.sh" 2>/dev/null || true
 # when the helpers are absent.
 _WTAR_REMOVED="${_WTAR_REMOVED:-removed}"
 _WTAR_SKIPPED="${_WTAR_SKIPPED:-skipped}"
+# GH#34943: ephemeral-worktree ownership evidence (see _dps_remove_ephemeral).
+_DPS_OWNER_FILE="aidevops-dirty-pr-sweep-owner"
+_DPS_MODE_SKIPPED="${_WTAR_MODE_SKIPPED:-skipped}"
+_DPS_EPHEMERAL_TIPS=""
 command -v log_worktree_removal_event >/dev/null 2>&1 || log_worktree_removal_event() { :; }
 command -v is_registered_canonical >/dev/null 2>&1 || is_registered_canonical() { return 1; }
 if [[ -f "${SCRIPT_DIR}/audit-worktree-removal-helper.sh" ]]; then
@@ -142,6 +146,8 @@ readonly _DIRTY_ACTION_SKIP="skip"
 
 readonly _DIRTY_LABEL_ORIGIN_WORKER="origin:worker"
 readonly _DIRTY_LABEL_ORIGIN_WORKER_TAKEOVER="origin:worker-takeover"
+# Pulse TODO handoff heads (pulse-todo-publication.sh); see GH#36112.
+readonly _DIRTY_PULSE_TODO_HANDOFF_PREFIX="aidevops/pulse-todo-"
 
 # Comment markers for idempotency when scanning PR comment history.
 readonly _DIRTY_PR_NOTIFY_MARKER="<!-- pulse-dirty-pr-escalate -->"  # string preserved for comment-history dedup continuity
@@ -398,7 +404,7 @@ _dps_pr_labels() {
 _dps_labels_has() {
 	local labels="$1"
 	local target="$2"
-	printf '%s' "$labels" | grep -qx "$target"
+	printf '%s' "$labels" | grep -x "$target" >/dev/null
 }
 
 # Check whether a PR body contains a recognised issue reference (t2708).
@@ -433,9 +439,9 @@ _dps_extract_linked_issue_from_body() {
 	local body="$1"
 	local match=""
 	[[ -n "$body" ]] || return 1
-	match=$(printf '%s' "$body" | grep -ioE '(close[ds]?|fix(es|ed)?|resolve[ds]?|for|ref)[[:space:]]+#[0-9]+' | head -n 1) || match=""
+	match=$(printf '%s' "$body" | grep -ioE '(close[ds]?|fix(es|ed)?|resolve[ds]?|for|ref)[[:space:]]+#[0-9]+' | sed -n '1p') || match=""
 	[[ -n "$match" ]] || return 1
-	printf '%s' "$match" | grep -oE '[0-9]+' | head -n 1
+	printf '%s' "$match" | grep -oE '[0-9]+' | sed -n '1p'
 	return 0
 }
 
@@ -652,6 +658,25 @@ _dps_closed_by_other_merged_pr_reason() {
 	return 0
 }
 
+# Print why the sweep must not classify a PR, or return 1 to classify it.
+# Args: $1=mergeStateStatus $2=head ref name
+_dps_skip_reason() {
+	local mss="$1"
+	local head_ref="$2"
+	if [[ "$mss" != "DIRTY" ]]; then
+		printf 'not-dirty'
+		return 0
+	fi
+	# GH#36112: a Pulse TODO handoff has no work issue, so its Ref lines must not
+	# drive rebase, conflict routing, close or notify. The merge pass supersedes
+	# trusted conflicting handoffs and the publisher regenerates them.
+	if [[ "$head_ref" == "${_DIRTY_PULSE_TODO_HANDOFF_PREFIX}"* ]]; then
+		printf 'pulse-todo-handoff-owned-by-merge-pass'
+		return 0
+	fi
+	return 1
+}
+
 #
 # Given a PR JSON object (from `gh pr list`), classify the action:
 #   rebase | conflict | close | notify | skip
@@ -674,7 +699,7 @@ _dirty_pr_classify() {
 	local repo_path="$3"
 	local self_login="$4"
 
-	local pr_number mss created updated author head_ref body
+	local pr_number mss created updated author head_ref body skip_reason
 	pr_number=$(printf '%s' "$pr_json" | jq -r '.number // empty')
 	mss=$(printf '%s' "$pr_json" | jq -r '.mergeStateStatus // empty')
 	created=$(printf '%s' "$pr_json" | jq -r '.createdAt // empty')
@@ -687,8 +712,8 @@ _dirty_pr_classify() {
 		printf '%s|invalid-pr-json' "$_DIRTY_ACTION_SKIP"
 		return 0
 	fi
-	if [[ "$mss" != "DIRTY" ]]; then
-		printf '%s|not-dirty' "$_DIRTY_ACTION_SKIP"
+	if skip_reason=$(_dps_skip_reason "$mss" "$head_ref"); then
+		printf '%s|%s' "$_DIRTY_ACTION_SKIP" "$skip_reason"
 		return 0
 	fi
 
@@ -810,7 +835,7 @@ _dps_post_comment_if_new() {
 	# Check existing comments for marker.
 	local existing
 	existing=$(_dps_pr_comment_bodies_rest "$pr_number" "$repo_slug" 2>/dev/null) || existing=""
-	if printf '%s' "$existing" | grep -qF "$marker"; then
+	if printf '%s' "$existing" | grep -F "$marker" >/dev/null; then
 		_dps_log "PR #$pr_number ($repo_slug): comment marker '$marker' already present — skipping"
 		return 0
 	fi
@@ -824,6 +849,12 @@ ${body}"
 		return 0
 	fi
 
+	# GH#34197: never recommend the do-not-close opt-out on a repo lacking it.
+	if [[ "$body" == *do-not-close* ]] && declare -F ensure_do_not_close_label_exists >/dev/null 2>&1; then
+		ensure_do_not_close_label_exists "$repo_slug" >/dev/null 2>&1 ||
+			_dps_log "PR #$pr_number ($repo_slug): could not provision do-not-close label"
+	fi
+
 	if gh_pr_comment "$pr_number" --repo "$repo_slug" --body "$full_body" >/dev/null 2>&1; then
 		return 0
 	fi
@@ -832,7 +863,7 @@ ${body}"
 }
 
 # Perform the actual rebase in an ephemeral worktree.
-# Creates a throwaway worktree, fetches refs, rebases with union strategy,
+# Creates a throwaway worktree, fetches refs, rebases with a TODO.md union driver,
 # force-pushes, and cleans up. Returns 0 on success, 1 on any failure.
 _dps_rebase_in_ephemeral() {
 	local pr_number="$1"
@@ -856,57 +887,178 @@ _dps_rebase_in_ephemeral() {
 	# Refresh origin/<default_branch> and origin/<head_ref> before anything else.
 	git -C "$repo_path" fetch --quiet origin "${default_branch}:refs/remotes/origin/${default_branch}" || {
 		_dps_log "PR #$pr_number ($repo_slug): fetch of origin/${default_branch} failed — skipping rebase"
-		rm -rf "$ephemeral" || true
+		rmdir "$ephemeral" 2>/dev/null || true
 		return 1
 	}
 	git -C "$repo_path" fetch --quiet origin "${head_ref}:refs/remotes/origin/${head_ref}" 2>/dev/null || {
 		_dps_log "PR #$pr_number ($repo_slug): fetch of origin/${head_ref} failed — skipping rebase"
-		rm -rf "$ephemeral" 2>/dev/null || true
+		rmdir "$ephemeral" 2>/dev/null || true
 		return 1
 	}
 
-	if ! git -C "$repo_path" worktree add -b "$ephemeral_branch" "$ephemeral" "origin/${head_ref}" >/dev/null 2>&1; then
+	# The exact empty directory is reserved by this invocation. Registration
+	# failure retains the created tree; rmdir below never deletes content.
+	if ! (
+		# shellcheck source=shared-worktree-create.sh
+		source "${BASH_SOURCE[0]%/*}/shared-worktree-create.sh" || exit 1
+		AIDEVOPS_WORKTREE_CREATE_RESERVED_PATH="$ephemeral" worktree_create_registered \
+			"$repo_path" "$ephemeral" "origin/${head_ref}" -b "$ephemeral_branch"
+	) >/dev/null; then
 		_dps_log "PR #$pr_number ($repo_slug): worktree add failed — skipping rebase"
-		rm -rf "$ephemeral" 2>/dev/null || true
+		rmdir "$ephemeral" 2>/dev/null || true
 		return 1
 	fi
 
+	# GH#34943: ownership evidence for cleanup. A random token in the new
+	# worktree's admin dir proves the registration at this path is ours, and
+	# the creation tip seeds the set of branch tips this invocation produced.
+	# Missing evidence leaves the token empty, so cleanup preserves.
+	local owner_mark="" owner_admin=""
+	_DPS_EPHEMERAL_TIPS=$(git -C "$ephemeral" rev-parse --verify HEAD 2>/dev/null) || _DPS_EPHEMERAL_TIPS=""
+	if owner_admin=$(git -C "$ephemeral" rev-parse --absolute-git-dir 2>/dev/null) &&
+		printf '%s-%s-%s-%s\n' "$$" "$ephemeral_branch_ts" "$RANDOM" "$RANDOM" >"${owner_admin}/${_DPS_OWNER_FILE}" 2>/dev/null; then
+		IFS= read -r owner_mark <"${owner_admin}/${_DPS_OWNER_FILE}" || owner_mark=""
+	fi
+
+	# GH#34943: the rebase and push run in a subshell whose EXIT trap removes
+	# the ephemeral worktree and branch, and INT/TERM/HUP exit through it. A
+	# watchdog TERM mid-rebase previously skipped cleanup and leaked a
+	# registered named-branch checkout that the detached temp-worktree sweep
+	# never matches. SIGKILL still cannot run traps. The trap reads
+	# _DPS_EPHEMERAL_TIPS late, so tips recorded inside the subshell count.
 	local rebase_ok=1
-	if git -C "$ephemeral" rebase -X union "origin/${default_branch}" >/dev/null 2>&1; then
+	if (
+		trap '_dps_remove_ephemeral "$repo_path" "$ephemeral" "$ephemeral_branch" "$pr_number" "$repo_slug" "$owner_mark" "$_DPS_EPHEMERAL_TIPS"' EXIT
+		trap 'exit 129' HUP
+		trap 'exit 130' INT
+		trap 'exit 143' TERM
+		_dps_rebase_and_push "$ephemeral" "$head_ref" "$default_branch" "$pr_number" "$repo_slug"
+	); then
 		rebase_ok=0
-	else
-		git -C "$ephemeral" rebase --abort >/dev/null 2>&1 || true
-		_dps_log "PR #$pr_number ($repo_slug): rebase -X union failed — conflicts outside TODO.md"
-	fi
-
-	if [[ "$rebase_ok" -eq 0 ]]; then
-		# Force-push with lease so we never clobber a human-pushed commit.
-		if ! git -C "$ephemeral" push --force-with-lease=refs/heads/"$head_ref":origin/"$head_ref" \
-			origin "HEAD:refs/heads/${head_ref}" >/dev/null 2>&1; then
-			_dps_log "PR #$pr_number ($repo_slug): force-push failed — possibly clobber protected"
-			rebase_ok=1
-		fi
-	fi
-
-	# Cleanup ephemeral worktree regardless of outcome.
-	# t2976 / GH#21699: canonical guard before destructive removal. The
-	# ephemeral path is created via mktemp under /tmp and can never legitimately
-	# match a registered canonical repo — so a hit here means a refactor or
-	# environment override has redirected the path. Skip + audit instead of
-	# destroying, and log the skip so the unexpected state is visible.
-	if is_registered_canonical "$ephemeral"; then
-		_dps_log "PR #$pr_number ($repo_slug): refusing to remove canonical path $ephemeral — registry hit"
-		log_worktree_removal_event "$_WTAR_SKIPPED" "$_WTAR_DPS_CALLER" "$ephemeral" "canonical-skip" "skipped"
-	else
-		git -C "$repo_path" worktree remove --force "$ephemeral" >/dev/null 2>&1 || true
-		git -C "$repo_path" branch -D "$ephemeral_branch" >/dev/null 2>&1 || true
-		rm -rf "$ephemeral" 2>/dev/null || true
-		log_worktree_removal_event "$_WTAR_FIXTURE_REMOVED" "$_WTAR_DPS_CALLER" "$ephemeral" "fixture" "fixture"
 	fi
 
 	if [[ "$rebase_ok" -ne 0 ]]; then
 		return 1
 	fi
+	return 0
+}
+
+# Rebase the ephemeral checkout with a TODO.md-only union driver and
+# force-push with lease. Returns 0 only when both succeed.
+_dps_rebase_and_push() {
+	local ephemeral="$1"
+	local head_ref="$2"
+	local default_branch="$3"
+	local pr_number="$4"
+	local repo_slug="$5"
+
+	local attributes_file="" rebase_ok=1
+	# Never write common-dir info/attributes: it also affects other worktrees.
+	# In-tree attributes take precedence, so verify the effective driver first.
+	if attributes_file=$(mktemp -t "dirty-pr-sweep-attributes.XXXXXX") &&
+		printf '/TODO.md merge=union\n' >"$attributes_file" &&
+		[[ "$(git -c core.attributesFile="$attributes_file" -C "$ephemeral" check-attr merge -- TODO.md)" == "TODO.md: merge: union" ]] &&
+		git -c core.attributesFile="$attributes_file" -C "$ephemeral" rebase "origin/${default_branch}" >/dev/null 2>&1; then
+		rebase_ok=0
+	fi
+	[[ -z "$attributes_file" ]] || rm -f "$attributes_file"
+	if [[ "$rebase_ok" -ne 0 ]]; then
+		git -C "$ephemeral" rebase --abort >/dev/null 2>&1 || true
+		_dps_log "PR #$pr_number ($repo_slug): TODO.md union rebase failed — unresolved conflicts, attribute override, or Git error"
+		return 1
+	fi
+	# Record the tip this invocation produced (see _dps_remove_ephemeral).
+	# Read it from the branch's newest reflog entry, and only when that entry
+	# is the rebase's own finish record: a commit landing after the rebase is
+	# then never adopted as ours. A no-op rebase leaves the creation tip.
+	local branch_ref="" reflog_top="" rebased_tip=""
+	branch_ref=$(git -C "$ephemeral" symbolic-ref -q HEAD 2>/dev/null) || branch_ref=""
+	if [[ -n "$branch_ref" ]] &&
+		reflog_top=$(git -C "$ephemeral" log -g -1 --format='%H %gs' "$branch_ref" 2>/dev/null); then
+		rebased_tip="${reflog_top%% *}"
+		case "${reflog_top#* }" in
+		"rebase (finish):"*) _DPS_EPHEMERAL_TIPS="${_DPS_EPHEMERAL_TIPS} ${rebased_tip}" ;;
+		esac
+	fi
+	# Force-push with lease so we never clobber a human-pushed commit.
+	if ! git -C "$ephemeral" push --force-with-lease=refs/heads/"$head_ref":origin/"$head_ref" \
+		origin "HEAD:refs/heads/${head_ref}" >/dev/null 2>&1; then
+		_dps_log "PR #$pr_number ($repo_slug): force-push failed — possibly clobber protected"
+		return 1
+	fi
+	return 0
+}
+
+# Remove the ephemeral worktree and its throwaway branch regardless of
+# outcome. t2976 / GH#21699: canonical guard before destructive removal. The
+# ephemeral path is created via mktemp and can never legitimately match a
+# registered canonical repo — a hit means a refactor or environment override
+# redirected the path. Skip + audit instead of destroying.
+# GH#34943: removal also requires invocation-owned evidence — the owner
+# token written into the worktree's admin dir at creation, and a branch tip
+# this invocation produced ($7, space-separated). Anything else preserves.
+_dps_remove_ephemeral() {
+	local repo_path="$1"
+	local ephemeral="$2"
+	local ephemeral_branch="$3"
+	local pr_number="$4"
+	local repo_slug="$5"
+	local owner_mark="${6:-}"
+	local expected_tips="${7:-}"
+	local preserve_msg="PR #$pr_number ($repo_slug): preserving $ephemeral and branch $ephemeral_branch"
+
+	if is_registered_canonical "$ephemeral"; then
+		_dps_log "PR #$pr_number ($repo_slug): refusing to remove canonical path $ephemeral — registry hit"
+		log_worktree_removal_event "$_WTAR_SKIPPED" "$_WTAR_DPS_CALLER" "$ephemeral" "canonical-skip" "$_DPS_MODE_SKIPPED"
+		return 0
+	fi
+	if [[ -e "$ephemeral" ]]; then
+		local admin="" found_mark=""
+		admin=$(git -C "$ephemeral" rev-parse --absolute-git-dir 2>/dev/null) || admin=""
+		if [[ -n "$admin" && -f "${admin}/${_DPS_OWNER_FILE}" ]]; then
+			IFS= read -r found_mark <"${admin}/${_DPS_OWNER_FILE}" || found_mark=""
+		fi
+		if [[ -z "$owner_mark" || "$found_mark" != "$owner_mark" ]]; then
+			_dps_log "${preserve_msg} — ownership token absent or mismatched"
+			log_worktree_removal_event "$_WTAR_SKIPPED" "$_WTAR_DPS_CALLER" "$ephemeral" "ownership-unproven" "$_DPS_MODE_SKIPPED"
+			return 0
+		fi
+		if ! worktree_managed_require_removal_proof "$ephemeral"; then
+			_dps_log "${preserve_msg} — managed completion proof unavailable"
+			log_worktree_removal_event "$_WTAR_SKIPPED" "$_WTAR_DPS_CALLER" "$ephemeral" "managed-proof-unavailable" "$_DPS_MODE_SKIPPED"
+			return 0
+		fi
+	fi
+	# The branch tip must resolve and be one this invocation produced; a
+	# commit added by anyone else, or an unresolvable tip while the checkout
+	# still exists, keeps both the branch and the worktree.
+	local branch_oid=""
+	branch_oid=$(git -C "$repo_path" rev-parse --verify --quiet "refs/heads/${ephemeral_branch}" 2>/dev/null) || branch_oid=""
+	if [[ -z "$branch_oid" && -e "$ephemeral" ]] ||
+		[[ -n "$branch_oid" && " ${expected_tips} " != *" ${branch_oid} "* ]]; then
+		_dps_log "${preserve_msg} — branch tip '${branch_oid}' unresolved or not produced by this run"
+		log_worktree_removal_event "$_WTAR_SKIPPED" "$_WTAR_DPS_CALLER" "$ephemeral" "foreign-branch-tip" "$_DPS_MODE_SKIPPED"
+		return 0
+	fi
+	# Native Git is the only remover: it refuses unregistered paths and
+	# locked worktrees (single --force), so a failure preserves the
+	# directory instead of falling back to raw deletion.
+	if [[ -e "$ephemeral" ]] && ! git -C "$repo_path" worktree remove --force "$ephemeral" >/dev/null 2>&1; then
+		_dps_log "PR #$pr_number ($repo_slug): native removal of $ephemeral refused — preserving it and branch $ephemeral_branch"
+		log_worktree_removal_event "$_WTAR_SKIPPED" "$_WTAR_DPS_CALLER" "$ephemeral" "native-remove-refused" "$_DPS_MODE_SKIPPED"
+		return 0
+	fi
+	git -C "$repo_path" worktree prune >/dev/null 2>&1 || true
+	# update-ref does not refuse a checked-out branch, so check that first.
+	local wt_line="" checked_out=0
+	while IFS= read -r wt_line; do
+		[[ "$wt_line" == "branch refs/heads/${ephemeral_branch}" ]] && checked_out=1
+	done < <(git -C "$repo_path" worktree list --porcelain 2>/dev/null || printf 'branch refs/heads/%s\n' "$ephemeral_branch")
+	if [[ -n "$branch_oid" ]] && { [[ "$checked_out" -eq 1 ]] ||
+		! git -C "$repo_path" update-ref -d "refs/heads/${ephemeral_branch}" "$branch_oid" >/dev/null 2>&1; }; then
+		_dps_log "PR #$pr_number ($repo_slug): branch $ephemeral_branch moved or is checked out elsewhere — preserved"
+	fi
+	log_worktree_removal_event "$_WTAR_FIXTURE_REMOVED" "$_WTAR_DPS_CALLER" "$ephemeral" "fixture" "fixture"
 	return 0
 }
 
@@ -920,7 +1072,7 @@ _dps_rebase_post_comment() {
 	local key="$5"
 
 	local comment_body
-	comment_body="**Auto-rebase**: this PR was DIRTY with only \`TODO.md\` conflicting, so the pulse rebased it onto \`origin/${default_branch}\` with the \`union\` merge strategy and force-pushed.
+	comment_body="**Auto-rebase**: this PR was DIRTY with only \`TODO.md\` conflicting, so the pulse rebased it onto \`origin/${default_branch}\` with a rebase-scoped \`union\` merge driver for \`TODO.md\` and force-pushed.
 
 - If CI now passes, the merge pass will take it from here.
 - If this rebase was wrong, revert with \`git push --force-with-lease origin ${head_ref}\` from your local copy.
@@ -935,7 +1087,7 @@ _Triggered by \`pulse-dirty-pr-sweep.sh\` (t2350 / GH#19948). Action cooldown: $
 	return 0
 }
 
-# Rebase action: attempt `git rebase origin/<default_branch> -X union` in an
+# Rebase action: attempt a TODO.md-only union-driver rebase in an
 # ephemeral worktree and force-push. If anything fails, abort cleanly and
 # return 1 (the PR remains DIRTY for re-classification on the next cycle).
 # Delegates the ephemeral-worktree work to _dps_rebase_in_ephemeral() and
@@ -1057,7 +1209,7 @@ _dirty_pr_action_close() {
 		local linked_state linked_labels
 		linked_state=$(gh issue view "$linked" --repo "$repo_slug" --json state --jq '.state // empty' 2>/dev/null) || linked_state=""
 		linked_labels=$(gh issue view "$linked" --repo "$repo_slug" --json labels --jq '[.labels[].name] | .[]' 2>/dev/null | tr '[:upper:]' '[:lower:]') || linked_labels=""
-		if [[ "$linked_state" == "OPEN" ]] && printf '%s' "$linked_labels" | grep -qx 'parent-task'; then
+		if [[ "$linked_state" == "OPEN" ]] && printf '%s' "$linked_labels" | grep -x 'parent-task' >/dev/null; then
 		_dps_log "PR #$pr_number ($repo_slug): close skipped — linked issue #$linked is open parent-task"
 		_dirty_pr_action_notify "$pr_number" "$repo_slug" "parent-task-linked"
 			return 0
@@ -1122,7 +1274,7 @@ _dirty_pr_action_notify() {
 Reason: \`${reason}\`
 
 Options:
-- Rebase manually: \`git fetch origin && git rebase origin/\$(git symbolic-ref --short refs/remotes/origin/HEAD | sed 's|origin/||')\` (or \`--strategy-option=union\` when TODO.md is the culprit).
+- Rebase manually: \`git fetch origin && git rebase origin/\$(git symbolic-ref --short refs/remotes/origin/HEAD | sed 's|origin/||')\`, then resolve any conflicts before continuing.
 - Close as superseded: \`gh pr close ${pr_number} --delete-branch\`.
 - Opt out of future sweeps: add the \`do-not-close\` label.
 

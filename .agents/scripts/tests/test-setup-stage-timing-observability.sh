@@ -77,7 +77,7 @@ test_time_step_logs_running_before_command() {
 
 test_noninteractive_cli_failure_continues_config_reconciliation() {
 	local snippet=""
-	snippet=$(perl -0ne 'print $1 if /(_setup_run_non_interactive\(\) \{.*?^\})/ms' "$SETUP_SH")
+	snippet=$(perl -0ne 'print $1 if /(_setup_run_noninteractive_migrations\(\) \{.*?^\}\n\n_setup_run_non_interactive\(\) \{.*?^\})/ms' "$SETUP_SH")
 	if [[ -z "$snippet" ]]; then
 		print_result "non-interactive setup extraction succeeds" 1 "setup function block not found"
 		return 0
@@ -93,6 +93,7 @@ test_noninteractive_cli_failure_continues_config_reconciliation() {
 		set -e
 		eval "$snippet"
 		SETUP_STAGE_OPENCODE="opencode"
+		SETUP_STAGE_OPENCODE_SERVICE="opencode_service"
 		SETUP_STAGE_AGENTS="agents"
 		SETUP_STAGE_OPENCODE_PLUGINS="opencode_plugins"
 		SETUP_STAGE_HOTFIX_CONFIG="hotfix_config"
@@ -120,6 +121,7 @@ test_noninteractive_cli_failure_continues_config_reconciliation() {
 	local output=""
 	output=$(<"$output_file")
 	if [[ "$status" -eq 0 ]] &&
+		grep -qx "opencode_service" "$trace_file" &&
 		grep -qx "install_aidevops_cli" "$trace_file" &&
 		grep -qx "update_opencode_config" "$trace_file" &&
 		[[ "$output" == *"continuing configuration reconciliation"* ]]; then

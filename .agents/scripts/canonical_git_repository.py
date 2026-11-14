@@ -6,9 +6,10 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 from pathlib import Path
+
+from native_git import real_git
 
 from canonical_git_management import (
     is_managed_root,
@@ -17,26 +18,11 @@ from canonical_git_management import (
 )
 
 
-def real_git(explicit: str = "") -> str:
-    """Resolve the real Git executable without selecting the sibling shim."""
-    if explicit:
-        return explicit
-    guard_dir = Path(__file__).resolve().parent
-    for directory in os.environ.get("PATH", "").split(os.pathsep):
-        candidate = Path(directory or ".") / "git"
-        try:
-            if (
-                candidate.is_file()
-                and os.access(candidate, os.X_OK)
-                and candidate.resolve().parent != guard_dir
-            ):
-                return str(candidate.resolve())
-        except OSError:
-            continue
-    return shutil.which("git") or "/usr/bin/git"
-
-
 def git_output(real_git_path: str, cwd: str, *args: str) -> str:
+    if not os.path.isdir(cwd):
+        # Deleted/missing cwd: probe from "/" so absolute `git -C <path>` still
+        # resolves; without -C, git finds no repository there (not canonical).
+        cwd = "/"
     try:
         result = subprocess.run(
             [real_git_path, *args],

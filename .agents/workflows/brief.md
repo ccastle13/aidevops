@@ -93,6 +93,45 @@ gh issue edit <N> --repo <slug> --remove-assignee <user>
 
 The wrapper currently self-assigns in violation of t2157. Until t2406/GH#19991 merges, manual unassign is required to avoid dispatch-blocking.
 
+### 6. Files Scope for auto-dispatch (GH#32531)
+
+Every `auto-dispatch` implementation issue body should carry a canonical scope
+section; the author has the most context to choose it. `## Files` and prose file
+lists do not count. Explicit
+`` `EDIT: path[:lines]` `` / `` `NEW: path` `` bullets under `### Files to Modify`
+(including `` and `other/path` `` continuations) are normalized: the pulse appends
+the derived Files Scope to trusted bodies. Otherwise the pulse still dispatches
+trusted briefs, and the worker's first step is scope discovery: it records the
+section on the issue before editing (GH#33243, `reference/worker-discipline.md`
+"Missing Files Scope"). Older `missing_files_scope` brief holds are released
+automatically.
+
+```markdown
+### Files Scope
+
+- `.agents/scripts/example-helper.sh`
+- `.agents/scripts/example-helper-test.sh`
+```
+
+One exact repository-relative path per line (no globs or `EDIT:`/`NEW:` prefixes),
+nothing after it; list tests and docs the worker must touch. Put descriptions,
+hard boundaries and recovery guidance in a sibling section. Verify before publishing:
+`pre-dispatch-validator-helper.sh scope-check <N> "$(cat body.md)" 1` (exit 0).
+Interactive `claim-task-id.sh --labels auto-dispatch` refuses a description
+without it, and the `gh_create_issue` PATH command refuses an unscoped
+`auto-dispatch` body, because the author can fix it on the spot; scripts that
+source the library only warn (GH#32880).
+Also list any test file a required CI gate will demand
+(for example platform/bash-compat fixes need a changed test). Planning-only
+issues start with `Planning-only:` instead.
+
+For work requiring runner-local credentials during verification or publication,
+declare **names only** with one `needs-secret:NAME` label per name. Alternatively
+put `<!-- aidevops:needs-secrets NAME1 NAME2 -->` in the issue body when labels
+are impractical. Labels take precedence when both are present. Never include
+secret values; names in either form remain visible to issue readers. A runner
+without every named secret silently yields before claiming.
+
 ## Dispatch Readiness Contract (brief schema v2)
 
 New briefs intended for auto-dispatch use `<!-- aidevops:brief-schema=v2 -->`
@@ -140,8 +179,10 @@ Rendered GitHub content serves people and workers from the same source:
 For maintained repositories, publishing a worker-ready implementation issue is
 the decision to implement it. Add `auto-dispatch` at creation and do not ask for
 a second dispatch approval. If the user explicitly chose later/manual handling,
-keep the work as a local TODO/plan instead; reserve `no-auto-dispatch` for a
-durable hold whose reason is recorded on the issue.
+saved `tNNN` TODO rows publish through issue-sync as non-dispatched tracking issues
+without `auto-dispatch`; ID-less plan lines stay local. Do not ask to dispatch
+saved work. Reserve `no-auto-dispatch` for a durable hold whose reason is recorded
+on the issue.
 
 ## Ordered Work / Dependencies
 
@@ -160,6 +201,25 @@ Once every blocker closes, Pulse changes the next leaf to `status:available`;
 the completing worker closes only its own leaf and does not edit its successor.
 Independent children may remain `status:available` for parallel dispatch, while
 the roadmap parent keeps `parent-task` and never receives `#auto-dispatch`.
+
+### Waiting on an upstream release
+
+When a worker-ready issue must wait until a third-party upstream tags a release
+containing a specific commit, never leave the blocker as prose only. Keep
+`#auto-dispatch` with `status:blocked` and put this marker on its own line in
+the issue body, with the full 40-character commit SHA:
+
+```text
+<!-- aidevops:upstream-release-gate repo=OWNER/REPO commit=SHA -->
+```
+
+Pulse's stale-blocked sweep checks the highest version-sorted upstream tags (not
+GitHub Releases, so tag-only upstreams work) and moves the issue to
+`status:available` once every gate is in a tag and every native or declared
+blocker is closed. Holds still win. Untrusted-author issues, malformed markers
+and more than five gates stay blocked; an unreachable upstream or commit is
+reported as a sweep failure. Markers inside fenced code blocks are examples,
+not gates. Still describe the resume condition and verification in prose.
 
 ## Seeded Draft PR Decision
 
@@ -192,6 +252,15 @@ Seeded draft PR bodies must mentor the next worker with:
 - Stale-assumption warning: what would make the seed wrong and what to re-check before continuing.
 
 Record the decision in `~/.aidevops/agents/templates/brief-template.md` under **Seeded Draft PR** whether a seed was created or intentionally skipped.
+
+### Seed mechanics (GH#34233)
+
+Seeds also carry companion files (fixtures, research notes, scaffolding) an issue needs, so nothing waits for a default-branch merge. Commit them in a linked worktree branch, then run `seed-pr-helper.sh open <issue> --notes <file> [--dispatch]`. It pushes, opens a same-repository draft labelled `seed-pr` with the body marker `<!-- aidevops:seed-pr issue=N -->` and `For #N`, and labels the issue `seed-pr` (`--dispatch` also adds `auto-dispatch`). Re-running pushes an updated head to the same seed.
+
+- **Dispatch:** dedup ignores the seed as an implementation checkpoint; the worker worktree starts from the exact seed head SHA.
+- **Trust:** only one open, same-repository draft by an OWNER/MEMBER/COLLABORATOR counts. Several marked seeds, forks, or untrusted authors are ignored, and the worker starts from the default branch.
+- **Supersede:** `full-loop-helper.sh commit-and-pr` proves the seed head is an ancestor before WIP squash/rebase, then closes the seed once the implementation PR exists. A seed that moved after the proof stays open.
+- Never mark a seed ready or merge it; its commits land through the implementation PR.
 
 ## Tier Classification
 

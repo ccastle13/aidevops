@@ -46,6 +46,9 @@ print_result() {
 
 setup_test_repo() {
 	TEST_ROOT=$(mktemp -d)
+	# Worktree creation canonicalizes its base (GH#35781), so path assertions
+	# must use the physical fixture path; macOS TMPDIR is under the /var symlink.
+	TEST_ROOT=$(cd "$TEST_ROOT" && pwd -P) || return 1
 	TEST_WORKTREE_BASE="$(dirname "$TEST_ROOT")/$(basename "$TEST_ROOT")-worktrees"
 	TEST_REGISTRY_DIR="${TEST_ROOT}/.registry"
 	TEST_REGISTRY_DB="${TEST_REGISTRY_DIR}/worktree-registry.db"
@@ -78,7 +81,8 @@ run_helper() {
 	shift
 	(
 		cd "$target_dir" || exit 1
-		WORKTREE_REGISTRY_DIR="$TEST_REGISTRY_DIR" \
+		AIDEVOPS_WORKTREE_BASE_DIR="$TEST_WORKTREE_BASE" \
+			WORKTREE_REGISTRY_DIR="$TEST_REGISTRY_DIR" \
 			WORKTREE_REGISTRY_DB="$TEST_REGISTRY_DB" \
 			"$HELPER" "$@"
 	)
@@ -241,32 +245,36 @@ test_blocks_when_linked_worktree_owned_by_another_live_process() {
 }
 
 test_allows_headless_child_of_exact_wrapper_owner() {
-	local worktree_path="${TEST_ROOT}/wrapper-owned-worktree"
-	"$GIT_BIN" -C "$TEST_ROOT" worktree add "$worktree_path" -b bugfix/wrapper-owned-worktree >/dev/null 2>&1
+	local owner_session="${1:-issue-28426}"
+	local worktree_path="${TEST_ROOT}/wrapper-owned-${owner_session}"
+	local branch="bugfix/wrapper-owned-${owner_session}"
+	"$GIT_BIN" -C "$TEST_ROOT" worktree add "$worktree_path" -b "$branch" >/dev/null 2>&1
 
 	ensure_registry_schema
 	sqlite3 "$TEST_REGISTRY_DB" "
         INSERT OR REPLACE INTO worktree_owners
             (worktree_path, branch, owner_pid, owner_session, task_id)
         VALUES
-            ('$worktree_path', 'bugfix/wrapper-owned-worktree', $$, 'issue-28426', '28426');
+            ('$worktree_path', '$branch', $$, '$owner_session', '28426');
     " >/dev/null 2>&1
 
 	local output=""
 	local exit_code=0
 	output=$(AIDEVOPS_SESSION_ORIGIN=worker AIDEVOPS_HEADLESS=true \
 		AIDEVOPS_WORKTREE_OWNER_PID="$$" \
-		AIDEVOPS_WORKTREE_OWNER_SESSION="issue-28426" \
+		AIDEVOPS_WORKTREE_OWNER_SESSION="$owner_session" \
 		AIDEVOPS_WORKTREE_OWNER_TASK="28426" \
 		AIDEVOPS_WORKTREE_OWNER_PATH="$worktree_path" \
 		PRE_EDIT_OWNER_PID="$BASHPID" run_helper "$worktree_path" 2>&1) || exit_code=$?
 
-	if [[ "$exit_code" -eq 0 && "$output" == *"OK"* && "$output" != *"WORKTREE_OWNERSHIP_CONFLICT=true"* ]]; then
-		print_result "allows headless child of exact live wrapper owner" 0
+	local registry_owner=""
+	registry_owner=$(sqlite3 "$TEST_REGISTRY_DB" "SELECT owner_pid || '|' || owner_session || '|' || task_id FROM worktree_owners WHERE worktree_path = '$worktree_path';")
+	if [[ "$exit_code" -eq 0 && "$output" == *"OK"* && "$output" != *"WORKTREE_OWNERSHIP_CONFLICT=true"* && "$registry_owner" == "$$|$owner_session|28426" ]]; then
+		print_result "allows headless child without replacing exact wrapper owner: ${owner_session}" 0
 		return 0
 	fi
 
-	print_result "allows headless child of exact live wrapper owner" 1 "exit=${exit_code} output=${output}"
+	print_result "allows headless child without replacing exact wrapper owner: ${owner_session}" 1 "exit=${exit_code} owner=${registry_owner} output=${output}"
 	return 0
 }
 
@@ -320,8 +328,10 @@ test_headless_wrapper_owner_proof_fails_closed() {
 }
 
 test_rejects_forged_proof_for_unrelated_live_owner() {
-	local worktree_path="${TEST_ROOT}/unrelated-live-owner-worktree"
-	"$GIT_BIN" -C "$TEST_ROOT" worktree add "$worktree_path" -b bugfix/unrelated-live-owner >/dev/null 2>&1
+	local owner_session="${1:-issue-28426}"
+	local worktree_path="${TEST_ROOT}/unrelated-live-owner-${owner_session}"
+	local branch="bugfix/unrelated-live-owner-${owner_session}"
+	"$GIT_BIN" -C "$TEST_ROOT" worktree add "$worktree_path" -b "$branch" >/dev/null 2>&1
 
 	local unrelated_pid=""
 	sleep 30 >/dev/null 2>&1 &
@@ -331,14 +341,14 @@ test_rejects_forged_proof_for_unrelated_live_owner() {
         INSERT OR REPLACE INTO worktree_owners
             (worktree_path, branch, owner_pid, owner_session, task_id)
         VALUES
-            ('$worktree_path', 'bugfix/unrelated-live-owner', $unrelated_pid, 'issue-28426', '28426');
+            ('$worktree_path', '$branch', $unrelated_pid, '$owner_session', '28426');
     " >/dev/null 2>&1
 
 	local output=""
 	local exit_code=0
 	output=$(AIDEVOPS_SESSION_ORIGIN=worker AIDEVOPS_HEADLESS=true \
 		AIDEVOPS_WORKTREE_OWNER_PID="$unrelated_pid" \
-		AIDEVOPS_WORKTREE_OWNER_SESSION="issue-28426" \
+		AIDEVOPS_WORKTREE_OWNER_SESSION="$owner_session" \
 		AIDEVOPS_WORKTREE_OWNER_TASK="28426" \
 		AIDEVOPS_WORKTREE_OWNER_PATH="$worktree_path" \
 		PRE_EDIT_OWNER_PID="$BASHPID" run_helper "$worktree_path" 2>&1) || exit_code=$?
@@ -346,11 +356,11 @@ test_rejects_forged_proof_for_unrelated_live_owner() {
 	wait "$unrelated_pid" 2>/dev/null || true
 
 	if [[ "$exit_code" -eq 2 && "$output" == *"WORKTREE_OWNERSHIP_CONFLICT=true"* ]]; then
-		print_result "rejects copied proof for unrelated live owner process" 0
+		print_result "rejects copied proof for unrelated live owner process: ${owner_session}" 0
 		return 0
 	fi
 
-	print_result "rejects copied proof for unrelated live owner process" 1 "exit=${exit_code} output=${output}"
+	print_result "rejects copied proof for unrelated live owner process: ${owner_session}" 1 "exit=${exit_code} output=${output}"
 	return 0
 }
 
@@ -395,6 +405,10 @@ test_headless_planning_path_requires_worktree() {
 	local exit_code=0
 	output=$(FULL_LOOP_HEADLESS=true run_helper "$TEST_ROOT" --loop-mode --file "README.md" 2>&1) || exit_code=$?
 
+	if [[ "$output" == *"LOOP_DECISION=worktree_created"* && "$output" != *"WORKTREE_PATH=${TEST_WORKTREE_BASE}/"* ]]; then
+		print_result "headless planning worktree stays inside fixture base" 1 "$output"
+		return 0
+	fi
 	if [[ "$exit_code" -ne 0 || "$output" == *"LOOP_DECISION=worktree"* || "$output" == *"LOOP_DECISION=worktree_created"* ]]; then
 		print_result "headless planning path requires a linked worktree" 0
 		return 0
@@ -634,6 +648,30 @@ test_task_branch_remote_refresh_failure_fails_closed() {
 	return 0
 }
 
+# GH#36370: a creation failure that reports no collision must not send the
+# caller looking for a branch collision that does not exist.
+test_creation_refusal_without_collision() {
+	local saved_base="$TEST_WORKTREE_BASE"
+	TEST_WORKTREE_BASE="${TEST_ROOT}/worktree-base-is-a-file"
+	printf 'not a directory\n' >"$TEST_WORKTREE_BASE"
+	local output=""
+	local exit_code=0
+	output=$(OPENCODE_SESSION_ID=refusal-session FULL_LOOP_HEADLESS=true \
+		run_helper "$TEST_ROOT" --loop-mode --task "Issue #30001 creation refusal" 2>&1) || exit_code=$?
+	rm -f "$TEST_WORKTREE_BASE"
+	TEST_WORKTREE_BASE="$saved_base"
+	if [[ "$exit_code" -eq 2 && "$output" == *"WORKTREE_COLLISION=unreported"* &&
+		"$output" == *"ACTION_REQUIRED=inspect_creation_refusal"* &&
+		"$output" == *"REFUSAL: Worktree base directory refused: configured path is not a directory"* &&
+		"$output" == *"No branch collision was reported"* &&
+		"$output" != *"Inspect the reported branch collision"* ]]; then
+		print_result "creation refusal without collision is not reported as a collision" 0
+	else
+		print_result "creation refusal without collision is not reported as a collision" 1 "exit=${exit_code} output=${output}"
+	fi
+	return 0
+}
+
 main() {
 	trap teardown_test_repo EXIT
 	setup_test_repo
@@ -646,8 +684,11 @@ main() {
 	test_warns_when_canonical_repo_is_off_main
 	test_blocks_when_linked_worktree_owned_by_another_live_process
 	test_allows_headless_child_of_exact_wrapper_owner
+	# GH#33303: manual dispatch must accept the same exact-wrapper proof as pulse.
+	test_allows_headless_child_of_exact_wrapper_owner "manual-cli-28426-1790835194"
 	test_headless_wrapper_owner_proof_fails_closed
 	test_rejects_forged_proof_for_unrelated_live_owner
+	test_rejects_forged_proof_for_unrelated_live_owner "manual-cli-28426-1790835194"
 	test_allows_same_opencode_session_pid_rollover
 	test_headless_planning_path_requires_worktree
 	test_interactive_allowlisted_path_still_requires_worktree
@@ -659,6 +700,7 @@ main() {
 	test_stale_task_branch_is_replaced_and_owned_continuation_resumes
 	test_unique_task_branch_fails_closed
 	test_task_branch_remote_refresh_failure_fails_closed
+	test_creation_refusal_without_collision
 
 	printf '\nRan %s tests, %s failed\n' "$TESTS_RUN" "$TESTS_FAILED"
 	if [[ "$TESTS_FAILED" -ne 0 ]]; then

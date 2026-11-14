@@ -34,6 +34,12 @@ r915|x|Pulse check — worker utilisation and self-improvement recommendations|r
 r916|x|Cloudron packages — check upstream releases|repeat:daily(@01:30)|~2m|scripts/cloudron-package-monitor-helper.sh upstream --apply|script|UTC
 r917|x|Cloudron packages — audit compatibility|repeat:weekly(sun@07:40)|~5m|scripts/cloudron-package-monitor-helper.sh compatibility --apply|script
 r918|x|Observability retention — archive bounded runtime evidence|repeat:daily(@03:10)|~2m|scripts/observability-helper.sh retention-maintenance --apply --max-partitions 20 --max-duration-seconds 120|script
+r919|x|Private mirror upstream sync|repeat:daily(@20:00)|~5m|scripts/mirror-sync-helper.sh sync|script
+r920|x|Memory audit — mine actionable learning patterns|repeat:daily(@04:00)|~2m|scripts/memory-audit-pulse.sh run --quiet|script
+r921|x|README badges — remediate managed repo drift|repeat:weekly(sun@08:10)|~5m|scripts/badges-sync-helper.sh --apply --json|script
+r922|x|Storage hygiene — reclaim tmp, worktrees, OpenCode DBs, observability|repeat:daily(@05:30)|~10m|scripts/storage-cleanup-helper.sh all --apply|script
+r923|x|Cert watch — CT issuance and CAA audit for operated domains|repeat:daily(@06:40)|~3m|scripts/cert-watch-helper.sh run --apply|script
+r924|x|Cloudron releases — process signed approvals|repeat:cron(*/30 * * * *)|~3m|scripts/cloudron-release-approval-helper.sh process --apply|script
 ENTRIES
 	return 0
 }
@@ -459,6 +465,51 @@ EOF
 	return 0
 }
 
+describe_r919() {
+	local os="${1:-darwin}"
+	cat <<EOF
+# r919: Private mirror upstream sync
+
+Daily at 20:00, synchronises only registered private mirrors with a string
+\`mirror_upstream\` slug and without \`mirror_sync: false\`. All merge work is
+isolated in a disposable temporary repository; canonical checkouts are read-only.
+
+Runs \`mirror-sync-helper.sh sync\`. Fast-forward pushes go only to the mirror;
+divergence creates a dated sync branch and merges without force. Conflicts leave
+the mirror default branch unchanged. Inspect \`mirror-sync-helper.sh status\`.
+$(_platform_footnote "$os")
+EOF
+	return 0
+}
+
+describe_r920() {
+	local os="${1:-darwin}"
+	cat <<EOF
+# r920: Memory audit
+
+Runs the local memory hygiene and improvement scan once daily. The scan only
+files bounded, deduplicated follow-up work for review; it never writes to a
+canonical checkout.
+
+## Schedule
+
+| Field | Value |
+|-------|-------|
+| Frequency | Daily at 04:00 |
+| Type | script |
+| Expected duration | ~2 minutes |
+| Script | \`scripts/memory-audit-pulse.sh run --quiet\` |
+$(_scheduler_row_calendar "$os" "StartCalendarInterval: Hour=4, Minute=0" "sh.aidevops.memory-audit" "sh.aidevops.memory-audit")
+
+## What to check
+
+- \`memory-audit-pulse.sh status\` — last successful audit and interval
+- \`memory-audit-pulse.sh run --dry-run --force\` — candidate and routing preview
+$(_platform_footnote "$os")
+EOF
+	return 0
+}
+
 describe_r907() {
 	local os="${1:-darwin}"
 	cat <<EOF
@@ -540,9 +591,9 @@ describe_r909() {
 	local os="${1:-darwin}"
 	local screen_time_check
 	if _is_darwin_os "$os"; then
-		screen_time_check="System Settings → Screen Time — raw data"
+		screen_time_check="System Settings → Screen Time — raw data; \`~/.aidevops/.agent-workspace/observability/screen-activity.jsonl\` — input-activity intervals from the per-minute \`sh.aidevops.screen-activity-sampler\` (HIDIdleTime, same 5-minute idle rule as Linux); \`screen-time-helper.sh input-stats\`"
 	else
-		screen_time_check="\`~/.aidevops/.agent-workspace/cron/screen-time/\` — snapshot data (no native Screen Time on Linux)"
+		screen_time_check="\`~/.aidevops/.agent-workspace/observability/screen-activity.jsonl\` — input-activity intervals from the per-minute \`aidevops-screen-activity-sampler\` (no native Screen Time on Linux); \`screen-time-helper.sh profile-stats\` reports \`unavailable\` until it has samples"
 	fi
 	cat <<EOF
 # r909: Screen time snapshot
@@ -953,6 +1004,46 @@ EOF
 	return 0
 }
 
+describe_r924() {
+	local os="${1:-}"
+	[[ -n "$os" ]] || os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+	cat <<EOF
+# r924: Cloudron signed release approvals
+
+## Overview
+
+Processes release-approval-required issues in registered Cloudron package repos.
+The maintainer signs once with \`sudo aidevops approve issue <N> <repo>\`.
+
+It also owns the worker release handoff (GH#36268). A held worker PR gets its
+approval request once checks are green. Older unsigned upstream bumps that main
+or the requested PR already bundles are closed with their findings.
+
+## Schedule
+
+| Field | Value |
+|-------|-------|
+| Frequency | Every 30 minutes |
+| Type | script |
+| Expected duration | ~3 minutes |
+| Script | \`scripts/cloudron-release-approval-helper.sh process --apply\` |
+$(_scheduler_row_pulse "repeat:cron(*/30 * * * *)")
+
+## Safety rails
+
+- Requires ADMIN/MAINTAIN authority and a verified signed issue approval.
+- Binds the merge to the approved head; changed heads require re-approval.
+- Keeps all existing merge, review, checks and publication workflow gates.
+- Waits at most 120 seconds per catalog run, resuming on the next invocation.
+- Closes only after verifying catalog version, tag and GitHub release.
+- Never supersedes signed approvals, human PRs or non-upstream PRs; branches are kept.
+- Never enables publication or deploys an app. NMR semantics are unchanged.
+$(_pulse_diag_commands "$os")
+$(_platform_footnote "$os")
+EOF
+	return 0
+}
+
 describe_r917() {
 	local os="${1:-}"
 	[[ -n "$os" ]] || os="$(uname -s | tr '[:upper:]' '[:lower:]')"
@@ -982,6 +1073,78 @@ the version-controlled \`repeat:\` expression; r917 has no dedicated platform un
 - Audits local package files without building or executing upstream content.
 - Creates issues only after target-local deduplication and authority checks.
 - Never acknowledges a finding when GitHub/API operations fail.
+$(_pulse_diag_commands "$os")
+$(_platform_footnote "$os")
+EOF
+	return 0
+}
+
+describe_r923() {
+	local os="${1:-}"
+	[[ -n "$os" ]] || os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+	cat <<EOF
+# r923: Certificate Transparency and CAA watch
+
+## Overview
+
+Checks operated domains from the site inventory, Hostinger fleet, repository
+registry and private cert-watch configuration. See \`tools/security/cert-watch.md\`.
+
+## Schedule
+
+| Field | Value |
+|-------|-------|
+| Frequency | Daily at 06:40 |
+| Type | script |
+| Expected duration | ~3 minutes (depends on domain count and crt.sh latency) |
+| Script | \`scripts/cert-watch-helper.sh run --apply\` |
+$(_scheduler_row_pulse "repeat:daily(@06:40)")
+
+## Safety rails
+
+- Baselines the first successful CT response; UNKNOWN responses preserve state.
+- Serializes runs and spaces CT requests at least two seconds apart.
+- Never changes DNS, revokes certificates or dispatches implementation workers.
+- Files deduplicated operator issues only after verifying PRIVATE visibility;
+  an unverified route falls back only to a verified private fallback repository.
+- The CLI defaults to a dry run; local state remains private.
+$(_pulse_diag_commands "$os")
+$(_platform_footnote "$os")
+EOF
+	return 0
+}
+
+describe_r921() {
+	local os="${1:-}"
+	[[ -n "$os" ]] || os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+	cat <<EOF
+# r921: README badge drift remediation
+
+## Overview
+
+Runs \`badges-check-helper.sh --json\` through the badge sync helper's existing
+maintained-repository selector, then opens one combined sync PR per actionable
+owned-org repository. Current repositories produce no PR.
+
+## Schedule
+
+| Field | Value |
+|-------|-------|
+| Frequency | Weekly on Sunday at 08:10 |
+| Type | script |
+| Expected duration | ~5 minutes |
+| Script | \`scripts/badges-sync-helper.sh --apply --json\` |
+$(_scheduler_row_pulse "repeat:weekly(sun@08:10)")
+
+## Safety rails
+
+- Honors \`badge-orgs.conf\`, maintenance opt-outs, local-only, contributed and
+  contributor-role exclusions, and starter-owned badge blocks.
+- Uses linked worktrees based on the remote default branch; canonical checkout
+  branch, HEAD, index and working files remain unchanged even when dirty.
+- Deduplicates open sync PRs and serializes each repository with a lock.
+- Failed transactions retain their worktree for recovery; successful runs request
+  guarded cleanup without forcing removal or merging the PR.
 $(_pulse_diag_commands "$os")
 $(_platform_footnote "$os")
 EOF
@@ -1023,6 +1186,61 @@ dedicated launchd plist or systemd unit.
   remains for the next scheduled run.
 - Missing stores and empty candidate sets are successful no-ops.
 $(_pulse_diag_commands "$os")
+$(_platform_footnote "$os")
+EOF
+	return 0
+}
+
+describe_r922() {
+	local os="${1:-}"
+	[[ -n "$os" ]] || os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+	cat <<EOF
+# r922: Storage hygiene
+
+## Overview
+
+Daily run of \`aidevops cleanup all --apply\`. It calls the existing owning
+cleaner for each aidevops store so disk usage stays bounded without anyone
+having to remember a manual cleanup:
+
+| Store | Cleaner |
+|-------|---------|
+| tmp | \`system-cleanup.sh --force\` (retention window, moves to Trash) |
+| worktrees | \`cleanup-worktrees-async-helper.sh\` (merged/closed, guarded removal) |
+| artefacts | \`worktree-artefact-reclaim.sh --force\` (ignored build output in idle worktrees, to Trash) |
+| opencode | \`opencode-db-maintenance-helper.sh auto\` (idle DBs, layout backups) |
+| observability | \`observability-helper.sh retention-maintenance --apply\` |
+
+Run \`aidevops cleanup\` any time for a read-only size report, or
+\`aidevops cleanup <store>\` to preview one store.
+
+## Schedule
+
+| Field | Value |
+|-------|-------|
+| Frequency | Daily at 05:30 local |
+| Type | script |
+| Expected duration | ~10 minutes (bounded per store) |
+| Script | \`scripts/storage-cleanup-helper.sh all --apply\` |
+$(_scheduler_row_calendar "$os" "Hour=5, Minute=30" "sh.aidevops.storage-hygiene" "aidevops-storage-hygiene")
+
+The platform scheduler is installed by \`setup.sh\` and does not depend on the
+supervisor Pulse. Pulse runs r922 only as a fallback when that job is missing
+or cannot start.
+
+## Safety rails
+
+- Orchestrator only: it never deletes files itself, so each cleaner keeps its
+  own safety gates (live-DB skips, dirty-worktree archives, verified archives).
+- A single-runner lock prevents overlapping scheduled and manual runs.
+- A failed store does not stop the others; the run exits non-zero and names
+  the failed stores.
+
+## Diagnostics
+
+- \`aidevops cleanup\` — current sizes and whether r922 is installed
+- \`~/.aidevops/.agent-workspace/logs/storage-hygiene.log\` — scheduled output
+$(_diag_commands "$os" "sh.aidevops.storage-hygiene" "aidevops-storage-hygiene")
 $(_platform_footnote "$os")
 EOF
 	return 0

@@ -47,6 +47,8 @@ SANDBOX=$(mktemp -d)
 trap 'rm -rf "$SANDBOX"' EXIT
 
 export XDG_DATA_HOME="$SANDBOX/data"
+# Real headless workers on the test host must not stall maintenance-window tests.
+export MAINTENANCE_WINDOW_DRAIN_TIMEOUT=0
 
 OPENCODE_DIR="$XDG_DATA_HOME/opencode"
 mkdir -p "$OPENCODE_DIR"
@@ -445,6 +447,51 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+# Test 11d.0: holder-blocked auto records skips, exits 0, and notice escalates
+# -----------------------------------------------------------------------------
+
+skip_state="$SANDBOX/skip-state"
+skip_bin="$SANDBOX/skip-bin"
+mkdir -p "$skip_bin"
+printf '%s\n' '#!/usr/bin/env bash' "printf '%s\\n' 4242" 'exit 0' >"$skip_bin/lsof"
+chmod +x "$skip_bin/lsof"
+skip_rc_ok=true
+for _i in 1 2 3; do
+	set +e
+	PATH="$skip_bin:$PATH" OPENCODE_MAINTENANCE_SINGLE_DB=1 OPENCODE_MAINTENANCE_STATE_DIR="$skip_state" \
+		_run_helper auto >/dev/null 2>&1
+	rc=$?
+	set -e
+	[[ "$rc" -eq 0 ]] || skip_rc_ok=false
+done
+if [[ "$skip_rc_ok" == true ]] && grep -q '"consecutive": 3' "$skip_state/auto-skips.json" 2>/dev/null; then
+	_pass "holder-blocked auto records consecutive skips and exits 0"
+else
+	_fail "auto-skips.json not recorded as expected (rc_ok=$skip_rc_ok)"
+fi
+
+set +e
+out=$(VACUUM_FREELIST_THRESHOLD=0.0 OPENCODE_MAINTENANCE_STATE_DIR="$skip_state" _run_helper notice 2>&1)
+rc=$?
+set -e
+if [[ "$rc" -eq 0 && "$out" == *"3 consecutive"* && "$out" == *"MB reclaimable"* && "$out" == *"maintenance-window --force-opencode"* ]]; then
+	_pass "notice escalates after repeated skips with reclaimable pages"
+else
+	_fail "notice missing skip escalation (rc=$rc) — output: $out"
+fi
+
+rm -f "$skip_state/auto-skips.json"
+set +e
+out=$(VACUUM_FREELIST_THRESHOLD=0.0 OPENCODE_MAINTENANCE_STATE_DIR="$skip_state" _run_helper notice 2>&1)
+rc=$?
+set -e
+if [[ "$rc" -eq 0 && "$out" != *"consecutive"* ]]; then
+	_pass "missing skip state produces no escalation and no error"
+else
+	_fail "missing skip state mishandled (rc=$rc) — output: $out"
+fi
+
+# -----------------------------------------------------------------------------
 # Test 11d.1: invalid integer environment thresholds fall back safely
 # -----------------------------------------------------------------------------
 
@@ -532,7 +579,7 @@ out=$(PATH="$mock_bin:$PATH" MOCK_PULSE_LOG="$mock_pulse_log" MOCK_ARCHIVE_LOG="
 	_run_helper maintenance-window --force-opencode --keep-sessions 123 2>&1)
 rc=$?
 set -e
-if [[ "$rc" -eq 0 ]] && grep -q '^stop$' "$mock_pulse_log" && grep -q '^start$' "$mock_pulse_log" && grep -q -- '--retention-days 30' "$mock_archive_log" && grep -q -- '--keep-sessions 123' "$mock_archive_log"; then
+if [[ "$rc" -eq 0 ]] && grep -q '^stop$' "$mock_pulse_log" && grep -q '^start$' "$mock_pulse_log" && grep -q -- '--worker-retention-days 7 --interactive-retention-days 90' "$mock_archive_log" && grep -q -- '--keep-sessions 123' "$mock_archive_log"; then
 	_pass "maintenance-window stops pulse, archives, maintains, and restarts pulse"
 else
 	_fail "maintenance-window mocked lifecycle failed (rc=$rc) — output: $out"
@@ -542,12 +589,13 @@ fi
 # Test 14: maintenance-window restarts pulse on early active-holder exit
 # -----------------------------------------------------------------------------
 
-cat >"$mock_bin/pgrep" <<'MOCK_PGREP'
+# maintenance-window gates each DB on its exact lsof holders.
+cat >"$mock_bin/lsof" <<'MOCK_LSOF_HOLDER'
 #!/usr/bin/env bash
 printf '%s\n' '12345'
 exit 0
-MOCK_PGREP
-chmod +x "$mock_bin/pgrep"
+MOCK_LSOF_HOLDER
+chmod +x "$mock_bin/lsof"
 : >"$mock_pulse_log"
 : >"$mock_archive_log"
 
@@ -558,7 +606,7 @@ out=$(PATH="$mock_bin:$PATH" MOCK_PULSE_LOG="$mock_pulse_log" MOCK_ARCHIVE_LOG="
 	_run_helper maintenance-window --keep-sessions 123 2>&1)
 rc=$?
 set -e
-rm -f "$mock_bin/pgrep"
+rm -f "$mock_bin/lsof"
 if [[ "$rc" -eq 2 ]] && grep -q '^stop$' "$mock_pulse_log" && grep -q '^start$' "$mock_pulse_log" && [[ ! -s "$mock_archive_log" ]]; then
 	_pass "maintenance-window restarts pulse after active-holder early return"
 else
@@ -572,6 +620,7 @@ fi
 deployed_scripts="$SANDBOX/deployed-scripts"
 mkdir -p "$deployed_scripts"
 cp "$HELPER" "$deployed_scripts/opencode-db-maintenance-helper.sh"
+cp "${SCRIPT_DIR}/../opencode-db-inventory-lib.sh" "$deployed_scripts/"
 _test_copy_shared_deps "${SCRIPT_DIR}/.." "$deployed_scripts"
 sibling_pulse_log="$SANDBOX/sibling-pulse-lifecycle.log"
 cat >"$deployed_scripts/pulse-lifecycle-helper.sh" <<'MOCK_SIBLING_PULSE'
@@ -623,6 +672,7 @@ fi
 missing_scripts="$SANDBOX/missing-scripts"
 mkdir -p "$missing_scripts"
 cp "$HELPER" "$missing_scripts/opencode-db-maintenance-helper.sh"
+cp "${SCRIPT_DIR}/../opencode-db-inventory-lib.sh" "$missing_scripts/"
 _test_copy_shared_deps "${SCRIPT_DIR}/.." "$missing_scripts"
 chmod +x "$missing_scripts/opencode-db-maintenance-helper.sh"
 sqlite_dir=$(dirname "$(command -v sqlite3)")
@@ -657,6 +707,71 @@ fi
 # -----------------------------------------------------------------------------
 # Summary
 # -----------------------------------------------------------------------------
+
+isolated_root="$SANDBOX/isolated"
+mkdir -p "$isolated_root/project with spaces/opencode"
+isolated_db="$isolated_root/project with spaces/opencode/opencode.db"
+cp "$OPENCODE_DIR/opencode.db" "$isolated_db"
+out=$(OPENCODE_INTERACTIVE_ROOT="$isolated_root" _run_helper report 2>&1)
+if [[ "$out" == *"$isolated_db"* && "$out" == *"active / WAL / archive bytes"* ]]; then
+	_pass "report includes isolated DB sizes alongside the selected DB"
+else
+	_fail "isolated report mismatch: $out"
+fi
+# The default DB has a recent throttle record; the isolated DB must still get
+# its own maintenance pass and independent throttle record.
+out=$(OPENCODE_INTERACTIVE_ROOT="$isolated_root" _run_helper auto 2>&1)
+if [[ -f "${isolated_db%/*}/aidevops-maintenance/last-run.json" ]]; then
+	_pass "auto maintains isolated DB independently of the default DB throttle"
+else
+	_fail "isolated maintenance state missing: $out"
+fi
+
+cat >"$mock_bin/lsof" <<'MOCK_LSOF_ERROR'
+#!/usr/bin/env bash
+printf 'lsof: permission denied\n' >&2
+exit 1
+MOCK_LSOF_ERROR
+chmod +x "$mock_bin/lsof"
+out=$(PATH="$mock_bin:$PATH" AUTO_MIN_SECONDS_BETWEEN=0 OPENCODE_INTERACTIVE_ROOT="$isolated_root" _run_helper auto 2>&1)
+if [[ "$out" == *"currently active"* && "$out" != *"Starting maintenance"* ]]; then
+	_pass "inventory maintenance treats lsof inspection errors as protected skips"
+else
+	_fail "lsof inspection error was treated as idle: $out"
+fi
+
+# maintenance-window drains headless workers, maintains idle inventory DBs, and
+# skips only the DB a process holds open (GH#35413).
+mkdir -p "$isolated_root/held project/opencode"
+cp "$OPENCODE_DIR/opencode.db" "$isolated_root/held project/opencode/opencode.db"
+cat >"$mock_bin/lsof" <<'MOCK_LSOF_PER_DB'
+#!/usr/bin/env bash
+case "$*" in *"held project"*) printf '%s\n' '4242' ;; esac
+exit 0
+MOCK_LSOF_PER_DB
+cat >"$mock_bin/pgrep" <<'MOCK_PGREP_DRAIN'
+#!/usr/bin/env bash
+[[ -e "$MOCK_DRAIN_MARKER" ]] && exit 1
+: >"$MOCK_DRAIN_MARKER"
+printf '%s\n' '777'
+exit 0
+MOCK_PGREP_DRAIN
+chmod +x "$mock_bin/lsof" "$mock_bin/pgrep"
+: >"$mock_pulse_log"
+set +e
+out=$(PATH="$mock_bin:$PATH" MOCK_PULSE_LOG="$mock_pulse_log" MOCK_DRAIN_MARKER="$SANDBOX/drain-marker" \
+	PULSE_LIFECYCLE_HELPER="$mock_bin/pulse-lifecycle-helper.sh" \
+	MAINTENANCE_WINDOW_DRAIN_TIMEOUT=5 MAINTENANCE_WINDOW_DRAIN_POLL=1 \
+	OPENCODE_INTERACTIVE_ROOT="$isolated_root" _run_helper maintenance-window --skip-archive 2>&1)
+rc=$?
+set -e
+rm -f "$mock_bin/lsof" "$mock_bin/pgrep"
+if [[ "$rc" -eq 2 && "$out" == *"Headless workers drained"* && "$out" == *"Skipping $isolated_root/held project"* &&
+	"$out" == *"2 maintained, 1 skipped"* ]] && grep -q '^start$' "$mock_pulse_log"; then
+	_pass "maintenance-window drains workers and skips only the held inventory DB"
+else
+	_fail "maintenance-window inventory/drain mismatch (rc=$rc) — output: $out"
+fi
 
 echo
 printf 'Results: %d passed, %d failed\n' "$PASS" "$FAIL"

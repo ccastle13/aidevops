@@ -5,18 +5,68 @@ import {
   routingCandidateIndex,
   routingCandidates,
   routingModelIdentity,
-  routingTierForModel,
+  routingUnavailableDetail,
   nextRoutingTier,
   selectConnectedRoutingCandidate,
 } from "./model-routing.mjs";
+import { loadDelegatedDomainKnowledge } from "./agent-loader.mjs";
+import { SPECIALIST_ADVISOR, validateSpecialistRequest } from "./specialist-advisor.mjs";
+import { loadChildSessionWithParent, routeCreativeMessage } from "./subagent-parent-routing.mjs";
+import { BROWSER_AGENT, routeBrowserDelegate } from "./browser-delegate-routing.mjs";
+import { routeChatParams } from "./subagent-effort-params.mjs";
+import { subagentArm, armRouting, eligibleSubagentTrial } from "./subagent-ab.mjs";
 
-async function loadChildSessionWithParent(context, sessionID) {
+const DOMAIN_KNOWLEDGE_MARKER = "\n\n[AIDEvOps canonical domain knowledge]";
+const DOMAIN_REQUIRED_FIELDS = ["task", "objective", "scope", "source", "decisions", "evidence", "output"];
+
+function validDomainEnvelope(envelope) {
+  if (!envelope) return false;
+  const hasText = (key) => typeof envelope[key] === "string" && Boolean(envelope[key].trim());
+  const checks = [
+    DOMAIN_REQUIRED_FIELDS.every(hasText),
+    ["simple", "standard"].includes(envelope.effort),
+    envelope.authority === "inference-only",
+    Array.isArray(envelope.tools) && envelope.tools.length === 0,
+  ];
+  return checks.every(Boolean);
+}
+
+function domainEnvelope(text) {
+  let envelope;
   try {
-    const childSession = await context.getSession(context.client, sessionID);
-    return childSession?.parentID ? childSession : null;
+    envelope = JSON.parse(text.split(DOMAIN_KNOWLEDGE_MARKER)[0]
+      .replace(/^\[effort:(simple|standard|thinking)\]\s*/i, ""));
   } catch {
-    return null;
+    throw new Error("[aidevops] Domain delegation requires a JSON child envelope");
   }
+  if (!validDomainEnvelope(envelope)) {
+    throw new Error("[aidevops] Invalid domain envelope: bounded evidence, effort and inference-only authority required");
+  }
+  return envelope;
+}
+
+async function routeDomainMessage(context, output, registry, agentName) {
+  const envelope = domainEnvelope(context.messageText(output.parts));
+  const child = await loadChildSessionWithParent(context, output.message.sessionID);
+  if (!child) throw new Error("[aidevops] Domain delegation requires an observed parent session");
+  const parent = await context.getParentRoute(context.client, child);
+  if (!parent.model || !["none", "minimal", "low", "medium", "high", "xhigh", "max"].includes(parent.variant)) {
+    throw new Error("[aidevops] Parent model/effort ceiling unavailable; domain delegation refused");
+  }
+  const light = agentName === "domain-light";
+  const delivered = loadDelegatedDomainKnowledge(registry, envelope.source, light);
+  const effort = light ? "simple" : envelope.effort;
+  // Keep the exact parent model: cross-model effort names are not compute ceilings.
+  output.message.model = routingModelIdentity(parent.model);
+  const variant = context.clampReasoningVariant("medium", parent.variant);
+  context.policies.set(output.message.sessionID, {
+    effort, reason: "bounded_domain", pinned: true, attempt: 1, createdAt: Date.now(),
+    parentSessionID: child.parentID, routedModel: parent.model, domainVariant: variant,
+  });
+  const target = output.parts.find((part) => part.type === "text");
+  target.text = `${JSON.stringify(envelope)}${DOMAIN_KNOWLEDGE_MARKER}\nSource: ${delivered.source}\nSHA256: ${delivered.sha256}\n${delivered.knowledge}`;
+  // No second transcript or duplicated canonical payload on repeated transformation.
+  output.parts = output.parts.filter((part) => part.type !== "text" || part === target);
 }
 
 async function applyConnectedRoutingModel(context, route, message, policy) {
@@ -25,17 +75,47 @@ async function applyConnectedRoutingModel(context, route, message, policy) {
     policy.reason = "provider_state_unavailable_inherit";
     return;
   }
+  const routing = policy.armRouting || context.modelRouting;
+  const availability = context.resolveAvailability?.() || {};
   const routedModel = selectConnectedRoutingCandidate(
-    context.modelRouting,
+    routing,
     route.effort,
     providerState,
+    undefined,
+    availability,
   );
   if (!routedModel) {
-    throw new Error(`[aidevops] No connected model is available for '${route.effort}' routing`);
+    // GH#36698/GH#37649: name same-tier models rejected for the current auth or
+    // rate limited so the failure is actionable; never substitute a lower tier.
+    throw new Error(`[aidevops] No connected model is available for '${route.effort}' routing${routingUnavailableDetail(routing, route.effort, availability)}`);
   }
   message.model = routingModelIdentity(routedModel);
   policy.routedModel = routedModel;
-  policy.candidateIndex = routingCandidateIndex(context.modelRouting, route.effort, routedModel);
+  policy.candidateIndex = routingCandidateIndex(routing, route.effort, routedModel);
+}
+
+function applySpecialistPolicy(context, agentName, text, policy) {
+  if (agentName !== SPECIALIST_ADVISOR || !context.agentRoutingState?.specialistAdvisor) return;
+  validateSpecialistRequest(text);
+  policy.effort = "thinking";
+  policy.reason = "specialist_advice";
+}
+
+async function checkSpecialistAvailability(context, policy) {
+  if (policy.reason !== "specialist_advice") return;
+  const model = context.agentRoutingState.specialistAdvisor.model;
+  const routing = { ...context.modelRouting, tiers: { thinking: { models: [model] } } };
+  const providerState = await context.resolveProviderState();
+  if (!providerState) {
+    throw new Error(`[aidevops] Specialist advisory route unavailable: unable to read provider state for ${model}. No automatic substitute is authorized; retain the evidence and use the declared blocker or user-escalation path.`);
+  }
+  const available = selectConnectedRoutingCandidate(
+    routing, "thinking", providerState, undefined,
+    context.resolveAvailability?.() || {},
+  );
+  if (!available) {
+    throw new Error(`[aidevops] Specialist advisory route unavailable: ${model} is not available for the connected account or locality policy. No automatic substitute is authorized; retain the evidence and use the declared blocker or user-escalation path.`);
+  }
 }
 
 async function routeChatMessage(context, output) {
@@ -46,6 +126,11 @@ async function routeChatMessage(context, output) {
   const now = Date.now();
   context.prunePolicies(context.policies, now);
   const existingPolicy = context.policies.get(sessionID);
+  if (existingPolicy?.reason?.startsWith("browser_") && existingPolicy.routedModel) {
+    existingPolicy.createdAt = now;
+    message.model = routingModelIdentity(existingPolicy.routedModel);
+    return;
+  }
   if (existingPolicy?.awaitingEscalationPrompt) {
     existingPolicy.awaitingEscalationPrompt = false;
     existingPolicy.createdAt = now;
@@ -57,6 +142,22 @@ async function routeChatMessage(context, output) {
 
   const text = context.messageText(output.parts);
   const agentName = String(message.agent ?? message.mode ?? "");
+  const domainRegistry = context.agentRoutingState?.domainDelegation;
+  if (domainRegistry?.profiles?.has(agentName)) {
+    await routeDomainMessage(context, output, domainRegistry, agentName);
+    return;
+  }
+  if (context.agentRoutingState?.inheritParentRoute?.has(agentName)
+    && !context.agentRoutingState?.pinned?.has(agentName)) {
+    await routeCreativeMessage(context, output);
+    return;
+  }
+  await routeTierMessage(context, output, { agentName, text, now });
+}
+
+async function routeTierMessage(context, output, { agentName, text, now }) {
+  const message = output.message;
+  const sessionID = message.sessionID;
   const route = context.routedPolicy(context.agentRoutingState, agentName, text);
   const policy = {
     effort: route.effort,
@@ -66,6 +167,8 @@ async function routeChatMessage(context, output) {
     pinned: route.pinned,
     createdAt: now,
   };
+  applySpecialistPolicy(context, agentName, text, policy);
+  await checkSpecialistAvailability(context, policy);
   context.policies.set(sessionID, policy);
 
   if (!context.modelRouting || route.pinned) return;
@@ -73,136 +176,22 @@ async function routeChatMessage(context, output) {
   if (candidates.length === 0) {
     throw new Error(`[aidevops] Model routing tier '${route.effort}' is disabled`);
   }
-
   const childSession = await loadChildSessionWithParent(context, sessionID);
   if (!childSession) return;
   policy.parentSessionID = childSession.parentID;
+  if (agentName === BROWSER_AGENT && await routeBrowserDelegate(context, childSession, message, policy)) return;
+  if (eligibleSubagentTrial(context.subagentTrial, agentName, context.agentRoutingState, now)) {
+    const arm = subagentArm(context.subagentTrial, sessionID);
+    policy.ab_experiment = context.subagentTrial.id;
+    policy.ab_arm = arm.name;
+    policy.armRouting = armRouting(context.modelRouting, arm);
+    policy.armModels = arm.tiers;
+  }
   if (nextRoutingTier(context.modelRouting, route.effort)) {
     context.appendCapabilityEscalationContract(output);
   }
 
   await applyConnectedRoutingModel(context, route, message, policy);
-}
-
-function childModelFrom(context, input) {
-  return context.modelIdentity({
-    providerID: input?.provider?.id ?? input?.model?.providerID,
-    modelID: input?.model?.id ?? input?.model?.modelID,
-  });
-}
-
-function currentVariantFrom(context, input, output) {
-  return context.extractVariant(input.message)
-    || output?.options?.reasoningEffort
-    || output?.options?.reasoning_effort
-    || context.extractVariant(input.model);
-}
-
-async function recordRootRouting(context, sessionID, input, childModel, currentVariant) {
-  const rootTier = routingTierForModel(context.modelRouting, childModel);
-  const dispatchTier = process.env.AIDEVOPS_DISPATCH_TIER || "";
-  const shouldRecord = rootTier && !dispatchTier
-    && typeof context.onRoutingDecision === "function";
-  if (!shouldRecord) return;
-
-  const routedVariant = context.resolveTierReasoning(
-    rootTier,
-    input?.provider?.id,
-    input?.model?.id,
-    context.tierReasoning,
-  );
-  await context.onRoutingDecision(sessionID, {
-    tier: rootTier,
-    model: childModel === "/" ? "" : childModel,
-    variant: currentVariant || routedVariant,
-    candidateIndex: routingCandidateIndex(context.modelRouting, rootTier, childModel),
-    attempt: 1,
-    reason: "model_profile",
-    population: "top_level_profile",
-  });
-}
-
-async function effectiveChildVariant(context, childSession, childModel, requestedVariant, currentVariant) {
-  const parentRoute = await context.getParentRoute(context.client, childSession);
-  const comparableModels = [requestedVariant, parentRoute.variant, parentRoute.model].every(Boolean);
-  if (comparableModels && parentRoute.model === childModel) {
-    return context.clampReasoningVariant(requestedVariant, parentRoute.variant);
-  }
-  return requestedVariant || currentVariant;
-}
-
-function applyRequestedVariant(output, requestedVariant, effectiveVariant) {
-  if (!requestedVariant) return;
-  output.options.reasoningEffort = effectiveVariant;
-  if (Object.hasOwn(output.options, "reasoning_effort")) {
-    output.options.reasoning_effort = effectiveVariant;
-  }
-}
-
-async function recordChildRouting(context, {
-  sessionID,
-  childSession,
-  childModel,
-  desiredEffort,
-  effectiveVariant,
-  policy,
-}) {
-  if (typeof context.onRoutingDecision !== "function") return;
-  await context.onRoutingDecision(sessionID, {
-    parentSessionID: policy?.parentSessionID || childSession.parentID,
-    tier: desiredEffort,
-    model: policy?.routedModel || (childModel === "/" ? "" : childModel),
-    variant: effectiveVariant,
-    candidateIndex: policy?.candidateIndex
-      ?? routingCandidateIndex(context.modelRouting, desiredEffort, childModel),
-    attempt: policy?.attempt || 1,
-    reason: policy?.reason || "agent_default",
-    escalated: Boolean(policy?.escalated),
-    population: "interactive_child",
-  });
-}
-
-async function routeChatParams(context, input, output) {
-  const sessionID = input?.message?.sessionID;
-  if (!sessionID) return;
-
-  try {
-    const childSession = await context.getSession(context.client, sessionID);
-    const childModel = childModelFrom(context, input);
-    const currentVariant = currentVariantFrom(context, input, output);
-    if (!childSession.parentID) {
-      await recordRootRouting(context, sessionID, input, childModel, currentVariant);
-      return;
-    }
-
-    const policy = context.policies.get(sessionID);
-    const desiredEffort = policy?.effort
-      ?? context.inferSubagentEffort(input.message.agent ?? childSession.agent);
-    const requestedVariant = context.resolveTierReasoning(
-      desiredEffort,
-      input?.provider?.id,
-      input?.model?.id,
-      context.tierReasoning,
-    );
-    const effectiveVariant = await effectiveChildVariant(
-      context,
-      childSession,
-      childModel,
-      requestedVariant,
-      currentVariant,
-    );
-    applyRequestedVariant(output, requestedVariant, effectiveVariant);
-    await recordChildRouting(context, {
-      sessionID,
-      childSession,
-      childModel,
-      desiredEffort,
-      effectiveVariant,
-      policy,
-    });
-  } catch {
-    // Fail open: provider requests must continue if session metadata is unavailable.
-  }
 }
 
 export function createSubagentEffortHandlers(context) {

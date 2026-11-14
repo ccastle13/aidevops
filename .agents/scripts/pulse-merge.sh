@@ -54,10 +54,13 @@
 #     _attempt_green_behind_update_branch, _check_required_checks_passing
 #   - pulse-merge-author-checks.sh: _is_collaborator_author,
 #     _is_owner_or_member_author, _check_interactive_pr_gates
-#   Functions kept here (>100 lines — identity-key preservation):
-#   - _check_pr_merge_gates                  (166 lines)
-#   - _handle_post_merge_actions             (107 lines)
-#   - _process_single_ready_pr               (211 lines)
+#   - pulse-merge-issue-closeout.sh: linked-issue and superseded-issue closure,
+#     non-closing parent references, and partial-parent closeout (GH#21426)
+#   Large functions kept here for complexity identity-key preservation:
+#   - _handle_changes_requested_review_gate
+#   - _pm_reconcile_pr_closeout_comments
+#   Orchestration retained here:
+#   - _check_pr_merge_gates, _handle_post_merge_actions, _process_single_ready_pr
 #   Extraction utilities (used by downstream modules):
 #   - _extract_linked_issue
 #   - _extract_merge_summary
@@ -93,6 +96,11 @@ PULSE_REVIEW_GATE_MODE_CI_REPAIR_ONLY="ci-repair-only"
 : "${STOP_FLAG:=${HOME}/.aidevops/logs/pulse-session.stop}"
 : "${PULSE_MERGE_BATCH_LIMIT:=50}"
 : "${PULSE_MERGE_CLOSE_CONFLICTING:=true}"
+
+if [[ -f "${BASH_SOURCE[0]%/*}/pulse-merge-dirty-queue.sh" ]]; then
+	# shellcheck source=./pulse-merge-dirty-queue.sh
+	source "${BASH_SOURCE[0]%/*}/pulse-merge-dirty-queue.sh"
+fi
 
 # Comma-delimited label pattern constant — avoids matching "origin:worker-takeover"
 # when checking for "origin:worker" in comma-joined label strings. (t2449)
@@ -255,6 +263,8 @@ _pulse_merge_ready_pr_json_fields() {
 # full-loop-helper.sh can call it after a successful PR merge. SCRIPT_DIR may not be set
 # when this module is sourced by pulse-wrapper.sh; resolve from BASH_SOURCE.
 _PULSE_MERGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./gh-closing-reference-lib.sh
+source "${_PULSE_MERGE_DIR}/gh-closing-reference-lib.sh"
 source "${_PULSE_MERGE_DIR}/shared-claim-lifecycle.sh"
 
 # Final duplicate-implementation fence for live interactive issue owners.
@@ -288,6 +298,15 @@ source "${_PULSE_MERGE_DIR}/gh-merge-cache-remediation-lib.sh"
 # shellcheck disable=SC1091  # sub-library resolved at runtime via _PULSE_MERGE_DIR
 source "${_PULSE_MERGE_DIR}/release-lane-helper.sh"
 
+# shellcheck source=./manual-release-hold-helper.sh
+# shellcheck disable=SC1091  # sub-library resolved at runtime via _PULSE_MERGE_DIR
+source "${_PULSE_MERGE_DIR}/manual-release-hold-helper.sh"
+
+# GH#37955: Cloudron manifest version bumps require release authority.
+# shellcheck source=./cloudron-release-merge-guard-lib.sh
+# shellcheck disable=SC1091  # sub-library resolved at runtime via _PULSE_MERGE_DIR
+source "${_PULSE_MERGE_DIR}/cloudron-release-merge-guard-lib.sh"
+
 readonly _PM_PARENT_TASK_LABEL_NEEDLE=",parent-task,"
 
 # Source author permission check helpers (GH#21426 — extracted to bring
@@ -318,6 +337,25 @@ source "${_PULSE_MERGE_DIR}/pulse-merge-process.sh"
 # shellcheck disable=SC1091  # sub-library resolved at runtime via _PULSE_MERGE_DIR
 source "${_PULSE_MERGE_DIR}/pulse-merge-required-checks.sh"
 
+# shellcheck source=./pulse-merge-ci-drift-ledger.sh
+# shellcheck disable=SC1091
+source "${_PULSE_MERGE_DIR}/pulse-merge-ci-drift-ledger.sh"
+
+# GH#34312: return merged non-closing worker partials to the dispatch queue.
+# shellcheck source=./pulse-merge-partial-continuation.sh
+# shellcheck disable=SC1091
+source "${_PULSE_MERGE_DIR}/pulse-merge-partial-continuation.sh"
+
+# GH#36028: restore open worker drafts that older runners projected blocked.
+# shellcheck source=./pulse-draft-checkpoint-unblock.sh
+# shellcheck disable=SC1091
+source "${_PULSE_MERGE_DIR}/pulse-draft-checkpoint-unblock.sh"
+
+# GH#36112: supersede conflicting Pulse TODO handoffs instead of routing them.
+# shellcheck source=./pulse-merge-todo-handoff.sh
+# shellcheck disable=SC1091
+source "${_PULSE_MERGE_DIR}/pulse-merge-todo-handoff.sh"
+
 # _release_interactive_claim_on_merge is now provided by shared-claim-lifecycle.sh
 # (sourced at the top of this module, t2429/GH#20067). The backward-compatible
 # underscore-prefixed alias is defined there so all existing call sites
@@ -328,8 +366,8 @@ source "${_PULSE_MERGE_DIR}/pulse-merge-required-checks.sh"
 #
 # Security invariant: this helper never marks a PR mergeable and never bypasses
 # collaborator, maintainer, review-bot, or branch-protection gates. A blocking
-# review either remains a skip/repair-route, or the existing maintainer-labeled
-# CodeRabbit-only dismissal path clears stale bot nits before normal gates run.
+# review either remains a skip/repair-route, or trusted-author CodeRabbit-only
+# advisory dismissal clears the aggregate block before normal gates run.
 #
 # Returns 0 if the caller may keep evaluating merge gates.
 # Returns 1 if the PR remains review-blocked. A converged remediation may also
@@ -370,21 +408,27 @@ _handle_changes_requested_review_gate() {
 		fi
 	fi
 
-	# t2179: coderabbit-nits-ok path.
-	if [[ ",${_cr_pr_labels}," == *",coderabbit-nits-ok,"* ]]; then
-		if _pulse_merge_dismiss_coderabbit_nits "$pr_number" "$repo_slug"; then
-			echo "[pulse-wrapper] Merge pass: PR #${pr_number} in ${repo_slug} — auto-dismissed CodeRabbit-only CHANGES_REQUESTED reviews (coderabbit-nits-ok label) (t2179)" >>"$LOGFILE"
-			if [[ -n "$dismissed_dest_var" && "$dismissed_dest_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-				printf -v "$dismissed_dest_var" '%s' "1"
-			fi
-			return 0
+	local active_requests=""
+	local _cr_label_list=",${_cr_pr_labels},"
+	local review_helper="${AIDEVOPS_REVIEW_BOT_GATE_HELPER:-${_PULSE_MERGE_DIR}/review-bot-gate-helper.sh}"
+	#aidevops:trust-boundary — aggregate bot decisions never authorize destructive routing.
+	[[ "$_cr_label_list" != *",external-contributor,"* ]] || return 1
+	active_requests=$(_review_feedback_active_change_requests "$pr_number" "$repo_slug") || return 75
+	if ! printf '%s\n' "$active_requests" | jq -e 'any(.[];
+		.user.type == "User" and (.author_association == "OWNER"
+			or .author_association == "MEMBER" or .author_association == "COLLABORATOR"))' >/dev/null; then
+		# Only exact known bot identities may be dismissed. Other untrusted reviews
+		# remain blocked, but must not close the PR or rewrite its linked issue.
+		bash "$review_helper" dismiss-advisory-coderabbit "$pr_number" "$repo_slug" >>"$LOGFILE" 2>&1 || return 75
+		if [[ -n "$dismissed_dest_var" && "$dismissed_dest_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+			printf -v "$dismissed_dest_var" '%s' "1"
 		fi
-
-		echo "[pulse-wrapper] Merge pass: skipping PR #${pr_number} in ${repo_slug} — coderabbit-nits-ok label present but human reviewer also blocking (t2179)" >>"$LOGFILE"
-		return 1
+		return 0
 	fi
 
-	local _cr_label_list=",${_cr_pr_labels},"
+	# A cosmetic override never clears a trusted human change request (t2179).
+	[[ "$_cr_label_list" != *",coderabbit-nits-ok,"* ]] || return 1
+
 	# Optional policy override (GH#26535): by default CHANGES_REQUESTED worker
 	# PRs keep the historical fast-routing behaviour below. Operators who prefer
 	# preserving the PR/review context can opt in to a remediation-first cycle.
@@ -465,8 +509,7 @@ _pm_gate_review_mode() {
 _pm_gate_author_trust() {
 	local pr_number="$1" repo_slug="$2" pr_author="$3" expected_head_sha="$4"
 	local trusted_dest="$5" permission_dest="$6" author_collab_rc=0 permission="" trusted=0
-	if [[ "$pr_author" == "app/github-actions" || "$pr_author" == "github-actions[bot]" ]] &&
-		_pulse_is_trusted_issue_sync_pr "$pr_number" "$repo_slug" "$expected_head_sha"; then
+	if _pulse_is_trusted_issue_sync_pr "$pr_number" "$repo_slug" "$expected_head_sha"; then
 		trusted=1
 		permission="write"
 		echo "[pulse-wrapper] Merge pass: PR #${pr_number} in ${repo_slug} — author ${pr_author} is trusted repository-generated Issue Sync automation, proceeding" >>"$LOGFILE"
@@ -478,13 +521,25 @@ _pm_gate_author_trust() {
 	printf -v "$trusted_dest" '%s' "$trusted"
 	printf -v "$permission_dest" '%s' "$permission"
 	if [[ "$trusted" -eq 0 && "$author_collab_rc" -eq 2 ]]; then
-		[[ "${DRY_RUN:-0}" == "1" ]] || check_permission_failure_pr "$pr_number" "$repo_slug" "$pr_author" "${_PULSE_AUTHOR_PERMISSION_HTTP:-unknown}" || true
-		echo "[pulse-wrapper] Merge pass: skipping PR #${pr_number} in ${repo_slug} — permission check failed for author ${pr_author} (HTTP ${_PULSE_AUTHOR_PERMISSION_HTTP:-unknown})" >>"$LOGFILE"
+		[[ "${DRY_RUN:-0}" == "1" ]] || check_permission_failure_pr "$pr_number" "$repo_slug" "$pr_author" "${_PULSE_AUTHOR_PERMISSION_HTTP:-unknown}" "${_PULSE_AUTHOR_PERMISSION_REASON:-unknown}" || true
+		echo "[pulse-wrapper] Merge pass: skipping PR #${pr_number} in ${repo_slug} — permission check failed for author ${pr_author} (HTTP ${_PULSE_AUTHOR_PERMISSION_HTTP:-unknown}, reason ${_PULSE_AUTHOR_PERMISSION_REASON:-unknown})" >>"$LOGFILE"
 		return 1
 	fi
 	if [[ "$trusted" -eq 0 && "$author_collab_rc" -ne 0 ]]; then
 		if _is_trusted_dependabot_update_pr "$pr_number" "$repo_slug" "$pr_author" "$expected_head_sha"; then
-			echo "[pulse-wrapper] Merge pass: PR #${pr_number} in ${repo_slug} — author ${pr_author} is trusted Dependabot with allowlisted dependency update, proceeding (GH#24473)" >>"$LOGFILE"
+			# #aidevops:trust-boundary — verified provenance and dependency
+			# allowlisting establish authenticity, not collaborator authority.
+			# Dependabot remains external and may proceed only with independent,
+			# current-head maintainer approval. A policy-only hold still enters the
+			# Dependabot lifecycle router so existing replacement work can converge
+			# or a tightly scoped maintainer-briefed intake can be created.
+			if _has_maintainer_crypto_approval "$pr_number" "$repo_slug" "$expected_head_sha"; then
+				echo "[pulse-wrapper] Merge pass: PR #${pr_number} in ${repo_slug} — verified Dependabot author ${pr_author} remains external but has current-head maintainer crypto-approval, proceeding" >>"$LOGFILE"
+			else
+				echo "[pulse-wrapper] Merge pass: skipping PR #${pr_number} in ${repo_slug} — verified Dependabot author ${pr_author} remains external and lacks current-head maintainer crypto-approval; entering lifecycle reconciliation" >>"$LOGFILE"
+				_pm_gate_route_ineligible_author "$pr_number" "$repo_slug" "$pr_author" "$expected_head_sha" "approval-required"
+				return 1
+			fi
 		elif _has_maintainer_crypto_approval "$pr_number" "$repo_slug" "$expected_head_sha"; then
 			echo "[pulse-wrapper] Merge pass: PR #${pr_number} in ${repo_slug} — author ${pr_author} is not a collaborator but has maintainer crypto-approval, proceeding (t3063)" >>"$LOGFILE"
 		else
@@ -497,9 +552,10 @@ _pm_gate_author_trust() {
 
 _pm_gate_route_ineligible_author() {
 	local pr_number="$1" repo_slug="$2" pr_author="$3" expected_head_sha="$4" intake_rc=0
-	_pulse_route_dependabot_pr_to_worker_issue "$pr_number" "$repo_slug" "$pr_author" "$expected_head_sha" "policy-ineligible" || intake_rc=$?
+	local reason="${5:-policy-ineligible}"
+	_pulse_route_dependabot_pr_to_worker_issue "$pr_number" "$repo_slug" "$pr_author" "$expected_head_sha" "$reason" || intake_rc=$?
 	case "$intake_rc" in
-	0) echo "[pulse-wrapper] Merge pass: PR #${pr_number} in ${repo_slug} — authentic Dependabot PR is outside automatic merge policy; routed to worker intake (GH#30351)" >>"$LOGFILE" ;;
+	0) echo "[pulse-wrapper] Merge pass: PR #${pr_number} in ${repo_slug} — authentic Dependabot PR requires ${reason}; routed to worker intake (GH#30351)" >>"$LOGFILE" ;;
 	3) echo "[pulse-wrapper] Merge pass: PR #${pr_number} in ${repo_slug} — authentic Dependabot PR has an explicit maintainer-review hold; preserving it without worker intake (GH#30389)" >>"$LOGFILE" ;;
 	4)
 		if [[ "${DRY_RUN:-0}" == "1" ]]; then
@@ -508,6 +564,8 @@ _pm_gate_route_ineligible_author() {
 			echo "[pulse-wrapper] Merge pass: closed superseded Dependabot source PR #${pr_number} in ${repo_slug} after verified replacement PR #${_PULSE_DEPENDABOT_SUPERSEDING_PR:-unknown} (GH#30478)" >>"$LOGFILE"
 		fi
 		;;
+	5) echo "[pulse-wrapper] Merge pass: PR #${pr_number} in ${repo_slug} — exact-head Dependabot source contains non-Dependabot commit authorship; actionable maintainer hold applied" >>"$LOGFILE" ;;
+	6) echo "[pulse-wrapper] Merge pass: PR #${pr_number} in ${repo_slug} — completed Dependabot intake lacks verified replacement evidence; preserving source without duplicate intake" >>"$LOGFILE" ;;
 	*) echo "[pulse-wrapper] Merge pass: skipping PR #${pr_number} in ${repo_slug} — author ${pr_author} is not a collaborator" >>"$LOGFILE" ;;
 	esac
 	return 0
@@ -550,15 +608,35 @@ _pm_gate_repository_and_issue() {
 _pm_gate_origin_authority() {
 	local pr_number="$1" repo_slug="$2" linked_issue="$3" pr_author="$4"
 	local trusted_issue_sync="$5" author_permission="$6" info_json="" labels_str="" is_draft="false"
-	info_json=$(gh_pr_view "$pr_number" --repo "$repo_slug" --json labels,isDraft 2>/dev/null) || info_json=""
+	info_json=$(AIDEVOPS_GH_PR_VIEW_CACHE_DISABLE=1 gh_pr_view "$pr_number" --repo "$repo_slug" --json labels,isDraft,autoMergeRequest 2>/dev/null) || info_json=""
+	# #aidevops:trust-boundary — holds apply to every origin, including takeover.
+	if ! printf '%s' "$info_json" | jq -e '(.isDraft | type) == "boolean" and (.labels | type) == "array"' >/dev/null 2>&1; then
+		return 1
+	fi
 	labels_str=$(printf '%s' "$info_json" | jq -r '[.labels[].name] | join(",")' 2>/dev/null) || labels_str=""
 	is_draft=$(printf '%s' "$info_json" | jq -r '.isDraft // false' 2>/dev/null) || is_draft="false"
+	if [[ "$is_draft" == "true" || ",${labels_str}," == *",hold-for-review,"* ]]; then
+		echo "[pulse-wrapper] Merge pass: skipping PR #${pr_number} in ${repo_slug} — PR is draft or has hold-for-review" >>"$LOGFILE"
+		# #aidevops:trust-boundary — selection must revoke an already armed merge.
+		# Do not invoke the draft fallback for PRs without a native request.
+		if [[ "${DRY_RUN:-0}" != "1" ]] && printf '%s' "$info_json" | jq -e '.autoMergeRequest | type == "object"' >/dev/null; then
+			local stop_rc=0
+			_stop_external_native_auto_merge "$pr_number" "$repo_slug" \
+				"PR is draft or has hold-for-review" || stop_rc=$?
+			if [[ "$stop_rc" -ne 0 && "$stop_rc" -ne 2 ]]; then
+				echo "[pulse-wrapper] Merge pass: PR #${pr_number} in ${repo_slug} — native auto-merge hold failed; manual intervention required" >>"$LOGFILE"
+			fi
+		fi
+		return 1
+	fi
 	if [[ "$labels_str" == *"origin:interactive"* ]]; then
 		_check_interactive_pr_gates "$pr_number" "$repo_slug" "$labels_str" "$is_draft" || return 1
 	fi
 	if [[ -n "${_OW_LABEL_PAT:-}" && ",${labels_str}," == *"${_OW_LABEL_PAT:-}"* && "$trusted_issue_sync" -eq 0 ]]; then
 		_attempt_worker_briefed_auto_merge "$pr_number" "$repo_slug" "$labels_str" "$is_draft" "$linked_issue" "$author_permission" "$pr_author" || return 1
 	elif [[ "$trusted_issue_sync" -eq 1 ]]; then
+		# GH#33955: generated-TODO trust replaces only linked-issue authority.
+		# Maintainer opt-outs that the worker path enforces still apply.
 		echo "[pulse-wrapper] Merge pass: PR #${pr_number} in ${repo_slug} — exact-head Issue Sync trust satisfies worker authority without a linked issue" >>"$LOGFILE"
 	fi
 	return 0
@@ -590,6 +668,8 @@ _pm_gate_review_bot() {
 		return 0
 	fi
 	echo "[pulse-wrapper] Review bot gate: ${rbg_status:-${PULSE_UNKNOWN_STATE}} for PR #${pr_number} in ${repo_slug} — missing or unpermitted current-head evidence; skipping merge" >>"$LOGFILE"
+	# Recovery only requests review; this invocation must still refuse merge.
+	_pulse_recover_external_review "$pr_number" "$repo_slug" "$pr_author" "$expected_head_sha" "$rbg_result" "$rbg_helper" || true
 	return 1
 }
 
@@ -601,6 +681,11 @@ _check_pr_merge_gates() {
 	local ci_repair_only="${PULSE_REVIEW_GATE_MODE_CI_REPAIR_ONLY:-ci-repair-only}"
 	local trusted_issue_sync=0 author_permission=""
 	_PULSE_REVIEW_GATE_EVIDENCE=""
+	# Association is not closure authority. Keep this fallback local to the
+	# gates so partial deliveries never reach post-merge issue closing.
+	if [[ -z "$linked_issue" && ",${pr_labels}," == *",origin:worker,"* ]]; then
+		linked_issue=$(_extract_pr_work_issue "$pr_number" "$repo_slug" explicit) || return 1
+	fi
 	if [[ -n "$linked_issue" ]] && _interactive_claim_fence_blocks_merge "$linked_issue" "$repo_slug" "$expected_head_sha"; then
 		echo "[pulse-wrapper] Merge pass: skipping PR #${pr_number} in ${repo_slug} — linked issue #${linked_issue} has a live interactive owner with different unmerged work (GH#30274)" >>"$LOGFILE"
 		return 1
@@ -612,6 +697,20 @@ _check_pr_merge_gates() {
 	_pm_gate_repository_and_issue "$pr_number" "$repo_slug" "$linked_issue" "$expected_head_sha" "$trusted_issue_sync" || return 1
 	_pm_gate_origin_authority "$pr_number" "$repo_slug" "$linked_issue" "$pr_author" \
 		"$trusted_issue_sync" "$author_permission" || return 1
+	# Creation wrappers are not final authority. Check before merge or repair,
+	# but only route feedback after the existing author/issue trust gates pass.
+	local closure_json="" closure_reason=""
+	if ! closure_json=$(AIDEVOPS_GH_PR_VIEW_CACHE_DISABLE=1 gh_pr_view "$pr_number" --repo "$repo_slug" --json body,closingIssuesReferences 2>/dev/null); then
+		echo "[pulse-wrapper] Merge pass: skipping PR #${pr_number} in ${repo_slug} — closing-reference metadata unavailable" >>"$LOGFILE"
+		return 1
+	fi
+	if ! closure_reason=$(_gh_pr_merge_closure_check "$closure_json" "$repo_slug"); then
+		echo "[pulse-wrapper] Merge pass: skipping PR #${pr_number} in ${repo_slug} — ${closure_reason}" >>"$LOGFILE"
+		if ! _gh_pr_repair_merge_closure "$pr_number" "$repo_slug" "$closure_json"; then
+			_route_pr_to_fix_worker "$pr_number" "$repo_slug" "$linked_issue" "review" "$pr_labels" || true
+		fi
+		return 1
+	fi
 	if [[ "$review_gate_mode" == "$ci_rebase_only" ]]; then
 		echo "[pulse-wrapper] Merge pass: PR #${pr_number} in ${repo_slug} passed non-review trust gates for ${review_gate_mode} evaluation; CHANGES_REQUESTED remains blocking" >>"$LOGFILE"
 		return 0
@@ -685,18 +784,29 @@ _pulse_merge_final_trust_gate() {
 	local pr_number="$1"
 	local repo_slug="$2"
 	local expected_head_sha="$3"
-
+	local trust_gate_start=0 trust_gate_rc=0
+	[[ -n "${timing_prefix:-}" ]] && trust_gate_start=$(_pmp_now_epoch)
 	_PULSE_MERGE_PREFLIGHT_BLOCKER_KIND=""
+	_PULSE_MERGE_PREFLIGHT_BLOCKING_CHECKS_JSON="[]"
 	if ! _pulse_merge_admin_safety_check "$pr_number" "$repo_slug" "$expected_head_sha"; then
 		_PULSE_MERGE_PREFLIGHT_BLOCKER_KIND="$PMRC_BLOCKER_MERGE_AUTHORITY"
-		return 1
-	fi
-	if ! _pulse_merge_refresh_review_gate_evidence "$pr_number" "$repo_slug" "$expected_head_sha"; then
+		trust_gate_rc=1
+	elif ! _pulse_merge_refresh_review_gate_evidence "$pr_number" "$repo_slug" "$expected_head_sha"; then
 		_PULSE_MERGE_PREFLIGHT_BLOCKER_KIND="$PMRC_BLOCKER_REVIEW_GATE"
-		return 1
+		trust_gate_rc=1
+	# GH#36922: re-run the worker-briefed verdict pinned to the exact head being
+	# merged, so a planning-checkpoint classification of another head is void.
+	elif declare -F worker_briefed_trust_verdict >/dev/null 2>&1 \
+		&& ! WORKER_BRIEFED_EXPECTED_HEAD="$expected_head_sha" \
+			worker_briefed_trust_verdict "$pr_number" "$repo_slug" >/dev/null; then
+		_PULSE_MERGE_PREFLIGHT_BLOCKER_KIND="$PMRC_BLOCKER_MERGE_AUTHORITY"
+		trust_gate_rc=1
+	else
+		_pulse_merge_preflight_snapshot_gate "$repo_slug" "$pr_number" "$expected_head_sha" || trust_gate_rc=1
 	fi
-	_pulse_merge_preflight_snapshot_gate "$repo_slug" "$pr_number" "$expected_head_sha" || return 1
-	return 0
+	# Time every native/admin/direct invocation, including blocked gates and retries.
+	[[ -n "${timing_prefix:-}" ]] && _pmp_add_elapsed_seconds "${timing_prefix}trust_gate_s" "$trust_gate_start"
+	return "$trust_gate_rc"
 }
 
 #######################################
@@ -964,281 +1074,10 @@ ${closing_comment}"
 	return 0
 }
 
-#######################################
-# Resolve the original issue behind a superseded PR reference.
-#
-# When PR B resolves PR A, GitHub treats PR A as an issue number. The normal
-# linked-issue extractor therefore returns PR A's number, not the issue that PR A
-# originally resolved. If PR A is actually a pull request, inspect PR A and return
-# its own linked issue so deterministic merge can close the original task too.
-#
-# Args: $1=merged_pr_number, $2=repo_slug, $3=candidate_issue_number
-# Stdout: original issue number, or empty when candidate is not a PR chain
-# Returns: 0 always
-#######################################
-_pm_resolve_superseded_original_issue() {
-	local merged_pr_number="$1" repo_slug="$2" candidate_issue="$3"
-	local original_issue
-
-	[[ -z "$candidate_issue" ]] && return 0
-	if ! gh api "repos/${repo_slug}/pulls/${candidate_issue}" >/dev/null 2>&1; then
-		return 0
-	fi
-
-	original_issue=$(_extract_linked_issue "$candidate_issue" "$repo_slug" 2>/dev/null) || original_issue=""
-	if [[ -z "$original_issue" || "$original_issue" == "$candidate_issue" || "$original_issue" == "$merged_pr_number" ]]; then
-		return 0
-	fi
-
-	printf '%s' "$original_issue"
-	return 0
-}
-
-#######################################
-# Extract a non-closing parent/umbrella reference from a PR body.
-#
-# Args: $1=pr_number, $2=repo_slug
-# Stdout: issue number from the first `For #NNN` / `Ref #NNN` reference
-# Returns: 0 always
-#######################################
-_pm_extract_partial_parent_reference() {
-	local pr_number="$1"
-	local repo_slug="$2"
-	local pr_body="" parent_issue=""
-
-	pr_body=$(gh_pr_view "$pr_number" --repo "$repo_slug" --json body --jq '.body // empty' 2>/dev/null) || pr_body=""
-	parent_issue=$(printf '%s' "$pr_body" | grep -ioE '(^|[[:space:]])(for|ref)[[:space:]]+#[0-9]+' | head -1 | grep -oE '[0-9]+') || parent_issue=""
-	printf '%s' "$parent_issue"
-	return 0
-}
-
-#######################################
-# Decide whether an issue is broad enough to require partial closeout hygiene.
-#
-# Args: $1=issue body, $2=comma-separated label names
-# Returns: 0=broad parent/umbrella issue, 1=normal leaf issue
-#######################################
-_pm_issue_needs_partial_closeout() {
-	local issue_body="$1"
-	local issue_labels="$2"
-	local checklist_count
-
-	if [[ ",${issue_labels}," == *"${_PM_PARENT_TASK_LABEL_NEEDLE}"* ]]; then
-		return 0
-	fi
-
-	if printf '%s' "$issue_body" | grep -qiE '\b(parent|umbrella|roadmap|lifecycle|incident|acceptance criteria)\b'; then
-		return 0
-	fi
-
-	checklist_count=$(printf '%s' "$issue_body" | grep -cE '^[[:space:]]*[-*+][[:space:]]*\[[ xX]\]' || true)
-	[[ "$checklist_count" =~ ^[0-9]+$ ]] || checklist_count=0
-	if [[ "$checklist_count" -ge 2 ]]; then
-		return 0
-	fi
-
-	return 1
-}
-
-#######################################
-# Extract unchecked acceptance criteria as a Markdown bullet list.
-#
-# Args: $1=issue body
-# Stdout: bullet list (or a conservative fallback)
-# Returns: 0 always
-#######################################
-_pm_unmet_acceptance_criteria() {
-	local issue_body="$1"
-	local criteria
-
-	criteria=$(printf '%s' "$issue_body" | sed -nE 's/^[[:space:]]*[-*+][[:space:]]*\[[[:space:]]\][[:space:]]*/- /p' | head -20) || criteria=""
-	if [[ -z "$criteria" ]]; then
-		criteria="- Review the parent issue acceptance criteria and file worker-ready child issues for remaining scope."
-	fi
-	printf '%s' "$criteria"
-	return 0
-}
-
-#######################################
-# Post partial parent/umbrella closeout when a For/Ref PR merges.
-#
-# Non-closing references intentionally do not flow through the normal linked
-# issue close path. This helper keeps the parent open but leaves an explicit
-# closeout trail naming delivered work and follow-ups so broad parents are not
-# left ambiguous after a leaf PR merge (GH#23937).
-#
-# Args: $1=pr_number, $2=repo_slug, $3=merge_summary, $4=linked_issue (optional)
-# Returns: 0 always (best-effort post-merge hygiene)
-#######################################
-_pm_handle_partial_parent_closeout() {
-	local pr_number="$1"
-	local repo_slug="$2"
-	local merge_summary="$3"
-	local linked_issue="${4:-}"
-	local parent_issue="" issue_api="" issue_json="" issue_body="" issue_labels="" dedup_count="" followups="" delivered_body=""
-
-	parent_issue=$(_pm_extract_partial_parent_reference "$pr_number" "$repo_slug") || parent_issue=""
-	[[ -n "$parent_issue" ]] || return 0
-	[[ "$parent_issue" != "$linked_issue" ]] || return 0
-
-	issue_api=$(_pm_issue_api "$repo_slug" "$parent_issue")
-	issue_json=$(gh api "$issue_api" 2>/dev/null) || issue_json=""
-	if [[ -z "$issue_json" ]]; then
-		return 0
-	fi
-	local _RS=$'\x1e'
-	IFS="$_RS" read -r -d '' issue_body issue_labels < <(
-		printf '%s' "$issue_json" | jq -j --arg rs "$_RS" \
-			'(.body // ""), $rs, ([.labels[]?.name] | join(",")), "\u0000"'
-	) || true
-
-	if ! _pm_issue_needs_partial_closeout "$issue_body" "$issue_labels"; then
-		return 0
-	fi
-
-	dedup_count=$(gh api "${issue_api}/comments" 2>/dev/null | jq --arg marker "PARTIAL_PARENT_CLOSEOUT:PR#${pr_number}" '[.[] | select(.body | contains($marker))] | length' 2>/dev/null) || dedup_count=0
-	[[ "$dedup_count" =~ ^[0-9]+$ ]] || dedup_count=0
-	if [[ "$dedup_count" -gt 0 ]]; then
-		echo "[pulse-wrapper] Deterministic merge: skipped duplicate partial parent closeout on #${parent_issue} for PR #${pr_number} (GH#23937)" >>"$LOGFILE"
-		return 0
-	fi
-
-	followups=$(_pm_unmet_acceptance_criteria "$issue_body")
-	delivered_body="${merge_summary:-PR #${pr_number} merged as a leaf delivery.}"
-
-	local partial_comment
-	partial_comment="<!-- PARTIAL_PARENT_CLOSEOUT:PR#${pr_number} -->
-## Partial Parent Closeout
-
-PR #${pr_number} merged against this broad parent using a non-closing \`For #${parent_issue}\` / \`Ref #${parent_issue}\` reference, so the parent remains open.
-
-### Delivered
-
-${delivered_body}
-
-### Follow-ups still requiring closure or child issues
-
-${followups}
-
-### Closeout rule
-
-Do not close this parent until the remaining acceptance criteria are covered by merged release evidence or an explicit maintainer/operator closeout decision is posted."
-
-	gh_issue_comment "$parent_issue" --repo "$repo_slug" --body "$partial_comment" 2>/dev/null || true
-	echo "[pulse-wrapper] Deterministic merge: posted partial parent closeout on issue #${parent_issue} for PR #${pr_number} (GH#23937)" >>"$LOGFILE"
-	return 0
-}
-
-_pm_close_primary_linked_issue() {
-	local pr_number="$1"
-	local repo_slug="$2"
-	local linked_issue="$3"
-	local closing_comment="$4"
-	local labels_supplied="$5"
-
-		# t2099 / GH#19032: parent-task close guard. Parent roadmap issues must
-		# stay open until ALL phase children merge (t2046). The PR-body keyword
-		# guard prevents workers from writing Closes/Resolves/Fixes against a
-		# parent, and they instead use "For #NNN" / "Ref #NNN". Keep this
-		# independent metadata guard as defence in depth in case a parent PR body
-		# accidentally contains a native closing clause.
-		#
-		# Behaviour:
-		#   - Still post the closing comment (it doubles as a phase-merged
-		#     status update on the parent).
-		#   - SKIP the `gh issue close` call.
-		#   - SKIP fast_fail_reset and unlock (both tied to closing).
-		_parent_task_guard=0
-		local _pm_li_api
-		_pm_li_api=$(_pm_issue_api "$repo_slug" "$linked_issue")
-		_linked_labels=$(gh api "${_pm_li_api}" \
-			--jq '[.labels[].name] | join(",")' 2>/dev/null) || _linked_labels=""
-		if [[ ",${_linked_labels}," == *"${_PM_PARENT_TASK_LABEL_NEEDLE}"* ]]; then
-			_parent_task_guard=1
-			echo "[pulse-wrapper] Deterministic merge: skipping close of parent-task issue #${linked_issue} (PR #${pr_number} is a phase child; parent stays open until all phases merge) — t2099/GH#19032" >>"$LOGFILE"
-		fi
-
-		# Dedup guard: skip if closing comment for this PR already exists (GH#18098).
-		local _dedup_count
-		_dedup_count=$(gh api "${_pm_li_api}/comments" \
-			2>/dev/null | jq --arg prnum "PR #${pr_number}" \
-			'[.[] | select(.body | contains($prnum))] | length' 2>/dev/null) || _dedup_count=0
-		[[ "$_dedup_count" =~ ^[0-9]+$ ]] || _dedup_count=0
-		if [[ "$_dedup_count" -gt 0 ]]; then
-			echo "[pulse-wrapper] Deterministic merge: skipped duplicate closing comment on #${linked_issue} — PR #${pr_number} already referenced in existing comment (GH#18098)" >>"$LOGFILE"
-		else
-			gh_issue_comment "$linked_issue" --repo "$repo_slug" \
-				--body "$closing_comment" 2>/dev/null || true
-		fi
-
-		if [[ "$_parent_task_guard" -eq 0 ]]; then
-			if [[ "$labels_supplied" -eq 0 ]]; then
-				pr_labels=$(gh_pr_view "$pr_number" --repo "$repo_slug" \
-					--json labels --jq '[.labels[].name] | join(",")' 2>/dev/null) || pr_labels=""
-			fi
-			local _solved_actor=""
-			_solved_actor=$(solved_actor_from_pr_labels "$pr_labels") || _solved_actor=""
-			[[ -n "$_solved_actor" ]] && set_solved_label "$linked_issue" "$repo_slug" "$_solved_actor" || true
-			clear_terminal_issue_dispatch_labels "$linked_issue" "$repo_slug" "post-merge-pr-${pr_number}" || true
-			if _gh_with_timeout write gh issue close "$linked_issue" --repo "$repo_slug" 2>/dev/null; then
-				# Closing is not a status transition in GitHub's label model. Converge
-				# explicitly so a merged issue cannot remain dashboard-visible as
-				# available, queued, claimed, in-progress, or in-review.
-				set_issue_status "$linked_issue" "$repo_slug" "done" || true
-				reconcile_dependants_after_verified_closure "$repo_slug" "$linked_issue" || true
-			fi
-			# Reset fast-fail counter now that the issue is resolved (GH#2076)
-			fast_fail_reset "$linked_issue" "$repo_slug" || true
-			# t1934: Unlock the issue (locked at dispatch time)
-			unlock_issue_after_worker "$linked_issue" "$repo_slug"
-		fi
-	return 0
-}
-
-_pm_close_superseded_original_issue() {
-	local pr_number="$1"
-	local repo_slug="$2"
-	local linked_issue="$3"
-	local closing_comment="$4"
-	local _superseded_original_issue
-	_superseded_original_issue=$(_pm_resolve_superseded_original_issue \
-		"$pr_number" "$repo_slug" "$linked_issue") || _superseded_original_issue=""
-	if [[ -n "$_superseded_original_issue" ]]; then
-			local _sup_api _sup_labels _sup_parent_guard=0 _sup_dedup_count
-			_sup_api=$(_pm_issue_api "$repo_slug" "$_superseded_original_issue")
-			_sup_labels=$(gh api "${_sup_api}" \
-				--jq '[.labels[].name] | join(",")' 2>/dev/null) || _sup_labels=""
-			if [[ ",${_sup_labels}," == *"${_PM_PARENT_TASK_LABEL_NEEDLE}"* ]]; then
-				_sup_parent_guard=1
-				echo "[pulse-wrapper] Deterministic merge: skipping close of parent-task original issue #${_superseded_original_issue} via superseded PR #${linked_issue} (merged PR #${pr_number}) — GH#22964" >>"$LOGFILE"
-			fi
-
-			_sup_dedup_count=$(gh api "${_sup_api}/comments" \
-				2>/dev/null | jq --arg prnum "PR #${pr_number}" \
-				'[.[] | select(.body | contains($prnum))] | length' 2>/dev/null) || _sup_dedup_count=0
-			[[ "$_sup_dedup_count" =~ ^[0-9]+$ ]] || _sup_dedup_count=0
-			if [[ "$_sup_dedup_count" -gt 0 ]]; then
-				echo "[pulse-wrapper] Deterministic merge: skipped duplicate closing comment on original issue #${_superseded_original_issue} via superseded PR #${linked_issue} — PR #${pr_number} already referenced (GH#22964)" >>"$LOGFILE"
-			else
-				gh_issue_comment "$_superseded_original_issue" --repo "$repo_slug" \
-					--body "$closing_comment" 2>/dev/null || true
-			fi
-
-			if [[ "$_sup_parent_guard" -eq 0 ]]; then
-				local _sup_solved_actor=""
-				_sup_solved_actor=$(solved_actor_from_pr_labels "$pr_labels") || _sup_solved_actor=""
-				[[ -n "$_sup_solved_actor" ]] && set_solved_label "$_superseded_original_issue" "$repo_slug" "$_sup_solved_actor" || true
-				clear_terminal_issue_dispatch_labels "$_superseded_original_issue" "$repo_slug" "post-merge-superseded-pr-${pr_number}" || true
-				if _gh_with_timeout write gh issue close "$_superseded_original_issue" --repo "$repo_slug" 2>/dev/null; then
-					set_issue_status "$_superseded_original_issue" "$repo_slug" "done" || true
-					reconcile_dependants_after_verified_closure "$repo_slug" "$_superseded_original_issue" || true
-				fi
-				fast_fail_reset "$_superseded_original_issue" "$repo_slug" || true
-				unlock_issue_after_worker "$_superseded_original_issue" "$repo_slug"
-			fi
-	fi
-	return 0
-}
+# Linked-issue closeout is kept separate from PR comment reconciliation above.
+# shellcheck source=./pulse-merge-issue-closeout.sh
+# shellcheck disable=SC1091  # sibling library resolved through _PULSE_MERGE_DIR
+source "${_PULSE_MERGE_DIR}/pulse-merge-issue-closeout.sh"
 
 _handle_post_merge_actions() {
 	local pr_number="$1"
@@ -1269,6 +1108,10 @@ _handle_post_merge_actions() {
 
 	# Post partial parent closeout if a For/Ref reference exists (GH#23937).
 	_pm_handle_partial_parent_closeout "$pr_number" "$repo_slug" "$merge_summary" "$linked_issue"
+	# GH#34312: a merged worker partial no longer owns its in-review target.
+	if declare -F _pm_restore_partial_continuation >/dev/null 2>&1; then
+		_pm_restore_partial_continuation "$pr_number" "$repo_slug" "$linked_issue" "$pr_labels" || true
+	fi
 
 	# Auto-release interactive claim if one exists for this issue (t2413).
 	# Handles the "when a PR they opened merges" release trigger from AGENTS.md
@@ -1442,12 +1285,27 @@ _pmp_stage_parse_and_validate() {
 		return 1
 	fi
 	if _pmp_is_protected_release_pr "$pr_head_ref_name" "$pr_labels"; then
+		_pmp_hold_protected_release_pr "$pr_number" "$repo_slug" "$pr_head_ref_name" "$pr_head_ref_oid" || return 1
 		echo "[pulse-wrapper] Merge pass: deferring protected release PR #${pr_number} in ${repo_slug} to provenance-preserving exact-merge reconciliation" >>"$LOGFILE"
 		return 4
 	fi
 	if [[ "$repo_slug" == "${AIDEVOPS_RELEASE_LANE_COORDINATED_REPO:-marcusquinn/aidevops}" ]] \
 		&& ! release_lane_merge_guard "$repo_slug" "$pr_number" "$pr_base_ref_name" "$pr_head_ref_name"; then
 		echo "[pulse-wrapper] Merge pass: deferring PR #${pr_number} in ${repo_slug} for active exact-tip release lane" >>"$LOGFILE"
+		return 1
+	fi
+	if [[ "$repo_slug" != "${AIDEVOPS_RELEASE_LANE_COORDINATED_REPO:-marcusquinn/aidevops}" ]] \
+		&& ! manual_release_hold_check "$repo_slug" "$pr_number" 2>>"$LOGFILE"; then
+		echo "[pulse-wrapper] Merge pass: deferring PR #${pr_number} in ${repo_slug} for active manual release hold" >>"$LOGFILE"
+		return 1
+	fi
+	#aidevops:trust-boundary GH#37955 — a Cloudron package version bump is a
+	# release; the raw merge below must never publish it without authority.
+	# Not skipped for snapshot hold-for-review: the live-state gate re-reads
+	# labels, so a hold removed mid-cycle must not bypass this check.
+	if [[ "$repo_slug" != "${AIDEVOPS_RELEASE_LANE_COORDINATED_REPO:-marcusquinn/aidevops}" ]] \
+		&& ! cloudron_release_merge_guard "$repo_slug" "$pr_number" "$pr_head_ref_oid" ",${pr_labels}," 2>>"$LOGFILE"; then
+		echo "[pulse-wrapper] Merge pass: deferring PR #${pr_number} in ${repo_slug} — Cloudron release requires exact-head release authority (GH#37955)" >>"$LOGFILE"
 		return 1
 	fi
 	# GH#24634: refresh REST-first UNKNOWN state before conflict handling.
@@ -1462,6 +1320,18 @@ _pmp_stage_handle_conflict() {
 	if [[ "${DRY_RUN:-0}" == "1" ]]; then
 		echo "[pulse-wrapper] DRY-RUN: PR #${pr_number} in ${repo_slug} is CONFLICTING; would evaluate rebase, repair routing, or protected close" >>"$LOGFILE"
 		return 2
+	fi
+	# GH#36112: a generated TODO handoff has no work issue; its Ref lines must
+	# never reach issue routing, holds or the generic close path.
+	local handoff_rc="${_PMTH_PROCEED:-10}"
+	if declare -F _pmth_handle_conflicting_handoff >/dev/null 2>&1; then
+		handoff_rc=0
+		_pmth_handle_conflicting_handoff "$pr_number" "$repo_slug" "${pr_head_ref_name:-}" \
+			"$pr_head_ref_oid" "$pr_labels" || handoff_rc=$?
+	fi
+	if [[ "$handoff_rc" -ne "${_PMTH_PROCEED:-10}" ]]; then
+		[[ -n "$timing_prefix" ]] && _pmp_add_elapsed_seconds "${timing_prefix}mergeability_s" "$_mergeability_start"
+		return "$handoff_rc"
 	fi
 	conflict_linked_issue=$(_extract_linked_issue "$pr_number" "$repo_slug")
 	if [[ -n "$conflict_linked_issue" ]]; then
@@ -1485,7 +1355,11 @@ _pmp_stage_handle_conflict() {
 		[[ -n "$timing_prefix" ]] && _pmp_add_elapsed_seconds "${timing_prefix}mergeability_s" "$_mergeability_start"
 		return 2
 	fi
-	if [[ "$conflict_route_rc" -eq "${PULSE_FEEDBACK_ROUTE_DEFERRED_RC:-75}" || "$conflict_route_rc" -eq "${PULSE_FEEDBACK_ROUTE_MAINTAINER_RC:-76}" ]]; then
+	if [[ "$conflict_route_rc" -eq "${PULSE_FEEDBACK_ROUTE_DEFERRED_RC:-75}" ]]; then
+		[[ -n "$timing_prefix" ]] && _pmp_add_elapsed_seconds "${timing_prefix}mergeability_s" "$_mergeability_start"
+		return 4
+	fi
+	if [[ "$conflict_route_rc" -eq "${PULSE_FEEDBACK_ROUTE_MAINTAINER_RC:-76}" ]]; then
 		[[ -n "$timing_prefix" ]] && _pmp_add_elapsed_seconds "${timing_prefix}mergeability_s" "$_mergeability_start"
 		return 1
 	fi
@@ -1547,6 +1421,7 @@ _pmp_stage_review_and_gates() {
 
 _pmp_stage_required_checks() {
 	local required_labels="$pr_labels" ci_route_rc=0
+	local drift_names="" drift_signature="" drift_skip=0 drift_classification_unavailable=0
 	[[ -n "$timing_prefix" ]] && _branch_protection_start=$(_pmp_now_epoch)
 	if ! _pr_required_checks_pass "$pr_number" "$repo_slug"; then
 		if _is_trusted_dependabot_update_pr "$pr_number" "$repo_slug" "$pr_author" "$pr_head_ref_oid" \
@@ -1560,8 +1435,44 @@ _pmp_stage_required_checks() {
 				echo "[pulse-wrapper] DRY-RUN: PR #${pr_number} in ${repo_slug} has non-passing required checks; would evaluate CI-drift rebase or repair routing" >>"$LOGFILE"
 				return 1
 			fi
-			if _attempt_pr_ci_rebase_retry "$pr_number" "$repo_slug" "$pr_base_ref_name" "$pr_head_ref_oid"; then
+			# Never use old ledger evidence while checks are active, but do route
+			# terminal failures from a fresh exact-head snapshot alongside them.
+			if _check_required_checks_have_pending_or_in_progress "$repo_slug" "$pr_number" "$pr_head_ref_oid"; then
+				_pmp_active_checks_allow_native_defer || true
+				return 1
+			fi
+			if drift_names=$(_required_checks_terminal_failure_names "$repo_slug" "$pr_number" "$pr_head_ref_oid"); then
+				if [[ -n "$drift_names" ]]; then
+					drift_signature=$(printf '%s\n' "$drift_names" | shasum -a 256 | cut -d ' ' -f 1) || drift_signature=""
+				fi
+			else
+				drift_classification_unavailable=1
+				# The ledger accepts hexadecimal signatures, not literal sentinels.
+				if ! drift_signature=$(printf 'classification-unavailable\n' | shasum -a 256 | cut -d ' ' -f 1) || [[ -z "$drift_signature" ]]; then
+					echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: CI-drift signature hashing (shasum) failed while classification unavailable; deferring without rebase or CI fix-worker routing (GH#37066)" >>"$LOGFILE"
+					[[ -n "$timing_prefix" ]] && _pmp_add_elapsed_seconds "${timing_prefix}branch_protection_s" "$_branch_protection_start"
+					return 1
+				fi
+				echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: CI-drift context classification unavailable (required-context/head/REST parse failure); allowing one rebase" >>"$LOGFILE"
+			fi
+			if [[ -n "$drift_signature" ]] && _ci_drift_ledger_should_skip "$repo_slug" "$pr_number" "$pr_head_ref_oid" "$drift_signature" "$drift_classification_unavailable"; then
+				if [[ "$drift_classification_unavailable" -eq 1 ]]; then
+					echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: CI-drift rebase already tried for this head while classification unavailable; deferring without rebase or CI fix-worker routing" >>"$LOGFILE"
+					return 1
+				fi
+				drift_skip=1
+				echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: CI-drift rebase already tried for the same failing required contexts (${drift_names//$'\n'/, }); routing to CI fix-worker" >>"$LOGFILE"
+			fi
+			if [[ "$drift_skip" -eq 0 ]] && _attempt_pr_ci_rebase_retry "$pr_number" "$repo_slug" "$pr_base_ref_name" "$pr_head_ref_oid"; then
+				if [[ -n "$drift_signature" ]]; then
+					_ci_drift_ledger_record "$repo_slug" "$pr_number" "$pr_head_ref_oid" "$drift_signature" || echo "[pulse-merge] CI-drift ledger write failed for PR #${pr_number}" >>"$LOGFILE"
+				fi
 				[[ -n "$timing_prefix" ]] && _pmp_add_elapsed_seconds "${timing_prefix}branch_protection_s" "$_branch_protection_start"
+				return 1
+			fi
+			if [[ "$drift_classification_unavailable" -eq 1 ]]; then
+				_ci_drift_ledger_record "$repo_slug" "$pr_number" "$pr_head_ref_oid" "$drift_signature" || echo "[pulse-merge] CI-drift ledger write failed for PR #${pr_number}" >>"$LOGFILE"
+				echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: CI-drift rebase unsuccessful while classification unavailable; deferring without CI fix-worker routing" >>"$LOGFILE"
 				return 1
 			fi
 			_route_pr_to_fix_worker "$pr_number" "$repo_slug" "$linked_issue" "ci" "$pr_labels" "" "$pr_updated_at" "$pr_head_ref_oid" || ci_route_rc=$?
@@ -1580,7 +1491,7 @@ _pmp_stage_required_checks() {
 }
 
 _pmp_stage_pre_merge() {
-	local preflight_route_rc=0 native_auto_rc=0
+	local native_auto_rc=0
 	if [[ "${DRY_RUN:-0}" == "1" ]]; then
 		_pulse_merge_preflight_snapshot_gate "$repo_slug" "$pr_number" "$pr_head_ref_oid" || return 1
 		echo "[pulse-wrapper] DRY-RUN: would merge PR #${pr_number} in ${repo_slug} (linked_issue=#${linked_issue:-none})" >>"$LOGFILE"
@@ -1597,28 +1508,67 @@ _pmp_stage_pre_merge() {
 	[[ -n "$timing_prefix" ]] && _pmp_add_elapsed_seconds "${timing_prefix}ruleset_s" "$_ruleset_start"
 	merge_summary=$(_extract_merge_summary "$pr_number" "$repo_slug")
 	_retarget_stacked_children "$pr_number" "$repo_slug" "$pr_head_ref_name"
+	# GH#37795: the full final gate (admin safety, review refresh, worker-briefed
+	# verdict, REST snapshot) runs once, immediately before each mutation
+	# (_pmp_stage_admin_merge, native auto-merge, ruleset fallbacks). Here only the
+	# cheap admin-authority check runs: it sets _PULSE_FINAL_REQUIRES_SYNCHRONOUS_MERGE,
+	# which native auto-merge handling needs before it retains or arms auto-merge.
 	# #aidevops:trust-boundary — revalidate exact-head authority before mutation.
-	if ! _pulse_merge_final_trust_gate "$pr_number" "$repo_slug" "$pr_head_ref_oid"; then
+	if ! _pulse_merge_admin_safety_check "$pr_number" "$repo_slug" "$pr_head_ref_oid"; then
+		_PULSE_MERGE_PREFLIGHT_BLOCKER_KIND="$PMRC_BLOCKER_MERGE_AUTHORITY"
 		_pulse_merge_maybe_dispatch_preflight_remediation "$pr_number" "$repo_slug"
-		if [[ "${_PULSE_MERGE_PREFLIGHT_BLOCKING_CHECKS_JSON:-[]}" != "[]" ]]; then
-			_route_pr_to_fix_worker "$pr_number" "$repo_slug" "$linked_issue" "ci" "$pr_labels" "" "$pr_updated_at" "$pr_head_ref_oid" "$_PULSE_MERGE_PREFLIGHT_BLOCKING_CHECKS_JSON" || preflight_route_rc=$?
-			if [[ "$preflight_route_rc" -eq "${PULSE_FEEDBACK_ROUTE_DEFERRED_RC:-75}" || "$preflight_route_rc" -eq "${PULSE_FEEDBACK_ROUTE_MAINTAINER_RC:-76}" ]]; then
-				echo "[pulse-wrapper] Merge pass: preflight feedback route for PR #${pr_number} in ${repo_slug} remains partial" >>"$LOGFILE"
-			fi
-		fi
 		return 1
+	fi
+	if ! _pmp_approve_issue_sync_action_required_runs "$pr_number" "$repo_slug" "$pr_head_ref_oid"; then
+		return 1
+	fi
+	if [[ "${_PULSE_ISSUE_SYNC_RUNS_APPROVED:-0}" -gt 0 ]]; then
+		return 1
+	fi
+	# Existing native auto-merge can return without a mutation-time gate. A
+	# required check may have failed since selection; route it even with CI active.
+	if ! _check_required_checks_passing "$repo_slug" "$pr_number" "$pr_head_ref_oid"; then
+		_pmp_active_checks_allow_native_defer || return 1
 	fi
 	_set_native_auto_merge_or_skip "$pr_number" "$repo_slug" "${_PULSE_FINAL_REQUIRES_SYNCHRONOUS_MERGE:-0}" "$pr_review" "$pr_head_ref_oid" || native_auto_rc=$?
 	case "$native_auto_rc" in 0) return 4 ;; 2 | 3) return 1 ;; esac
-	if ! _pulse_merge_final_trust_gate "$pr_number" "$repo_slug" "$pr_head_ref_oid"; then
-		_pulse_merge_maybe_dispatch_preflight_remediation "$pr_number" "$repo_slug"
-		return 1
-	fi
 	return 10
+}
+
+_pmp_route_preflight_ci_failures() {
+	local route_rc=0
+	if [[ "${_PULSE_MERGE_PREFLIGHT_BLOCKING_CHECKS_JSON:-[]}" != "[]" ]]; then
+		_route_pr_to_fix_worker "$pr_number" "$repo_slug" "$linked_issue" "ci" "$pr_labels" "" "$pr_updated_at" "$pr_head_ref_oid" "$_PULSE_MERGE_PREFLIGHT_BLOCKING_CHECKS_JSON" || route_rc=$?
+		if [[ "$route_rc" -eq "${PULSE_FEEDBACK_ROUTE_DEFERRED_RC:-75}" || "$route_rc" -eq "${PULSE_FEEDBACK_ROUTE_MAINTAINER_RC:-76}" ]]; then
+			echo "[pulse-wrapper] Merge pass: preflight feedback route for PR #${pr_number} in ${repo_slug} remains partial" >>"$LOGFILE"
+		fi
+	fi
+	return 0
+}
+
+# Inspect only the exact-head snapshot, not the full authority/review gate.
+# Pending-only CI may retain native auto-merge; terminal failures must route now.
+_pmp_active_checks_allow_native_defer() {
+	_pulse_merge_preflight_snapshot_gate "$repo_slug" "$pr_number" "$pr_head_ref_oid" && return 0
+	_pulse_merge_maybe_dispatch_preflight_remediation "$pr_number" "$repo_slug"
+	_pmp_route_preflight_ci_failures
+	[[ "${_PULSE_MERGE_PREFLIGHT_BLOCKER_KIND:-}" == "$PMRC_BLOCKER_CHECKS_ACTIVE" ]] && return 0
+	return 1
+}
+
+# GH#37795: the single full final gate before the admin merge. A failure
+# routes blocking checks to a fix worker, using current exact-head evidence.
+_pmp_admin_final_gate_or_route() {
+	_pulse_merge_final_trust_gate "$pr_number" "$repo_slug" "$pr_head_ref_oid" && return 0
+	_pulse_merge_maybe_dispatch_preflight_remediation "$pr_number" "$repo_slug"
+	_pmp_route_preflight_ci_failures
+	return 1
 }
 
 _pmp_stage_admin_merge() {
 	local original_output="" missing_output="" missing_exit=0
+	# #aidevops:trust-boundary — revalidate at the mutation, not only selection.
+	_pmp_admin_final_gate_or_route || return 1
 	merge_output=$(gh pr merge "$pr_number" --repo "$repo_slug" --squash --admin --match-head-commit "$pr_head_ref_oid" 2>&1)
 	_merge_exit=$?
 	if [[ $_merge_exit -ne 0 ]] && gh_merge_remediate_stale_auth_cache "$merge_output" "pulse merge PR #${pr_number} in ${repo_slug}" "$LOGFILE"; then
@@ -1667,6 +1617,8 @@ _pmp_stage_ruleset_fallback() {
 			_pulse_merge_maybe_dispatch_preflight_remediation "$pr_number" "$repo_slug"
 			return 1
 		fi
+		# Live authority can now require synchronous merging even if selection did not.
+		[[ "${_PULSE_FINAL_REQUIRES_SYNCHRONOUS_MERGE:-0}" != "1" ]] || return 1
 		auto_output=$(gh pr merge "$pr_number" --repo "$repo_slug" --auto --squash --match-head-commit "$pr_head_ref_oid" 2>&1)
 		auto_exit=$?
 	fi
@@ -1740,6 +1692,14 @@ _pmp_stage_finalize_merge() {
 
 _process_single_ready_pr() {
 	local repo_slug="$1" pr_obj="$2" timing_prefix="${3:-}" stage_rc=0
+	local queue_parent_context="${_PULSE_MERGE_QUEUE_CONTEXT:-}"
+	local _PULSE_MERGE_QUEUE_CONTEXT="" _PULSE_MERGE_QUEUE_OWNED=0 _PULSE_MERGE_QUEUE_DIRTY=0
+	if declare -F _pulse_merge_queue_begin_object >/dev/null 2>&1; then
+		_pulse_merge_queue_begin_object "$repo_slug" "$pr_obj" "$queue_parent_context" || return 4
+		if [[ "$_PULSE_MERGE_QUEUE_DIRTY" -eq 1 && "${4:-0}" != 1 ]]; then
+			_pulse_merge_queue_refresh_object "$repo_slug" pr_obj || { _pulse_merge_queue_finish 1; return 1; }
+		fi
+	fi
 	local pr_number="" pr_state="" pr_mergeable="" pr_review="" pr_author="" pr_title="" pr_updated_at=""
 	local pr_head_ref_oid="" pr_head_ref_name="" pr_base_ref_name="" pr_labels="" pr_is_draft="false"
 	local _mergeability_start="" _branch_protection_start="" _ruleset_start=""
@@ -1753,10 +1713,15 @@ _process_single_ready_pr() {
 		_pmp_stage_admin_merge _pmp_stage_ruleset_fallback; do
 		stage_rc=0
 		"$stage" || stage_rc=$?
-		[[ "$stage_rc" -eq 10 ]] || return "$stage_rc"
+		if [[ "$stage_rc" -ne 10 ]]; then
+			declare -F _pulse_merge_queue_finish >/dev/null 2>&1 && _pulse_merge_queue_finish "$stage_rc"
+			return "$stage_rc"
+		fi
 	done
-	_pmp_stage_finalize_merge
-	return $?
+	stage_rc=0
+	_pmp_stage_finalize_merge || stage_rc=$?
+	declare -F _pulse_merge_queue_finish >/dev/null 2>&1 && _pulse_merge_queue_finish "$stage_rc"
+	return "$stage_rc"
 }
 
 #######################################
@@ -1794,16 +1759,23 @@ process_pr() {
 		return 1
 	fi
 
+	local queue_parent_context="${_PULSE_MERGE_QUEUE_CONTEXT:-}"
+	local _PULSE_MERGE_QUEUE_CONTEXT="" _PULSE_MERGE_QUEUE_OWNED=0 _PULSE_MERGE_QUEUE_DIRTY=0
+	if declare -F _pulse_merge_queue_begin >/dev/null 2>&1; then
+		_pulse_merge_queue_begin "$repo_slug" "$pr_number" event "$queue_parent_context" || return 4
+	fi
+
 	# Fetch the PR JSON in the same shape _merge_ready_prs_for_repo uses and
 	# synthesize a single-PR object. _process_single_ready_pr expects a compact
 	# JSON object with metadata used by draft, label, stale, and repair-routing
 	# gates.
 	local pr_obj
-	pr_obj=$(AIDEVOPS_GH_REST_FIRST_READS=1 gh_pr_view "$pr_number" --repo "$repo_slug" \
+	pr_obj=$(AIDEVOPS_GH_PR_VIEW_CACHE_DISABLE=1 AIDEVOPS_GH_REST_FIRST_READS=1 gh_pr_view "$pr_number" --repo "$repo_slug" \
 		--json "$(_pulse_merge_ready_pr_json_fields)" 2>/dev/null) || pr_obj=""
 
 	if [[ -z "$pr_obj" || "$pr_obj" == "null" ]]; then
 		echo "[pulse-merge] process_pr: gh pr view failed for ${repo_slug}#${pr_number}" >>"$LOGFILE"
+		declare -F _pulse_merge_queue_finish >/dev/null 2>&1 && _pulse_merge_queue_finish 1
 		return 1
 	fi
 
@@ -1813,12 +1785,17 @@ process_pr() {
 	_pmp_normalize_pr_lifecycle_state_into pr_state "$pr_state"
 	if [[ "$pr_state" != "OPEN" ]]; then
 		echo "[pulse-merge] process_pr: PR ${repo_slug}#${pr_number} is not OPEN (state=${pr_state}) — skipping" >>"$LOGFILE"
+		local queue_result=1
+		case "$pr_state" in CLOSED|MERGED) queue_result=2 ;; esac
+		declare -F _pulse_merge_queue_finish >/dev/null 2>&1 && _pulse_merge_queue_finish "$queue_result"
 		return 1
 	fi
 
 	echo "[pulse-merge] process_pr: webhook-triggered merge attempt for ${repo_slug}#${pr_number} (t3038)" >>"$LOGFILE"
-	_process_single_ready_pr "$repo_slug" "$pr_obj"
-	return $?
+	local process_result=0
+	_process_single_ready_pr "$repo_slug" "$pr_obj" "" 1 || process_result=$?
+	declare -F _pulse_merge_queue_finish >/dev/null 2>&1 && _pulse_merge_queue_finish "$process_result"
+	return "$process_result"
 }
 
 #######################################
@@ -1831,14 +1808,17 @@ process_pr() {
 # Cross-repository references use owner/repo#NNN and do not match the local #NNN
 # shape below.
 #
-# Args: $1=PR number, $2=repo slug
+# Args: $1=PR number, $2=repo slug, $3=optional already-fetched body
 # Returns: issue number on stdout, or empty if none found
 #######################################
 _extract_linked_issue() {
 	local pr_number="$1"
 	local repo_slug="$2"
+	local supplied_body="${3-}"
 	local pr_body=""
-	if ! pr_body=$(gh_pr_view "$pr_number" --repo "$repo_slug" --json body --jq '.body // empty' 2>/dev/null); then
+	if [[ "$#" -ge 3 ]]; then
+		pr_body="$supplied_body"
+	elif ! pr_body=$(gh_pr_view "$pr_number" --repo "$repo_slug" --json body --jq '.body // empty' 2>/dev/null); then
 		echo "[pulse-wrapper] _extract_linked_issue: PR #${pr_number} in ${repo_slug} body metadata unavailable — no routing target" >>"$LOGFILE"
 		return 1
 	fi
@@ -1851,9 +1831,7 @@ _extract_linked_issue() {
 	# The body keyword is AUTHORITATIVE. A project-specific GH#NNN title prefix
 	# must not override or contradict a single native closing target. (t2108)
 	local body_issues="" body_issue=""
-	body_issues=$(printf '%s' "$pr_body" \
-		| grep -ioE '(close[ds]?|fix(es|ed)?|resolve[ds]?)[[:space:]]+#[0-9]+' \
-		| grep -oE '[0-9]+' | sort -u) || body_issues=""
+	body_issues=$(_gh_pr_body_closing_issues "$pr_body") || body_issues=""
 
 	# No closing keyword in the body → return empty. The PR is intentionally
 	# not closing any issue (planning-only PR, multi-PR roadmap, "For #NNN"
@@ -1863,12 +1841,95 @@ _extract_linked_issue() {
 		return 0
 	fi
 	if [[ "$body_issues" == *$'\n'* ]]; then
+		body_issues=$(_drop_closing_pull_request_refs "$repo_slug" "$body_issues")
+	fi
+	if [[ "$body_issues" == *$'\n'* ]]; then
 		echo "[pulse-wrapper] _extract_linked_issue: PR #${pr_number} in ${repo_slug} has ambiguous closing issue identities — no routing target" >>"$LOGFILE"
 		return 1
 	fi
 	body_issue="$body_issues"
 
 	printf '%s' "$body_issue"
+	return 0
+}
+
+#######################################
+# Drop closing-keyword targets that are pull requests. GitHub closing keywords
+# link issues only, so prose such as "close #<source-PR> as superseded" in a
+# Dependabot replacement body must not make the real target ambiguous; that
+# held a replacement PR unmerged and footprint-deferred every other Dependabot
+# intake (GH#36704; workflow counterpart GH#36682). Only called when several
+# candidates exist, so the single-target hot path makes no API calls. A number
+# is dropped only on positive pull-request evidence; lookup failures keep it.
+# Args: $1=repo slug, $2=newline-separated candidate numbers
+# Output: remaining candidates, newline-separated
+#######################################
+_drop_closing_pull_request_refs() {
+	local repo_slug="$1"
+	local candidates="$2"
+	_gh_drop_closing_pull_request_refs "$repo_slug" "$candidates"
+	return $?
+}
+
+#######################################
+# Resolve a work target for conflict repair/carry-forward, never issue closing.
+# A native closing target wins; ambiguous or unavailable closing metadata must
+# not fall back. Otherwise require one distinct local For/Ref or title identity.
+# Mode explicit accepts standalone declarations, or a title corroborated by a
+# visible For/Ref when no closing or explicit target exists.
+# Args: $1=PR number, $2=repo slug, $3=mode, $4=optional fetched body
+#######################################
+_extract_pr_work_issue() {
+	local pr_number="$1"
+	local repo_slug="$2"
+	local mode="${3:-repair}"
+	local supplied_body="${4-}"
+	local closing_issue="" pr_body="" pr_title=""
+	[[ "$repo_slug" =~ ^[^/]+/[^/]+$ ]] || return 1
+	[[ "$mode" == "repair" || "$mode" == "explicit" ]] || return 1
+	if [[ "$#" -ge 4 ]]; then
+		pr_body="$supplied_body"
+		closing_issue=$(_extract_linked_issue "$pr_number" "$repo_slug" "$pr_body") || return 1
+	else
+		closing_issue=$(_extract_linked_issue "$pr_number" "$repo_slug") || return 1
+	fi
+	if [[ -n "$closing_issue" ]]; then
+		printf '%s' "$closing_issue"
+		return 0
+	fi
+	if [[ "$#" -lt 4 ]]; then
+		pr_body=$(gh_pr_view "$pr_number" --repo "$repo_slug" --json body --jq '.body // empty' 2>/dev/null) || return 1
+	fi
+	if [[ "$mode" == "explicit" ]]; then
+		local explicit_issues=""
+		explicit_issues=$(_gh_pr_body_explicit_issues "$pr_body") || return 1
+		if [[ "$explicit_issues" == *$'\n'* || "$explicit_issues" == "ambiguous" ]]; then
+			echo "[pulse-wrapper] _extract_pr_work_issue: PR #${pr_number} in ${repo_slug} has ambiguous explicit issue identities — no merge association" >>"$LOGFILE"
+			return 1
+		fi
+		# aidevops:trust-boundary: never infer from the title alone or fall back
+		# after ambiguous closing/explicit metadata or a closing body reference.
+		if [[ -z "$explicit_issues" ]] && ! _pmpc_pr_body_has_closing_ref "$pr_number" "$repo_slug" "$pr_body"; then
+			explicit_issues=$(_pmpc_corroborated_target "$pr_number" "$repo_slug" "$pr_body") || explicit_issues=""
+		fi
+		printf '%s' "$explicit_issues"
+		return 0
+	fi
+	pr_title=$(gh_pr_view "$pr_number" --repo "$repo_slug" --json title --jq '.title // empty' 2>/dev/null) || return 1
+
+	local body_issues="" title_issue="" work_issues=""
+	body_issues=$(printf '%s' "$pr_body" \
+		| grep -ioE '(^|[^[:alnum:]_])(For|Ref)[[:space:]]+#[0-9]+' \
+		| grep -oE '[0-9]+' | sort -u) || body_issues=""
+	title_issue=$(printf '%s' "$pr_title" \
+		| grep -oE '^(t[0-9]+|GH#[0-9]+)([^[:alnum:]_]|$)' \
+		| grep -oE '[0-9]+') || title_issue=""
+	work_issues=$(printf '%s\n%s\n' "$body_issues" "$title_issue" | grep -E '^[0-9]+$' | sort -u) || work_issues=""
+	if [[ "$work_issues" == *$'\n'* ]]; then
+		echo "[pulse-wrapper] _extract_pr_work_issue: PR #${pr_number} in ${repo_slug} has ambiguous work issue identities — no routing target" >>"$LOGFILE"
+		return 1
+	fi
+	printf '%s' "$work_issues"
 	return 0
 }
 

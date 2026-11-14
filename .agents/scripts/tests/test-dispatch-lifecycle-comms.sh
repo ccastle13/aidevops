@@ -469,6 +469,89 @@ else
 	print_result "Fix D: posts dispatch comment before stagger sleep" 1 "log: $(cat "$GH_COMMENT_LOG")"
 fi
 
+# The dispatch comment uses the same worker resolver as the headless runtime.
+for tier_model_expected in 'standard openai/gpt-6.1-sol medium' 'thinking openai/gpt-6.1-sol medium'; do
+	read -r effort_tier effort_model effort_expected <<<"$tier_model_expected"
+	reset_gh_state
+	PULSE_DISPATCH_STAGGER_SECONDS=0 \
+		_dlw_post_launch_hooks "12345" "owner/repo" "runner-a" "4242" "worker-owner-repo-12345" "$effort_tier" "$effort_model"
+	if grep -Fq -- "- **Effort**: ${effort_expected}" "$GH_COMMENT_LOG"; then
+		print_result "dispatch effort: ${effort_tier} ${effort_model} resolves to ${effort_expected}" 0
+	else
+		print_result "dispatch effort: ${effort_tier} ${effort_model} resolves to ${effort_expected}" 1
+	fi
+done
+
+reset_gh_state
+AIDEVOPS_HEADLESS_VARIANT_STANDARD=high PULSE_DISPATCH_STAGGER_SECONDS=0 \
+	_dlw_post_launch_hooks "12345" "owner/repo" "runner-a" "4242" "worker-owner-repo-12345" "standard" "openai/gpt-6.1-sol"
+if grep -Fq -- '- **Effort**: high' "$GH_COMMENT_LOG"; then
+	print_result "dispatch effort respects tier override" 0
+else
+	print_result "dispatch effort respects tier override" 1
+fi
+
+reset_gh_state
+PULSE_DISPATCH_STAGGER_SECONDS=0 \
+	_dlw_post_launch_hooks "12345" "owner/repo" "runner-a" "4242" "worker-owner-repo-12345" "standard" ""
+if grep -Fq -- '- **Effort**: resolved at launch' "$GH_COMMENT_LOG"; then
+	print_result "auto-select effort is deferred to launch" 0
+else
+	print_result "auto-select effort is deferred to launch" 1
+fi
+
+# GH#31239: public blocker observations preserve lifecycle attempt correlation,
+# while public text never copies raw attempt metadata or a protected dossier.
+# shellcheck source=../terminal-blocker-circuit.sh
+source "${SCRIPTS_DIR}/terminal-blocker-circuit.sh"
+blocker_fingerprint=$(_terminal_blocker_hash 'v2:missing_files_scope')
+AIDEVOPS_ATTEMPT_ID='attempt:fixture-one'
+first_observation=$(terminal_blocker_observation_fragment 111111111111111111111111 "$blocker_fingerprint")
+AIDEVOPS_ATTEMPT_ID='attempt:fixture-two'
+second_observation=$(terminal_blocker_observation_fragment 111111111111111111111111 "$blocker_fingerprint")
+if [[ "$first_observation" != "$second_observation" &&
+	"$first_observation" == *'reason=missing_files_scope owner=brief-author'* &&
+	"$first_observation" == *'Add a canonical ### Files Scope'* &&
+	"$second_observation" != *'attempt:fixture-two'* ]]; then
+	print_result "blocker recovery uses real lifecycle attempt identity and allowlisted actions" 0
+else
+	print_result "blocker recovery uses real lifecycle attempt identity and allowlisted actions" 1
+fi
+
+# GH#36760: the contract shared by normal, clean-room and fallback launches
+# requests a public-safe question; the rendered observation names that input.
+question_contract=$(_dlw_first_pass_completion_contract)
+if [[ "$question_contract" == *'TERMINAL_BLOCKER_QUESTION=<sanitized one-line question>'* &&
+	"$question_contract" == *'at most 500 characters'* &&
+	"$question_contract" == *'never include secrets'* ]]; then
+	print_result "worker contract requests a bounded public-safe input question" 0
+else
+	print_result "worker contract requests a bounded public-safe input question" 1
+fi
+blocker_fingerprint=$(_terminal_blocker_hash 'v2:input_required:maintainer')
+input_observation=$(PRIVACY_REPOS_CONFIG="$REPOS_JSON" \
+	AIDEVOPS_TERMINAL_BLOCKER_QUESTION='Which deployment region should be used?' \
+	terminal_blocker_observation_fragment 111111111111111111111111 "$blocker_fingerprint")
+missing_observation=$(AIDEVOPS_TERMINAL_BLOCKER_QUESTION='' \
+	terminal_blocker_observation_fragment 111111111111111111111111 "$blocker_fingerprint")
+if [[ "$input_observation" == *'Input requested: Which deployment region should be used?'* &&
+	"$missing_observation" == *"no sanitized question recorded; the originating runner's recovery supervisor must publish one"* &&
+	"$missing_observation" != *'Input requested:'* ]]; then
+	print_result "input blocker observation exposes the question or names supervisor recovery" 0
+else
+	print_result "input blocker observation exposes the question or names supervisor recovery" 1
+fi
+
+reset_gh_state
+printf '%s' '[[{"body":"terminal-blocker-circuit:retry","created_at":"2026-09-01T11:00:00Z","author_association":"NONE"}],[{"body":"trusted observation","created_at":"2026-09-01T10:00:00Z","author_association":"MEMBER"}]]' >"$GH_API_COMMENTS_RESPONSE"
+trusted_comments=$(terminal_blocker_fetch_trusted_comments 12345 owner/repo)
+if [[ "$(printf '%s' "$trusted_comments" | jq length)" -eq 1 &&
+	-z "$(_terminal_blocker_latest_retry_at "$trusted_comments")" ]]; then
+	print_result "paginated blocker comments reject an untrusted retry" 0
+else
+	print_result "paginated blocker comments reject an untrusted retry" 1
+fi
+
 # Cleanup
 rm -rf "$TMP_HOME"
 

@@ -31,11 +31,16 @@
 #                                                 framework,circuit-breaker-meta
 #   AIDEVOPS_CIRCUIT_BREAKER_META_TARGET_REPO   force the repo where the
 #                                               meta-issue is filed. By default,
-#                                               public repos without framework
-#                                               script sources route to the
-#                                               framework source repo so workers
-#                                               land in a repo containing the
-#                                               files named by the brief.
+#                                               repos without framework script
+#                                               sources route to the framework
+#                                               source repo so workers land in
+#                                               a repo containing the files
+#                                               named by the brief. Private or
+#                                               unknown originals are withheld
+#                                               from the meta body (GH#34223).
+#   AIDEVOPS_REPOS_JSON                         repo inventory used to find
+#                                               withheld originals on merge
+#                                               (default ~/.config/aidevops/repos.json).
 #   AIDEVOPS_CIRCUIT_BREAKER_META_FRAMEWORK_REPO
 #                                               framework source repo fallback.
 #                                               Default: marcusquinn/aidevops.
@@ -75,6 +80,7 @@ source "${SCRIPT_DIR}/shared-constants.sh"
 source "${SCRIPT_DIR}/shared-gh-wrappers.sh"
 
 readonly _CB_META_MARKER='circuit-breaker-meta-filed'
+readonly _CB_META_WITHHELD_MARKER='circuit-breaker-meta-original:withheld'
 readonly _CB_META_DEFAULT_LABELS='auto-dispatch,tier:thinking,bug,pulse,framework,circuit-breaker-meta'
 readonly _CB_BREAKER_COST='cost'
 readonly _CB_BREAKER_NO_WORK='no_work'
@@ -140,9 +146,12 @@ _cb_meta_repo_is_private_or_unknown() {
 #
 # Root cause fixed for example-repo#4003: framework breaker meta-issues were filed
 # into application repos that do not contain aidevops framework scripts, so the
-# dispatched worker had no target files to edit and exited clean/no-work. Public
-# repos that lack the framework source route to the framework repo by default;
-# private/unknown repos stay local to avoid leaking private repo names.
+# dispatched worker had no target files to edit and exited clean/no-work. Repos
+# that lack the framework source route to the framework repo by default.
+# GH#34223: private/unknown repos previously stayed local, so the generated
+# brief scoped framework scripts and tests absent from that repo. They now route
+# to the framework source too; cmd_file withholds the private original identity
+# and forensics from the meta body (see _cb_meta_original_withheld).
 # Args: $1=original_repo
 # Stdout: target repo slug
 # Returns: 0 always
@@ -160,13 +169,24 @@ _cb_meta_target_repo() {
 		return 0
 	fi
 
-	if _cb_meta_repo_is_private_or_unknown "$original_repo"; then
-		printf '%s' "$original_repo"
-		return 0
-	fi
-
 	printf '%s' "${AIDEVOPS_CIRCUIT_BREAKER_META_FRAMEWORK_REPO:-$_CB_DEFAULT_FRAMEWORK_REPO}"
 	return 0
+}
+
+#######################################
+# Must the original identity be withheld from the meta-issue? Cross-repo metas
+# for private/unknown originals never publish the original slug, number, free
+# text reason or local forensics. Fails closed on API errors.
+# Args: $1=original_repo, $2=meta_repo
+# Returns: 0 if withheld, 1 if the original may be referenced
+#######################################
+_cb_meta_original_withheld() {
+	local original_repo="$1"
+	local meta_repo="$2"
+
+	[[ "$original_repo" != "$meta_repo" ]] || return 1
+	_cb_meta_repo_is_private_or_unknown "$original_repo" && return 0
+	return 1
 }
 
 #######################################
@@ -265,20 +285,25 @@ _cb_meta_stages_slice() {
 #######################################
 #######################################
 # Body section: intro (What/Why/Tracking/Hypothesis intro).
-# Args: $1=issue, $2=slug, $3=breaker_label, $4=trip_marker,
-#        $5=failure_count, $6=safe_reason, $7=cost_block
+# Args: $1=original_ref (slug#N or withheld text), $2=original_display
+#        (how later prose names the original), $3=breaker_label,
+#        $4=trip_marker, $5=failure_count, $6=safe_reason, $7=cost_block,
+#        $8=withheld (1 when the private original identity is withheld)
 #######################################
 _cb_meta_body_intro() {
-	local issue_number="$1" repo_slug="$2" breaker_label="$3"
+	local original_ref="$1" original_display="$2" breaker_label="$3"
 	local trip_marker="$4" failure_count="$5" safe_reason="$6"
-	local cost_block="$7"
+	local cost_block="$7" withheld="${8:-0}"
+	local withheld_marker=""
+	[[ "$withheld" == "1" ]] && withheld_marker="
+<!-- ${_CB_META_WITHHELD_MARKER} -->"
 
 	cat <<EOF
-<!-- aidevops:generator=circuit-breaker-meta-filer -->
+<!-- aidevops:generator=circuit-breaker-meta-filer -->${withheld_marker}
 
 ## What
 
-Diagnose why the **${breaker_label}** circuit breaker fired on ${repo_slug}#${issue_number} after ${failure_count} consecutive worker failure(s), and ship the systemic fix that prevents the same class of failure on subsequent issues.
+Diagnose why the **${breaker_label}** circuit breaker fired on ${original_ref} after ${failure_count} consecutive worker failure(s), and ship the systemic fix that prevents the same class of failure on subsequent issues.
 
 The breaker tripping is the SYMPTOM. This issue is for finding and fixing the ROOT CAUSE — typically a dispatch path bug, a worker setup race, an exit-classifier defect, or a brief-quality gap that caused workers to crash before reading the brief.
 
@@ -286,11 +311,11 @@ The breaker tripping is the SYMPTOM. This issue is for finding and fixing the RO
 
 The existing breaker (\`${breaker_label}\`) halts dispatch with \`status:blocked\` on the original. Filing this meta-issue converts the trip into a self-healing cycle: forensics → hypothesis → fix → original unblocks automatically.
 
-The original (#${issue_number}) gets a \`blocked-by\` label pointing at this meta-issue and clears automatically when this meta-issue's PR merges (handled by \`pulse-merge.sh::_unblock_circuit_breaker_meta_original\`).
+The original (${original_display}) gets a \`blocked-by\` label pointing at this meta-issue and clears automatically when this meta-issue's PR merges (handled by \`pulse-merge.sh::_unblock_circuit_breaker_meta_pr\`).
 
 ## Tracking original issue
 
-- Original: ${repo_slug}#${issue_number}
+- Original: ${original_ref}
 - Breaker: \`${breaker_label}\` (\`${trip_marker}\`)
 - Failure count: ${failure_count}
 - Last failure reason: ${safe_reason}${cost_block}
@@ -312,7 +337,7 @@ _cb_meta_body_hypothesis() {
 
 	if [[ "$breaker_type" == "$_CB_BREAKER_NO_WORK" ]]; then
 		cat <<'EOF'
-- **Worker exit classifier defect** — workers killed by SIGTERM/SIGKILL before producing a session may be misclassified as `reason=clean` (see #21818 / #21754). Check `headless-runtime-failure.sh::classify_worker_exit` and the wait_status sentinel propagation.
+- **Worker exit classifier defect** — workers killed by SIGTERM/SIGKILL before producing a session may be misclassified as `reason=clean` (see #21818 / #21754). Check `headless-runtime-failure-classify.sh::classify_worker_exit` and the wait_status sentinel propagation (still in `headless-runtime-failure.sh`).
 - **Stale-recovery false positive** — assignment recovery may mark active work as stale and record `stale_timeout` / `no_work` fast-fails. Check `dispatch-dedup-stale.sh::_is_stale_assignment`, especially comment pagination/slurping and last-activity aggregation on long issue threads.
 - **Plugin init crash** — opencode plugin (`opencode-aidevops`) failing during boot due to FD exhaustion, env pollution, or a stale cache. Check the worker's stderr in `~/.aidevops/logs/worker-*-stderr.log`.
 - **Branch naming race** — worker tries to checkout a branch that another concurrent worker just consumed.
@@ -333,24 +358,25 @@ EOF
 
 #######################################
 # Body section: How / Forensics / Acceptance / Verification.
-# Args: $1=issue, $2=slug, $3=max_lines, $4=log_slice, $5=stages_slice
+# Args: $1=original_display, $2=verify_line, $3=max_lines, $4=log_slice,
+#       $5=stages_slice
 #######################################
 _cb_meta_body_guidance() {
-	local issue_number="$1" repo_slug="$2" max_lines="$3"
+	local original_display="$1" verify_line="$2" max_lines="$3"
 	local log_slice="$4" stages_slice="$5"
 
 	cat <<EOF
 
 ## How (mentor's guidance for the next worker)
 
-Treat the original (#${issue_number}) as evidence, not as the work to do. The work is **here** — diagnose the systemic gap that lets workers fail in this pattern, ship the fix, and the original unblocks itself.
+Treat the original (${original_display}) as evidence, not as the work to do. The work is **here** — diagnose the systemic gap that lets workers fail in this pattern, ship the fix, and the original unblocks itself.
 
 ### Files to inspect first
 
 - \`EDIT: .agents/scripts/dispatch-dedup-cost.sh\` — t2007 cost breaker definition and trip site.
 - \`EDIT: .agents/scripts/worker-lifecycle-common.sh\` — t2769 no_work breaker definition and trip site (around the \`no_work_loop\` marker).
 - \`EDIT: .agents/scripts/dispatch-dedup-stale.sh::_is_stale_assignment\` — stale assignment recovery path; for \`no_work\` trips, verify comment pagination/slurping and last-activity aggregation before changing exit classification.
-- \`EDIT: .agents/scripts/headless-runtime-failure.sh\` — worker exit classifier (the prime suspect for misclassification).
+- \`EDIT: .agents/scripts/headless-runtime-failure-classify.sh::classify_worker_exit\` — worker exit classifier (the prime suspect for misclassification); wait_status sentinel propagation stays in \`headless-runtime-failure.sh\`.
 - \`EDIT: .agents/scripts/circuit-breaker-meta-filer.sh\` — this filer; if it filed too eagerly, fix the trip-detection upstream rather than the filer.
 - \`EDIT: .agents/scripts/pulse-merge.sh::_handle_post_merge_actions\` — meta-PR merge cleanup that unblocks the original.
 
@@ -374,16 +400,16 @@ ${stages_slice:-(no matching stage records)}
 ### Acceptance
 
 1. Root cause identified and named explicitly in the PR description (which file/function/race).
-2. Fix lands as a normal PR with \`Resolves #<this>\` (NOT \`Resolves #${issue_number}\` — this meta-issue is the unit of work, the original is downstream).
-3. PR merge automatically removes the meta blocker label that points from the original issue to this meta-issue via \`_unblock_circuit_breaker_meta_original\`.
-4. If no other \`blocked-by:*\` labels remain on #${issue_number}, \`status:available\` is restored automatically.
+2. Fix lands as a normal PR with \`Resolves #<this>\` (NOT a closing keyword for ${original_display} — this meta-issue is the unit of work, the original is downstream).
+3. PR merge automatically removes the meta blocker label that points from the original issue to this meta-issue via \`_unblock_circuit_breaker_meta_pr\`.
+4. If no other \`blocked-by:*\` labels remain on ${original_display}, \`status:available\` is restored automatically.
 5. A regression test exists for the specific failure mode identified (test in \`.agents/scripts/tests/\`).
 
 ### Verification
 
 \`\`\`bash
-# After the fix lands and #${issue_number} unblocks, dispatch should proceed normally:
-gh issue view ${issue_number} --repo ${repo_slug} --json labels --jq '[.labels[].name]'
+# After the fix lands and the original unblocks, dispatch should proceed normally:
+${verify_line}
 # Expect: status:available and no blocked-by label for the meta-issue
 
 # Re-run the regression tests:
@@ -407,6 +433,7 @@ _cb_meta_body_tail() {
 - `.agents/scripts/dispatch-dedup-stale.sh`
 - `.agents/scripts/worker-lifecycle-common.sh`
 - `.agents/scripts/headless-runtime-failure.sh`
+- `.agents/scripts/headless-runtime-failure-classify.sh`
 - `.agents/scripts/headless-runtime-helper.sh`
 - `.agents/scripts/circuit-breaker-meta-filer.sh`
 - `.agents/scripts/pulse-merge.sh`
@@ -436,6 +463,8 @@ _cb_meta_body() {
 	local tier="${6:-}"
 	local spent="${7:-}"
 	local budget="${8:-}"
+	local meta_repo="${9:-$2}"
+	local withheld="${10:-0}"
 
 	local max_lines="${AIDEVOPS_CIRCUIT_BREAKER_META_FORENSIC_LINES:-50}"
 
@@ -445,9 +474,25 @@ _cb_meta_body() {
 		trip_marker='cost-circuit-breaker:fired'
 	fi
 
+	# Same-repo prose keeps the short #N; cross-repo prose must name the repo,
+	# or #N would resolve to an unrelated issue in the meta repo.
+	local original_ref="${repo_slug}#${issue_number}" original_display="#${issue_number}"
+	[[ "$repo_slug" == "$meta_repo" ]] || original_display="$original_ref"
+	local verify_line="gh issue view ${issue_number} --repo ${repo_slug} --json labels --jq '[.labels[].name]'"
 	local log_slice stages_slice
-	log_slice=$(_cb_meta_log_slice "$issue_number" "$max_lines")
-	stages_slice=$(_cb_meta_stages_slice "$issue_number")
+	if [[ "$withheld" == "1" ]]; then
+		# Never publish a private original's slug, number, free text or local
+		# forensics. The withheld marker drives label-based unblock-on-merge.
+		original_ref="withheld (private repository)"
+		original_display="the private original issue"
+		verify_line="# Original withheld: on the filing runner, confirm it no longer carries the meta blocked-by label."
+		reason="(withheld: private original)"
+		log_slice="(withheld: private original; inspect pulse.log on the filing runner)"
+		stages_slice="(withheld: private original; inspect dispatch-stages.tsv on the filing runner)"
+	else
+		log_slice=$(_cb_meta_log_slice "$issue_number" "$max_lines")
+		stages_slice=$(_cb_meta_stages_slice "$issue_number")
+	fi
 
 	local cost_block=""
 	if [[ "$breaker_type" == "$_CB_BREAKER_COST" && -n "$spent" && -n "$budget" ]]; then
@@ -460,10 +505,10 @@ _cb_meta_body() {
 	local safe_reason
 	safe_reason=$(_sanitize_markdown "${reason:-(not provided)}" 2>/dev/null || printf '%s' "${reason:-(not provided)}")
 
-	_cb_meta_body_intro "$issue_number" "$repo_slug" "$breaker_label" \
-		"$trip_marker" "$failure_count" "$safe_reason" "$cost_block"
+	_cb_meta_body_intro "$original_ref" "$original_display" "$breaker_label" \
+		"$trip_marker" "$failure_count" "$safe_reason" "$cost_block" "$withheld"
 	_cb_meta_body_hypothesis "$breaker_type"
-	_cb_meta_body_guidance "$issue_number" "$repo_slug" "$max_lines" \
+	_cb_meta_body_guidance "$original_display" "$verify_line" "$max_lines" \
 		"$log_slice" "$stages_slice"
 	_cb_meta_body_tail
 	return 0
@@ -625,13 +670,19 @@ cmd_file() {
 		return 0
 	fi
 
+	local withheld=0 title_ref="${repo_slug}#${issue_number}"
+	if _cb_meta_original_withheld "$repo_slug" "$meta_repo"; then
+		withheld=1
+		title_ref="a private original issue"
+	fi
+
 	local body title
 	body=$(_cb_meta_body "$issue_number" "$repo_slug" "$breaker_type" \
-		"$failure_count" "$reason" "$tier" "$spent" "$budget")
+		"$failure_count" "$reason" "$tier" "$spent" "$budget" "$meta_repo" "$withheld")
 
 	local breaker_label="$_CB_LABEL_NO_WORK"
 	[[ "$breaker_type" == "$_CB_BREAKER_COST" ]] && breaker_label="$_CB_LABEL_COST"
-	title="Circuit-breaker meta: diagnose ${breaker_label} trip on ${repo_slug}#${issue_number}"
+	title="Circuit-breaker meta: diagnose ${breaker_label} trip on ${title_ref}"
 
 	local labels="${AIDEVOPS_CIRCUIT_BREAKER_META_LABELS:-${_CB_META_DEFAULT_LABELS}}"
 
@@ -673,13 +724,19 @@ cmd_file() {
 # Stdout: original issue ref (owner/repo#number), or empty
 # Returns: 0 always (best-effort)
 #######################################
+# Shared issue read for body and lineage metadata checks.
+_cb_meta_read_issue() {
+	local meta_number="$1" repo_slug="$2" query="${3:-.body // \"\"}"
+	gh api "repos/${repo_slug}/issues/${meta_number}" --jq "$query" 2>/dev/null || return 1
+	return 0
+}
+
 _cb_meta_extract_original() {
 	local meta_number="$1"
 	local repo_slug="$2"
 
 	local body
-	body=$(gh api "repos/${repo_slug}/issues/${meta_number}" \
-		--jq '.body // ""' 2>/dev/null) || body=""
+	body=$(_cb_meta_read_issue "$meta_number" "$repo_slug") || body=""
 	[[ -z "$body" || "$body" == "null" ]] && return 0
 
 	# Match "- Original: owner/repo#NNN" — slug-aware so cross-repo metas
@@ -746,9 +803,71 @@ cmd_unblock_on_merge() {
 		return 1
 	fi
 
+	local meta_numbers="" number=""
+	meta_numbers=$(_cb_meta_unblock_lineage "$meta_number" "$repo_slug") || return 2
+	while IFS= read -r number; do
+		_cb_meta_unblock_one "$number" "$repo_slug" || return 2
+	done <<<"$meta_numbers"
+	return 0
+}
+
+# Resolve the consolidated meta's exact same-repo predecessor chain before any
+# mutations. Bound traversal and reject cycles; arbitrary prose references are
+# not authority to release blockers. Legacy metas without a header are unchanged.
+# Args: $1=meta number, $2=repo; output: validated meta numbers, newest first
+_cb_meta_unblock_lineage() {
+	local meta_number="$1" repo_slug="$2"
+	local current="$meta_number" body="" predecessor="" trusted=""
+	local numbers="$meta_number" seen=" $meta_number " depth=0
+	while [[ "$depth" -lt 20 ]]; do
+		body=$(_cb_meta_read_issue "$current" "$repo_slug") || return 1
+		predecessor=$(printf '%s' "$body" | jq -Rrs '
+			[split("\n")[] | capture("^_Supersedes #(?<n>[1-9][0-9]*)[ —].*_$")? | .n]
+			| if length == 0 then "" elif length == 1 then .[0] else error("ambiguous lineage") end
+		' 2>/dev/null) || return 1
+		if [[ -z "$predecessor" ]]; then
+			printf '%s\n' "$numbers"
+			return 0
+		fi
+		[[ "$seen" != *" $predecessor "* ]] || return 1
+		#aidevops:trust-boundary — only collaborator-authored breaker metas may
+		# authorize predecessor cleanup, and predecessors must already be closed.
+		# Validate the actual issue metadata, never body-supplied association text.
+		trusted=$(_cb_meta_trusted_state "$current" "$repo_slug") || return 1
+		[[ "$trusted" == "open" || "$trusted" == "closed" ]] || return 1
+		trusted=$(_cb_meta_trusted_state "$predecessor" "$repo_slug") || return 1
+		[[ "$trusted" == "closed" ]] || return 1
+		numbers+=$'\n'"$predecessor"
+		seen+="$predecessor "
+		current="$predecessor"
+		depth=$((depth + 1))
+	done
+	return 1
+}
+
+# Output the state only for a trusted breaker meta; missing/invalid metadata is
+# never authorization to release another issue's blocker.
+_cb_meta_trusted_state() {
+	local meta_number="$1" repo_slug="$2" state=""
+	state=$(_cb_meta_read_issue "$meta_number" "$repo_slug" '
+		select((.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR")
+			and any(.labels[]?; .name == "circuit-breaker-meta")) | .state
+	') || return 1
+	printf '%s' "$state"
+	return 0
+}
+
+# Apply the existing unblock path separately to each validated meta number so
+# withheld originals are discovered by their actual (possibly predecessor) label.
+_cb_meta_unblock_one() {
+	local meta_number="$1" repo_slug="$2"
 	local original_ref
 	original_ref=$(_cb_meta_extract_original "$meta_number" "$repo_slug")
 	if [[ -z "$original_ref" ]]; then
+		if _cb_meta_body_is_withheld "$meta_number" "$repo_slug"; then
+			_cb_meta_unblock_withheld_originals "$meta_number" "$repo_slug" || return 2
+			return 0
+		fi
 		log_info "[circuit-breaker-meta-filer] unblock: no original-issue line in #${meta_number} body — not a meta-issue, skip" >&2
 		return 0
 	fi
@@ -759,6 +878,132 @@ cmd_unblock_on_merge() {
 		log_info "[circuit-breaker-meta-filer] unblock: invalid original ref '${original_ref}' in #${meta_number} body — skip" >&2
 		return 0
 	fi
+
+	_cb_meta_unblock_original "$original_repo" "$original_issue" "$repo_slug" "$meta_number" || return 2
+	return 0
+}
+
+#######################################
+# Does the meta-issue body carry the withheld-original marker?
+# Args: $1=meta_issue_number, $2=meta_repo
+# Returns: 0 if withheld, 1 otherwise
+#######################################
+_cb_meta_body_is_withheld() {
+	local meta_number="$1"
+	local repo_slug="$2"
+	local body=""
+
+	body=$(_cb_meta_read_issue "$meta_number" "$repo_slug") || return 1
+	[[ "$body" == *"<!-- ${_CB_META_WITHHELD_MARKER} -->"* ]] && return 0
+	return 1
+}
+
+#######################################
+# List open issues that carry the exact cross-repo meta blocker label. Withheld
+# metas never name their private original, so the label (applied only by write
+# collaborators) is the linkage. Sources: the local repo inventory plus GitHub
+# issue search, which also covers repos this runner can read but has not
+# registered. Output is de-duplicated "owner/repo#N" lines.
+# Args: $1=meta_issue_number, $2=meta_repo
+# Returns: 0 always (best-effort)
+#######################################
+_cb_meta_find_withheld_originals() {
+	local meta_number="$1"
+	local meta_repo="$2"
+	local blocked_label="blocked-by:${meta_repo}#${meta_number}"
+	local repos_json="${AIDEVOPS_REPOS_JSON:-${HOME}/.config/aidevops/repos.json}"
+	local slugs="" slug="" found=""
+
+	if [[ -f "$repos_json" ]]; then
+		slugs=$(jq -r '.initialized_repos[]? | .slug // empty' "$repos_json" 2>/dev/null |
+			sort -fu) || slugs=""
+	fi
+	while IFS= read -r slug; do
+		[[ "$slug" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || continue
+		[[ "$slug" != "$meta_repo" ]] || continue
+		found+=$(gh api -X GET "repos/${slug}/issues" -f state=open \
+			-f labels="$blocked_label" -f per_page=100 \
+			--jq ".[] | select(.pull_request == null) | \"${slug}#\\(.number)\"" \
+			2>/dev/null || true)
+		found+=$'\n'
+	done <<<"$slugs"
+	found+=$(gh api -X GET search/issues \
+		-f q="is:issue is:open label:\"${blocked_label}\"" -f per_page=100 \
+		--jq '.items[] | "\(.repository_url | sub("^.*/repos/"; ""))#\(.number)"' \
+		2>/dev/null || true)
+
+	printf '%s\n' "$found" |
+		grep -E '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+$' |
+		sort -fu || true
+	return 0
+}
+
+#######################################
+# Unblock every original linked to a withheld meta-issue.
+# Args: $1=meta_issue_number, $2=meta_repo
+# Returns: 0 on success/no match, 2 if any original could not be reset
+#######################################
+_cb_meta_unblock_withheld_originals() {
+	local meta_number="$1"
+	local meta_repo="$2"
+	local originals="" ref="" count=0 reset_failed=0
+
+	originals=$(_cb_meta_find_withheld_originals "$meta_number" "$meta_repo")
+	while IFS= read -r ref; do
+		[[ -n "$ref" ]] || continue
+		_cb_meta_unblock_original "${ref%#*}" "${ref##*#}" "$meta_repo" "$meta_number" || reset_failed=1
+		count=$((count + 1))
+	done <<<"$originals"
+	if [[ "$count" -eq 0 ]]; then
+		log_info "[circuit-breaker-meta-filer] unblock: withheld original for ${meta_repo}#${meta_number} not found on this runner; the meta blocker label remains for a runner with access" >&2
+	fi
+	[[ "$reset_failed" -eq 0 ]] || return 2
+	return 0
+}
+
+#######################################
+# Persist a cost-window boundary once per merged meta, before releasing dispatch.
+# GH#34349: label removal alone immediately re-trips on the old worker spend.
+# Args: $1=original_repo, $2=original_issue, $3=meta_repo, $4=meta_number
+# Returns: 0 on durable reset, 1 on read/write failure (keep the blocker).
+#######################################
+_cb_meta_reset_cost_window() {
+	local original_repo="$1" original_issue="$2" meta_repo="$3" meta_number="$4"
+	local marker="<!-- cost-circuit-breaker:reset meta=${meta_repo}#${meta_number} -->"
+	local comments_json reset_count
+	comments_json=$(gh api "repos/${original_repo}/issues/${original_issue}/comments" \
+		--paginate --slurp 2>/dev/null) || return 1
+	reset_count=$(printf '%s' "$comments_json" | jq -r --arg marker "$marker" '
+		(if type == "array" and (.[0]? | type) == "array" then [.[][]]
+		elif type == "array" then . else error("invalid comments") end)
+		| [.[] | select(.author_association == "OWNER" or
+			.author_association == "MEMBER" or .author_association == "COLLABORATOR")
+			| select((.body // "") | contains($marker))] | length
+	' 2>/dev/null) || return 1
+	[[ "$reset_count" =~ ^[0-9]+$ ]] || return 1
+	[[ "$reset_count" -gt 0 ]] && return 0
+	gh_issue_comment "$original_issue" --repo "$original_repo" \
+		--body "${marker}
+The circuit-breaker meta-issue ${meta_repo}#${meta_number} has merged its fix. Start a new worker cost window before removing its dispatch blocker; historical spend remains in the audit trail." \
+		2>/dev/null || return 1
+	return 0
+}
+
+#######################################
+# Remove one meta blocker from an original issue, restore availability when no
+# other blocked-by labels remain, and post the unblock comment.
+# Args: $1=original_repo, $2=original_issue, $3=meta_repo, $4=meta_number
+# Returns: 0 on success, 2 when the durable reset cannot be recorded
+#######################################
+_cb_meta_unblock_original() {
+	local original_repo="$1"
+	local original_issue="$2"
+	local repo_slug="$3"
+	local meta_number="$4"
+
+	# A failed reset must leave the structural blocker intact. Posting it after
+	# status:available creates a race with dispatch on another runner.
+	_cb_meta_reset_cost_window "$original_repo" "$original_issue" "$repo_slug" "$meta_number" || return 2
 
 	local blocked_label
 	blocked_label=$(_cb_meta_blocked_label "$original_repo" "$repo_slug" "$meta_number")
@@ -822,8 +1067,9 @@ WIRED BY:
   dispatch-dedup-cost.sh     (t2007 cost)
 
 CLEANUP:
-  pulse-merge.sh::_unblock_circuit_breaker_meta_original removes
+  pulse-merge.sh::_unblock_circuit_breaker_meta_pr removes
   the meta blocked-by label from the original when the meta-PR merges.
+  Withheld private originals are found by that exact label.
 EOF
 	return 0
 }

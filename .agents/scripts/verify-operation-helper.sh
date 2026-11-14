@@ -37,7 +37,7 @@ readonly MAX_OUTPUT_TOKENS=500
 # =============================================================================
 
 # Detect the provider from a model ID string.
-# Arguments: $1 — model ID (e.g., "claude-sonnet-4-6", "gemini-2.5-flash")
+# Arguments: $1 — model ID (e.g., "claude-sonnet-5-5", "gemini-2.5-flash")
 # Output: provider name on stdout (anthropic|google|openai|unknown)
 detect_provider() {
 	local model="$1"
@@ -59,8 +59,8 @@ select_verifier() {
 
 	# Provider preference chains (cheapest tier of each)
 	local -a anthropic_chain=("google|gemini-2.5-flash" "openai|gpt-4.1-mini")
-	local -a google_chain=("anthropic|claude-haiku-4-5" "openai|gpt-4.1-mini")
-	local -a openai_chain=("anthropic|claude-haiku-4-5" "google|gemini-2.5-flash")
+	local -a google_chain=("anthropic|claude-haiku-5-5" "openai|gpt-4.1-mini")
+	local -a openai_chain=("anthropic|claude-haiku-5-5" "google|gemini-2.5-flash")
 
 	local -a chain
 	case "$primary_provider" in
@@ -69,7 +69,7 @@ select_verifier() {
 	openai) chain=("${openai_chain[@]}") ;;
 	*)
 		# Unknown primary — try anthropic first, then google
-		chain=("anthropic|claude-haiku-4-5" "google|gemini-2.5-flash")
+		chain=("anthropic|claude-haiku-5-5" "google|gemini-2.5-flash")
 		;;
 	esac
 
@@ -151,7 +151,7 @@ _has_api_key() {
 _get_same_provider_fallback() {
 	local provider="$1"
 	case "$provider" in
-	anthropic) echo "claude-haiku-4-5" ;;
+	anthropic) echo "claude-haiku-5-5" ;;
 	google) echo "gemini-2.5-flash" ;;
 	openai) echo "gpt-4.1-mini" ;;
 	*) echo "" ;;
@@ -186,12 +186,43 @@ readonly -a RISK_PATTERNS=(
 	"chown|permission_change|high"
 )
 
+# Classify GitHub REST API deletion commands that need endpoint-aware handling.
+# Arguments: $1 — operation string
+# Output: "type|tier" when the operation is a GitHub API DELETE
+# Returns: 0 when classified, 1 when the operation is not a GitHub API DELETE
+_classify_github_api_delete() {
+	local operation="$1"
+
+	if ! printf '%s\n' "$operation" | grep -qiE '(^|[[:space:]])gh[[:space:]]+api([[:space:]]|$)'; then
+		return 1
+	fi
+
+	if ! printf '%s\n' "$operation" | grep -qiE '(^|[[:space:]])(--method|-X)[[:space:]]+DELETE([[:space:]]|$)'; then
+		return 1
+	fi
+
+	# Deleting an issue comment is irreversible; other DELETE endpoints remain
+	# high risk until their reversibility is explicitly understood and tested.
+	if printf '%s\n' "$operation" | grep -qE "(^|[[:space:]/\\\"'])issues/comments/[0-9]+([[:space:]\\\"']|$)"; then
+		echo "destructive_delete|critical"
+		return 0
+	fi
+
+	echo "github_api_delete|high"
+	return 0
+}
+
 # Classify an operation string into a risk tier.
 # Arguments: $1 — operation string
 # Output: "type|tier" on stdout (e.g., "git_force_push|critical")
 classify_operation() {
 	local operation="$1"
-	local entry pattern op_type tier
+	local entry pattern op_type tier github_api_classification
+
+	if github_api_classification=$(_classify_github_api_delete "$operation"); then
+		echo "$github_api_classification"
+		return 0
+	fi
 
 	for entry in "${RISK_PATTERNS[@]}"; do
 		pattern="${entry%%|*}"
@@ -481,7 +512,7 @@ _cmd_verify_select_verifier() {
 	local branch="$6"
 
 	local primary_provider
-	primary_provider=$(detect_provider "${primary_model:-claude-sonnet-4-6}")
+	primary_provider=$(detect_provider "${primary_model:-claude-sonnet-5-5}")
 
 	local verifier_entry verifier_provider verifier_model
 	verifier_entry=$(select_verifier "$primary_provider") || {
@@ -514,7 +545,7 @@ _cmd_verify_select_verifier() {
 	if [[ "$verifier_provider" != "anthropic" ]]; then
 		log_info "Note: Using Anthropic API for verification call (multi-provider API support planned in t1364.3)"
 		verifier_provider="anthropic"
-		verifier_model="claude-haiku-4-5"
+		verifier_model="claude-haiku-5-5"
 		model_short="simple"
 	fi
 
@@ -616,7 +647,7 @@ cmd_verify() {
 	prompt=$(_build_verification_prompt "$operation" "$op_type" "$risk_tier" "$repo" "$branch" "$details")
 
 	local primary_provider
-	primary_provider=$(detect_provider "${primary_model:-claude-sonnet-4-6}")
+	primary_provider=$(detect_provider "${primary_model:-claude-sonnet-5-5}")
 
 	local raw_response
 	raw_response=$(_call_verifier "$prompt" "$model_short") || {

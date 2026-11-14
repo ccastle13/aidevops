@@ -16,9 +16,157 @@ PULSE_FEEDBACK_ROUTE_OPEN_STATE="OPEN"
 PULSE_FEEDBACK_ROUTE_AVAILABLE_LABEL="status:available"
 PULSE_FEEDBACK_ROUTE_JSON_ARRAY_TYPE="array"
 PULSE_FEEDBACK_ROUTE_WORKER_TAKEOVER_LABEL="origin:worker-takeover"
+PULSE_FEEDBACK_ROUTE_WORKER_ORIGIN_LABEL="origin:worker"
+PULSE_FEEDBACK_ROUTE_INTERACTIVE_ORIGIN_LABEL="origin:interactive"
+PULSE_FEEDBACK_ROUTE_MARKER_OPEN="<!--"
+PULSE_FEEDBACK_ROUTE_REVIEW_STATUS="status:in-review"
+PULSE_FEEDBACK_ROUTE_CONVERGE_DELETE_LIMIT=20
 
 _PULSE_FEEDBACK_ROUTE_CONTEXT_KIND=""
 _PULSE_FEEDBACK_ROUTE_CONTEXT_HEAD=""
+_PULSE_FEEDBACK_ROUTE_SUPERSEDE_PRIOR=0
+
+_feedback_route_comments_endpoint() {
+	local linked_issue="$1" repo_slug="$2"
+	printf '%s/comments?per_page=100' "$(_feedback_route_issue_endpoint "$repo_slug" "$linked_issue")"
+	return 0
+}
+
+# Re-read ownership at each destructive boundary, independently of the PR's
+# original worker provenance. A preserved worker PR can have a live interactive
+# repair owner on this runner or another runner (GH#31305).
+_feedback_route_owner_allows() {
+	local linked_issue="$1"
+	local repo_slug="$2"
+	local metadata="" comments="" endpoint=""
+	local issue_state=""
+	local candidates=""
+	local trusted=""
+	if ! declare -F _interactive_claim_fence_blocks_dispatch >/dev/null 2>&1; then
+		# shellcheck source=interactive-claim-fence.sh
+		source "${BASH_SOURCE[0]%/*}/interactive-claim-fence.sh"
+	fi
+	if _interactive_claim_fence_blocks_dispatch "$linked_issue" "$repo_slug"; then
+		return 1
+	fi
+	metadata=$(gh api "repos/${repo_slug}/issues/${linked_issue}" 2>/dev/null) || return 1
+	issue_state=$(printf '%s' "$metadata" | jq -r '.state // empty' 2>/dev/null) || return 1
+	[[ "$issue_state" == "open" ]] || return 1
+	endpoint=$(_feedback_route_comments_endpoint "$linked_issue" "$repo_slug") || return 1
+	comments=$(gh api "$endpoint" --paginate --slurp 2>/dev/null) || return 1
+	#aidevops:trust-boundary — a forged claim comment cannot fence another owner.
+	# Match comment authors to current assignees, not text attribution, then
+	# verify authority independently of the reading token (GH#34605).
+	candidates=$(jq -cn --argjson issue "$metadata" --argjson pages "$comments" \
+		--arg review_status "$PULSE_FEEDBACK_ROUTE_REVIEW_STATUS" '
+		($issue.assignees | map(.login)) as $owners |
+		($pages | if (.[0]? | type) == "array" then add else . end) as $comments |
+		[$comments[]?
+		 | select(.user.login as $u | $owners | index($u))
+		 | select(.user.login as $u | (.body // "") | contains("Interactive session claimed by @" + $u))
+		 | select(($issue.labels | map(.name) | index($review_status)) != null)
+		 | select((.created_at | fromdateiso8601) as $at | now - $at >= 0 and now - $at < 7200)
+		 | {id, created_at, login: .user.login, association: (.author_association // "")}]
+	' 2>/dev/null) || return 1
+	# An author whose authority cannot be verified still fences: fail closed.
+	trusted=$(_feedback_route_trusted_entries "$repo_slug" <<<"$candidates") || return 1
+	printf '%s' "$trusted" | jq -e 'length == 0' >/dev/null 2>&1
+	return $?
+}
+
+# A live headless worker lease is an owner too. Routing an OPEN PR while its
+# worker still pushes strips the worker's assignee and status, races the close
+# against the worker's next head, and strands both on a maintainer hold
+# (GH#35939, PR #35835). Only exit 1 from the claim helper means "no active
+# claim"; a live lease or unreadable state defers until the terminal lease or
+# expiry (DISPATCH_READY_LEASE_TTL bounds a dead worker's lease).
+_feedback_route_worker_lease_allows() {
+	local linked_issue="$1"
+	local repo_slug="$2"
+	local claim_helper="${BASH_SOURCE[0]%/*}/dispatch-claim-helper.sh"
+	local check_rc=0
+	[[ -x "$claim_helper" ]] || return 1
+	"$claim_helper" check "$linked_issue" "$repo_slug" >/dev/null 2>&1 || check_rc=$?
+	[[ "$check_rc" -eq 1 ]] || return 1
+	return 0
+}
+
+#######################################
+# Decide whether a comment author is a trusted repository writer, independently
+# of the token that read the comment (GH#34605). GitHub only reports OWNER,
+# MEMBER or COLLABORATOR when that relationship is visible, but App installation
+# reads report org members as CONTRIBUTOR, so every other association is
+# resolved through the cached collaborator-permission API.
+# Args: $1=repo_slug, $2=author login, $3=author_association
+# Returns: 0=trusted, 1=confirmed untrusted, 2=unknown (callers fail closed).
+#######################################
+_feedback_route_author_trusted() {
+	local repo_slug="$1"
+	local login="$2"
+	local association="${3:-}"
+	local rc=0
+	#aidevops:trust-boundary — positive associations are authoritative; absent
+	# or downgraded associations require the live permission API.
+	case "$association" in
+	OWNER | MEMBER | COLLABORATOR) return 0 ;;
+	esac
+	_feedback_route_actor_is_valid "$login" || return 1
+	if ! declare -F _is_collaborator_author >/dev/null 2>&1; then
+		# shellcheck source=pulse-merge-author-checks.sh
+		source "${BASH_SOURCE[0]%/*}/pulse-merge-author-checks.sh" >/dev/null 2>&1 || return 2
+		declare -F _is_collaborator_author >/dev/null 2>&1 || return 2
+	fi
+	_is_collaborator_author "$login" "$repo_slug" || rc=$?
+	case "$rc" in
+	0 | 1) return "$rc" ;;
+	esac
+	return 2
+}
+
+#######################################
+# Keep only trusted entries from a JSON array of comment summaries.
+# Entries carry {login, association} and optionally own=true for this runner's
+# own comments (matched by numeric user ID), which need no lookup.
+# Args: $1=repo_slug; stdin: JSON array
+# Output: JSON array of trusted entries, in input order.
+# Returns: 0=all authors resolved, 2=at least one author was unknown (excluded).
+#######################################
+_feedback_route_trusted_entries() {
+	local repo_slug="$1"
+	local entries="" index="" login="" association="" own="" rc=0
+	local keep="" unknown=0 verdicts="|"
+	entries=$(cat)
+	[[ -n "$entries" ]] || entries='[]'
+	# Unit separator, not tab: IFS whitespace would collapse an empty login.
+	while IFS=$'\x1f' read -r index login association own; do
+		[[ "$index" =~ ^[0-9]+$ ]] || continue
+		if [[ "$own" == "true" ]]; then
+			keep="${keep},${index}"
+			continue
+		fi
+		# Memoize per author so one call costs at most one lookup per login.
+		if [[ "$verdicts" == *"|${login}:${association}="* ]]; then
+			rc="${verdicts#*"|${login}:${association}="}"
+			rc="${rc%%|*}"
+		else
+			rc=0
+			_feedback_route_author_trusted "$repo_slug" "$login" "$association" || rc=$?
+			verdicts="${verdicts}${login}:${association}=${rc}|"
+		fi
+		case "$rc" in
+		0) keep="${keep},${index}" ;;
+		2) unknown=1 ;;
+		esac
+	done < <(printf '%s' "$entries" | jq -r 'to_entries[]
+		| [(.key | tostring), (.value.login // ""), (.value.association // ""),
+		   ((.value.own // false) | tostring)]
+		| map(gsub("[\u001f\n]"; "")) | join("\u001f")' 2>/dev/null)
+	printf '%s' "$entries" | jq -c --arg keep "${keep#,}" '
+		($keep | split(",") | map(select(length > 0) | tonumber)) as $kept
+		| [to_entries[] | select(.key as $k | $kept | index($k)) | .value]' 2>/dev/null || printf '[]\n'
+	[[ "$unknown" -eq 0 ]] || return 2
+	return 0
+}
 
 _feedback_route_gh_write() {
 	if declare -F _gh_with_timeout >/dev/null 2>&1; then
@@ -49,7 +197,7 @@ _feedback_route_labels_block_routing() {
 		&& _feedback_route_labels_include "$labels" "$PULSE_FEEDBACK_ROUTE_HOLD_LABEL"; then
 		return 0
 	fi
-	if _feedback_route_labels_include "$labels" "origin:interactive" \
+	if _feedback_route_labels_include "$labels" "$PULSE_FEEDBACK_ROUTE_INTERACTIVE_ORIGIN_LABEL" \
 		&& ! _feedback_route_labels_include "$labels" "$PULSE_FEEDBACK_ROUTE_WORKER_TAKEOVER_LABEL"; then
 		return 0
 	fi
@@ -61,7 +209,7 @@ _feedback_route_labels_allow_worker_route() {
 	local ignore_hold="${2:-0}"
 
 	_feedback_route_labels_block_routing "$labels" "$ignore_hold" && return 1
-	if _feedback_route_labels_include "$labels" "origin:worker" \
+	if _feedback_route_labels_include "$labels" "$PULSE_FEEDBACK_ROUTE_WORKER_ORIGIN_LABEL" \
 		|| _feedback_route_labels_include "$labels" "$PULSE_FEEDBACK_ROUTE_WORKER_TAKEOVER_LABEL"; then
 		return 0
 	fi
@@ -85,13 +233,20 @@ _feedback_route_body_has_other_head_evidence() {
 	local pr_number="$3"
 	local start_marker="$4"
 	local completion_marker="$5"
-	local start_prefix="<!-- feedback-route:start:${kind}:PR${pr_number}:SHA"
-	local completion_prefix="<!-- feedback-route:complete:${kind}:PR${pr_number}:SHA"
+	local start_prefix="${PULSE_FEEDBACK_ROUTE_MARKER_OPEN} feedback-route:start:${kind}:PR${pr_number}:SHA"
+	local completion_prefix="${PULSE_FEEDBACK_ROUTE_MARKER_OPEN} feedback-route:complete:${kind}:PR${pr_number}:SHA"
+	local start_lines=""
+	local completion_lines=""
 
-	if printf '%s' "$issue_body" | grep -F "$start_prefix" | grep -qvF "$start_marker"; then
+	# No early-exit pipe readers: callers run under pipefail, and a grep -q that
+	# exits mid-body turns a match into SIGPIPE 141 (GH#36235). An empty capture
+	# must not reach grep -v, which would match the here-string's empty line.
+	start_lines=$(grep -F -- "$start_prefix" <<<"$issue_body") || start_lines=""
+	if [[ -n "$start_lines" ]] && grep -qvF -- "$start_marker" <<<"$start_lines"; then
 		return 0
 	fi
-	if printf '%s' "$issue_body" | grep -F "$completion_prefix" | grep -qvF "$completion_marker"; then
+	completion_lines=$(grep -F -- "$completion_prefix" <<<"$issue_body") || completion_lines=""
+	if [[ -n "$completion_lines" ]] && grep -qvF -- "$completion_marker" <<<"$completion_lines"; then
 		return 0
 	fi
 	return 1
@@ -117,17 +272,19 @@ _feedback_route_release_comments() {
 	local linked_issue="$1"
 	local repo_slug="$2"
 	local marker="$3"
-	local endpoint="repos/${repo_slug}/issues/${linked_issue}/comments?per_page=100"
+	local endpoint=""
+	endpoint=$(_feedback_route_comments_endpoint "$linked_issue" "$repo_slug") || return 1
 	local comments_json=""
+	local candidates=""
 	# #aidevops:trust-boundary — only trusted automation comments can satisfy or
 	# win release-marker convergence; copied markers from untrusted users do not.
+	# Authority is verified independently of the reading token (GH#34605);
+	# authors that cannot be verified are excluded.
 	# shellcheck disable=SC2016 # $marker is a jq variable supplied below.
 	local filter='[
 		(if type == $array_type and ((.[0]? | type) == $array_type) then .[] else . end)[]?
-		| select((.author_association // "") as $association
-			| ["OWNER", "MEMBER", "COLLABORATOR"] | index($association))
 		| select((.body // "") | startswith("CLAIM_RELEASED reason=feedback_route_") and contains($marker))
-		| {id, created_at}
+		| {id, created_at, login: (.user.login // ""), association: (.author_association // "")}
 	] | sort_by([.created_at, .id])'
 
 	if declare -F _gh_with_timeout >/dev/null 2>&1; then
@@ -135,9 +292,10 @@ _feedback_route_release_comments() {
 	else
 		comments_json=$(gh api "$endpoint" --paginate --slurp 2>/dev/null) || return 1
 	fi
-	printf '%s' "$comments_json" | jq -c --arg array_type "$PULSE_FEEDBACK_ROUTE_JSON_ARRAY_TYPE" \
-		--arg marker "$marker" "$filter" 2>/dev/null
-	return $?
+	candidates=$(printf '%s' "$comments_json" | jq -c --arg array_type "$PULSE_FEEDBACK_ROUTE_JSON_ARRAY_TYPE" \
+		--arg marker "$marker" "$filter" 2>/dev/null) || return 1
+	_feedback_route_trusted_entries "$repo_slug" <<<"$candidates" || true
+	return 0
 }
 
 _feedback_route_release_exists() {
@@ -225,6 +383,44 @@ _feedback_route_authenticated_actor() {
 	return 0
 }
 
+#######################################
+# Resolve the writer identity used to recognise this runner's own comments.
+# `gh api user` names no repository, so Pulse App read routing
+# (github_auth_routing.py) keeps it on the original credential, which also
+# performs writes. AIDEVOPS_PULSE_REPO is cleared so an ambient repo context
+# cannot scope it to an installation token. If /user still fails, callers must
+# not write (fail closed, never a comment loop).
+# Output: "<numeric user id>\t<login>"
+# Returns: 0=resolved, 1=unresolved.
+#######################################
+_feedback_route_authenticated_identity() {
+	local identity="" user_id="" login=""
+	local jq_identity='[(.id | tostring), (.login // "")] | @tsv'
+	if declare -F _gh_with_timeout >/dev/null 2>&1; then
+		identity=$(AIDEVOPS_PULSE_REPO="" _gh_with_timeout read gh api user --jq "$jq_identity" 2>/dev/null) || return 1
+	else
+		identity=$(AIDEVOPS_PULSE_REPO="" gh api user --jq "$jq_identity" 2>/dev/null) || return 1
+	fi
+	IFS=$'\t' read -r user_id login <<<"$identity"
+	[[ "$user_id" =~ ^[0-9]+$ ]] || return 1
+	_feedback_route_actor_is_valid "$login" || return 1
+	printf '%s\t%s\n' "$user_id" "$login"
+	return 0
+}
+
+# Attribution only, never trust: which runner posted a marker (GH#34605).
+# Hashes the host name so no host or path detail is published.
+_feedback_route_runner_id() {
+	local runner_id="${AIDEVOPS_PULSE_RUNNER_ID:-}"
+	if [[ ! "$runner_id" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
+		runner_id=$(uname -n 2>/dev/null | cksum 2>/dev/null) || runner_id=""
+		runner_id="${runner_id%% *}"
+	fi
+	[[ "$runner_id" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || runner_id="unknown"
+	printf '%s' "$runner_id"
+	return 0
+}
+
 _feedback_route_automation_hold_marker() {
 	local kind="$1"
 	local pr_number="$2"
@@ -270,16 +466,17 @@ _feedback_route_automation_hold_comments() {
 	local marker_prefix="$3"
 	local marker_suffix="${4:-}"
 	local automation_actor="${5:-}"
-	local endpoint="repos/${repo_slug}/issues/${linked_issue}/comments?per_page=100"
+	local endpoint=""
+	endpoint=$(_feedback_route_comments_endpoint "$linked_issue" "$repo_slug") || return 1
 	local comments_json=""
-	# #aidevops:trust-boundary — copied hold markers from untrusted comments do
-	# not authorize automated removal of a maintainer-created hold.
+	# #aidevops:trust-boundary — copied hold markers from any other login do
+	# not authorize automated removal of a maintainer-created hold. The login is
+	# pinned to the authenticated actor; author_association is not checked
+	# because GitHub App read auth reports org members as CONTRIBUTOR (GH#34600).
 	# shellcheck disable=SC2016 # $marker_prefix is a jq variable supplied below.
 	local filter='[
 		(if type == $array_type and ((.[0]? | type) == $array_type) then .[] else . end)[]?
-		| select((.author_association // "") as $association
-			| ["OWNER", "MEMBER", "COLLABORATOR"] | index($association))
-		| select((.user.login // "") == $automation_actor)
+		| select($automation_actor != "" and (.user.login // "") == $automation_actor)
 		| select((.body // "") | contains($marker_prefix) and contains($marker_suffix))
 		| {id, created_at}
 	] | sort_by([.created_at, .id])'
@@ -384,15 +581,73 @@ _feedback_route_review_generations_complete() {
 		[[ "$marker" == *":EVIDENCE"*" -->" ]] || return 1
 		[[ "$marker" == "$current_start" ]] && continue
 		partner="${marker/feedback-route:start:/feedback-route:complete:}"
-		printf '%s' "$issue_body" | grep -qF "$partner" || return 1
+		grep -qF -- "$partner" <<<"$issue_body" || return 1
 	done < <(printf '%s\n' "$issue_body" | grep -F "$start_prefix" || true)
 
 	while IFS= read -r marker; do
 		[[ -n "$marker" ]] || continue
 		[[ "$marker" == *":EVIDENCE"*" -->" ]] || return 1
 		partner="${marker/feedback-route:complete:/feedback-route:start:}"
-		printf '%s' "$issue_body" | grep -qF "$partner" || return 1
+		grep -qF -- "$partner" <<<"$issue_body" || return 1
 	done < <(printf '%s\n' "$issue_body" | grep -F "$completion_prefix" || true)
+	return 0
+}
+
+# Return success only when every prior non-review route marker is a complete,
+# exact start/completion pair. The current generation may be absent, but a
+# partial, malformed, or evidence-bearing marker remains ambiguous.
+_feedback_route_generations_complete() {
+	local issue_body="$1"
+	local kind="$2"
+	local pr_number="$3"
+	local current_start="$4"
+	local start_prefix="${PULSE_FEEDBACK_ROUTE_MARKER_OPEN} feedback-route:start:${kind}:PR${pr_number}:SHA"
+	local completion_prefix="${PULSE_FEEDBACK_ROUTE_MARKER_OPEN} feedback-route:complete:${kind}:PR${pr_number}:SHA"
+	local marker=""
+	local partner=""
+	local head=""
+
+	while IFS= read -r marker; do
+		[[ -n "$marker" ]] || continue
+		[[ "$marker" == "$current_start" ]] && continue
+		head="${marker#"${start_prefix}"}"
+		head="${head% -->}"
+		[[ "$marker" == "${start_prefix}${head} -->" && "$head" =~ ^[0-9A-Za-z]{7,64}$ ]] || return 1
+		partner="${marker/feedback-route:start:/feedback-route:complete:}"
+		grep -qF -- "$partner" <<<"$issue_body" || return 1
+	done < <(printf '%s\n' "$issue_body" | grep -F "$start_prefix" || true)
+
+	while IFS= read -r marker; do
+		[[ -n "$marker" ]] || continue
+		head="${marker#"${completion_prefix}"}"
+		head="${head% -->}"
+		[[ "$marker" == "${completion_prefix}${head} -->" && "$head" =~ ^[0-9A-Za-z]{7,64}$ ]] || return 1
+		partner="${marker/feedback-route:complete:/feedback-route:start:}"
+		grep -qF -- "$partner" <<<"$issue_body" || return 1
+	done < <(printf '%s\n' "$issue_body" | grep -F "$completion_prefix" || true)
+	return 0
+}
+
+# A completed old-head generation may be superseded only when the route's
+# terminal/source labels still bind it to the managed worker lifecycle.
+_feedback_route_prior_generation_is_automation_owned() {
+	local pr_number="$1"
+	local repo_slug="$2"
+	local linked_issue="$3"
+	local source_label="$4"
+	local terminal_label="$5"
+	local pr_labels="$6"
+	local issue_snapshot=""
+	local issue_labels=""
+	local issue_assignees=""
+
+	_feedback_route_labels_include "$pr_labels" "$terminal_label" || return 1
+	issue_snapshot=$(_feedback_route_issue_snapshot "$linked_issue" "$repo_slug") || return 1
+	IFS=$'\t' read -r issue_labels issue_assignees <<<"$issue_snapshot"
+	: "$pr_number" "$issue_assignees"
+	_feedback_route_labels_include "$issue_labels" "$source_label" || return 1
+	_feedback_route_labels_include "$issue_labels" "$PULSE_FEEDBACK_ROUTE_WORKER_ORIGIN_LABEL" || return 1
+	! _feedback_route_labels_include "$issue_labels" "$PULSE_FEEDBACK_ROUTE_INTERACTIVE_ORIGIN_LABEL" || return 1
 	return 0
 }
 
@@ -402,8 +657,10 @@ _feedback_route_review_evidence_completed() {
 	local evidence_fingerprint="$3"
 	local completion_prefix="<!-- feedback-route:complete:review:PR${pr_number}:SHA"
 	local evidence_suffix=":EVIDENCE${evidence_fingerprint} -->"
+	local completion_lines=""
 
-	printf '%s\n' "$issue_body" | grep -F "$completion_prefix" | grep -qF "$evidence_suffix"
+	completion_lines=$(grep -F -- "$completion_prefix" <<<"$issue_body") || return 1
+	grep -qF -- "$evidence_suffix" <<<"$completion_lines"
 	return $?
 }
 
@@ -461,8 +718,8 @@ _feedback_route_issue_is_ready() {
 	IFS=$'\t' read -r labels assignees <<<"$snapshot"
 	_feedback_route_labels_include "$labels" "$PULSE_FEEDBACK_ROUTE_AVAILABLE_LABEL" || return 1
 	_feedback_route_labels_include "$labels" "$source_label" || return 1
-	_feedback_route_labels_include "$labels" "origin:worker" || return 1
-	! _feedback_route_labels_include "$labels" "origin:interactive" || return 1
+	_feedback_route_labels_include "$labels" "$PULSE_FEEDBACK_ROUTE_WORKER_ORIGIN_LABEL" || return 1
+	! _feedback_route_labels_include "$labels" "$PULSE_FEEDBACK_ROUTE_INTERACTIVE_ORIGIN_LABEL" || return 1
 	! _feedback_route_labels_include "$labels" "$PULSE_FEEDBACK_ROUTE_WORKER_TAKEOVER_LABEL" || return 1
 	! _feedback_route_labels_include "$labels" "$PULSE_FEEDBACK_ROUTE_HOLD_LABEL" || return 1
 	! _feedback_route_labels_include "$labels" "$PULSE_FEEDBACK_ROUTE_NMR_LABEL" || return 1
@@ -476,7 +733,7 @@ _feedback_route_body_contains() {
 	local marker="$3"
 	local body=""
 	body=$(_feedback_route_issue_body "$linked_issue" "$repo_slug") || return 1
-	printf '%s' "$body" | grep -qF "$marker"
+	grep -qF -- "$marker" <<<"$body"
 	return $?
 }
 
@@ -517,7 +774,7 @@ _feedback_route_hold_for_maintainer() {
 			--add-label "$PULSE_FEEDBACK_ROUTE_HOLD_LABEL" >/dev/null 2>&1 || issue_hold_rc=$?
 	else
 		_feedback_route_gh_write issue edit "$linked_issue" --repo "$repo_slug" \
-			--add-label "status:in-review" --add-label "$PULSE_FEEDBACK_ROUTE_HOLD_LABEL" \
+			--add-label "$PULSE_FEEDBACK_ROUTE_REVIEW_STATUS" --add-label "$PULSE_FEEDBACK_ROUTE_HOLD_LABEL" \
 			--remove-label "$PULSE_FEEDBACK_ROUTE_AVAILABLE_LABEL" >/dev/null 2>&1 || issue_hold_rc=$?
 	fi
 	_feedback_route_gh_write pr edit "$pr_number" --repo "$repo_slug" \
@@ -543,6 +800,154 @@ _feedback_route_hold_for_maintainer() {
 	return "$PULSE_FEEDBACK_ROUTE_MAINTAINER_RC"
 }
 
+# List the authorized receipts for one closed-issue hold generation, oldest
+# first. Any Pulse runner's receipt counts, so several runners (servers or
+# accounts) share one comment (GH#34605).
+# Args: $1=pr_number, $2=repo_slug, $3=marker core (no terminator), $4=self user id
+# Output: JSON array of {id, created_at, login, association, own}
+# Returns: 0=listed, 1=read/parse failure.
+_feedback_route_closed_issue_receipts() {
+	local pr_number="$1" repo_slug="$2" marker_core="$3" self_id="$4"
+	local comments=""
+	local candidates=""
+	comments=$(gh api "repos/${repo_slug}/issues/${pr_number}/comments?per_page=100" --paginate --slurp 2>/dev/null) || return 1
+	#aidevops:trust-boundary — a copied marker counts only when written by this
+	# runner's own user ID or by a verified repository writer (another runner).
+	# The marker core is terminated (legacy close, current RUNNER field) so a
+	# head SHA prefix cannot match a longer SHA.
+	candidates=$(printf '%s' "$comments" | jq -c --arg self_id "$self_id" \
+		--arg legacy "${marker_core} -->" --arg current "${marker_core}:RUNNER" \
+		--arg array_type "$PULSE_FEEDBACK_ROUTE_JSON_ARRAY_TYPE" '
+		(if (.[0]? | type) == $array_type then add else . end)
+		| [.[]?
+			| select((.body // "") as $body
+				| ($body | contains($legacy)) or ($body | contains($current)))
+			| {id, created_at, login: (.user.login // ""), association: (.author_association // ""),
+				own: ($self_id != "" and ((.user.id // "") | tostring) == $self_id)}]
+		| sort_by([.created_at, .id])' 2>/dev/null) || return 1
+	_feedback_route_trusted_entries "$repo_slug" <<<"$candidates" || true
+	return 0
+}
+
+# Converge duplicate receipts: the oldest authorized receipt wins and this
+# runner deletes only its own later copies, bounded per call so a historical
+# comment storm drains over several cycles.
+_feedback_route_converge_closed_issue_receipts() {
+	local repo_slug="$1" receipts="$2"
+	local duplicate_id="" deleted=0
+	while IFS= read -r duplicate_id; do
+		[[ "$duplicate_id" =~ ^[0-9]+$ ]] || continue
+		[[ "$deleted" -lt "$PULSE_FEEDBACK_ROUTE_CONVERGE_DELETE_LIMIT" ]] || break
+		_feedback_route_gh_write api "repos/${repo_slug}/issues/comments/${duplicate_id}" \
+			--method DELETE >/dev/null 2>&1 || true
+		deleted=$((deleted + 1))
+	done < <(printf '%s' "$receipts" | jq -r '.[1:][]? | select(.own == true) | .id' 2>/dev/null)
+	return 0
+}
+
+# Returns: 0=receipt present (duplicates converged), 1=absent, 75=unverifiable.
+_feedback_route_closed_issue_receipt() {
+	local pr_number="$1" repo_slug="$2" marker_core="$3" self_id="$4"
+	local receipts="" count=""
+	receipts=$(_feedback_route_closed_issue_receipts "$pr_number" "$repo_slug" "$marker_core" "$self_id") \
+		|| return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+	count=$(printf '%s' "$receipts" | jq 'length' 2>/dev/null) || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+	[[ "$count" =~ ^[0-9]+$ ]] || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+	[[ "$count" -gt 0 ]] || return 1
+	_feedback_route_converge_closed_issue_receipts "$repo_slug" "$receipts"
+	return 0
+}
+
+# Local write fuse: once this runner has posted a generation's hold comment it
+# never posts it again, even when the GitHub read-back cannot see it. This
+# bounds the worst case to one comment per runner (GH#34600, GH#34605).
+_feedback_route_closed_issue_fuse_path() {
+	local repo_slug="$1" pr_number="$2" linked_issue="$3" head="$4"
+	local fuse_dir="${AIDEVOPS_PULSE_FEEDBACK_FUSE_DIR:-${HOME}/.aidevops/state/pulse-feedback-route-fuse}"
+	local key=""
+	key=$(printf '%s_PR%s_ISSUE%s_SHA%s' "$repo_slug" "$pr_number" "$linked_issue" "$head" | tr -c '[:alnum:]._-' '_')
+	printf '%s/closed-issue-%s' "$fuse_dir" "$key"
+	return 0
+}
+
+_feedback_route_closed_issue_record_fuse() {
+	local fuse_path="$1"
+	mkdir -p "${fuse_path%/*}" 2>/dev/null || return 1
+	: >"$fuse_path" 2>/dev/null || return 1
+	return 0
+}
+
+_feedback_route_closed_issue_current_labels() {
+	local pr_number="$1" repo_slug="$2" expected_head="$3"
+	local snapshot="" state="" head="" labels=""
+	snapshot=$(_feedback_route_pr_snapshot "$pr_number" "$repo_slug") || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+	IFS=$'\t' read -r state head labels <<<"$snapshot"
+	[[ "$state" == "$PULSE_FEEDBACK_ROUTE_OPEN_STATE" ]] || return "$PULSE_FEEDBACK_ROUTE_MAINTAINER_RC"
+	[[ "$head" == "$expected_head" ]] || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+	_feedback_route_labels_allow_worker_route "$labels" 1 || return "$PULSE_FEEDBACK_ROUTE_MAINTAINER_RC"
+	printf '%s' "$labels"
+	return 0
+}
+
+# Closed issues have no redispatch executor. Hold only the PR, without creating
+# recoverable automation-hold provenance or changing the closed issue (GH#34531).
+_feedback_route_guard_closed_issue() {
+	local pr_number="$1" repo_slug="$2" linked_issue="$3" kind="$4"
+	local expected_head="${5:-}"
+	local metadata="" state="" reason="" snapshot="" pr_state="" head="" labels=""
+	local marker_core="" identity="" self_id="" actor="" body="" fuse_path="" receipt_rc=0
+
+	# Review evidence routing retains its existing lifecycle policy.
+	[[ "$kind" == "conflict" || "$kind" == "ci" ]] || return 0
+	metadata=$(gh api "repos/${repo_slug}/issues/${linked_issue}" 2>/dev/null) || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+	state=$(printf '%s' "$metadata" | jq -r '.state // empty') || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+	[[ "$state" != "open" ]] || return 0
+	[[ "$state" == "closed" ]] || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+	[[ "${DRY_RUN:-0}" != "1" ]] || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+	snapshot=$(_feedback_route_pr_snapshot "$pr_number" "$repo_slug") || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+	IFS=$'\t' read -r pr_state head labels <<<"$snapshot"
+	[[ "$pr_state" == "$PULSE_FEEDBACK_ROUTE_OPEN_STATE" ]] || return "$PULSE_FEEDBACK_ROUTE_MAINTAINER_RC"
+	[[ "$head" =~ ^[0-9A-Za-z]{7,64}$ ]] || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+	[[ -z "$expected_head" || "$head" == "$expected_head" ]] || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+	_feedback_route_labels_allow_worker_route "$labels" 1 || return "$PULSE_FEEDBACK_ROUTE_MAINTAINER_RC"
+	reason=$(printf '%s' "$metadata" | jq -r '
+		if .state_reason == "not_planned" or any(.labels[]?; .name == "consolidated" or .name == "not-planned")
+		then "orphaned (not planned or consolidated)"
+		elif .state_reason == "completed" then "prematurely completed with an open unmerged PR"
+		else "closed with an open unmerged PR" end') || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+	marker_core="<!-- feedback-route:closed-issue:PR${pr_number}:ISSUE${linked_issue}:SHA${head}"
+	identity=$(_feedback_route_authenticated_identity) || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+	IFS=$'\t' read -r self_id actor <<<"$identity"
+	[[ "$self_id" =~ ^[0-9]+$ && -n "$actor" ]] || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+	fuse_path=$(_feedback_route_closed_issue_fuse_path "$repo_slug" "$pr_number" "$linked_issue" "$head")
+	_feedback_route_closed_issue_receipt "$pr_number" "$repo_slug" "$marker_core" "$self_id" || receipt_rc=$?
+	[[ "$receipt_rc" -le 1 ]] || return "$receipt_rc"
+	if [[ "$receipt_rc" -eq 1 && -e "$fuse_path" ]]; then
+		# Already posted by this runner but not visible: never repost.
+		echo "[pulse-wrapper] feedback finalizer: closed-issue hold comment for PR #${pr_number} in ${repo_slug} was already posted by this runner but is not visible; not reposting (write fuse)" >>"$LOGFILE"
+	elif [[ "$receipt_rc" -eq 1 ]]; then
+		# Persist the comment first: a failed hold write retries without another comment.
+		body="${marker_core}:RUNNER$(_feedback_route_runner_id) -->
+Holding this ${kind} repair PR for maintainer review: linked issue #${linked_issue} is ${reason}. The closed issue is unchanged; no repair worker will be dispatched. Review the linked issue's closing rationale before resolving this hold."
+		_feedback_route_gh_write pr comment "$pr_number" --repo "$repo_slug" --body "$body" >/dev/null 2>&1 || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+		_feedback_route_closed_issue_record_fuse "$fuse_path" \
+			|| echo "[pulse-wrapper] feedback finalizer: could not record closed-issue write fuse for PR #${pr_number} in ${repo_slug}" >>"$LOGFILE"
+		_feedback_route_closed_issue_receipt "$pr_number" "$repo_slug" "$marker_core" "$self_id" || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+	fi
+	# Revalidate the receipt's generation and ownership at the label boundary.
+	labels=$(_feedback_route_closed_issue_current_labels "$pr_number" "$repo_slug" "$head") || return $?
+	if ! _feedback_route_labels_include "$labels" "$PULSE_FEEDBACK_ROUTE_HOLD_LABEL"; then
+		_feedback_route_gh_write pr edit "$pr_number" --repo "$repo_slug" \
+			--add-label "$PULSE_FEEDBACK_ROUTE_HOLD_LABEL" >/dev/null 2>&1 || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+	fi
+	labels=$(_feedback_route_closed_issue_current_labels "$pr_number" "$repo_slug" "$head") || return $?
+	_feedback_route_labels_include "$labels" "$PULSE_FEEDBACK_ROUTE_HOLD_LABEL" || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+	if [[ "$receipt_rc" -eq 1 ]]; then
+		echo "[pulse-wrapper] feedback finalizer: terminal closed-issue hold for PR #${pr_number} and issue #${linked_issue} in ${repo_slug} (${reason})" >>"$LOGFILE"
+	fi
+	return "$PULSE_FEEDBACK_ROUTE_MAINTAINER_RC"
+}
+
 _feedback_route_defer() {
 	local pr_number="$1"
 	local repo_slug="$2"
@@ -564,7 +969,7 @@ _feedback_route_restore_unverified_hold() {
 			--add-label "$PULSE_FEEDBACK_ROUTE_HOLD_LABEL" >/dev/null 2>&1 || issue_rc=$?
 	else
 		_feedback_route_gh_write issue edit "$linked_issue" --repo "$repo_slug" \
-			--add-label "status:in-review" --add-label "$PULSE_FEEDBACK_ROUTE_HOLD_LABEL" \
+			--add-label "$PULSE_FEEDBACK_ROUTE_REVIEW_STATUS" --add-label "$PULSE_FEEDBACK_ROUTE_HOLD_LABEL" \
 			--remove-label "$PULSE_FEEDBACK_ROUTE_AVAILABLE_LABEL" >/dev/null 2>&1 || issue_rc=$?
 	fi
 	_feedback_route_gh_write pr edit "$pr_number" --repo "$repo_slug" \
@@ -584,6 +989,7 @@ _feedback_route_transition_and_verify() {
 	local expected_head="${7:-}"
 	local companion_source_label="${8:-}"
 
+	_feedback_route_owner_allows "$linked_issue" "$repo_slug" || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
 	if [[ "$clear_hold" == "1" ]]; then
 		[[ "$pr_number" =~ ^[0-9]+$ && -n "$kind" && -n "$expected_head" ]] || return 1
 		if ! _feedback_route_automation_hold_exists "$kind" "$pr_number" "$repo_slug" \
@@ -690,10 +1096,11 @@ _feedback_route_prepare_start() {
 	local caller="${11}"
 	local legacy_match="${12:-$legacy_marker}"
 
-	if printf '%s' "$issue_body" | grep -qF "$start_marker"; then
+	if grep -qF -- "$start_marker" <<<"$issue_body"; then
 		return 0
 	fi
-	if printf '%s' "$issue_body" | grep -qF "$legacy_match"; then
+	if [[ "${_PULSE_FEEDBACK_ROUTE_SUPERSEDE_PRIOR:-0}" != "1" ]] \
+		&& grep -qF -- "$legacy_match" <<<"$issue_body"; then
 		_feedback_route_hold_for_maintainer "$pr_number" "$repo_slug" "$linked_issue" \
 			"legacy ${kind} route marker has no head-bound start evidence"
 		return $?
@@ -754,8 +1161,15 @@ _feedback_route_finish_closed() {
 	local completion_marker="$7"
 	local caller="$8"
 	local closed_by_this_call="$9"
+	local completion_write_rc=0
 
-	if ! _append_feedback_to_issue "$linked_issue" "$repo_slug" "$completion_marker" "" "$caller"; then
+	_append_feedback_to_issue "$linked_issue" "$repo_slug" "$completion_marker" "" "$caller" || completion_write_rc=$?
+	if [[ "$completion_write_rc" -ne 0 ]]; then
+		if [[ "$completion_write_rc" -eq "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC" ]]; then
+			_feedback_route_defer "$pr_number" "$repo_slug" "$linked_issue" \
+				"closed ${kind} route completion evidence write was transiently deferred"
+			return $?
+		fi
 		if [[ "$closed_by_this_call" == "1" ]]; then
 			_feedback_route_restore_after_postclose_failure "$pr_number" "$repo_slug" "$linked_issue" \
 				"$expected_head" "could not persist ${kind} completion evidence"
@@ -894,6 +1308,13 @@ _feedback_route_close_and_finish() {
 				return $?
 			fi
 		fi
+		# Guarded interactive takeover normalizes the preserved PR itself. Do not
+		# rely on a label snapshot taken before repair ownership changed.
+		snapshot=$(_feedback_route_pr_snapshot "$pr_number" "$repo_slug") || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+		IFS=$'\t' read -r pr_state current_head labels <<<"$snapshot"
+		[[ "$pr_state" == "$PULSE_FEEDBACK_ROUTE_OPEN_STATE" && "$current_head" == "$expected_head" ]] || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+		_feedback_route_labels_allow_worker_route "$labels" || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
+		_feedback_route_owner_allows "$linked_issue" "$repo_slug" || return "$PULSE_FEEDBACK_ROUTE_DEFERRED_RC"
 		_feedback_route_gh_write pr close "$pr_number" --repo "$repo_slug" \
 			--comment "${close_comment}
 
@@ -957,8 +1378,8 @@ _feedback_route_existing_evidence_gate() {
 	local pr_state="${12}"
 	local labels="${13}"
 
-	if printf '%s' "$issue_body" | grep -qF "$completion_marker"; then
-		if ! printf '%s' "$issue_body" | grep -qF "$start_marker"; then
+	if grep -qF -- "$completion_marker" <<<"$issue_body"; then
+		if ! grep -qF -- "$start_marker" <<<"$issue_body"; then
 			_feedback_route_hold_for_maintainer "$pr_number" "$repo_slug" "$linked_issue" \
 				"${kind} completion evidence has no matching start marker"
 			return $?
@@ -983,9 +1404,19 @@ _feedback_route_existing_evidence_gate() {
 		fi
 	elif _feedback_route_body_has_other_head_evidence "$issue_body" "$kind" "$pr_number" \
 		"$start_marker" "$completion_marker"; then
-		_feedback_route_hold_for_maintainer "$pr_number" "$repo_slug" "$linked_issue" \
-			"existing ${kind} route evidence belongs to a different PR head"
-		return $?
+		if ! _feedback_route_generations_complete "$issue_body" "$kind" "$pr_number" "$start_marker"; then
+			_feedback_route_hold_for_maintainer "$pr_number" "$repo_slug" "$linked_issue" \
+				"existing ${kind} route generation is incomplete or ambiguous"
+			return $?
+		fi
+		if ! _feedback_route_prior_generation_is_automation_owned "$pr_number" "$repo_slug" \
+			"$linked_issue" "$source_label" "$terminal_label" "$labels"; then
+			_feedback_route_hold_for_maintainer "$pr_number" "$repo_slug" "$linked_issue" \
+				"completed old-head ${kind} route lacks trusted automation ownership"
+			return $?
+		fi
+		echo "[pulse-wrapper] feedback finalizer: superseding completed automation-owned ${kind} route generation for PR #${pr_number} with current head ${expected_head}" >>"$LOGFILE"
+		_PULSE_FEEDBACK_ROUTE_SUPERSEDE_PRIOR=1
 	fi
 	return 0
 }
@@ -1002,12 +1433,21 @@ _feedback_route_prepare_finalization_snapshot() {
 	local labels=""
 	local clear_automation_hold=0
 
+	_feedback_route_guard_closed_issue "$pr_number" "$repo_slug" "$linked_issue" "$kind" "$expected_head" || return $?
 	snapshot=$(_feedback_route_pr_snapshot "$pr_number" "$repo_slug") || {
 		_feedback_route_defer "$pr_number" "$repo_slug" "$linked_issue" \
 			"current PR snapshot unavailable before ${kind} finalization"
 		return $?
 	}
 	IFS=$'\t' read -r pr_state current_head labels <<<"$snapshot"
+	# Before the head-drift hold, issue transition and close: a live worker's
+	# push must defer the route, not strand the PR on a maintainer hold.
+	if [[ "$pr_state" == "$PULSE_FEEDBACK_ROUTE_OPEN_STATE" ]] \
+		&& ! _feedback_route_worker_lease_allows "$linked_issue" "$repo_slug"; then
+		_feedback_route_defer "$pr_number" "$repo_slug" "$linked_issue" \
+			"linked issue dispatch lease is live or unreadable; ${kind} route waits for its terminal lease or expiry"
+		return $?
+	fi
 	if [[ "$current_head" != "$expected_head" ]]; then
 		_feedback_route_hold_for_maintainer "$pr_number" "$repo_slug" "$linked_issue" \
 			"${kind} route head drifted from ${expected_head} to ${current_head:-unknown}"
@@ -1072,6 +1512,7 @@ _finalize_feedback_route() {
 	local evidence_gate_rc=0
 	local clear_automation_hold=0
 	local preflight="" preflight_rc=0
+	_PULSE_FEEDBACK_ROUTE_SUPERSEDE_PRIOR=0
 
 	if [[ "${DRY_RUN:-0}" == "1" ]]; then
 		_feedback_route_defer "$pr_number" "$repo_slug" "$linked_issue" "dry-run forbids ${kind} finalization writes"
@@ -1195,15 +1636,15 @@ _feedback_route_guard_existing_terminal_label() {
 	}
 	start_marker=$(_feedback_route_marker start "$kind" "$pr_number" "$current_head")
 	completion_marker=$(_feedback_route_marker complete "$kind" "$pr_number" "$current_head")
-	if [[ "$pr_state" == "$PULSE_FEEDBACK_ROUTE_OPEN_STATE" ]] && printf '%s' "$issue_body" | grep -qF "$completion_marker"; then
+	if [[ "$pr_state" == "$PULSE_FEEDBACK_ROUTE_OPEN_STATE" ]] && grep -qF -- "$completion_marker" <<<"$issue_body"; then
 		_feedback_route_hold_for_maintainer "$pr_number" "$repo_slug" "$linked_issue" \
 			"completed same-head ${kind} route was manually reopened"
 		return $?
 	fi
-	if [[ "$pr_state" == "$PULSE_FEEDBACK_ROUTE_OPEN_STATE" ]] && printf '%s' "$issue_body" | grep -qF "$start_marker"; then
+	if [[ "$pr_state" == "$PULSE_FEEDBACK_ROUTE_OPEN_STATE" ]] && grep -qF -- "$start_marker" <<<"$issue_body"; then
 		return 0
 	fi
-	if printf '%s' "$issue_body" | grep -qF "$marker_prefix"; then
+	if grep -qF -- "$marker_prefix" <<<"$issue_body"; then
 		_feedback_route_hold_for_maintainer "$pr_number" "$repo_slug" "$linked_issue" \
 			"existing ${kind} route evidence belongs to a different PR head"
 		return $?

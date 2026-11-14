@@ -6,8 +6,30 @@ import {
   isTitleOverwritable,
   purposePreservingTitle,
 } from "../lib/session-rename-guards"
-import { withAidevopsTitleSuffix } from "../lib/session-title-suffix"
+import { isSessionTitleAddressEnabled, withSessionTitleDecorations } from "../lib/session-title-suffix"
 import { emitTerminalTitle } from "../lib/terminal-title"
+
+type SessionRow = { title: string; parent_id: string | null }
+
+function readSessionRow(db: Database, sessionID: string): SessionRow | null {
+  try {
+    return db
+      .query("SELECT COALESCE(title, '') AS title, parent_id FROM session WHERE id = ?")
+      .get(sessionID) as SessionRow | null
+  } catch {
+    // Schemas without parent_id: treat the session as a root session.
+    const row = db
+      .query("SELECT COALESCE(title, '') AS title FROM session WHERE id = ?")
+      .get(sessionID) as { title: string } | null
+    return row ? { title: row.title, parent_id: null } : null
+  }
+}
+
+// GH#37630: interactive root sessions carry their session-bus address token.
+function displayTitleFor(title: string, sessionID: string, row: SessionRow | null): string {
+  const addressed = isSessionTitleAddressEnabled() && row !== null && !row.parent_id
+  return withSessionTitleDecorations(title, { sessionID: addressed ? sessionID : "" })
+}
 
 /**
  * Rename a session by updating the title directly in the SQLite database.
@@ -26,11 +48,9 @@ function renameSession(
   try {
     const db = new Database(dbPath)
     try {
-      const current = db
-        .query("SELECT COALESCE(title, '') AS title FROM session WHERE id = ?")
-        .get(sessionID) as { title: string } | null
+      const current = readSessionRow(db, sessionID)
       const preservedTitle = purposePreservingTitle(current?.title || "", title, replacePurpose)
-      const displayTitle = withAidevopsTitleSuffix(preservedTitle)
+      const displayTitle = displayTitleFor(preservedTitle, sessionID, current)
       const nowMs = Date.now()
       const result = db.run(
         "UPDATE session SET title = ?, time_updated = ? WHERE id = ?",
@@ -83,7 +103,7 @@ function syncSessionWithBranch(
         }
       }
 
-      const displayTitle = withAidevopsTitleSuffix(branch)
+      const displayTitle = displayTitleFor(branch, sessionID, readSessionRow(db, sessionID))
       const nowMs = Date.now()
       const result = db.run(
         "UPDATE session SET title = ?, time_updated = ? WHERE id = ?",
@@ -106,17 +126,19 @@ function syncSessionWithBranch(
   }
 }
 
+// Descriptions are sent on every request in this repository; keep them
+// compact without dropping title rules (GH#32592).
 export default tool({
   description:
-    "Set or extend the current session title without losing its original overall purpose. The first meaningful purpose remains the stable prefix; later phases become a trailing '— Current: ...' context. Do not rename for branches, implementation phases, reviews, releases, or other transient state when the existing title already identifies the session. Set replace_purpose only when the user explicitly repurposes the whole session. For issue/PR work, keep the complete issue/PR identity at the beginning. Long titles are supported and the AIDevOps version suffix is automatic.",
+    "Set or extend the session title. The first meaningful purpose stays as the stable prefix; later phases append '— Current: ...'. Skip renames for transient state (branch, phase, review, release) when the title already identifies the session. Keep issue/PR identity first. Long titles are fine.",
   args: {
     title: tool.schema
       .string()
-      .describe("Long title or current-context description; the tool preserves the existing stable purpose unless replace_purpose is explicitly authorised"),
+      .describe("Title or current-context description"),
     replace_purpose: tool.schema
       .boolean()
       .optional()
-      .describe("Replace the stable original purpose only when the user explicitly redirects or repurposes the whole session"),
+      .describe("Replace the stable purpose; only when the user explicitly repurposes the whole session"),
   },
   async execute(args, context) {
     const { sessionID } = context
@@ -137,7 +159,7 @@ export default tool({
 // repo on main must not clobber meaningful titles (t2252).
 export const sync_branch = tool({
   description:
-    "Rename the current session to match the current git branch name. Call this after creating or switching branches only when no issue/PR-prefixed title is already set; issue/PR work should keep 'Issue #123: <issue title>' or 'PR #456: <PR title>' at the beginning.",
+    "Rename the session to the current git branch after creating or switching branches, unless an 'Issue #N: <title>' or 'PR #N: <title>' prefix is already set.",
   args: {},
   async execute(_args, context) {
     const { sessionID } = context

@@ -36,6 +36,12 @@ _PULSE_REPO_ROLE_CONTRIBUTOR="contributor"
 # shellcheck disable=SC1091  # sibling library resolved by the orchestrator
 source "${SCRIPT_DIR}/infrastructure-advisory-lib.sh"
 
+# shellcheck source=./pulse-repo-dormancy.sh
+source "${SCRIPT_DIR}/pulse-repo-dormancy.sh"
+
+# shellcheck source=./pulse-repo-auth-status-lib.sh
+source "${SCRIPT_DIR}/pulse-repo-auth-status-lib.sh"
+
 #######################################
 # Resolve managed repo path from slug
 # Arguments:
@@ -50,7 +56,7 @@ get_repo_path_by_slug() {
 	fi
 
 	local repo_path
-	repo_path=$(jq -r --arg slug "$repo_slug" '.initialized_repos[] | select(.slug == $slug) | .path // ""' "$REPOS_JSON" 2>/dev/null | head -n 1)
+	repo_path=$(jq -r --arg slug "$repo_slug" '.initialized_repos[] | select(.slug == $slug) | .path // ""' "$REPOS_JSON" 2>/dev/null | sed -n '1p')
 	echo "$repo_path"
 	return 0
 }
@@ -105,7 +111,7 @@ get_repo_priority_by_slug() {
 	fi
 
 	local repo_priority
-	repo_priority=$(jq -r --arg slug "$repo_slug" '.initialized_repos[] | select(.slug == $slug) | .priority // "tooling"' "$REPOS_JSON" 2>/dev/null | head -n 1)
+	repo_priority=$(jq -r --arg slug "$repo_slug" '.initialized_repos[] | select(.slug == $slug) | .priority // "tooling"' "$REPOS_JSON" 2>/dev/null | sed -n '1p')
 	if [[ -z "$repo_priority" ]]; then
 		repo_priority="tooling"
 	fi
@@ -146,14 +152,14 @@ get_repo_role_by_slug() {
 		local explicit_role
 		explicit_role=$(jq -r --arg slug "$repo_slug" \
 			'.initialized_repos[] | select(.slug == $slug) | .role // ""' \
-			"$REPOS_JSON" 2>/dev/null | head -n 1) || explicit_role=""
+			"$REPOS_JSON" 2>/dev/null | sed -n '1p') || explicit_role=""
 		if [[ "$explicit_role" == "$_PULSE_REPO_ROLE_MAINTAINER" || "$explicit_role" == "$_PULSE_REPO_ROLE_CONTRIBUTOR" ]]; then
 			printf '%s\n' "$explicit_role"
 			return 0
 		fi
 		configured_maintainer=$(jq -r --arg slug "$repo_slug" \
 			'.initialized_repos[] | select(.slug == $slug) | .maintainer // ""' \
-			"$REPOS_JSON" 2>/dev/null | head -n 1) || configured_maintainer=""
+			"$REPOS_JSON" 2>/dev/null | sed -n '1p') || configured_maintainer=""
 	fi
 
 	# 2. Auto-detect from configured maintainer or slug owner vs current gh user.
@@ -219,6 +225,7 @@ repo_allows_pulse_write_actions() {
 #   - infrastructure + source:ci-failure-miner (operational advisories)
 #   - parent-task (decomposition tracker, never directly dispatchable; t2924)
 #   - no-auto-dispatch (explicit dispatch opt-out; t2924)
+#   - status:needs-info (waiting for contributor evidence)
 #   - status:in-progress, status:in-review, status:claimed without auto-dispatch
 #     (active claims that the dispatcher would otherwise block; t2924)
 #   - status:done (completed work, never dispatchable)
@@ -263,13 +270,211 @@ _pulse_issue_snapshot_is_valid() {
 	return 0
 }
 
+#######################################
+# Return success only when a bounded native GraphQL retry is safe. Candidate
+# enumeration normally uses REST-first routing, but a transient REST-core error
+# must not make an otherwise healthy GraphQL pool look like an empty queue.
+#######################################
+_pulse_candidate_graphql_retry_available() {
+	local remaining="" threshold="${_GH_REST_FALLBACK_THRESHOLD:-10}"
+	[[ "$threshold" =~ ^[0-9]+$ ]] || threshold=10
+	if declare -F _gh_with_timeout >/dev/null 2>&1; then
+		remaining=$(_gh_with_timeout read gh api rate_limit --jq '.resources.graphql.remaining' 2>/dev/null) || return 1
+	else
+		remaining=$(gh api rate_limit --jq '.resources.graphql.remaining' 2>/dev/null) || return 1
+	fi
+	[[ "$remaining" =~ ^[0-9]+$ && "$remaining" -gt "$threshold" ]]
+}
+
+#######################################
+# Read a recent complete canonical issue snapshot from batch-prefetch storage.
+# This is a dispatch recovery input, not fresh lifecycle authority: callers must
+# keep snapshot_succeeded=0 so lock reconciliation and completeness lending stay
+# fail-closed. The dispatch-time dedup/readiness gates still verify each result.
+#######################################
+_pulse_candidate_cached_issue_snapshot_json() {
+	local repo_slug="$1"
+	local helper="${PULSE_BATCH_PREFETCH_HELPER:-${SCRIPT_DIR}/pulse-batch-prefetch-helper.sh}"
+	local max_age="${PULSE_DISPATCH_CANDIDATE_CACHE_MAX_AGE_SECONDS:-300}"
+	local now_epoch="${PULSE_DISPATCH_CANDIDATE_NOW_EPOCH:-}"
+	local snapshot="" items=""
+	[[ "$max_age" =~ ^[0-9]+$ && "$max_age" -gt 0 ]] || max_age=300
+	[[ -x "$helper" ]] || return 1
+	if [[ -z "$now_epoch" ]]; then
+		now_epoch=$(date -u +%s 2>/dev/null) || return 1
+	fi
+	[[ "$now_epoch" =~ ^[0-9]+$ ]] || return 1
+	snapshot=$("$helper" read-snapshot --kind issues --slug "$repo_slug" 2>/dev/null) || return 1
+	items=$(printf '%s' "$snapshot" | jq -ce \
+		--argjson now "$now_epoch" --argjson max_age "$max_age" '
+		select(.complete == true) |
+		(.fetched_at | fromdateiso8601) as $fetched |
+		select($fetched <= $now and ($now - $fetched) <= $max_age) |
+		.items
+	' 2>/dev/null) || return 1
+	_pulse_issue_snapshot_is_valid "$items" || return 1
+	printf '%s\n' "$items"
+	return 0
+}
+
+#######################################
+# Fetch one dispatch issue snapshot with bounded transport and cache recovery.
+# Args: repo slug, limit, stderr file, source marker file.
+# Stdout: validated issue JSON. Source marker: live, graphql-retry, or cache.
+#######################################
+_pulse_fetch_candidate_issue_snapshot_json() {
+	local repo_slug="$1" limit="$2" error_file="$3" source_file="$4"
+	local issue_json="" gh_exit_code=0 initial_error=""
+	: >"$source_file"
+	issue_json=$(gh_issue_list --repo "$repo_slug" --state open \
+		--json number,title,url,assignees,labels,createdAt,updatedAt \
+		--limit "$limit" 2>"$error_file") || gh_exit_code=$?
+	if [[ "$gh_exit_code" -eq 0 ]] && _pulse_issue_snapshot_is_valid "$issue_json"; then
+		printf 'live\n' >"$source_file"
+		printf '%s\n' "$issue_json"
+		return 0
+	fi
+	initial_error=$(<"$error_file") || initial_error=""
+
+	if [[ "$initial_error" != *"secondary-rate-limit active=true skip=read"* ]] &&
+		_pulse_candidate_graphql_retry_available; then
+		gh_exit_code=0
+		if declare -F _gh_with_timeout >/dev/null 2>&1; then
+			issue_json=$(_gh_with_timeout read gh issue list --repo "$repo_slug" --state open \
+				--json number,title,url,assignees,labels,createdAt,updatedAt \
+				--limit "$limit" 2>>"$error_file") || gh_exit_code=$?
+		else
+			issue_json=$(gh issue list --repo "$repo_slug" --state open \
+				--json number,title,url,assignees,labels,createdAt,updatedAt \
+				--limit "$limit" 2>>"$error_file") || gh_exit_code=$?
+		fi
+		if [[ "$gh_exit_code" -eq 0 ]] && _pulse_issue_snapshot_is_valid "$issue_json"; then
+			printf 'graphql-retry\n' >"$source_file"
+			printf '[pulse-wrapper] list_dispatchable_issue_candidates: recovered %s via bounded native GraphQL retry\n' \
+				"$repo_slug" >>"$LOGFILE"
+			printf '%s\n' "$issue_json"
+			return 0
+		fi
+	fi
+
+	if issue_json=$(_pulse_candidate_cached_issue_snapshot_json "$repo_slug"); then
+		printf 'cache\n' >"$source_file"
+		printf '[pulse-wrapper] list_dispatchable_issue_candidates: recovered %s from fresh complete batch cache\n' \
+			"$repo_slug" >>"$LOGFILE"
+		printf '%s\n' "$issue_json"
+		return 0
+	fi
+	local error_message=""
+	error_message=$(<"$error_file") || error_message="unknown error"
+	if [[ "$error_message" == *"secondary-rate-limit active=true skip=read"* ]]; then
+		printf '[pulse-wrapper] list_dispatchable_issue_candidates: gh_issue_list cooldown skip for %s; recovery sources unavailable: %s\n' \
+			"$repo_slug" "$error_message" >>"$LOGFILE"
+	else
+		printf '[pulse-wrapper] list_dispatchable_issue_candidates: live transports and fresh cache unavailable for %s: %s\n' \
+			"$repo_slug" "${error_message:-unknown error}" >>"$LOGFILE"
+	fi
+	printf 'unavailable\n' >"$source_file"
+	printf '[]\n'
+	return 1
+}
+
+#######################################
+# Recognize blocked readiness in both GitHub and normalized label snapshots.
+#######################################
+_pulse_candidate_snapshot_has_blocked_work() {
+	local issue_json="$1"
+	if jq -e 'any(.[]; any(.labels[]?; (.name? // .) == "status:blocked"))' <<<"$issue_json" >/dev/null 2>&1; then
+		return 0
+	fi
+	return 1
+}
+
+#######################################
+# Refresh a snapshot after dependency normalization only when the current
+# snapshot contains blocked work. The source marker file is updated by fetch.
+#######################################
+_pulse_normalize_candidate_issue_snapshot_json() {
+	local repo_slug="$1" limit="$2" mode="$3" issue_json="$4"
+	local error_file="$5" source_file="$6"
+	if [[ "$mode" == "skip" ]] ||
+		! _pulse_candidate_snapshot_has_blocked_work "$issue_json" ||
+		! declare -F normalize_repo_dependency_readiness_if_due >/dev/null 2>&1; then
+		printf '%s\n' "$issue_json"
+		return 0
+	fi
+	normalize_repo_dependency_readiness_if_due "$repo_slug" >/dev/null 2>&1 || true
+	_pulse_fetch_candidate_issue_snapshot_json "$repo_slug" "$limit" "$error_file" "$source_file"
+	return $?
+}
+
+#######################################
+# Persist optional campaign/source completeness evidence for one snapshot.
+#######################################
+_pulse_persist_candidate_snapshot_evidence() {
+	local repo_slug="$1" issue_json="$2" snapshot_succeeded="$3" limit="$4"
+	local raw_snapshot_file="$5" snapshot_status_file="$6" completeness_file="$7"
+	local normalization_mode="${8:-normalize}"
+	if [[ -n "$raw_snapshot_file" ]]; then
+		(
+			umask 077
+			printf '%s\n' "$issue_json" >"$raw_snapshot_file"
+		) || printf '[pulse-wrapper] list_dispatchable_issue_candidates: unable to persist campaign snapshot for %s\n' \
+			"$repo_slug" >>"$LOGFILE"
+	fi
+	if [[ -n "$snapshot_status_file" ]]; then
+		(umask 077; printf '%s\n' "$snapshot_succeeded" >"$snapshot_status_file") || true
+	fi
+	# A successful bounded read is not necessarily complete. Never lend a
+	# reserved class's slots based on a failed, malformed or truncated snapshot.
+	# Deferred blocked readiness cannot prove absence of newly eligible work.
+	if [[ "$normalization_mode" == "skip" ]] && _pulse_candidate_snapshot_has_blocked_work "$issue_json"; then
+		return 0
+	fi
+	if [[ -n "$completeness_file" && "$snapshot_succeeded" == 1 ]] &&
+		jq -e --argjson limit "$limit" 'length < $limit' <<<"$issue_json" >/dev/null 2>&1; then
+		printf '1\n' >"$completeness_file"
+	fi
+	return 0
+}
+
+#######################################
+# Decide whether a candidate source may be read at all. On a gate, writes the
+# empty raw snapshot/failed status evidence and sets _PULSE_CANDIDATE_GATE_RC
+# to the caller's return code: 0 for a dormant repo (expected skip), 1 for an
+# invalid pulse_auth configuration (GH#34552: source unavailable, never an
+# empty queue). The auth fault is logged once, attributed, to LOGFILE and stderr
+# instead of burning gh calls that can only fail closed.
+# Args: repo slug, optional raw snapshot file, optional snapshot status file
+# Returns: 0 proceed, 1 gated
+#######################################
+_pulse_candidate_source_gate() {
+	local repo_slug="$1" raw_snapshot_file="$2" snapshot_status_file="$3"
+	local auth_fault_class="" auth_fault_line=""
+	_PULSE_CANDIDATE_GATE_RC=0
+	if ! pulse_repo_scan_allowed "$repo_slug"; then
+		_PULSE_CANDIDATE_GATE_RC=0
+	elif auth_fault_class=$(pulse_repo_auth_config_fault "$repo_slug"); then
+		_PULSE_CANDIDATE_GATE_RC=1
+		auth_fault_line="[pulse-wrapper] list_dispatchable_issue_candidates: repo auth config invalid for ${repo_slug} (class=${auth_fault_class}); candidates unavailable; remedy: $(pulse_repo_auth_fault_remedy "$repo_slug")"
+		printf '%s\n' "$auth_fault_line" >>"${LOGFILE:-/dev/null}" 2>/dev/null || true
+		printf '%s\n' "$auth_fault_line" >&2
+	else
+		return 0
+	fi
+	[[ -z "$raw_snapshot_file" ]] || printf '[]\n' >"$raw_snapshot_file"
+	[[ -z "$snapshot_status_file" ]] || printf '0\n' >"$snapshot_status_file"
+	return 1
+}
+
 list_dispatchable_issue_candidates_json() {
 	local repo_slug="$1"
 	local limit="${2:-100}"
 	local raw_snapshot_file="${3:-}"
 	local snapshot_status_file="${4:-}"
 	local dependency_normalization_mode="${5:-normalize}"
-	local snapshot_succeeded=1
+	local completeness_file="${6:-}"
+	local snapshot_succeeded=0 snapshot_available=0 snapshot_source="unavailable"
+	[[ -z "$completeness_file" ]] || printf '0\n' >"$completeness_file"
 
 	if [[ -z "$repo_slug" ]]; then
 		printf '[]\n'
@@ -277,24 +482,33 @@ list_dispatchable_issue_candidates_json() {
 	fi
 	[[ "$limit" =~ ^[0-9]+$ ]] || limit=100
 
-	local issue_json issue_dispatch_err gh_exit_code
-	issue_dispatch_err=$(mktemp)
-	gh_exit_code=0
-	issue_json=$(gh_issue_list --repo "$repo_slug" --state open --json number,title,url,assignees,labels,createdAt,updatedAt --limit "$limit" 2>"$issue_dispatch_err") || gh_exit_code=$?
-	if [[ "$gh_exit_code" -ne 0 ]] || ! _pulse_issue_snapshot_is_valid "$issue_json"; then
-		snapshot_succeeded=0
-		local _issue_dispatch_err_msg
-		_issue_dispatch_err_msg=$(<"$issue_dispatch_err") || _issue_dispatch_err_msg="unknown error"
-		if [[ "$gh_exit_code" -eq 75 || "$_issue_dispatch_err_msg" == *"secondary-rate-limit active=true skip=read"* ]]; then
-			printf '[pulse-wrapper] list_dispatchable_issue_candidates: gh_issue_list cooldown skip for %s (exit %s): %s\n' \
-				"$repo_slug" "$gh_exit_code" "$_issue_dispatch_err_msg" >>"$LOGFILE"
-		else
-			printf '[pulse-wrapper] list_dispatchable_issue_candidates: gh_issue_list FAILED for %s (exit %s): %s\n' \
-				"$repo_slug" "$gh_exit_code" "$_issue_dispatch_err_msg" >>"$LOGFILE"
-		fi
+	if ! _pulse_candidate_source_gate "$repo_slug" "$raw_snapshot_file" "$snapshot_status_file"; then
+		printf '[]\n'
+		return "$_PULSE_CANDIDATE_GATE_RC"
+	fi
+	pulse_repo_dormancy_prepare "$repo_slug"
+
+	local issue_json="" issue_dispatch_err="" snapshot_source_file=""
+	issue_dispatch_err=$(mktemp) || {
+		printf '[]\n'
+		return 1
+	}
+	snapshot_source_file=$(mktemp) || {
+		rm -f "$issue_dispatch_err"
+		printf '[]\n'
+		return 1
+	}
+	if issue_json=$(_pulse_fetch_candidate_issue_snapshot_json \
+		"$repo_slug" "$limit" "$issue_dispatch_err" "$snapshot_source_file"); then
+		snapshot_available=1
+		snapshot_source=$(<"$snapshot_source_file")
+		case "$snapshot_source" in
+		live | graphql-retry) snapshot_succeeded=1 ;;
+		*) snapshot_succeeded=0 ;;
+		esac
+	else
 		issue_json="[]"
 	fi
-	rm -f "$issue_dispatch_err"
 
 	# GH#30180: auto-dispatch is the worker-authorization boundary, not the
 	# later spawn boundary. Reconcile from the complete raw open-issue snapshot
@@ -306,46 +520,48 @@ list_dispatchable_issue_candidates_json() {
 		}
 	fi
 
-	local candidates_json=""
-	candidates_json=$(_filter_dispatchable_issue_candidates_json "$issue_json")
-
 	# Dependency-blocked children are filtered before ranking, so they cannot
 	# reach the dispatch-time readiness guard. Normalize once per bounded TTL
 	# whenever the fetched snapshot contains blocked work; this also covers a
 	# roadmap alongside unrelated runnable candidates.
-	if [[ "$dependency_normalization_mode" != "skip" ]] &&
-		printf '%s' "$issue_json" | jq -e 'any(.[]; any(.labels[]?; .name == "status:blocked"))' >/dev/null 2>&1 &&
-		declare -F normalize_repo_dependency_readiness_if_due >/dev/null 2>&1; then
-		normalize_repo_dependency_readiness_if_due "$repo_slug" >/dev/null 2>&1 || true
-		local refreshed_issue_json=""
-		if ! refreshed_issue_json=$(gh_issue_list --repo "$repo_slug" --state open --json number,title,url,assignees,labels,createdAt,updatedAt --limit "$limit" 2>/dev/null) ||
-			! _pulse_issue_snapshot_is_valid "$refreshed_issue_json"; then
+	if [[ "$snapshot_available" -eq 1 ]]; then
+		local normalized_issue_json=""
+		if normalized_issue_json=$(_pulse_normalize_candidate_issue_snapshot_json \
+			"$repo_slug" "$limit" "$dependency_normalization_mode" "$issue_json" \
+			"$issue_dispatch_err" "$snapshot_source_file"); then
+			issue_json="$normalized_issue_json"
+			snapshot_source=$(<"$snapshot_source_file")
+			case "$snapshot_source" in
+			live | graphql-retry) snapshot_succeeded=1 ;;
+			*) snapshot_succeeded=0 ;;
+			esac
+		else
 			issue_json='[]'
 			snapshot_succeeded=0
-		else
-			issue_json="$refreshed_issue_json"
+			snapshot_available=0
 		fi
-		candidates_json=$(_filter_dispatchable_issue_candidates_json "$issue_json")
+	fi
+	rm -f "$issue_dispatch_err" "$snapshot_source_file"
+
+	local candidates_json=""
+	candidates_json=$(_filter_dispatchable_issue_candidates_json "$issue_json") || {
+		snapshot_succeeded=0
+		snapshot_available=0
+	}
+	if [[ "$snapshot_source" == "cache" && "$candidates_json" == "[]" ]]; then
+		# Cached candidates are revalidated later, but a cache cannot prove absence.
+		snapshot_available=0
 	fi
 
-	if [[ -n "$raw_snapshot_file" ]]; then
-		(
-			umask 077
-			printf '%s\n' "$issue_json" >"$raw_snapshot_file"
-		) || {
-			printf '[pulse-wrapper] list_dispatchable_issue_candidates: unable to persist campaign snapshot for %s\n' \
-				"$repo_slug" >>"$LOGFILE"
-		}
-	fi
-	if [[ -n "$snapshot_status_file" ]]; then
-		(
-			umask 077
-			printf '%s\n' "$snapshot_succeeded" >"$snapshot_status_file"
-		) || true
-	fi
+	_pulse_persist_candidate_snapshot_evidence "$repo_slug" "$issue_json" \
+		"$snapshot_succeeded" "$limit" "$raw_snapshot_file" \
+		"$snapshot_status_file" "$completeness_file" "$dependency_normalization_mode"
+
+	pulse_repo_dormancy_observe_candidates "$repo_slug" "$issue_json" "$candidates_json" "$snapshot_succeeded" "$limit"
 
 	printf '%s\n' "$candidates_json"
-	return 0
+	[[ "$snapshot_available" -eq 1 ]]
+	return $?
 }
 
 _filter_dispatchable_issue_candidates_json() {
@@ -353,7 +569,7 @@ _filter_dispatchable_issue_candidates_json() {
 	local infrastructure_advisory_jq="" jq_program=""
 	infrastructure_advisory_jq=$(infrastructure_advisory_jq_definition) || {
 		printf '[]\n'
-		return 0
+		return 1
 	}
 	# shellcheck disable=SC2016  # jq variables are literal program syntax
 	jq_program="${infrastructure_advisory_jq}"$'\n''
@@ -383,12 +599,17 @@ _filter_dispatchable_issue_candidates_json() {
 			# candidate build and dispatch.
 			select(($labels | index("parent-task")) == null) |
 			select(($labels | index("no-auto-dispatch")) == null) |
+			select(($labels | index("status:needs-info")) == null) |
+			# hold-for-review is a maintainer hold the dispatch policy gate always
+			# blocks (HOLD_FOR_REVIEW_BLOCKED). Evaluating it cost a 40-110s
+			# ceremony per runner per cycle before that late rejection.
+			select(($labels | index("hold-for-review")) == null) |
 			(($labels | index($auto_dispatch_label)) != null) as $has_auto_dispatch |
 			select((($labels | index("status:in-progress")) == null) or $has_auto_dispatch) |
 			select((($labels | index("status:in-review")) == null) or $has_auto_dispatch) |
 			select((($labels | index("status:claimed")) == null) or $has_auto_dispatch) |
 			select(($labels | index("status:done")) == null) |
-			{
+			({
 				number,
 				title,
 				url,
@@ -396,11 +617,16 @@ _filter_dispatchable_issue_candidates_json() {
 				updatedAt,
 				labels: $labels,
 				assignees: $assignees
-			}
+			} +
+			# GH#35038: keep a fetched body only for consolidated issues, so
+			# the pre-ranking consolidated filter can recognize canonical
+			# successor specs without carrying every body through ranking.
+			(if (($labels | index("consolidated")) != null) and has("body")
+				then {body: (.body // "")} else {} end))
 		]
 	'
 	printf '%s' "$issue_json" | jq -c --arg auto_dispatch_label 'auto-dispatch' \
-		"$jq_program" 2>/dev/null || printf '[]\n'
+		"$jq_program" 2>/dev/null || { printf '[]\n'; return 1; }
 	return 0
 }
 
@@ -411,6 +637,7 @@ _filter_dispatchable_issue_candidates_json() {
 # Candidate rules:
 # - open and not blocked
 # - exclude any issue carrying a needs-* label (e.g. needs-maintainer-review)
+# - exclude status:needs-info while contributor evidence is outstanding
 # - include queued/in-progress/in-review states (status labels are not blockers)
 # - include assigned issues (assignment state is resolved by dedup/claim checks)
 # - exclude supervisor/persistent telemetry issues

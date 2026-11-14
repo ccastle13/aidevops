@@ -21,6 +21,12 @@ fi
 # shellcheck source=shared-constants.sh
 # shellcheck disable=SC1091  # This module's directory is resolved at runtime.
 source "${BASH_SOURCE[0]%/*}/shared-constants.sh"
+# Reuse the launcher's effort precedence without triggering model selection.
+# shellcheck source=headless-runtime-model.sh
+source "${BASH_SOURCE[0]%/*}/headless-runtime-model.sh"
+# Names-only admission shared with the early candidate filter.
+# shellcheck source=pulse-dispatch-lib-candidates.sh
+source "${BASH_SOURCE[0]%/*}/pulse-dispatch-lib-candidates.sh"
 
 #######################################
 # Transition a durably registered live worker from queued to in-progress.
@@ -117,7 +123,12 @@ _dlw_post_launch_hooks() {
 	fi
 
 	local dispatch_comment_body
-	local display_model="${selected_model:-auto-select (round-robin)}"
+	local display_model="${selected_model:-auto-select (ordered fallback)}"
+	local display_effort="resolved at launch"
+	if [[ -n "$selected_model" ]]; then
+		display_effort=$(resolve_headless_variant worker "$dispatch_tier" "$selected_model")
+		display_effort="${display_effort:-runtime default}"
+	fi
 	local aidevops_version="$AIDEVOPS_UNKNOWN_VERSION" opencode_version="$AIDEVOPS_UNKNOWN_VERSION"
 	if declare -F aidevops_find_version >/dev/null 2>&1; then
 		aidevops_version=$(aidevops_find_version 2>/dev/null || printf '%s' "$AIDEVOPS_UNKNOWN_VERSION")
@@ -132,6 +143,7 @@ Dispatching worker (deterministic).
 - **Worker PID**: ${worker_pid}
 - **Model**: ${display_model}
 - **Tier**: ${dispatch_tier}
+- **Effort**: ${display_effort}
 - **Runner**: ${self_login}
 - **aidevops**: $(_dlw_display_version_or_unknown "$aidevops_version")
 - **OpenCode**: $(_dlw_display_version_or_unknown "$opencode_version")
@@ -230,8 +242,11 @@ _dlw_canary_last_failure_reason() {
 
 _dlw_canary_failure_is_soft() {
 	local reason="$1"
+	# GH#36698: model_unavailable stays soft (as the provider_error it was
+	# previously classified as); the canary records a model-only backoff, so
+	# the worker selector moves to the next same-tier candidate.
 	case "$reason" in
-		inconclusive | overload | provider_error | rate_limit | timeout | transient)
+		inconclusive | overload | provider_error | rate_limit | timeout | transient | model_unavailable)
 			return 0
 			;;
 	esac
@@ -296,6 +311,17 @@ _dlw_claim_lock_after_canary() {
 	local repo_slug="$2"
 	local self_login="$3"
 	local _ds_t0
+	# Re-read declarations immediately before the first persistent claim write.
+	# repo_path is dynamically scoped by _dispatch_launch_worker, as are
+	# the other launch gate inputs. Missing context must fail closed too.
+	[[ -n "${repo_path:-}" ]] || return 1
+	# shellcheck source=runner-capability-helper.sh
+	source "${SCRIPT_DIR}/runner-capability-helper.sh"
+	_ds_t0=$(_ds_now_ns)
+	local capability_rc=0
+	runner_capability_check_fresh "${repo_path:-}" "$issue_number" "$repo_slug" "$LOGFILE" || capability_rc=$?
+	_ds_record "$issue_number" "$repo_slug" "preclaim_issue_read" "$_ds_t0"
+	[[ "$capability_rc" -eq 0 ]] || return 1
 
 	# t3549: acquire the cross-runner GitHub claim only after the canary proves
 	# this runtime can start. Otherwise canary timeout storms publish persistent
@@ -480,6 +506,38 @@ _dlw_prebootstrap_gates() {
 	return 0
 }
 
+#######################################
+# Prepare the worker log, then run the pre-bootstrap gates. Both steps run
+# before resolve_tier_model and record entry and completion stage events, so a
+# slow step stays attributable even when a per-candidate timeout kills it.
+# Sets _DLW_WORKER_LOG for the launch orchestrator.
+# Args: issue number, repo slug, issue metadata JSON, repo path
+# Returns: 0 to continue, otherwise the pre-runtime failure return code
+#######################################
+_dlw_timed_log_and_prebootstrap() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local issue_meta_json="$3"
+	local repo_path="$4"
+	local _ds_t0="" _ds_stage_attempt_id=""
+	_DLW_WORKER_LOG=""
+
+	_ds_t0=$(_ds_now_ns)
+	_ds_stage_start "$issue_number" "$repo_slug" "setup_worker_log" "$_ds_t0" _ds_stage_attempt_id
+	_DLW_WORKER_LOG=$(_dlw_setup_worker_log "$repo_slug" "$issue_number")
+	_ds_record "$issue_number" "$repo_slug" "setup_worker_log" "$_ds_t0"
+
+	_ds_t0=$(_ds_now_ns)
+	_ds_stage_start "$issue_number" "$repo_slug" "prebootstrap_gates" "$_ds_t0" _ds_stage_attempt_id
+	if ! _dlw_prebootstrap_gates "$issue_number" "$repo_slug" "$issue_meta_json" "$repo_path"; then
+		_ds_record "$issue_number" "$repo_slug" "prebootstrap_gates" "$_ds_t0"
+		_dlw_pre_runtime_failure "$issue_number" "$repo_slug" "prebootstrap_gate" 2 || return $?
+		return 0
+	fi
+	_ds_record "$issue_number" "$repo_slug" "prebootstrap_gates" "$_ds_t0"
+	return 0
+}
+
 _dlw_issue_still_open_before_claim() {
 	local issue_number="$1"
 	local repo_slug="$2"
@@ -537,6 +595,36 @@ _dlw_pre_runtime_failure() {
 	_ds_record "$issue_number" "$repo_slug" "pre_runtime_failure:${reason}" "$failure_started_ns"
 	echo "[dispatch_with_dedup] PRE_RUNTIME_FAILURE issue=${issue_number} repo=${repo_slug} reason=${reason}" >>"$LOGFILE"
 	return "$return_code"
+}
+
+#######################################
+# Stage-boundary check against the fixed prelaunch deadline set by
+# _dlw_begin_prelaunch (a local of _dispatch_launch_worker). Mode
+# "publication" (GH#35602) also requires the reserve that queued ownership
+# publication, the live open-issue guard and spawn need, so ownership is
+# never published when the remaining budget cannot reach spawn. The reserve
+# never slides the deadline. AIDEVOPS_DISPATCH_PUBLICATION_RESERVE_SECONDS:
+# default 75 (assign_and_label max ~51 s + live guard/spawn ~25 s); 0 = off.
+# Args: issue number, repo slug, optional mode ("publication")
+#######################################
+_dlw_prelaunch_budget_available() {
+	local issue_number="$1" repo_slug="$2" mode="${3:-}"
+	local reserve=0 remaining=0
+	[[ "${prelaunch_deadline:-0}" -gt 0 ]] || return 0
+	remaining=$((prelaunch_deadline - SECONDS))
+	if [[ "$remaining" -le 0 ]]; then
+		_dlw_pre_runtime_failure "$issue_number" "$repo_slug" "prelaunch_budget_exhausted" 2
+		return $?
+	fi
+	if [[ "$mode" == "publication" ]]; then
+		reserve="${AIDEVOPS_DISPATCH_PUBLICATION_RESERVE_SECONDS:-75}"
+		[[ "$reserve" =~ ^[0-9]{1,3}$ ]] || reserve=75
+		if [[ "$remaining" -lt "$((10#$reserve))" ]]; then
+			_dlw_pre_runtime_failure "$issue_number" "$repo_slug" "prelaunch_reserve_insufficient" 2
+			return $?
+		fi
+	fi
+	return 0
 }
 
 _dlw_final_worker_spawn_gates() {

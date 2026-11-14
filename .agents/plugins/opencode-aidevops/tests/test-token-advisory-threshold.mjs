@@ -11,7 +11,13 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createSessionStartGreetingGate, createTtsrHooks } from "../ttsr.mjs";
+import { createRootSessionGreetingGate, openCodeV1SessionLookup } from "../root-session-greeting-gate.mjs";
+import { createTtsrHooks } from "../ttsr.mjs";
+
+// OpenCode 1 wiring (index.mjs): the shared root gate over the V1 SDK lookup.
+function createV1GreetingGate(client) {
+  return createRootSessionGreetingGate({ getSession: openCodeV1SessionLookup(client) });
+}
 
 function createHooks(options = {}) {
   const logs = [];
@@ -25,6 +31,9 @@ function createHooks(options = {}) {
     intentField: "agent__intent",
     isHeadless: options.isHeadless || (() => false),
     shouldInjectGreeting: options.shouldInjectGreeting,
+    // The plugin greeting is on by default (AIDEVOPS_PLUGIN_SESSION_GREETING=0
+    // disables it); cases pass greetingEnabled to cover the disabled path.
+    greetingEnabled: options.greetingEnabled || (() => true),
     readGreetingCache: options.readGreetingCache,
     now: options.now,
     refreshTtlMs: options.refreshTtlMs,
@@ -52,7 +61,7 @@ function advisoryMessages(output) {
 }
 
 describe("token cost advisory threshold", () => {
-  test("prepends session greeting order to system prompt", async () => {
+  test("appends session greeting after durable system guidance", async () => {
     const { hooks } = createHooks({
       readIfExists: (path) => path.endsWith("VERSION") ? "3.14.23\n" : "",
       readGreetingCache: () => ({
@@ -67,11 +76,12 @@ describe("token cost advisory threshold", () => {
 
     await hooks.systemTransformHook({ model: { providerID: "openai" } }, output);
 
-    assert.match(output.system[0], /Session-start greeting order/);
-    assert.match(output.system[0], /authoritative greeting instruction/);
-    assert.match(output.system[0], /do not read the greeting cache or VERSION/);
-    assert.match(output.system[0], /this exact aidevops greeting/);
-    assert.match(output.system[0], /We're running aidevops v3\.14\.23 in OpenCode v1\.14\.33\./);
+    assert.equal(output.system[0], "base system prompt");
+    assert.match(output.system.at(-1), /Session-start greeting order/);
+    assert.match(output.system.at(-1), /authoritative greeting instruction/);
+    assert.match(output.system.at(-1), /do not read the greeting cache or VERSION/);
+    assert.match(output.system.at(-1), /this exact aidevops greeting/);
+    assert.match(output.system.at(-1), /We're running aidevops v3\.14\.23 in OpenCode v1\.14\.33\./);
     assert.equal(output.system.filter((entry) => entry.includes("Session-start greeting order")).length, 1);
   });
 
@@ -83,7 +93,7 @@ describe("token cost advisory threshold", () => {
 
     await hooks.systemTransformHook({ model: { providerID: "openai" } }, output);
 
-    assert.match(output.system[0], /We're running aidevops v3\.14\.23\./);
+    assert.match(output.system.at(-1), /We're running aidevops v3\.14\.23\./);
   });
 
   test("trims fallback aidevops version whitespace", async () => {
@@ -94,8 +104,8 @@ describe("token cost advisory threshold", () => {
 
     await hooks.systemTransformHook({ model: { providerID: "openai" } }, output);
 
-    assert.match(output.system[0], /We're running aidevops v3\.14\.23\./);
-    assert.doesNotMatch(output.system[0], /v3\.14\.23\r/);
+    assert.match(output.system.at(-1), /We're running aidevops v3\.14\.23\./);
+    assert.doesNotMatch(output.system.at(-1), /v3\.14\.23\r/);
   });
 
   test("keeps startup advisory messages out of chat instructions", async () => {
@@ -113,11 +123,11 @@ describe("token cost advisory threshold", () => {
 
     await hooks.systemTransformHook({ model: { providerID: "openai" } }, output);
 
-    assert.match(output.system[0], /Do not include startup status or advisory messages in chat/);
-    assert.doesNotMatch(output.system[0], /cache lines/);
-    assert.doesNotMatch(output.system[0], /\[SECURITY ADVISORY\] Rotate test credentials/);
-    assert.doesNotMatch(output.system[0], /\[WARN\] Pulse stalled for 12 minutes/);
-    assert.doesNotMatch(output.system[0], /Security: all protections active/);
+    assert.match(output.system.at(-1), /Do not include startup status or advisory messages in chat/);
+    assert.doesNotMatch(output.system.at(-1), /cache lines/);
+    assert.doesNotMatch(output.system.at(-1), /\[SECURITY ADVISORY\] Rotate test credentials/);
+    assert.doesNotMatch(output.system.at(-1), /\[WARN\] Pulse stalled for 12 minutes/);
+    assert.doesNotMatch(output.system.at(-1), /Security: all protections active/);
   });
 
   test("avoids duplicate greeting after salutation-only launch input", async () => {
@@ -133,8 +143,8 @@ describe("token cost advisory threshold", () => {
 
     await hooks.systemTransformHook({ model: { providerID: "openai" } }, output);
 
-    assert.match(output.system[0], /do not add any additional salutations, greetings, introductory questions, or equivalent help prompts/);
-    assert.doesNotMatch(output.system[0], /How can I help you\?/);
+    assert.match(output.system.at(-1), /do not add any additional salutations, greetings, introductory questions, or equivalent help prompts/);
+    assert.doesNotMatch(output.system.at(-1), /How can I help you\?/);
   });
 
   test("does not inject session greeting order in headless sessions", async () => {
@@ -146,9 +156,9 @@ describe("token cost advisory threshold", () => {
     assert.equal(output.system[0], "base system prompt");
   });
 
-  test("injects the greeting only on the first request of an interactive root session", async () => {
+  test("keeps the identical greeting on every request of an interactive root session", async () => {
     const client = { session: { get: async () => ({ data: { id: "root-session" } }) } };
-    const shouldInjectGreeting = createSessionStartGreetingGate(client);
+    const shouldInjectGreeting = createV1GreetingGate(client);
     const { hooks } = createHooks({ shouldInjectGreeting });
     const first = { system: ["base system prompt"] };
     const later = { system: ["base system prompt"] };
@@ -156,13 +166,15 @@ describe("token cost advisory threshold", () => {
     await hooks.systemTransformHook({ sessionID: "root-session", model: { providerID: "openai" } }, first);
     await hooks.systemTransformHook({ sessionID: "root-session", model: { providerID: "openai" } }, later);
 
-    assert.match(first.system[0], /Session-start greeting order/);
+    // A stable greeting keeps the cached prefix identical across turns (GH#32444).
+    assert.match(first.system.at(-1), /Session-start greeting order/);
+    assert.deepEqual(later.system, first.system);
     assert.equal(later.system[0], "base system prompt");
   });
 
   test("does not inject the greeting into subagent sessions", async () => {
     const client = { session: { get: async () => ({ data: { id: "child-session", parentID: "root-session" } }) } };
-    const shouldInjectGreeting = createSessionStartGreetingGate(client);
+    const shouldInjectGreeting = createV1GreetingGate(client);
     const { hooks } = createHooks({ shouldInjectGreeting });
     const output = { system: ["base system prompt"] };
 
@@ -177,63 +189,81 @@ describe("token cost advisory threshold", () => {
 
     await hooks.systemTransformHook({ model: { providerID: "anthropic" } }, output);
 
-    assert.match(output.system[0], /Session-start greeting order/);
-    assert.equal(output.system[1], "You are Claude Code, Anthropic's official CLI for Claude.");
-    assert.match(output.system[2], /^You are Claude Code, Anthropic's official CLI for Claude\.\n\nbase system prompt/);
+    assert.equal(output.system[0], "You are Claude Code, Anthropic's official CLI for Claude.");
+    assert.match(output.system[1], /^You are Claude Code, Anthropic's official CLI for Claude\.\n\nbase system prompt/);
+    assert.match(output.system.at(-1), /Session-start greeting order/);
+    assert.equal(output.system.filter((entry) => entry.includes("Session-start greeting order")).length, 1);
   });
 
-  test("does not inject advisory below 300k tokens", async () => {
+  test("injects no plugin greeting unless explicitly enabled", async () => {
+    const { hooks } = createHooks({ greetingEnabled: () => false });
+    const output = { system: ["base system prompt"] };
+
+    await hooks.systemTransformHook({ model: { providerID: "openai" } }, output);
+
+    assert.ok(!output.system.some((entry) => entry.includes("Session-start greeting order")));
+  });
+
+  test("does not inject advisory below 400k tokens", async () => {
     const { hooks } = createHooks();
-    const output = outputForTokens(299_999);
+    const output = outputForTokens(399_999);
 
     await hooks.messagesTransformHook({}, output);
 
     assert.equal(advisoryMessages(output).length, 0);
   });
 
-  test("injects first advisory at 300k tokens", async () => {
+  test("injects first advisory at 400k tokens", async () => {
     const { hooks, logs } = createHooks();
-    const output = outputForTokens(300_000);
+    const output = outputForTokens(400_000);
 
     await hooks.messagesTransformHook({}, output);
 
     const advisories = advisoryMessages(output);
     assert.equal(advisories.length, 1);
-    assert.match(advisories[0].parts[0].text, /approximately 300k tokens/);
-    assert.deepEqual(logs, [{ level: "INFO", message: "Token advisory: session token-advisory-test-session at ~300k tokens" }]);
+    assert.match(advisories[0].parts[0].text, /approximately 400k tokens/);
+    assert.deepEqual(logs, [{ level: "INFO", message: "Token advisory: session token-advisory-test-session at ~400k tokens" }]);
   });
 
   test("does not inject advisory in headless sessions", async () => {
     const { hooks } = createHooks({ isHeadless: () => true });
-    const output = outputForTokens(300_000);
+    const output = outputForTokens(500_000);
 
     await hooks.messagesTransformHook({}, output);
 
     assert.equal(advisoryMessages(output).length, 0);
   });
 
-  test("does not inject advisory for GPT-5.5 family models", async () => {
+  test("injects the default advisory for GPT-5.5 and newer ordinary models", async () => {
     const { hooks } = createHooks();
-    const output = outputForTokens(300_000);
+    const gpt55 = outputForTokens(400_000, "gpt55-session");
+    const gpt6 = outputForTokens(400_000, "gpt6-session");
 
-    await hooks.messagesTransformHook({ model: { modelID: "gpt-5.5-fast" } }, output);
+    await hooks.messagesTransformHook({ model: { modelID: "gpt-5.5-fast" } }, gpt55);
+    await hooks.messagesTransformHook({ model: { modelID: "gpt-6" } }, gpt6);
 
-    assert.equal(advisoryMessages(output).length, 0);
+    assert.equal(advisoryMessages(gpt55).length, 1);
+    assert.equal(advisoryMessages(gpt6).length, 1);
   });
 
-  test("does not inject advisory for models newer than GPT-5.5", async () => {
-    const { hooks } = createHooks();
-    const output = outputForTokens(300_000);
+  test("starts Astra, Grok, and Gemini advisories at 500k", async () => {
+    for (const modelID of ["gpt-6-astra", "grok-4", "gemini-3-pro"]) {
+      const { hooks } = createHooks();
+      const below = outputForTokens(499_999, `${modelID}-session`);
+      const atThreshold = outputForTokens(500_000, `${modelID}-session`);
 
-    await hooks.messagesTransformHook({ model: { modelID: "gpt-6" } }, output);
+      await hooks.messagesTransformHook({ model: { modelID } }, below);
+      await hooks.messagesTransformHook({ model: { modelID } }, atThreshold);
 
-    assert.equal(advisoryMessages(output).length, 0);
+      assert.equal(advisoryMessages(below).length, 0);
+      assert.equal(advisoryMessages(atThreshold).length, 1);
+    }
   });
 
   test("does not repeat at the same threshold for a session", async () => {
     const { hooks } = createHooks();
-    const first = outputForTokens(300_000);
-    const second = outputForTokens(325_000);
+    const first = outputForTokens(400_000);
+    const second = outputForTokens(425_000);
 
     await hooks.messagesTransformHook({}, first);
     await hooks.messagesTransformHook({}, second);
@@ -244,14 +274,14 @@ describe("token cost advisory threshold", () => {
 
   test("fires again at the next 50k interval", async () => {
     const { hooks } = createHooks();
-    const first = outputForTokens(300_000);
-    const second = outputForTokens(350_000);
+    const first = outputForTokens(400_000);
+    const second = outputForTokens(450_000);
 
     await hooks.messagesTransformHook({}, first);
     await hooks.messagesTransformHook({}, second);
 
     const advisories = advisoryMessages(second);
     assert.equal(advisories.length, 1);
-    assert.match(advisories[0].parts[0].text, /approximately 350k tokens/);
+    assert.match(advisories[0].parts[0].text, /approximately 450k tokens/);
   });
 });

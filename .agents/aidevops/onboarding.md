@@ -34,6 +34,7 @@ Hand-fix: `"tools": {}` (not `[]`), `"type": "local"|"remote"`, `"tool_name": tr
 5. **Guide service-by-service setup**: purpose → credential source → setup command → verification
 6. **Per-repo platform setup**: after `gh auth login` succeeds, mention `/setup-git` for per-repo secrets (SYNC_PAT for issue-sync, etc.) — see "Scope" note below.
 7. **Optional Buzz team**: after a supported Buzz Desktop build is installed, generate and import the canonical **AI DevOps** team through the owner-review flow below.
+8. **Optional GitHub webhooks**: for users interested in event latency or further API optimisation, offer [webhook onboarding](../reference/github-webhook-onboarding.md). Outbound-only polling is the default; no domain, public ingress, VPN, or webhook secret is required. Explain Cloudflare Tunnel, NetBird native ingress, and the separate-gateway route for Cloudron before seeking live setup approval. The webhook secret belongs in Settings → Webhooks, not Actions secrets.
 
 ## Outcome Examples
 
@@ -80,11 +81,13 @@ The two workflows compose: `/onboarding` first (you need `gh` to be authenticate
 | Quality | Snyk | `SNYK_TOKEN` | https://app.snyk.io/account |
 | SEO | DataForSEO | `DATAFORSEO_USERNAME`, `DATAFORSEO_PASSWORD` | https://app.dataforseo.com/api-access |
 | SEO | Serper | `SERPER_API_KEY` | https://serper.dev/api-key |
+| SEO | SerpApi | `SERPAPI_API_KEY` | https://serpapi.com/ (account → API key) |
 | SEO | Outscraper | `OUTSCRAPER_API_KEY` | https://outscraper.com/dashboard |
+| Data | GetAnyAPI | `ANYAPI_API_KEY` | https://getanyapi.com/dashboard |
+| Data | Linkup (web search/fetch) | `LINKUP_<ACCOUNT>_API_KEY` | https://app.linkup.so |
 | SEO | Google Search Console | OAuth via MCP | https://search.google.com/search-console |
 | Context | Context7 | MCP config only | — |
 | Browser | Playwright | `npx playwright install` | — |
-| Browser | Stagehand | OpenAI/Anthropic key required | — |
 | Browser | Chrome DevTools | `--remote-debugging-port=9222` | — |
 | Containers | OrbStack | `brew install orbstack` — docs: `@orbstack` | — |
 | Containers | Tailscale | `brew install tailscale` — docs: `@tailscale` | — |
@@ -169,8 +172,8 @@ chmod 600 ~/.config/aidevops/credentials.sh && chmod 700 ~/.config/aidevops
 
 - **Layers**: Main agents (Tab) → subagents (`@name`) → commands (`/name`)
 - **Main**: generated from the canonical roster; currently `Aidevops`, `Automate`, `Build+`, `Business`, `Content`, `Health`, `Legal`, `Marketing-Sales`, `PR`, `Product`, `Reports`, `Research`, `SEO`, `Vault` | **Init**: `cd ~/your-project && aidevops init`
-- **Subagents**: `@hetzner`, `@cloudflare`, `@cloudron`, `@coolify`, `@vercel`, `@github-cli`, `@dataforseo`, `@code-standards`, `@wp-dev`, `@calendar`
-- **Commands**: `/create-prd`, `/generate-tasks`, `/feature`, `/bugfix`, `/hotfix`, `/pr`, `/preflight`, `/release`, `/linters-local`, `/keyword-research`
+- **Subagents**: `@hetzner`, `@cloudflare`, `@cloudron`, `@coolify`, `@vercel`, `@github-cli`, `@dataforseo`, `@getanyapi`, `@code-standards`, `@wp-dev`, `@calendar`
+- **Commands**: `/define`, `/new-task`, `/save-todo`, `/full-loop`, `/review`, `/pr`, `/preflight`, `/release`, `/seo` (runtime pickers list them with an `aidevops-` prefix)
 
 ## Repo Sync & Orchestration
 
@@ -191,5 +194,5 @@ Settings: `settings-helper.sh list`. Cost note: subscription plans (Claude Max/P
 
 1. **Playground**: `mkdir ~/Git/aidevops-playground && cd $_ && git init && aidevops init`
 2. **Smoke test**: "List my GitHub repos" or "Check my Hetzner servers"
-3. **First flow**: `/create-prd` → `/generate-tasks` → `/feature` → build → `/release`
+3. **First flow**: `/define` → `/full-loop` → `/release`
 4. **Orchestration**: see `scripts/commands/runners.md`, add `#auto-dispatch` to a TODO.md task

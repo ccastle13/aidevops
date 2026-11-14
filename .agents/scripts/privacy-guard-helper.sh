@@ -35,12 +35,16 @@ set -u
 # Configuration
 # =============================================================================
 
-PRIVACY_REPOS_CONFIG="${PRIVACY_REPOS_CONFIG:-$HOME/.config/aidevops/repos.json}"
-PRIVACY_CACHE_FILE="${PRIVACY_CACHE_FILE:-$HOME/.aidevops/cache/repo-privacy.json}"
+PRIVACY_REPOS_CONFIG="${PRIVACY_REPOS_CONFIG:-${HOME:-}/.config/aidevops/repos.json}"
+PRIVACY_CACHE_FILE="${PRIVACY_CACHE_FILE:-${HOME:-}/.aidevops/cache/repo-privacy.json}"
 PRIVACY_CACHE_TTL="${PRIVACY_CACHE_TTL:-600}" # 10 minutes
+# Private-slug enumeration needs last-known visibility, not push-time
+# freshness: nothing on the enumeration path refreshes the cache, so a short
+# TTL turns every known-public repo "private" minutes after its last probe.
+PRIVACY_ENUM_PUBLIC_TTL="${PRIVACY_ENUM_PUBLIC_TTL:-604800}" # 7 days
 # Optional local-only inventory. One `person: value`, `client: value`, or
 # `repo: owner/repo` entry per line; tabs are also accepted after the class.
-PRIVACY_ENTITY_CONFIG="${PRIVACY_ENTITY_CONFIG:-$HOME/.aidevops/configs/privacy-guard-private-entities.txt}"
+PRIVACY_ENTITY_CONFIG="${PRIVACY_ENTITY_CONFIG:-${HOME:-}/.aidevops/configs/privacy-guard-private-entities.txt}"
 # Paths whose diffs we scan. Default to the full repository because aidevops is
 # public and private names/paths must not land in code, docs, tests, or plans.
 # Override with PRIVACY_SCAN_GLOBS_TEXT as a newline/colon/comma-separated list.
@@ -170,19 +174,32 @@ privacy_is_target_public() {
 _privacy_cache_write() {
 	local slug="$1"
 	local private="$2"
-	local now
+	local now tmp
 	now=$(date +%s)
 
 	mkdir -p "$(dirname "$PRIVACY_CACHE_FILE")" 2>/dev/null || true
-	if [[ ! -f "$PRIVACY_CACHE_FILE" ]]; then
-		printf '{}\n' >"$PRIVACY_CACHE_FILE"
+	tmp=$(mktemp "${PRIVACY_CACHE_FILE}.XXXXXX" 2>/dev/null) || return 0
+	# shellcheck disable=SC2016 # jq variables must reach jq literally.
+	local -a jq_args=(--arg slug "$slug" --arg private "$private" --argjson now "$now"
+		'.[$slug] = {private: ($private == "true"), checked_at: $now}')
+	# t18917: a sudo-run caller can leave the cache root-owned (unreadable) or
+	# it can be corrupt; either way the merge fails and the cache would never
+	# recover. Rebuild from an empty object instead. The mv below replaces an
+	# unreadable file because the cache directory is user-owned.
+	if ! { [[ -r "$PRIVACY_CACHE_FILE" ]] && jq "${jq_args[@]}" "$PRIVACY_CACHE_FILE" >"$tmp" 2>/dev/null; }; then
+		if ! printf '{}\n' | jq "${jq_args[@]}" >"$tmp" 2>/dev/null; then
+			rm -f "$tmp"
+			return 0
+		fi
 	fi
-
-	local tmp
-	tmp=$(mktemp "${PRIVACY_CACHE_FILE}.XXXXXX")
-	jq --arg slug "$slug" --arg private "$private" --argjson now "$now" \
-		'.[$slug] = {private: ($private == "true"), checked_at: $now}' \
-		"$PRIVACY_CACHE_FILE" >"$tmp" 2>/dev/null && mv "$tmp" "$PRIVACY_CACHE_FILE" || rm -f "$tmp"
+	if ! mv -f "$tmp" "$PRIVACY_CACHE_FILE" 2>/dev/null; then
+		rm -f "$tmp"
+		return 0
+	fi
+	# Hand a sudo-written cache back to the real user (approval-helper.sh pattern).
+	if [[ -n "${SUDO_USER:-}" && "$(id -u)" -eq 0 ]]; then
+		chown "$SUDO_USER" "$PRIVACY_CACHE_FILE" 2>/dev/null || true
+	fi
 	return 0
 }
 
@@ -197,7 +214,8 @@ _privacy_cache_write() {
 #   - local_only: true (no remote, definitionally not public)
 #   - the slug's owner is the current gh user AND the repo is private on GH
 #
-# For speed, we use structural markers only (mirror_upstream, local_only).
+# Also: cached private visibility (repo-privacy.json) or `private: true`;
+# unknown visibility on pulse-enabled repos fails closed.
 # We do NOT probe every slug with gh api — that would cost N network calls
 # on every push. Users who want additional slugs covered can add them to
 # ~/.aidevops/configs/privacy-guard-extra-slugs.txt (one per line).
@@ -222,6 +240,46 @@ privacy_enumerate_private_slugs() {
 		)
 		| .slug // empty
 	' "$PRIVACY_REPOS_CONFIG" 2>/dev/null)
+
+	# Ordinary private repos: cached GitHub visibility (never a live API call).
+	# A repos.json `private: true` field always counts, whatever the cache says.
+	# Unknown visibility (no cache entry, or a public entry older than
+	# PRIVACY_ENUM_PUBLIC_TTL) fails closed only for pulse-enabled repos;
+	# known-public entries stay out so self-references and the public site name
+	# in signature footers remain allowed. Cached private entries remain
+	# protected even after expiry.
+	# A non-numeric TTL would make jq reject --argjson and silently drop this
+	# whole class of slugs, so fall back to the documented default instead.
+	local enum_ttl="$PRIVACY_ENUM_PUBLIC_TTL"
+	if [[ ! "$enum_ttl" =~ ^[0-9]{1,10}$ ]]; then
+		privacy_log WARN "PRIVACY_ENUM_PUBLIC_TTL must be whole seconds; using 604800"
+		enum_ttl=604800
+	fi
+	local cache_json='{}'
+	if [[ -r "$PRIVACY_CACHE_FILE" ]]; then
+		cache_json=$(jq -c 'if type == "object" then . else {} end' "$PRIVACY_CACHE_FILE" 2>/dev/null) || cache_json='{}'
+		[[ -n "$cache_json" ]] || cache_json='{}'
+	fi
+	local vis_slugs
+	# shellcheck disable=SC2016 # jq variables must reach jq literally.
+	vis_slugs=$(jq -r --argjson cache "$cache_json" \
+		--argjson now "$(date +%s)" --argjson ttl "$enum_ttl" '
+		.initialized_repos[]?
+		| select((.slug // "") != "")
+		| . as $r
+		| (($cache[$r.slug] // null)
+			| if .private == false and ($now - (.checked_at // 0)) >= $ttl
+			  then null else . end) as $c
+		| select(
+			($r.private // false) == true
+			or ($c != null and ($c.private // false) == true)
+			or ($c == null and ($r.pulse // false) == true)
+		)
+		| .slug
+	' "$PRIVACY_REPOS_CONFIG" 2>/dev/null || true)
+	if [[ -n "$vis_slugs" ]]; then
+		slugs=$(printf '%s\n%s\n' "$slugs" "$vis_slugs")
+	fi
 
 	# Also include extra user-configured slugs
 	local extra_file="$HOME/.aidevops/configs/privacy-guard-extra-slugs.txt"
@@ -305,11 +363,12 @@ privacy_scan_public_text() {
 	local entities_file="$2"
 	local aidevops_script_basenames_provided="${3+x}"
 	local aidevops_script_basenames="${3:-}"
-	local hits=0 class value secret_hits path_hits
+	local target_repo="${4:-}"
+	local hits=0 class value secret_hits path_hits basename escaped scan_text
 
 	[[ -f "$entities_file" ]] || return 2
 	[[ -z "$text" ]] && return 0
-	path_hits=$(privacy_scan_local_paths "$text")
+	path_hits=$(privacy_scan_local_paths "$text" "$target_repo")
 	case $? in
 	1) printf '%s\n' '[local-path]'; hits=$((hits + 1)) ;;
 	2) return 2 ;;
@@ -328,6 +387,20 @@ privacy_scan_public_text() {
 		if [[ "$text" == *"$value"* ]]; then
 			printf '[private-%s]\n' "$class"
 			hits=$((hits + 1))
+		elif [[ "$class" == "repo" ]]; then
+			basename="${value##*/}"
+			if [[ ${#basename} -ge "$PRIVACY_BARE_BASENAME_MIN_LEN" ]]; then
+				scan_text="$text"
+				if [[ "$basename" == "aidevops" ]]; then
+					scan_text="${scan_text//<!-- aidevops:sig -->/ }"
+					scan_text="${scan_text//<!-- aidevops:skipped-check:qlty-out-of-credits -->/ }"
+				fi
+				escaped=$(printf '%s' "$basename" | sed -E 's/[][(){}.^$*+?|\\]/\\&/g')
+				if printf '%s' "$scan_text" | grep -qE "(^|[^a-zA-Z0-9-])${escaped}([^a-zA-Z0-9-]|$)"; then
+					printf '[private-repo]\n'
+					hits=$((hits + 1))
+				fi
+			fi
 		fi
 	done <"$entities_file"
 	[[ "$hits" -gt 0 ]] && return 1
@@ -336,14 +409,14 @@ privacy_scan_public_text() {
 
 #######################################
 # Redact tagged private entities in locally previewed text.
-# Arguments: $1=text $2=entity inventory
+# Arguments: $1=text $2=entity inventory $3=optional public target slug
 #######################################
 privacy_redact_public_text() {
 	local text="$1"
 	local entities_file="$2"
 	local class value redacted="$text"
 	[[ -f "$entities_file" ]] || return 1
-	redacted=$(privacy_redact_local_paths "$redacted") || return 1
+	redacted=$(privacy_redact_local_paths "$redacted" "${3:-}") || return 1
 	while IFS=$'\t' read -r class value || [[ -n "$class" ]]; do
 		[[ -z "$class" || -z "$value" ]] && continue
 		redacted="${redacted//"$value"/[private-${class}]}"
@@ -378,15 +451,21 @@ privacy_redact_public_text_from_inventory() {
 # Replace local filesystem paths before rendering text for a public surface.
 # Mirrors privacy_scan_local_paths() so callers can preserve useful dashboard
 # data without bypassing the public-write privacy guard.
-# Arguments: $1=text
+# Arguments: $1=text $2=optional public target slug
 #######################################
 privacy_redact_local_paths() {
 	local text="$1"
+	local target_repo="${2:-}"
+	local folders='Git|Projects|Code|src|work|dev'
+	if [[ -n "$target_repo" ]]; then
+		text=$(_privacy_transform_git_paths "$text" "$target_repo" redact) || return 1
+		folders='Projects|Code|src|work|dev'
+	fi
 	# shellcheck disable=SC2016  # sed expressions intentionally use single quotes
 	printf '%s' "$text" | sed -E \
 		-e 's%(^|[[:space:]`"(:=])/Users/[^[:space:]`")]*%\1[local-path]%g' \
 		-e 's%(^|[[:space:]`"(:=])/home/[^[:space:]`")]*%\1[local-path]%g' \
-		-e 's%(^|[[:space:]`"(:=])~/(Git|Projects|Code|src|work|dev)/[^[:space:]`")]*%\1[local-path]%g' \
+		-e "s%(^|[[:space:]\`\"(:=])~/(${folders})/[^[:space:]\`\")]*%\\1[local-path]%g" \
 		-e 's%(^|[[:space:]`"(:=])file:///(Users|home)/[^[:space:]`")]*%\1[local-path]%g'
 	return 0
 }
@@ -422,7 +501,7 @@ privacy_guard_public_write() {
 		printf '[privacy-guard][BLOCK] Private entity inventory could not be loaded.\n' >&2
 		return 1
 	fi
-	hits=$(privacy_scan_public_text "$text" "$entities_file")
+	hits=$(privacy_scan_public_text "$text" "$entities_file" "$(_privacy_aidevops_script_reference_basenames)" "$repo")
 	scan_rc=$?
 	rm -f "$entities_file"
 	if [[ "$scan_rc" -eq 1 ]]; then
@@ -520,6 +599,14 @@ privacy_scan_bare_basenames() {
 	local matched_full_slugs="$3"
 	local slug owner basename escaped_basename
 	local hits=0
+	local framework_text="$text"
+	local scan_text
+	# Only these literal metadata tokens identify the framework, not a private
+	# repository. Do not exempt arbitrary aidevops comments or their payloads.
+	# Full-slug, local-path and secret scans continue to inspect the original.
+	# Preserve word boundaries for prose immediately beside either marker.
+	framework_text="${framework_text//<!-- aidevops:sig -->/ }"
+	framework_text="${framework_text//<!-- aidevops:skipped-check:qlty-out-of-credits -->/ }"
 
 	while IFS= read -r slug || [[ -n "$slug" ]]; do
 		# Skip blanks and comment lines.
@@ -543,8 +630,12 @@ privacy_scan_bare_basenames() {
 		fi
 
 		if [[ ${#basename} -ge "$PRIVACY_BARE_BASENAME_MIN_LEN" ]]; then
+			scan_text="$text"
+			if [[ "$basename" == "aidevops" ]]; then
+				scan_text="$framework_text"
+			fi
 			escaped_basename=$(printf '%s' "$basename" | sed -E 's/[][(){}.^$*+?|\\]/\\&/g')
-			if printf '%s' "$text" | grep -qE "(^|[^a-zA-Z0-9_-])${escaped_basename}([^a-zA-Z0-9_-]|$)" 2>/dev/null; then
+			if printf '%s' "$scan_text" | grep -qE "(^|[^a-zA-Z0-9-])${escaped_basename}([^a-zA-Z0-9-]|$)" 2>/dev/null; then
 				if [[ -n "$owner" ]]; then
 					printf '%s (basename of %s)\n' "$basename" "$slug"
 				else
@@ -660,9 +751,36 @@ privacy_scan_text() {
 # Returns:
 #   0 if no hits, 1 if at least one hit, 2 on setup error.
 #######################################
+_privacy_transform_git_paths() {
+	local text="$1" target_repo="$2" mode="$3"
+	printf '%s' "$text" | awk -v slug="$target_repo" -v mode="$mode" '
+	BEGIN { split(slug, parts, "/"); repo=parts[2]; valid=(length(parts[1]) && length(repo) && !parts[3]) }
+	{
+		line=$0; out=""
+		while (match(line, /(^|[[:space:]`"\047(:=])~\/Git\/[^[:space:]`"\047)]*/)) {
+			prefix=substr(line, 1, RSTART-1); token=substr(line, RSTART, RLENGTH)
+			boundary=""; if (substr(token,1,1)!="~") { boundary=substr(token,1,1); token=substr(token,2) }
+			path=substr(token,7); n=split(path, p, "/")
+			allowed=valid && (p[1]==repo || (n>=2 && p[2]==repo))
+			for (i=1; i<=n; i++) if (p[i]==".." || p[i]==".") allowed=0
+			if (allowed) {
+				if (mode=="scan") { token="[public-repo-path]"; print "[privacy-scan][ALLOW] public repository path" > "/dev/stderr" }
+			} else if (mode=="redact") token="[local-path]"
+			out=out prefix boundary token; line=substr(line,RSTART+RLENGTH)
+		}
+		printf "%s%s", out line, (NR ? ORS : "")
+	}' || return 1
+	return 0
+}
+
 privacy_scan_local_paths() {
 	local text="$1"
+	local target_repo="${2:-}"
 	[[ -z "$text" ]] && return 0
+	local builtin_text="$text"
+	if [[ -n "$target_repo" ]]; then
+		builtin_text=$(_privacy_transform_git_paths "$text" "$target_repo" scan) || return 2
+	fi
 
 	local hits=0
 	local emitted_builtin=0
@@ -674,7 +792,7 @@ privacy_scan_local_paths() {
 	)
 	local pattern
 	for pattern in "${builtin_patterns[@]}"; do
-		if printf '%s' "$text" | grep -qE "$pattern" 2>/dev/null; then
+		if printf '%s' "$builtin_text" | grep -qE "$pattern" 2>/dev/null; then
 			if [[ "$emitted_builtin" -eq 0 ]]; then
 				printf '[local-path]\n'
 				emitted_builtin=1
@@ -823,6 +941,109 @@ privacy_scan_secret_material_text() {
 }
 
 #######################################
+# Stream a conservative candidate diff in one process. Synthetic one-line hunk
+# headers retain original line numbers for the authoritative scanners below.
+# Optional $3 lists ordinals (nth added line) selected by custom inventories.
+#######################################
+_privacy_builtin_candidate_diff() {
+	local diff_text="$1"
+	local mode="$2"
+	local extras_file="${3:-}"
+	printf '%s\n' "$diff_text" | awk -v credentials="$PRIVACY_CREDENTIAL_PREFIX_ERE" -v mode="$mode" -v debug="${PRIVACY_GUARD_DEBUG:-0}" -v extras="$extras_file" '
+		BEGIN { if (extras != "") while ((getline n < extras) > 0) extra[n + 0] = 1 }
+		/^\+\+\+ b\// { pem = 0; print; next }
+		/^\+\+\+ / { next }
+		/^@@ / {
+			header = $0
+			sub(/^@@ -[^+]*\+/, "", header)
+			split(header, fields, /[, ]/)
+			line = fields[1] + 0
+			next
+		}
+		/^\+/ {
+			text = substr($0, 2)
+			ordinal++
+			if (text ~ /-----BEGIN[[:space:]][A-Z0-9[:space:]]*PRIVATE[[:space:]]KEY-----/) pem = 1
+			candidate = pem || text ~ credentials || index(text, "PRIVATE") || (ordinal in extra)
+			if (mode == "public" && (index(text, "/" "Users/") || index(text, "/" "home/") || index(text, "~/") || index(text, "file://"))) candidate = 1
+			if (candidate) {
+				candidates++
+				printf "@@ -0,0 +%d,1 @@\n", line
+				print
+			}
+			if (text ~ /-----END[[:space:]][A-Z0-9[:space:]]*PRIVATE[[:space:]]KEY-----/) pem = 0
+			line++
+			next
+		}
+		/^ / { line++ }
+		END { if (debug == 1) printf "[privacy-guard][INFO] %s filter: %d diff lines, %d candidate lines\n", mode, NR, candidates > "/dev/stderr" }
+	'
+	return $?
+}
+
+#######################################
+# Select added-line ordinals matching custom inventories in two batched grep
+# passes (literal entity values, configured path regexes) instead of per-line
+# subprocesses. The authoritative per-line scanner still runs on candidates.
+# Arguments: $1=diff text $2=entity file $3=path-pattern file $4=output file
+# Returns: 0 ok, 1 unsupported rules (caller must fall back to full scan),
+#          2 error
+#######################################
+_privacy_custom_candidate_ordinals() {
+	local diff_text="$1"
+	local entities_file="$2"
+	local patterns_file="$3"
+	local out_file="$4"
+	local work texts values patterns class value pattern rc
+
+	work=$(mktemp -d) || return 2
+	texts="${work}/texts"
+	values="${work}/values"
+	patterns="${work}/patterns"
+	: >"$values"
+	: >"$patterns"
+	if ! : >"$out_file"; then
+		rm -rf "$work"
+		return 2
+	fi
+	if ! printf '%s\n' "$diff_text" | awk '/^\+\+\+ / { next } /^\+/ { print substr($0, 2) }' >"$texts"; then
+		rm -rf "$work"
+		return 2
+	fi
+	while IFS=$'\t' read -r class value || [[ -n "$class" ]]; do
+		[[ -z "$class" || -z "$value" ]] && continue
+		printf '%s\n' "$value" >>"$values"
+		if [[ "$class" == "repo" && ${#value} -ge "$PRIVACY_BARE_BASENAME_MIN_LEN" ]]; then
+			printf '%s\n' "${value##*/}" >>"$values"
+		fi
+	done <"$entities_file"
+	if [[ -f "$patterns_file" ]]; then
+		while IFS= read -r pattern || [[ -n "$pattern" ]]; do
+			[[ -z "$pattern" || "$pattern" == \#* ]] && continue
+			printf '%s\n' "$pattern" >>"$patterns"
+		done <"$patterns_file"
+	fi
+	if [[ -s "$values" ]]; then
+		grep -anF -f "$values" "$texts" 2>/dev/null | cut -d: -f1 >>"$out_file"
+		rc=${PIPESTATUS[0]}
+		if [[ "$rc" -gt 1 ]]; then
+			rm -rf "$work"
+			return 1
+		fi
+	fi
+	if [[ -s "$patterns" ]]; then
+		grep -anE -f "$patterns" "$texts" 2>/dev/null | cut -d: -f1 >>"$out_file"
+		rc=${PIPESTATUS[0]}
+		if [[ "$rc" -gt 1 ]]; then
+			rm -rf "$work"
+			return 1
+		fi
+	fi
+	rm -rf "$work"
+	return 0
+}
+
+#######################################
 # Scan all added diff lines for private-key material.
 # Arguments:
 #   $1 - base SHA (remote tip); may be all zeros for a new branch push
@@ -846,13 +1067,14 @@ privacy_scan_secret_material_diff() {
 	local diff_output
 	diff_output=$(git diff --unified=0 --no-color "$diff_base" "$head_sha" 2>/dev/null) || return 0
 	[[ -z "$diff_output" ]] && return 0
+	diff_output=$(_privacy_builtin_candidate_diff "$diff_output" secret) || return 2
 
 	local hits=0 current_file="" line_num=0 in_pem=0
 	local aidevops_script_basenames
 	aidevops_script_basenames=$(_privacy_aidevops_script_reference_basenames)
 	while IFS= read -r line; do
 		case "$line" in
-		"+++ b/"*) current_file="${line#+++ b/}"; line_num=0 ;;
+		"+++ b/"*) current_file="${line#+++ b/}"; line_num=0; in_pem=0 ;;
 		"--- "*) ;;
 		"@@ "*)
 			local rest="${line#@@ -*+}"
@@ -862,8 +1084,12 @@ privacy_scan_secret_material_diff() {
 		"+"*)
 			[[ "$line" == "+++ "* ]] && continue
 			local added="${line:1}"
-			local scan_added
-			scan_added=$(_privacy_redact_aidevops_script_references "$added" "$aidevops_script_basenames")
+			local scan_added="$added"
+			# Redaction only affects credential-like script references. Avoid a
+			# subshell on every ordinary added line, without skipping PEM state.
+			if [[ "$added" =~ $PRIVACY_CREDENTIAL_PREFIX_ERE ]]; then
+				scan_added=$(_privacy_redact_aidevops_script_references "$added" "$aidevops_script_basenames")
+			fi
 			if [[ "$scan_added" != "$added" ]]; then
 				printf '%s:%s: [privacy-scan][ALLOW] aidevops script file reference\n' "$current_file" "$line_num" >&2
 			fi
@@ -878,7 +1104,7 @@ privacy_scan_secret_material_diff() {
 			if [[ "$scan_added" =~ -----END[[:space:]][A-Z0-9[:space:]]*PRIVATE[[:space:]]KEY----- ]]; then
 				in_pem=0
 			fi
-			if printf '%s' "$scan_added" | grep -qE -- "$PRIVACY_CREDENTIAL_PREFIX_ERE"; then
+			if [[ "$scan_added" =~ $PRIVACY_CREDENTIAL_PREFIX_ERE ]]; then
 				printf '%s:%s: credential token prefix\n' "$current_file" "$line_num"
 				hits=$((hits + 1))
 			fi
@@ -1029,17 +1255,86 @@ privacy_scan_diff() {
 }
 
 #######################################
+# Replace already-public additions with context lines, preserving line counters.
+# Quoted/unrecognized paths receive no exemption. Blob bytes stay in a file so
+# shell command substitution cannot remove NUL bytes and create false matches.
+_privacy_exclude_public_lines() {
+	local diff_output="$1"
+	local public_head="$2"
+	local line current_file="" public_tree="" loaded=0 scratch in_hunk=0
+	scratch=$(mktemp -d) || return 2
+	while IFS= read -r line; do
+		if [[ "$line" == "diff --git "* ]]; then
+			current_file=""
+			in_hunk=0
+			loaded=0
+		elif [[ "$line" == "@@ "* ]]; then
+			in_hunk=1
+		elif [[ "$in_hunk" -eq 0 && "$line" == "+""++ b/"* ]]; then
+			current_file="${line#+""++ b/}"
+			loaded=0
+		elif [[ "$in_hunk" -eq 0 && "$line" == "+""++ "* ]]; then
+			current_file=""
+			loaded=0
+		elif [[ "$in_hunk" -eq 1 && "$line" == "+"* ]]; then
+			if [[ -n "$current_file" ]]; then
+				if [[ "$loaded" -eq 0 ]]; then
+					if ! public_tree=$(git ls-tree "$public_head" -- ":(literal)$current_file" 2>/dev/null); then
+						rm -rf "$scratch"
+						return 2
+					fi
+					if [[ -n "$public_tree" ]] && ! git show "${public_head}:${current_file}" >"${scratch}/blob" 2>/dev/null; then
+						rm -rf "$scratch"
+						return 2
+					fi
+					loaded=1
+				fi
+				if [[ -n "$public_tree" ]] && grep -aFx -- "${line:1}" "${scratch}/blob" >/dev/null; then
+					line=" ${line:1}"
+				fi
+			fi
+		fi
+		printf '%s\n' "$line"
+	done <<<"$diff_output"
+	rm -rf "$scratch"
+	return 0
+}
+
+#######################################
+# Do not approve a filtered scan if custom rules appeared or changed during it.
+_privacy_public_inventory_unchanged() {
+	local entities_file="$1"
+	local configured_paths="$2"
+	local filtered="$3"
+	local snap_dir="$4"
+	[[ -f "$entities_file" ]] || return 1
+	[[ "$filtered" -eq 1 && (-s "$entities_file" || -s "$configured_paths") ]] && return 1
+	if [[ "$filtered" -eq 2 ]]; then
+		local current_paths="$configured_paths" snap_paths="${snap_dir}/paths"
+		[[ -f "$current_paths" ]] || current_paths=/dev/null
+		[[ -f "$snap_paths" ]] || snap_paths=/dev/null
+		cmp -s "$entities_file" "${snap_dir}/entities" && cmp -s "$current_paths" "$snap_paths" || return 1
+	fi
+	return 0
+}
+
+#######################################
 # Scan added diff lines with the tagged public-entity scanner. Output contains
 # file/line context and generic hit classes only.
 # Arguments: $1=base SHA $2=head SHA $3=tagged entity inventory
+# Optional $4=verified public default tip: exclude identical lines in the same file.
 #######################################
 privacy_scan_public_diff() {
 	local base_sha="$1"
 	local head_sha="$2"
 	local entities_file="$3"
+	local public_head="${4:-}"
+	local target_repo="${5:-}"
 	local diff_base="$base_sha" diff_output
 	local current_file="" line_num=0 hits=0 line added matching_hits scan_rc hit
 	local aidevops_script_basenames
+	local configured_paths="$HOME/.aidevops/configs/privacy-guard-private-path-patterns.txt"
+	local filtered=0 snap_dir="" extras_file="" ordinals_rc
 
 	[[ -f "$entities_file" ]] || return 2
 	if [[ "$base_sha" =~ ^0+$ ]]; then
@@ -1049,6 +1344,39 @@ privacy_scan_public_diff() {
 		[[ -z "$diff_base" ]] && diff_base=$(git hash-object -t tree /dev/null)
 	fi
 	diff_output=$(git diff --unified=0 --no-color "$diff_base" "$head_sha" -- . 2>/dev/null) || return 2
+	# Keep raw file boundaries intact before the candidate filter drops headers.
+	if [[ -n "$public_head" ]]; then
+		diff_output=$(_privacy_exclude_public_lines "$diff_output" "$public_head") || return 2
+	fi
+	if [[ ! -s "$entities_file" && ! -s "$configured_paths" ]]; then
+		diff_output=$(_privacy_builtin_candidate_diff "$diff_output" public) || return 2
+		filtered=1
+	else
+		# Custom inventories: batch candidate selection against a snapshot;
+		# unsupported rules (e.g. an invalid regex) fall back to the full scan.
+		snap_dir=$(mktemp -d) || return 2
+		extras_file="${snap_dir}/ordinals"
+		if ! cp "$entities_file" "${snap_dir}/entities" 2>/dev/null; then
+			rm -rf "$snap_dir"
+			return 2
+		fi
+		if [[ -f "$configured_paths" ]] && ! cp "$configured_paths" "${snap_dir}/paths" 2>/dev/null; then
+			rm -rf "$snap_dir"
+			return 2
+		fi
+		_privacy_custom_candidate_ordinals "$diff_output" "${snap_dir}/entities" "${snap_dir}/paths" "$extras_file"
+		ordinals_rc=$?
+		if [[ "$ordinals_rc" -eq 0 ]]; then
+			if ! diff_output=$(_privacy_builtin_candidate_diff "$diff_output" public "$extras_file"); then
+				rm -rf "$snap_dir"
+				return 2
+			fi
+			filtered=2
+		elif [[ "$ordinals_rc" -ne 1 ]]; then
+			rm -rf "$snap_dir"
+			return 2
+		fi
+	fi
 	aidevops_script_basenames=$(_privacy_aidevops_script_reference_basenames)
 	while IFS= read -r line; do
 		case "$line" in
@@ -1064,7 +1392,7 @@ privacy_scan_public_diff() {
 		"+"*)
 			[[ "$line" == "+""++ " ]] && continue
 			added="${line:1}"
-			matching_hits=$(privacy_scan_public_text "$added" "$entities_file" "$aidevops_script_basenames")
+			matching_hits=$(privacy_scan_public_text "$added" "$entities_file" "$aidevops_script_basenames" "$target_repo")
 			scan_rc=$?
 			if [[ "$scan_rc" -eq 1 ]]; then
 				while IFS= read -r hit; do
@@ -1072,6 +1400,7 @@ privacy_scan_public_diff() {
 				done <<<"$matching_hits"
 				hits=$((hits + 1))
 			elif [[ "$scan_rc" -ne 0 ]]; then
+				[[ -n "$snap_dir" ]] && rm -rf "$snap_dir"
 				return 2
 			fi
 			line_num=$((line_num + 1))
@@ -1079,6 +1408,11 @@ privacy_scan_public_diff() {
 		" "*) line_num=$((line_num + 1)) ;;
 		esac
 	done <<<"$diff_output"
+	if ! _privacy_public_inventory_unchanged "$entities_file" "$configured_paths" "$filtered" "$snap_dir"; then
+		[[ -n "$snap_dir" ]] && rm -rf "$snap_dir"
+		return 2
+	fi
+	[[ -n "$snap_dir" ]] && rm -rf "$snap_dir"
 	[[ "$hits" -gt 0 ]] && return 1
 	return 0
 }

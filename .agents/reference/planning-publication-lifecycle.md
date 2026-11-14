@@ -3,11 +3,48 @@
 
 # Atomic Task Dispatch and Planning Publication
 
-Decision record for GH#27791. This document defines how `/new-task`, task-ID
-allocation, planning publication, issue sync, and pulse dispatch must coordinate
-when `TODO.md` and `todo/**` are the canonical planning source.
+Decision record for GH#27791, superseded as the default by GH#34232. This
+document defines how `/new-task`, task-ID allocation, planning publication,
+issue sync, and pulse dispatch coordinate.
 
-## Decision
+## Current decision: issue-first (GH#34232)
+
+**Issues are the leading record; `TODO.md` and `todo/tasks/` are repository
+backups.** A worker-ready issue is dispatchable as soon as it is created.
+
+- `claim-task-id.sh` and `issue-sync-helper.sh push` create issues in the
+  `canonical` publication state by default: the intended `auto-dispatch` and
+  `status:available` labels are applied at creation, with no
+  `publication:pending`.
+- The issue body is composed from the validated brief at creation
+  (`_compose_issue_body`, Files Scope validation for interactive auto-dispatch),
+  so the default-branch copy adds latency, not information.
+- The creating session still commits the TODO row and brief as a backup. If it
+  never lands, Pulse TODO sync (`issue-sync-helper.sh pull`) seeds the orphan
+  row after `AIDEVOPS_ORPHAN_SEED_GRACE_HOURS` (default 6; `0` seeds
+  immediately), so the backup converges without racing the creator's own
+  planning commit.
+- Workers read the issue, never the default-branch brief, and never edit
+  `TODO.md`; a backup landing mid-run cannot change a running worker's input.
+- Companion files an issue genuinely needs travel on a seed draft PR (see
+  `workflows/brief.md` "Seeded Draft PR Decision"), not on the default branch.
+- `publication:pending` remains a supported **opt-in hold** for issues whose
+  body is not yet self-contained. `/new-task --batch` uses it because its
+  bodies are template stubs. Every gate, reconciliation and stale-repair path
+  below still applies to labelled issues, including legacy ones.
+
+Why the earlier rejection of issue-body-first no longer holds: creation always
+composes the body from the brief through one path; maintainer/collaborator
+issue creation is already the authorization to implement (worker-ready issue =
+dispatch decision), and non-collaborator issues remain behind the existing
+maintainer-review gates; TODO reconciliation cannot race a worker because
+workers do not consume it; batch keeps the hold and offline/`--no-issue`
+planning still has no tracker to dispatch.
+
+The rest of this document is the GH#27791 contract for issues that carry the
+`publication:pending` hold.
+
+## Hold-until-published contract (opt-in)
 
 Use a **hold-until-published** model with an orthogonal
 `publication:pending` issue label.
@@ -74,6 +111,8 @@ LOCAL_ONLY
 PUBLISHING
   issue: publication:pending; no auto-dispatch/status:available projection
   publication: direct push in progress OR planning PR open
+  reconcile: absent task younger than AIDEVOPS_PUBLICATION_STALE_HOURS
+    (default 24) is deferred without label edits and does not fail the run
 
 PUBLISHED
   issue: publication:pending removed
@@ -82,8 +121,40 @@ PUBLISHED
 
 PUBLICATION_FAILED
   issue: publication:pending retained
-  default branch: canonical task absent or invalid
+  default branch: canonical task absent beyond the stale window (or invalid
+    creation timestamp), or present with an invalid mapping/brief/readiness
+  reconcile: stale and failed counts make the run fail; deferred alone does not
   recovery: retry the same publication/mapping; never allocate a replacement ID
+
+ABANDONED -> REPAIRED (GH#34149)
+  trigger: Pulse TODO sync (`issue-sync-helper.sh pull`, never GitHub Actions)
+    sees an open pending issue with a tNNN: title, no default-branch TODO row,
+    age >= AIDEVOPS_PUBLICATION_REPAIR_HOURS (default 6) and an
+    OWNER/MEMBER/COLLABORATOR author
+  repair: capture the issue body as todo/tasks/tNNN-brief.md
+    (`brief-readiness-helper.sh stub`), seed the TODO row with ref:GH#N, and
+    add #auto-dispatch when the brief is worker-ready and no hold, parent or
+    live-ownership label exists
+  publication: the existing allowlisted planning publisher or Pulse TODO
+    handoff (TODO.md plus added brief captures only); reconciliation then
+    clears the blocker exactly as for a normal publication
+  bounds: AIDEVOPS_PUBLICATION_REPAIR_LIMIT (default 10) per pull;
+    AIDEVOPS_PUBLICATION_REPAIR=0 disables
+
+UNMAPPED (GH#33321)
+  issue: publication:pending retained; title has no tNNN prefix and no TODO
+    task line carries ref:GH#N (a ref match maps the issue without a prefix)
+  reconcile: reported as unmapped=N; never consumes the
+    AIDEVOPS_PUBLICATION_RECONCILE_LIMIT attempt budget (the scan window is
+    AIDEVOPS_PUBLICATION_SCAN_LIMIT, default 200) and never fails the run
+  diagnostic: past the stale window, one idempotent marker comment names the
+    cause and the fix (add a ref:GH#N task line, or deliberately drop the label)
+
+CLOSED
+  issue: closed; publication:pending removed only if ref:GH#N exists on the
+    verified default branch (brief readiness is not required for closed work)
+  recovery: if reopened, default-branch mapping exists; normal open-issue
+    reconciliation still validates brief readiness before dispatch
 ```
 
 `publication:pending` is preferable to overloading `status:blocked` because
@@ -225,7 +296,8 @@ orthogonal because publication readiness is not an execution status.
 
 ### Treat a worker-ready issue body as the canonical source immediately
 
-**Rejected as the general rule.** It would make dispatch semantics depend on
+**Adopted as the default by GH#34232** (see "Current decision"). Original
+GH#27791 rationale, retained for the opt-in hold: it would make dispatch semantics depend on
 which body-composition path ran, bypass default-branch review for protected
 repositories, and leave TODO/brief reconciliation racing an already running
 worker. It also makes batch and offline behavior inconsistent. Canonical stubs
@@ -245,7 +317,8 @@ release ambiguous and can either strand tasks or remove a deliberate hold.
 - Issue-sync pull defers orphan TODO seeding for an open issue carrying the
   exact `publication:pending` label. Once the canonical row appears, reference
   synchronization proceeds normally; removing the label before publication
-  restores legacy orphan recovery on the next pull.
+  restores orphan recovery on the next pull. Unlabelled (issue-first) orphans
+  are seeded once older than `AIDEVOPS_ORPHAN_SEED_GRACE_HOURS` (GH#34232).
 - New task-creation paths opt into the protocol together. During rollout, pulse
   must understand the blocker before creators can emit it, and creators must
   defer available labels before reconciliation is enabled.

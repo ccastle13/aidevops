@@ -19,10 +19,12 @@ mode: subagent
 - **Code refs**: `rg "pattern"` search patterns, not `file:line` (line numbers drift)
 - **Subagents**: `agent-review.md` (review), `agent-testing.md` (testing)
 - **Slash command**: `/build-agent {name} {kind} [category]` → `.agents/scripts/commands/build-agent.md` (interactive harness for creating new agents)
-- **Related**: `@code-standards`, `.agents/aidevops/architecture.md`, `tools/browser/browser-automation.md`
-- **After creating/promoting**: `~/.aidevops/agents/scripts/subagent-index-helper.sh generate`
+- **Related**: `@code-standards`, `.agents/aidevops/architecture.md`, `.agents/aidevops/purpose.md`, `tools/browser/browser-automation.md`
+- **After creating/promoting**: in a source worktree run `AIDEVOPS_AGENTS_DIR="<worktree>/.agents" .agents/scripts/subagent-index-helper.sh generate`; without the override the helper targets the deployed agent tree
 - **Behavioural verification when material**: reuse an existing `agent-test-helper.sh` suite or a bounded live prompt; do not create a suite by default
 - **Workload tier**: Author `simple`, `standard`, or `thinking`; the preference-ordered runtime mapping in `tools/context/model-routing.md` selects concrete providers/models.
+- **Improvement contract**: All agents inherit `reference/self-improvement.md`; add only domain-specific evidence triggers, sensitivity boundaries, and promotion routes
+- **Purpose and ownership**: Read `.agents/aidevops/purpose.md` before changing value, repository/forge ownership, or cross-domain delegation semantics; preserve its decisions through the delivered route.
 
 <!-- AI-CONTEXT-END -->
 
@@ -34,6 +36,12 @@ mode: subagent
 | **Role** | Coordinates, strategic | Focused independent execution |
 | **Location** | Root of `.agents/` | `tools/`, `services/`, `workflows/` |
 | **MCP tools** | NEVER enable directly | Enable per-agent |
+
+Execution role does not limit useful domain knowledge. For a bounded primary-domain
+child or lighter canonical subset, use `reference/agent-routing.md` "Focused domain
+delegation". Derive knowledge from the verified canonical source, not a hand-written
+parallel prompt. Keep the child's tools, authority, effort and resource ownership
+inside the parent envelope; source readiness never grants permission.
 
 ## Subagent YAML Frontmatter (Required — omitting defaults to read-only)
 
@@ -61,6 +69,7 @@ tools:
   2. `agent-loader.mjs` `AGENT_MCP_TOOLS`: `"my-agent": ["foo_*"]`
   Then add `foo_*: true` to the agent's frontmatter `tools:` block for documentation.
 - **Source of truth**: `.agents/` → deployed to `~/.aidevops/agents/` by `setup.sh`. Stubs: `~/.config/opencode/agent/` via `generate-opencode-agents.sh`.
+- **OpenCode V1 and V2 parity**: Maintain the root agent source and `subagent-index.toon`, not a V2 copy. V1's config generator and V2's `v2-agent-profiles.mjs` consume those sources differently; when changing a primary agent's name, tools, or mode, verify both adapters and the parity test in `plugins/opencode-aidevops/tests/test-v2-agent-profiles.mjs`. See `tools/opencode/opencode.md` "Maintaining agent parity".
 - **Deployment sync**: changes in `.agents/` require `./setup.sh`. Offer to run on create/rename/move/merge/delete.
 
 ## Folder Organization
@@ -151,7 +160,8 @@ Linter order: (1) deterministic (ShellCheck, ESLint, Ruff/Pylint), (2) static an
 7. **Existing agent?** Call and improve vs duplicate — never create a copy
 8. **Sources verified?** Primary, cross-referenced
 9. **Markdown linting?** MD025/MD022/MD031/MD012. Run `bunx markdownlint-cli2 "path/to/file.md"`
-10. **Terse pass done?** See below
+10. **Ambient learning complete?** The inherited contract works without a command; document only domain-specific signals, scope/sensitivity, and verification
+11. **Terse pass done?** See below
 
 ## Post-Creation Semantic Terse Pass (MANDATORY)
 
@@ -167,7 +177,7 @@ Verify the target through its delivered runtime context, applicable existing che
 
 ## Self-Assessment Protocol
 
-**Triggers**: Observable failure, user correction, contradiction with Context7/codebase, staleness. **Process**: (1) Complete current task. (2) Identify root cause. (3) `rg "pattern" .agents/` — list ALL files needing coordinated updates. (4) Propose fix with evidence, ask user to confirm before applying.
+**Triggers**: Observable failure, user correction, contradiction with primary evidence/codebase, staleness, repeated friction, or a reusable success. **Process**: (1) Preserve the current outcome. (2) Identify and cite the evidence. (3) `rg "pattern" .agents/` — find coordinated surfaces and duplicates. (4) Apply and verify a safe, authorized, in-scope fix; otherwise capture the narrow learning or route a worker-ready task. Ask only at the escalation boundaries in `reference/self-improvement.md`.
 
 ## Tool Selection
 
@@ -177,7 +187,7 @@ Verify the target through its delivered runtime context, applicable existing che
 | Search contents | `rg` | `mcp_grep` |
 | Read/Edit files | `mcp_read` / `mcp_edit` | `cat`/`sed` via bash |
 | Web content | `mcp_webfetch` | `curl` via bash |
-| Remote repo | `mcp_webfetch` README first | `npx repomix --remote` |
+| Remote repo | `gh api` README + tree first | Bulk-loading the whole repo |
 | Parallel AI dispatch | OpenCode server API | Multiple TUI instances |
 
 Self-checks: "Faster CLI alternative?" and "Could this return >50K tokens?" See `tools/context/context-guardrails.md`.

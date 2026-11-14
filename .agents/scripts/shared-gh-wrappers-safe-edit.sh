@@ -28,6 +28,7 @@
 _SHARED_GH_WRAPPERS_SAFE_EDIT_LIB_LOADED=1
 _GH_AUDIT_ISSUE_EDIT_OP="issue_edit"
 _GH_AUDIT_NMR_LABEL="needs-maintainer-review"
+_GH_AUDIT_OPEN_STATE="open"
 
 # Resolve this module's dependencies from its own location. Do not inherit a
 # caller-owned SCRIPT_DIR from an interactive recovery shell.
@@ -76,7 +77,8 @@ _gh_edit_audit_rejection() {
 	local reason="$2"
 	shift 2
 	local context
-	context=$(printf '%q ' "$@" | head -c 500)
+	context=$(printf '%q ' "$@")
+	context=$(printf '%.500s' "$context")
 	local audit_helper
 	audit_helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/audit-log-helper.sh"
 	if [[ -x "$audit_helper" ]]; then
@@ -102,8 +104,17 @@ _gh_edit_audit_rejection() {
 #######################################
 _gh_extract_number_from_args() {
 	local arg
+	local skip_next=0
 	for arg in "$@"; do
+		if [[ "$skip_next" -eq 1 ]]; then
+			skip_next=0
+			continue
+		fi
 		case "$arg" in
+		--repo | -R | --title | -t | --body | -b | --body-file | -F | --base | -B | --milestone | -m | --add-label | --remove-label | --add-assignee | --remove-assignee | --add-reviewer | --remove-reviewer | --add-project | --remove-project | --label | -l | --assignee | -a | --comment | -c | --reason | -r)
+			# Separate-value flag: its value is not the positional number.
+			skip_next=1
+			;;
 		-*)
 			continue
 			;;
@@ -112,34 +123,6 @@ _gh_extract_number_from_args() {
 			return 0
 			;;
 		esac
-	done
-	echo ""
-	return 0
-}
-
-#######################################
-# Extract the --repo value from a gh arg list.
-# Output: "owner/repo" on stdout, or empty if not present.
-#######################################
-_gh_extract_repo_from_args() {
-	local i=0
-	local -a args=("$@")
-	while [[ $i -lt ${#args[@]} ]]; do
-		case "${args[i]}" in
-		--repo | -R)
-			if [[ -n "${args[i + 1]:-}" && "${args[i + 1]}" != -* ]]; then
-				echo "${args[i + 1]}"
-			else
-				echo ""
-			fi
-			return 0
-			;;
-		--repo=*)
-			echo "${args[i]#--repo=}"
-			return 0
-			;;
-		esac
-		i=$((i + 1))
 	done
 	echo ""
 	return 0
@@ -250,6 +233,72 @@ _gh_audit_fetch_pr_state_json() {
 }
 
 #######################################
+# Print an absolute form of a caller's BASH_SOURCE entry.
+# A helper started by relative path (for example `.agents/scripts/x.sh` from a
+# worktree root) reports that relative path in BASH_SOURCE, so the anchored
+# `*/agents/scripts/<name>` provenance patterns below and in the anomaly
+# filter never match it (GH#34821). Resolve it against the current directory
+# only when it still names an existing file; otherwise keep the original.
+# Provenance stays a hint: every exemption still re-verifies live GitHub state.
+# Args: $1=caller_script
+#######################################
+_gh_audit_absolute_caller_script() {
+	local caller_script="$1"
+	local caller_dir=""
+	if [[ -n "$caller_script" && "$caller_script" != /* && -f "$caller_script" ]]; then
+		caller_dir="$(dirname "$caller_script")"
+		caller_dir="$(cd "$caller_dir" 2>/dev/null && pwd)" || caller_dir=""
+		if [[ -n "$caller_dir" ]]; then
+			printf '%s/%s\n' "$caller_dir" "$(basename "$caller_script")"
+			return 0
+		fi
+	fi
+	printf '%s\n' "$caller_script"
+	return 0
+}
+
+#######################################
+# Print the audit proof flags for a signed-approval label transition, or {}.
+# Args: $1=op $2=repo $3=number $4=caller_script (absolute) $5=caller_function
+#######################################
+_gh_audit_signed_approval_flags() {
+	local op="$1" repo="$2" number="$3" caller_script="$4" caller_function="$5"
+	local verification=""
+	# aidevops:trust-boundary — caller provenance alone is spoofable. Record the
+	# exemption proof only after independently re-verifying the signed approval
+	# and authenticated actor authority against current GitHub state.
+	local approval_target_type=""
+	if [[ "$op" == "$_GH_AUDIT_ISSUE_EDIT_OP" && "$caller_function" == "_approval_apply_issue_lifecycle_updates" ]]; then
+		approval_target_type="issue"
+	elif [[ "$op" == "pr_edit" && "$caller_function" == "_approval_apply_pr_lifecycle_updates" ]]; then
+		approval_target_type="pr"
+	fi
+	if [[ -n "$approval_target_type" ]] && command -v cmd_verify &>/dev/null; then
+		verification=$(cmd_verify "$approval_target_type" "$number" "$repo" --require-authority 2>/dev/null) || verification=""
+		if [[ "$verification" == "VERIFIED" ]]; then
+			printf '%s\n' '{"approval_verified":"v2-current-state"}'
+			return 0
+		fi
+	fi
+	# aidevops:trust-boundary — a signed worker-permission grant clears its
+	# needs-maintainer-permissions hold only after the grant comment is posted.
+	# Re-verify that signed grant against the latest live request (GH#37906);
+	# caller provenance alone never earns the exemption.
+	if [[ "$op" == "$_GH_AUDIT_ISSUE_EDIT_OP" && "$caller_function" == "_apply_permission_approval_state" ]] &&
+		[[ "$caller_script" == */agents/scripts/approval-helper-permissions.sh ||
+			"$caller_script" == */.agents/scripts/approval-helper-permissions.sh ]] &&
+		command -v cmd_verify_permissions &>/dev/null; then
+		verification=$(cmd_verify_permissions issue "$number" "$repo" 2>/dev/null) || verification=""
+		if [[ "$verification" == "VERIFIED" ]]; then
+			printf '%s\n' '{"permission_approval_verified":"v1-current-state"}'
+			return 0
+		fi
+	fi
+	printf '%s\n' '{}'
+	return 0
+}
+
+#######################################
 # Write one audit record via gh-audit-log-helper.sh record.
 # Non-blocking: silently returns 0 on any failure.
 # Args:
@@ -271,26 +320,12 @@ _gh_audit_record_op() {
 	# Skip audit when number is unavailable or not an integer
 	[[ -z "$number" || ! "$number" =~ ^[0-9]+$ ]] && return 0
 	[[ -z "$repo" ]] && return 0
+	caller_script="$(_gh_audit_absolute_caller_script "$caller_script")"
 
 	local audit_helper
 	audit_helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gh-audit-log-helper.sh"
 	[[ ! -x "$audit_helper" ]] && return 0
-	# aidevops:trust-boundary — caller provenance alone is spoofable. Record the
-	# exemption proof only after independently re-verifying the signed approval
-	# and authenticated actor authority against current GitHub state.
-	local approval_target_type=""
-	if [[ "$op" == "$_GH_AUDIT_ISSUE_EDIT_OP" && "$caller_function" == "_approval_apply_issue_lifecycle_updates" ]]; then
-		approval_target_type="issue"
-	elif [[ "$op" == "pr_edit" && "$caller_function" == "_approval_apply_pr_lifecycle_updates" ]]; then
-		approval_target_type="pr"
-	fi
-	if [[ -n "$approval_target_type" ]] && command -v cmd_verify &>/dev/null; then
-		local approval_verification=""
-		approval_verification=$(cmd_verify "$approval_target_type" "$number" "$repo" --require-authority 2>/dev/null) || approval_verification=""
-		if [[ "$approval_verification" == "VERIFIED" ]]; then
-			flags_json='{"approval_verified":"v2-current-state"}'
-		fi
-	fi
+	flags_json="$(_gh_audit_signed_approval_flags "$op" "$repo" "$number" "$caller_script" "$caller_function")"
 	# aidevops:trust-boundary — trusted-author NMR normalization is expected only
 	# when the immutable snapshots show a pure NMR removal and live GitHub state
 	# independently confirms both issue-author and current-token write authority.
@@ -312,6 +347,23 @@ _gh_audit_record_op() {
 					"$caller_script" == */.agents/scripts/full-loop-helper.sh ]]; }; } &&
 		_gh_audit_verify_full_loop_review_transition "$repo" "$number" "$before_json" "$after_json"; then
 		flags_json='{"pr_review_handoff_verified":"v1-current-state"}'
+	fi
+	# aidevops:trust-boundary — the explicit CLI path must additionally prove an
+	# open, non-draft closing PR and current actor ownership, never just a hint.
+	if [[ "$op" == "$_GH_AUDIT_ISSUE_EDIT_OP" && "$caller_function" == "_issue_review_handoff" ]] &&
+		[[ "$caller_script" == */agents/scripts/gh-write-helper.sh ||
+			"$caller_script" == */.agents/scripts/gh-write-helper.sh ]] &&
+		_gh_audit_verify_full_loop_review_transition "$repo" "$number" "$before_json" "$after_json" &&
+		_gh_verify_owned_review_handoff_pr "$repo" "$number" "${_GH_REVIEW_HANDOFF_PR:-}"; then
+		flags_json='{"pr_review_handoff_verified":"v2-owned-pr-current-state"}'
+	fi
+	# aidevops:trust-boundary — only the runtime projection after a persisted,
+	# trusted blocked release may attest this transition; re-read GitHub.
+	if [[ "$op" == "$_GH_AUDIT_ISSUE_EDIT_OP" && "$caller_function" == "_hrff_project_blocked_exit" ]] &&
+		[[ "$caller_script" == */agents/scripts/headless-runtime-failure.sh ||
+			"$caller_script" == */.agents/scripts/headless-runtime-failure.sh ]] &&
+		_gh_audit_verify_worker_blocked_exit "$repo" "$number"; then
+		flags_json='{"worker_blocked_exit_verified":"v1-release-persisted"}'
 	fi
 	# aidevops:trust-boundary — planning publication may remove its temporary
 	# manual hold only after preserving publication:pending. Require an exact,
@@ -341,6 +393,63 @@ _gh_audit_record_op() {
 }
 
 #######################################
+# Independently verify the explicit handoff's closing PR and current owner.
+# Args: repo, issue number, PR number. Fail closed on unavailable live reads.
+# Precondition failures return 3, distinct from a failed write (1).
+#######################################
+_gh_review_handoff_failure() {
+	local reason="$1"
+	printf 'REVIEW_HANDOFF=%s\n' "$reason" >&2
+	return 3
+}
+
+_gh_verify_owned_review_handoff_pr() {
+	local repo="$1" number="$2" pr="$3"
+	local actor="" issue_json="" pr_json="" reason=""
+	local unavailable="api-unavailable"
+	[[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ &&
+		"$number" =~ ^[1-9][0-9]*$ && "$pr" =~ ^[1-9][0-9]*$ ]] || {
+		_gh_review_handoff_failure invalid-arguments; return 3
+	}
+	actor=$(gh api user --jq '.login' 2>/dev/null) || {
+		_gh_review_handoff_failure api-unavailable; return 3
+	}
+	[[ -n "$actor" && "$actor" != "null" ]] || {
+		_gh_review_handoff_failure api-unavailable; return 3
+	}
+	issue_json=$(gh api "repos/${repo}/issues/${number}" 2>/dev/null) || {
+		_gh_review_handoff_failure api-unavailable; return 3
+	}
+	reason=$(jq -er --arg actor "$actor" --arg unavailable "$unavailable" --arg text_type string '
+		if (.state | type) != $text_type or (.assignees | type) != "array" then $unavailable
+		elif (.state | ascii_upcase) != "OPEN" then "issue-not-open"
+		elif .pull_request != null then "issue-is-pr"
+		elif ([.assignees[]?.login] | index($actor)) == null then "issue-not-assigned-to-actor"
+		else "ok" end
+	' <<<"$issue_json" 2>/dev/null) || reason="$unavailable"
+	[[ "$reason" == ok ]] || { _gh_review_handoff_failure "$reason"; return 3; }
+	pr_json=$(gh pr view "$pr" --repo "$repo" \
+		--json state,isDraft,author,closingIssuesReferences 2>/dev/null) || {
+		_gh_review_handoff_failure api-unavailable; return 3
+	}
+	reason=$(jq -er --arg actor "$actor" --arg repo "$repo" --argjson number "$number" \
+		--arg unavailable "$unavailable" --arg text_type string '
+		if (.state | type) != $text_type or (.isDraft | type) != "boolean"
+			or (.author.login | type) != $text_type or (.closingIssuesReferences | type) != "array"
+		then $unavailable
+		elif .state != "OPEN" then "pr-not-open"
+		elif .isDraft then "pr-draft"
+		elif .author.login != $actor then "pr-not-authored-by-actor"
+		elif any(.closingIssuesReferences[]?;
+			.number == $number
+			and ((.repository.owner.login + "/" + .repository.name) | ascii_downcase) == ($repo | ascii_downcase))
+		then "ok" else "pr-missing-closing-reference" end
+	' <<<"$pr_json" 2>/dev/null) || reason="$unavailable"
+	[[ "$reason" == ok ]] || { _gh_review_handoff_failure "$reason"; return 3; }
+	return 0
+}
+
+#######################################
 # Verify that a full-loop PR handoff changed only the active worker status.
 # Args: repo, issue number, before JSON, after JSON
 # Returns: 0 only for a comparable in-progress -> in-review transition whose
@@ -355,7 +464,7 @@ _gh_audit_verify_full_loop_review_transition() {
 	local active_status="status:in-progress"
 	local review_status="status:in-review"
 	local capture_ok="ok"
-	local open_state="open"
+	local open_state="$_GH_AUDIT_OPEN_STATE"
 
 	[[ -n "$repo" && "$number" =~ ^[0-9]+$ ]] || return 1
 	jq -e -n --arg active "$active_status" --arg review "$review_status" --arg capture_ok "$capture_ok" \
@@ -377,6 +486,26 @@ _gh_audit_verify_full_loop_review_transition() {
 	return 0
 }
 
+_gh_audit_verify_worker_blocked_exit() {
+	local repo="$1" number="$2"
+	local issue_json="" comments_json="" actor=""
+	[[ -n "$repo" && "$number" =~ ^[0-9]+$ ]] || return 1
+	issue_json=$(gh api "repos/${repo}/issues/${number}" 2>/dev/null) || return 1
+	jq -e --arg open "$_GH_AUDIT_OPEN_STATE" '.state == $open and .pull_request == null
+		and ([.labels[]?.name] | index("status:blocked") != null)
+		and ([.labels[]?.name | select(. == "status:in-progress" or . == "status:queued" or . == "status:claimed")] | length == 0)
+	' <<<"$issue_json" >/dev/null 2>&1 || return 1
+	comments_json=$(gh api "repos/${repo}/issues/${number}/comments?per_page=100" --paginate --slurp 2>/dev/null |
+		jq -ce 'add | arrays') || return 1
+	actor=$(gh api user --jq .login 2>/dev/null) || return 1
+	# shellcheck source=./terminal-blocker-circuit.sh
+	source "${BASH_SOURCE[0]%/*}/terminal-blocker-circuit.sh"
+	# Circuit markers alone do not prove that CLAIM_RELEASED was persisted.
+	comments_json=$(jq -c 'map(select((.body // "") | test("(?m)^CLAIM_RELEASED reason=blocked |^DISPATCH_CLAIM ")))' <<<"$comments_json") || return 1
+	TERMINAL_BLOCKER_SELF_LOGIN="$actor" terminal_blocker_has_current_hold "$comments_json"
+	return $?
+}
+
 #######################################
 # Verify that planning publication released only its temporary manual hold.
 # Args: repo, issue number, before JSON, after JSON
@@ -392,7 +521,7 @@ _gh_audit_verify_planning_publication_transition() {
 	local manual_hold="no-auto-dispatch"
 	local publication_hold="publication:pending"
 	local auto_dispatch="auto-dispatch"
-	local open_state="open"
+	local open_state="$_GH_AUDIT_OPEN_STATE"
 
 	[[ -n "$repo" && "$number" =~ ^[0-9]+$ ]] || return 1
 	jq -e -n --arg manual "$manual_hold" --arg publication "$publication_hold" \
@@ -470,6 +599,20 @@ _gh_audit_verify_trusted_author_nmr_transition() {
 }
 
 #######################################
+# Return success when an issue edit contains at least one label delta. A failed
+# native edit may have partially converged before rejecting an already-absent
+# removal, so the validated REST delta path is safe to reconcile once.
+_gh_issue_edit_has_label_deltas() {
+	local arg=""
+	for arg in "$@"; do
+		case "${arg%%=*}" in
+		--add-label | --remove-label) return 0 ;;
+		esac
+	done
+	return 1
+}
+
+#######################################
 # gh_issue_edit_safe — drop-in replacement for gh issue edit.
 # Validates --title/--body before delegating. Rejects empty/stub values.
 # Records an audit event to gh-audit.log on success.
@@ -497,16 +640,156 @@ gh_issue_edit_safe() {
 	_before="$(_gh_audit_fetch_issue_state_json "$_num" "$_repo")"
 	gh issue edit "$@"
 	local _exit=$?
-	if [[ $_exit -ne 0 ]] && _rest_should_fallback; then
-		print_info "[INFO] gh-wrapper: GraphQL exhausted, falling back to REST for issue edit"
-		_rest_issue_edit "$@"
-		_exit=$?
+	if [[ $_exit -ne 0 ]]; then
+		if _rest_should_fallback; then
+			print_info "[INFO] gh-wrapper: GraphQL exhausted, falling back to REST for issue edit"
+			_rest_issue_edit "$@"
+			_exit=$?
+		elif _gh_issue_edit_has_label_deltas "$@"; then
+			print_info "[INFO] gh-wrapper: reconciling failed issue-label edit through validated REST deltas"
+			_rest_issue_edit "$@"
+			_exit=$?
+		fi
 	fi
 	_after="$(_gh_audit_fetch_issue_state_json "$_num" "$_repo")"
 	_gh_audit_record_op "$_GH_AUDIT_ISSUE_EDIT_OP" "$_repo" "$_num" "$_before" "$_after" \
 		"${BASH_SOURCE[1]:-}" "${FUNCNAME[1]:-}" "${BASH_LINENO[0]:-0}"
 	return "$_exit"
 }
+
+#######################################
+# GH#33539: find a negated GitHub closing keyword in PR body text.
+# GitHub parses `close/fix/resolve` + issue reference as closure intent even
+# under negation ("Do not close #123"), so merging closes the issue anyway.
+# Fenced code blocks and inline code spans are ignored, matching GitHub.
+# Args: $1 = body text
+# Output: first offending phrase on stdout
+# Exit: 0 found, 1 clean
+#######################################
+# shellcheck source=./gh-closing-reference-lib.sh
+source "${_SHARED_GH_WRAPPERS_SAFE_EDIT_DIR}/gh-closing-reference-lib.sh"
+
+# GH#36174: merge-time defence for creation-wrapper bypasses. This is a
+# read-only check: callers hold the PR and use their existing repair route.
+# Args: $1=PR JSON (body, closingIssuesReferences), $2=repository slug
+# Output: one diagnostic on failure. Returns: 0=safe, 1=contradiction/unavailable
+_gh_pr_merge_closure_check() {
+	local pr_json="$1" repo_slug="$2"
+	local body_text="" stripped="" contradiction=""
+	local backtick=$'\x60'
+	if ! printf '%s' "$pr_json" | jq -e '
+		(.body | type) == "string" and ((.closingIssuesReferences | arrays | length) >= 0)
+		and all(.closingIssuesReferences[]; (.number | type) == "number")
+	' >/dev/null 2>&1; then
+		printf '%s\n' 'closing-reference metadata unavailable'
+		return 1
+	fi
+	body_text=$(printf '%s' "$pr_json" | jq -r '.body') || return 1
+	if _gh_pr_body_negated_closing_ref "$body_text" >/dev/null; then
+		printf '%s\n' 'negated closing reference in PR body (GH#33539)'
+		return 1
+	fi
+	stripped=$(printf '%s\n' "$body_text" |
+		awk '/^[[:space:]]*(```|~~~)/ { fenced = !fenced; next } !fenced' |
+		sed -E "s/${backtick}[^${backtick}]*${backtick}//g")
+	contradiction=$(printf '%s' "$pr_json" | jq -r --arg body "$stripped" --arg repo "$repo_slug" '
+		[ $body | scan("(?i)(?:^|[^a-z0-9_])(?:For|Ref):?[[:space:]]+(?:([a-z0-9_.-]+/[a-z0-9_.-]+))?#([0-9]+)")
+		  | {repo: (.[0] // $repo), number: (.[1] | tonumber)} ] as $nonclosing
+		| [.closingIssuesReferences[] as $ref
+		   | ($ref.repository | .nameWithOwner //
+		       (if .owner.login and .name then .owner.login + "/" + .name else $repo end)) as $ref_repo
+		   | $nonclosing[]
+		   | select(.number == $ref.number and
+		       (.repo | ascii_downcase) == ($ref_repo | ascii_downcase))
+		   | .number] | unique | map("#" + tostring) | join(", ")
+	') || return 1
+	if [[ -n "$contradiction" ]]; then
+		printf 'For/Ref contradicts native closing references: %s\n' "$contradiction"
+		return 1
+	fi
+	return 0
+}
+
+# Repair body-only contradictions without manufacturing review feedback. Keep
+# code examples and unrelated valid closing references intact. The caller still
+# holds this merge pass, so the next pass reads fresh GitHub closing metadata.
+# Args: $1=PR number, $2=repository slug, $3=PR JSON
+_gh_pr_repair_merge_closure() {
+	local pr_number="$1" repo_slug="$2" pr_json="$3"
+	local body_text="" discovery_body="" offending="" phrases="" repaired="" body_file="" repair_rc=0
+	body_text=$(printf '%s' "$pr_json" | jq -er '.body | strings') || return 1
+	discovery_body="$body_text"
+	while offending=$(_gh_pr_body_negated_closing_ref "$discovery_body"); do
+		# Inline-code stripping can produce a phrase absent from the raw body.
+		# Leave unsupported repairs to the caller rather than looping forever.
+		[[ "$discovery_body" == *"$offending"* ]] || return 1
+		phrases+="${offending}"$'\n'
+		discovery_body="${discovery_body//"$offending"/The issue remains open.}"
+	done
+	command -v python3 >/dev/null 2>&1 || return 1
+	# shellcheck disable=SC2016 # Literal Python regexes contain Markdown backticks, not shell substitutions.
+	repaired=$(printf '%s' "$pr_json" | python3 -c '
+import json, re, sys
+pr = json.load(sys.stdin)
+repo, phrases = sys.argv[1].lower(), sys.argv[2].splitlines()
+repo_field, number_field = "repo", "number"
+body = pr["body"]
+# Use the same fence and inline-code exclusions as GH#33539.
+chunks, fenced = [], False
+for line in body.splitlines(keepends=True):
+    if re.match(r"^\s*(```|~~~)", line):
+        fenced = not fenced
+        chunks.append((False, line))
+    elif fenced:
+        chunks.append((False, line))
+    else:
+        chunks.extend((i % 2 == 0, text) for i, text in enumerate(re.split(r"(`[^`]*`)", line)))
+prose = "".join(text if editable else "\n" for editable, text in chunks)
+ref = r"(?:(?P<repo>[\w.-]+/[\w.-]+))?#(?P<number>[0-9]+)"
+nonclosing = {(m.group(repo_field).lower() if m.group(repo_field) else repo, int(m.group(number_field)))
+              for m in re.finditer(r"\b(?:For|Ref):?\s+" + ref, prose, re.I)}
+native = set()
+for issue in pr["closingIssuesReferences"]:
+    repository = issue.get("repository") or {}
+    slug = repository.get("nameWithOwner")
+    if not slug and repository.get("owner", {}).get("login") and repository.get("name"):
+        slug = repository["owner"]["login"] + "/" + repository["name"]
+    native.add(((slug or repo).lower(), issue[number_field]))
+targets = nonclosing & native
+closing = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+" + ref, re.I)
+def neutralize(match):
+    identity = ((match.group(repo_field) or repo).lower(), int(match.group(number_field)))
+    return "Ref " + (match.group(repo_field) or "") + "#" + match.group(number_field) if identity in targets else match.group(0)
+result = []
+for editable, text in chunks:
+    if editable:
+        for phrase in phrases:
+            text = text.replace(phrase, "leave the issue open")
+        text = closing.sub(neutralize, text)
+    result.append(text)
+sys.stdout.write("".join(result))
+' "$repo_slug" "$phrases") || return 1
+	[[ "$repaired" != "$body_text" ]] || return 1
+	# Validate the proposed body before any write; cross-line or unsupported
+	# references that cannot be repaired safely stay held and use normal routing.
+	local repaired_json=""
+	repaired_json=$(printf '%s' "$pr_json" | jq --arg body "$repaired" '.body = $body | .closingIssuesReferences = []') || return 1
+	_gh_pr_merge_closure_check "$repaired_json" "$repo_slug" >/dev/null || return 1
+	body_file=$(mktemp) || return 1
+	printf '%s\n' "$repaired" >"$body_file"
+	gh_pr_edit_safe "$pr_number" --repo "$repo_slug" --body-file "$body_file" >/dev/null 2>&1 || repair_rc=$?
+	rm -f "$body_file"
+	return "$repair_rc"
+}
+
+#######################################
+# GH#33539: reject managed PR create/edit bodies whose negated closing keyword
+# GitHub would still treat as a closing reference. Issue bodies/comments are
+# not checked: only PR bodies feed closingIssuesReferences.
+# Args: the argument list passed to gh pr create/edit
+# Returns: 0 clean or no body, 1 rejected (stderr + _GH_EDIT_REJECTION_REASON)
+#######################################
+# _gh_validate_pr_closing_keywords is shared with the PATH shim above.
 
 #######################################
 # gh_pr_edit_safe — drop-in replacement for gh pr edit.
@@ -531,16 +814,24 @@ gh_pr_edit_safe() {
 		_gh_edit_audit_rejection "gh pr edit" "$_GH_EDIT_REJECTION_REASON" "$@"
 		return 1
 	fi
+	local _GH_PR_IDENTITY_ORIGIN="edit"
+	if ! _gh_validate_pr_closing_keywords "$@"; then
+		_gh_edit_audit_rejection "gh pr edit" "$_GH_EDIT_REJECTION_REASON" "$@"
+		return 1
+	fi
 	if ! _gh_guard_public_write_args "$@"; then
 		return 1
 	fi
 	local _num _repo _before _after
 	_num="$(_gh_extract_number_from_args "$@")"
 	_repo="$(_gh_extract_repo_from_args "$@")"
-	_before="$(_gh_audit_fetch_pr_state_json "$_num" "$_repo")"
+	_before="$(AIDEVOPS_GH_PR_VIEW_CACHE_DISABLE=1 _gh_audit_fetch_pr_state_json "$_num" "$_repo")"
 	gh pr edit "$@"
 	local _exit=$?
-	_after="$(_gh_audit_fetch_pr_state_json "$_num" "$_repo")"
+	if [[ "$_exit" -eq 0 ]] && command -v _rest_pr_view_cache_invalidate >/dev/null 2>&1; then
+		_rest_pr_view_cache_invalidate "$_repo" "$_num" || true
+	fi
+	_after="$(AIDEVOPS_GH_PR_VIEW_CACHE_DISABLE=1 _gh_audit_fetch_pr_state_json "$_num" "$_repo")"
 	_gh_audit_record_op "pr_edit" "$_repo" "$_num" "$_before" "$_after" \
 		"${BASH_SOURCE[1]:-}" "${FUNCNAME[1]:-}" "${BASH_LINENO[0]:-0}"
 	return "$_exit"

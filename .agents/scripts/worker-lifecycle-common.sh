@@ -13,6 +13,8 @@
 #   _get_process_age()        Get process age in seconds from ps etime
 #   _get_pid_cpu()            Get integer CPU% for a single PID
 #   _get_process_tree_cpu()   Get CPU% summed across a process tree (BFS)
+#   _worker_output_has_fresh_provider_failure() Trusted provider failure at output tail
+#   _worker_kill_reason_class() Map a watchdog kill reason to its persisted class
 #   _extract_session_title_from_cmd() Extract session title from opencode CLI args
 #   _count_recent_opencode_messages() Count recent OpenCode messages by title match
 #   _collect_worker_stall_evidence()  Summarise recent worker transcript/output tail
@@ -44,6 +46,7 @@
 [[ -n "${_WORKER_LIFECYCLE_COMMON_LOADED:-}" ]] && return 0
 _WORKER_LIFECYCLE_COMMON_LOADED=1
 _WLC_STATUS_BLOCKED="blocked"
+_WLC_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 _worker_attempt_observability_dir="${BASH_SOURCE[0]%/*}"
 # shellcheck source=worker-attempt-observability.sh
@@ -239,7 +242,41 @@ _emit_objective_recovery_evidence() {
 		verification_preserved:$verification_preserved,subsequent_action_at:$evidence_timestamp,
 		pr_repair:(if $repair_pr_number == "" then null else {pr_number:($repair_pr_number|tonumber),
 		head_sha:$repair_head_sha,head_ref:$repair_head_ref,failure_fingerprint:$repair_fingerprint} end)}') || evidence_record=""
-	[[ -n "$evidence_record" ]] && printf '%s\n' "$evidence_record" >>"$evidence_file" 2>/dev/null || true
+	[[ -n "$evidence_record" ]] || return 0
+	_objective_evidence_locked_append "$evidence_file" "$evidence_record"
+	return 0
+}
+
+# GH#32938: concurrent unlocked `>>` appends of >1KB records tore ledger lines.
+# Shares objective-reconciliation-helper.sh's `<file>.lockdir` so both writers
+# serialise. Lock contention past ~5s falls back to the previous best-effort append.
+_objective_evidence_locked_append() {
+	local evidence_file="$1"
+	local record="$2"
+	local lock_dir="${evidence_file}.lockdir"
+	local attempts=0
+	local owner_pid=""
+	local locked=0
+	while [[ "$attempts" -lt 100 ]]; do
+		if mkdir "$lock_dir" 2>/dev/null; then
+			locked=1
+			printf '%s\n' "$$" >"${lock_dir}/owner.pid" 2>/dev/null || true
+			break
+		fi
+		attempts=$((attempts + 1))
+		owner_pid=$(tr -d '[:space:]' <"${lock_dir}/owner.pid" 2>/dev/null || true)
+		if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
+			rm -f "${lock_dir}/owner.pid" 2>/dev/null || true
+			rmdir "$lock_dir" 2>/dev/null || true
+			continue
+		fi
+		sleep 0.05
+	done
+	printf '%s\n' "$record" >>"$evidence_file" 2>/dev/null || true
+	if [[ "$locked" -eq 1 ]]; then
+		rm -f "${lock_dir}/owner.pid" 2>/dev/null || true
+		rmdir "$lock_dir" 2>/dev/null || true
+	fi
 	return 0
 }
 
@@ -254,9 +291,11 @@ _emit_worker_runtime_event() {
 	worker.completed | worker.failed | worker.deferred)
 		if [[ -n "${AIDEVOPS_DISPATCH_LEASE_TOKEN:-}" && "${WORKER_ISSUE_NUMBER:-}" =~ ^[0-9]+$ && -n "${DISPATCH_REPO_SLUG:-${WORKER_REPO_SLUG:-}}" ]]; then
 			local lease_helper="${BASH_SOURCE[0]%/*}/dispatch-claim-helper.sh"
-			"$lease_helper" transition terminal "$WORKER_ISSUE_NUMBER" \
-				"${DISPATCH_REPO_SLUG:-$WORKER_REPO_SLUG}" "$AIDEVOPS_DISPATCH_LEASE_TOKEN" \
-				"${_invoke_session_key:-issue-${WORKER_ISSUE_NUMBER}}" 0 >/dev/null 2>&1 || true
+			# shellcheck source=./terminal-lease-recovery.sh
+			source "${BASH_SOURCE[0]%/*}/terminal-lease-recovery.sh"
+			_terminal_lease_emit_or_record "$WORKER_ISSUE_NUMBER" \
+				"${DISPATCH_REPO_SLUG:-$WORKER_REPO_SLUG}" \
+				"${AIDEVOPS_DISPATCH_LEASE_SESSION:-${_invoke_session_key:-issue-${WORKER_ISSUE_NUMBER}}}" "$lease_helper" || true
 		fi
 		;;
 	esac
@@ -625,6 +664,68 @@ _get_process_tree_cpu() {
 	done < <(_get_descendant_pids "$pid")
 
 	echo "$total_cpu"
+	return 0
+}
+
+#######################################
+# Return whether the most recent worker output records a trusted provider
+# failure (GH#34067).
+#
+# Only the trusted classifier (headless-runtime-provider-classifier.py, also
+# used by the fast rate-limit monitor) may identify provider failures. It
+# accepts structured APIError events and runtime-tagged lines, never free text
+# from tool results or documentation. Only the output tail is classified, so a
+# provider error the runtime already recovered from cannot justify a later kill.
+#
+# Arguments:
+#   arg1 - worker output file
+#   arg2 - tail lines to classify (optional; default
+#          WORKER_PROVIDER_FAILURE_TAIL_LINES, then 40)
+# Returns: 0 for rate_limit, quota_exceeded or provider server errors; 1 otherwise
+#######################################
+_worker_output_has_fresh_provider_failure() {
+	local output_file="$1"
+	local tail_lines="${2:-${WORKER_PROVIDER_FAILURE_TAIL_LINES:-40}}"
+	local classifier="${_WLC_SCRIPT_DIR}/headless-runtime-provider-classifier.py"
+	local classification="" reason="" provider_type="" _rest=""
+
+	[[ -f "$output_file" && -f "$classifier" ]] || return 1
+	[[ "$tail_lines" =~ ^[1-9][0-9]*$ ]] || tail_lines=40
+	classification=$(tail -n "$tail_lines" "$output_file" 2>/dev/null |
+		python3 "$classifier" /dev/stdin 2>/dev/null) || return 1
+	[[ -n "$classification" ]] || return 1
+	IFS=$'\t' read -r reason provider_type _rest <<<"$classification"
+	case "$reason" in
+	rate_limit | quota_exceeded) return 0 ;;
+	provider_error)
+		[[ "$provider_type" == "server_error" ]] && return 0
+		;;
+	esac
+	return 1
+}
+
+#######################################
+# Map a watchdog kill reason string to the class persisted in
+# ${exit_code_file}.kill_reason and emitted in [lifecycle] worker_killed
+# lines (t3056 / GH#34067). One mapping keeps telemetry, the persisted
+# reason and classify_worker_kill_reason in agreement.
+#
+# Arguments:
+#   arg1 - human-readable reason, prefixed with its kill path
+# Returns: class string via stdout; 0 always
+#######################################
+_worker_kill_reason_class() {
+	local reason="$1"
+	case "$reason" in
+	phase1:*) printf '%s' "phase1_zero_output" ;;
+	# GH#34068: elapsed cap reached while liveness deferrals were recent —
+	# policy-cap termination, not proven inactivity.
+	hard_kill_cap_active:*) printf '%s' "hard_kill_cap_active" ;;
+	hard_kill:*) printf '%s' "hard_kill_stall" ;;
+	provider_rate_limit:*) printf '%s' "provider_rate_limit" ;;
+	stall:*) printf '%s' "no_output_stall" ;;
+	*) printf '%s' "other" ;;
+	esac
 	return 0
 }
 
@@ -1024,9 +1125,12 @@ _format_duration() {
 # Output: one line per logical worker: "pid etime command..."
 #######################################
 list_active_worker_processes() {
-	local script_dir
+	local script_dir effective_uid
+	local -a pipeline_status
 	script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 	local awk_script="${script_dir}/list_active_workers.awk"
+	effective_uid=$(id -u) || return 1
+	[[ "$effective_uid" =~ ^[0-9]+$ ]] || return 1
 	# Awk logic extracted to list_active_workers.awk (GH#17561)
 	# t2190: use `axww` (unlimited line width) so Linux procps doesn't
 	# truncate the command column to the detected terminal width (~80
@@ -1038,7 +1142,12 @@ list_active_worker_processes() {
 	# unassigns the worker, and every dispatch cycle loops on the same
 	# issue. macOS BSD ps already emits full commands; `ww` is harmless
 	# there (and also supported).
-	ps axwwo pid,stat,etime,command | awk -f "$awk_script"
+	# Include numeric UID in the snapshot rather than relying on usernames or a
+	# platform-specific ps user selector. The parser filters before deduplication,
+	# so an identical foreign-user session cannot hide a runner-owned worker.
+	ps axwwo uid,pid,stat,etime,command | awk -v effective_uid="$effective_uid" -f "$awk_script"
+	pipeline_status=("${PIPESTATUS[@]}")
+	[[ "${pipeline_status[0]}" -eq 0 && "${pipeline_status[1]}" -eq 0 ]] || return 1
 	return 0
 }
 
@@ -1095,16 +1204,14 @@ _escalate_body_has_investigation_context() {
 		'^#{1,6}[[:space:]]+Approach[[:space:]]*:?[[:space:]]*$' \
 		'^#{1,6}[[:space:]]+Acceptance criteria[[:space:]]*:?[[:space:]]*$' \
 		'^#{1,6}[[:space:]]+Verification[[:space:]]*:?[[:space:]]*$'; do
-		printf '%s\n' "$issue_body" | grep -qiE "$heading_pattern" || return 1
+		grep -qiE "$heading_pattern" <<<"$issue_body" || return 1
 	done
 
 	# A bounded investigation still needs a concrete starting surface.
-	printf '%s\n' "$issue_body" |
-		grep -qE '[a-zA-Z0-9_.-]+(/[a-zA-Z0-9_.-]+)+\.[a-zA-Z0-9]+' || return 1
+	grep -qE '[a-zA-Z0-9_.-]+(/[a-zA-Z0-9_.-]+)+\.[a-zA-Z0-9]+' <<<"$issue_body" || return 1
 	# Verification must name something executable, not only a prose promise.
 	# shellcheck disable=SC2016 # Backticks are literal Markdown delimiters in the regex.
-	printf '%s\n' "$issue_body" |
-		grep -qE '(^|[[:space:]`])((bash|shellcheck|pytest|python[0-9]*|node|npm|pnpm|yarn|bun|make)[[:space:]]|go[[:space:]]+test([[:space:]]|$)|cargo[[:space:]]+test([[:space:]]|$)|git[[:space:]]+diff([[:space:]]|$)|[.]/|[.][[:alnum:]_/-]+\.sh([[:space:]`]|$))' || return 1
+	grep -qE '(^|[[:space:]`])((bash|shellcheck|pytest|python[0-9]*|node|npm|pnpm|yarn|bun|make)[[:space:]]|go[[:space:]]+test([[:space:]]|$)|cargo[[:space:]]+test([[:space:]]|$)|git[[:space:]]+diff([[:space:]]|$)|[.]/|[.][[:alnum:]_/-]+\.sh([[:space:]`]|$))' <<<"$issue_body" || return 1
 	return 0
 }
 
@@ -1142,7 +1249,7 @@ _escalate_body_quality_gate() {
 	# Check for file path indicators: paths with extensions, EDIT:/NEW: prefixes,
 	# backtick-quoted paths, or "Files to Modify" section headers.
 	# shellcheck disable=SC2016 # pattern is literal regex; no variable expansion intended
-	if echo "$issue_body" | grep -qE '(EDIT:|NEW:|`[a-zA-Z0-9_./-]+\.[a-z]+`|Files to Modify|## How|\.sh:|\.py:|\.ts:|\.js:|\.md:)'; then
+	if grep -qE '(EDIT:|NEW:|`[a-zA-Z0-9_./-]+\.[a-z]+`|Files to Modify|## How|\.sh:|\.py:|\.ts:|\.js:|\.md:)' <<<"$issue_body"; then
 		return 0
 	fi
 
@@ -1316,6 +1423,8 @@ _worker_failure_reason_is_launch_preflight() {
 	case "$reason" in
 	worker_launch_rc_2 | \
 	worker_worktree_live_owner | \
+	worktree_live_owner_refused | \
+	*":worktree_live_owner_refused" | \
 	worker_worktree_continuation_* | \
 	worker_worktree_owner_concurrent_mutation | \
 	worker_runtime_not_invoked | \
@@ -1693,9 +1802,9 @@ _post_tier_escalation() {
 **Reason:** ${safe_reason}
 ${crash_type_label:+${crash_type_label}
 }
-Previous attempts at \`tier:${current_tier}\` failed to produce a PR. Escalating to a more capable model with accumulated context from prior attempts.
+Previous attempts at \`tier:${current_tier}\` failed to produce a PR. Escalating to a more capable model.
 
-The next worker should review prior attempt comments on this issue for context on what was tried and where it got stuck.
+The next worker receives validated prior-attempt state and sanitised failure signals in its dispatch prompt; it should work from the issue body and current repository state, not from operational comments like this one.
 
 _Automated by \`escalate_issue_tier()\` cascade dispatch in worker-lifecycle-common.sh_"
 
@@ -1814,8 +1923,13 @@ _emit_stdout_line_safely() {
 # Returns: count via stdout
 #######################################
 count_active_workers() {
-	local count
-	count=$(list_active_worker_processes | wc -l | tr -d ' ') || count=0
+	local count worker_processes
+	worker_processes=$(list_active_worker_processes) || return 1
+	if [[ -z "$worker_processes" ]]; then
+		count=0
+	else
+		count=$(printf '%s\n' "$worker_processes" | wc -l | tr -d ' ') || return 1
+	fi
 	_emit_stdout_line_safely "$count"
 	return 0
 }

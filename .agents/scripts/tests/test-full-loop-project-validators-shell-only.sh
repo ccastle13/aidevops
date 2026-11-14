@@ -11,6 +11,14 @@
 # NOTE: not using `set -e` — assertions capture non-zero exits.
 set -uo pipefail
 
+# Resolve native Git once from the system default PATH (portable to non-FHS
+# hosts such as NixOS); fixtures must bypass the aidevops git wrapper.
+TEST_NATIVE_GIT=$(command -p -v git) || {
+	printf '%s\n' 'Native Git is unavailable on the system PATH' >&2
+	exit 1
+}
+export TEST_NATIVE_GIT
+
 TEST_RED=$'\033[0;31m'
 TEST_GREEN=$'\033[0;32m'
 TEST_RESET=$'\033[0m'
@@ -48,11 +56,20 @@ print_error() {
 	return 0
 }
 
+# Production callers inherit the portable implementation from shared-constants.
+# This focused source-level fixture supplies the same command contract.
+timeout_sec() {
+	local _seconds="$1"
+	shift
+	"$@"
+	return $?
+}
+
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=../full-loop-helper-commit.sh
 source "${SCRIPT_DIR}/full-loop-helper-commit.sh"
 
-GIT_BIN="${AIDEVOPS_TEST_GIT_BIN:-/usr/bin/git}"
+GIT_BIN="${AIDEVOPS_TEST_GIT_BIN:-${TEST_NATIVE_GIT}}"
 git() {
 	"$GIT_BIN" "$@"
 	return $?
@@ -65,17 +82,26 @@ FAKE_BIN="${TEST_ROOT}/bin"
 mkdir -p "$FAKE_BIN"
 cat >"${FAKE_BIN}/npm" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "npm should not run for shell-only diffs" >>"${NPM_CALL_LOG:?}"
-if [[ "${NPM_FAKE_ACTION:-}" == "delete-cwd-after-edit" ]]; then
-	printf '%s\n' 'fixed' >>"${NPM_FIX_TARGET:?}"
-	if [[ -n "${NPM_DELETE_DIR:-}" ]]; then
-		rm -rf "$NPM_DELETE_DIR"
+printf '%s|%s\n' "$PWD" "$*" >>"${NPM_CALL_LOG:?}"
+if [[ "$1" == ci ]]; then
+	if [[ "${NPM_INSTALL_FAIL:-0}" == 1 ]]; then
+		exit 42
 	fi
-	exit 0
+	mkdir -p node_modules
+	touch node_modules/.package-lock.json
 fi
-exit "${NPM_FAKE_RC:-2}"
+if [[ "${NPM_FAKE_ACTION:-}" == "mutate-other" ]]; then
+	printf '%s\n' 'validator mutation' >>"${NPM_FIX_TARGET:?}"
+fi
+exit "${NPM_FAKE_RC:-0}"
 EOF
 chmod +x "${FAKE_BIN}/npm"
+cat >"${FAKE_BIN}/pnpm" <<'EOF'
+#!/usr/bin/env bash
+printf '%s|%s\n' "$PWD" "$*" >>"${NPM_CALL_LOG:?}"
+exit "${NPM_FAKE_RC:-0}"
+EOF
+chmod +x "${FAKE_BIN}/pnpm"
 
 make_repo() {
 	local repo_dir="$1"
@@ -173,37 +199,515 @@ else
 	print_result "docs-only branch skips project validators" 1 "rc=${case3_rc}, npm_log=$(wc -c <"$NPM_CALL_LOG" 2>/dev/null || printf 0)"
 fi
 
-# Case 4: if an auto-fix command removes the process' current subdirectory,
-# the validator restores the repository root before running git diff/add/amend.
-# This guards the GH#22526 failure class where amend hit getcwd() from a stale
-# cwd and reported: fatal: Unable to read current working directory.
-CWD_REPO="${TEST_ROOT}/cwd-restore"
-make_repo "$CWD_REPO"
-mkdir -p "${CWD_REPO}/vanishing"
-(
-	cd "$CWD_REPO" || exit 1
-	cat >package.json <<'EOF'
-{"scripts":{"format:fix":"node scripts/fix.js"}}
+make_workspace_repo() {
+	local repo_dir="$1" workspace_kind="${2:-npm}"
+	mkdir -p "$repo_dir/packages/a" "$repo_dir/packages/b"
+	(
+		cd "$repo_dir" || exit 1
+		git init -q
+		git config commit.gpgsign false
+		git config tag.gpgsign false
+		git branch -M develop
+		cat >package.json <<'EOF'
+{"private":true,"workspaces":["packages/*"],"scripts":{"lint:fix":"unsafe-root-fixer"}}
 EOF
-	printf '%s\n' 'before' >tracked.txt
-	git add package.json tracked.txt
-	git -c user.name='Test User' -c user.email='test@example.invalid' commit -qm 'node project'
-)
-NPM_CALL_LOG="${TEST_ROOT}/npm-cwd.log"
-NPM_FIX_TARGET="${CWD_REPO}/tracked.txt"
-NPM_DELETE_DIR="${CWD_REPO}/vanishing"
-export NPM_CALL_LOG NPM_FIX_TARGET NPM_DELETE_DIR NPM_FAKE_ACTION=delete-cwd-after-edit NPM_FAKE_RC=0
+		if [[ "$workspace_kind" == "pnpm" ]]; then
+			cat >package.json <<'EOF'
+{"private":true,"scripts":{"lint":"eslint ."}}
+EOF
+			cat >pnpm-workspace.yaml <<'EOF'
+packages:
+  - 'packages/*'
+  - '!packages/excluded'
+EOF
+			printf '%s\n' 'lockfileVersion: 9.0' >pnpm-lock.yaml
+		fi
+		printf '%s\n' '{"scripts":{"lint":"eslint .","typecheck":"tsc --noEmit"}}' >packages/a/package.json
+		printf '%s\n' '{"scripts":{"lint":"eslint ."}}' >packages/b/package.json
+		printf '%s\n' 'export const a = 1;' >packages/a/index.ts
+		printf '%s\n' 'export const b = 1;' >packages/b/index.ts
+		git add .
+		git -c user.name='Test User' -c user.email='test@example.invalid' commit -qm 'initial workspace'
+		git remote add origin .
+		git update-ref refs/remotes/origin/develop HEAD
+		git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/develop
+		git switch -qc feature/test
+	) || return 1
+	return 0
+}
+
+# Case 4: a package-A-only change runs only package A checks. Pre-existing
+# staged and unstaged edits in package B retain their bytes and index state.
+WORKSPACE_REPO="${TEST_ROOT}/workspace-scope"
+make_workspace_repo "$WORKSPACE_REPO"
+NPM_CALL_LOG="${TEST_ROOT}/npm-workspace.log"
+export NPM_CALL_LOG NPM_FAKE_ACTION='' NPM_FAKE_RC=0
 (
-	cd "${CWD_REPO}/vanishing" || exit 1
-	PATH="${FAKE_BIN}:$PATH" fix_changes=0 _run_node_auto_fix npm 30 0
+	cd "$WORKSPACE_REPO" || exit 1
+	printf '%s\n' 'export const a = 2;' >packages/a/index.ts
+	git add packages/a/index.ts
+	git -c user.name='Test User' -c user.email='test@example.invalid' commit -qm 'change package a'
+	printf '%s\n' 'pre-existing staged package b edit' >>packages/b/index.ts
+	git add packages/b/index.ts
+	printf '%s\n' 'pre-existing unstaged package b edit' >>packages/b/index.ts
+	PATH="${FAKE_BIN}:$PATH" _run_project_validators 0
 )
 case4_rc=$?
-case4_head_subject=$(git -C "$CWD_REPO" log -1 --format=%s 2>/dev/null || printf '')
-case4_file=$(git -C "$CWD_REPO" show HEAD:tracked.txt 2>/dev/null || printf '')
-if [[ "$case4_rc" -eq 0 && "$case4_head_subject" == "node project" && "$case4_file" == $'before\nfixed' ]]; then
-	print_result "auto-fix restores repo root before amend when cwd disappears" 0
+case4_b=$(git -C "$WORKSPACE_REPO" diff -- packages/b/index.ts)
+case4_cached=$(git -C "$WORKSPACE_REPO" diff --cached --name-only)
+case4_index_b=$(git -C "$WORKSPACE_REPO" show :packages/b/index.ts)
+if [[ "$case4_rc" -eq 0 && "$case4_b" == *"pre-existing unstaged package b edit"* && "$case4_cached" == "packages/b/index.ts" && "$case4_index_b" == *"pre-existing staged package b edit"* ]] &&
+	[[ $(wc -l <"$NPM_CALL_LOG") -eq 2 ]] && ! grep -q '/packages/b|' "$NPM_CALL_LOG" && ! grep -q 'unsafe-root-fixer' "$NPM_CALL_LOG"; then
+	print_result "affected workspace checks preserve unrelated tracked edits" 0
 else
-	print_result "auto-fix restores repo root before amend when cwd disappears" 1 "rc=${case4_rc}, subject=${case4_head_subject}, file=${case4_file}"
+	print_result "affected workspace checks preserve unrelated tracked edits" 1 "rc=${case4_rc}, cached=${case4_cached}"
+fi
+
+# Case 5: a nominally check-only script that mutates package B fails closed.
+MUTATION_REPO="${TEST_ROOT}/workspace-mutation"
+make_workspace_repo "$MUTATION_REPO"
+NPM_CALL_LOG="${TEST_ROOT}/npm-mutation.log"
+NPM_FIX_TARGET="${MUTATION_REPO}/packages/b/index.ts"
+export NPM_CALL_LOG NPM_FIX_TARGET NPM_FAKE_ACTION=mutate-other NPM_FAKE_RC=0
+(
+	cd "$MUTATION_REPO" || exit 1
+	printf '%s\n' 'export const a = 2;' >packages/a/index.ts
+	git add packages/a/index.ts
+	git -c user.name='Test User' -c user.email='test@example.invalid' commit -qm 'change package a'
+	PATH="${FAKE_BIN}:$PATH" _run_project_validators 0
+)
+case5_rc=$?
+case5_head=$(git -C "$MUTATION_REPO" show HEAD:packages/b/index.ts)
+case5_worktree=$(git -C "$MUTATION_REPO" diff -- packages/b/index.ts)
+case5_cached=$(git -C "$MUTATION_REPO" diff --cached --name-only)
+if [[ "$case5_rc" -ne 0 && "$case5_head" == 'export const b = 1;' && "$case5_worktree" == *"validator mutation"* && -z "$case5_cached" ]]; then
+	print_result "out-of-scope validator mutation fails without staging or amend" 0
+else
+	print_result "out-of-scope validator mutation fails without staging or amend" 1 "rc=${case5_rc}, cached=${case5_cached}"
+fi
+
+# Case 6: portable timeout status is distinct from a validator check failure.
+TIMEOUT_REPO="${TEST_ROOT}/validator-timeout"
+make_repo "$TIMEOUT_REPO"
+NPM_CALL_LOG="${TEST_ROOT}/npm-timeout.log"
+export NPM_CALL_LOG NPM_FAKE_ACTION='' NPM_FAKE_RC=0
+(
+	cd "$TIMEOUT_REPO" || exit 1
+	printf '%s\n' 'const answer: number = 42;' >index.ts
+	git add index.ts
+	git -c user.name='Test User' -c user.email='test@example.invalid' commit -qm 'typescript change'
+	timeout_sec() { return 124; }
+	PATH="${FAKE_BIN}:$PATH" _run_project_validators 0
+) 2>"${TEST_ROOT}/timeout-error.log"
+case6_rc=$?
+if [[ "$case6_rc" -ne 0 ]] && grep -q 'TIMEOUT after' "${TEST_ROOT}/timeout-error.log" &&
+	grep -q 'AIDEVOPS_VALIDATOR_TIMEOUT=<n> and rerun' "${TEST_ROOT}/timeout-error.log" &&
+	grep -q "validator_timeout_seconds.*${TIMEOUT_REPO}/.aidevops.json" "${TEST_ROOT}/timeout-error.log"; then
+	print_result "portable validator timeout is a distinct failure" 0
+else
+	print_result "portable validator timeout is a distinct failure" 1 "rc=${case6_rc}"
+fi
+
+# Project configuration wins over the environment; invalid values fail before
+# invoking any package manager. The fallback is 300 when neither is specified.
+printf '%s\n' '{"validator_timeout_seconds":1500}' >"$TIMEOUT_REPO/.aidevops.json"
+(
+	cd "$TIMEOUT_REPO" || exit 1
+	timeout_sec() { [[ "$1" == 1500 ]] || return 1; shift; "$@"; }
+	PATH="${FAKE_BIN}:$PATH" AIDEVOPS_VALIDATOR_TIMEOUT=60 _run_project_validators 0
+) >/dev/null 2>"${TEST_ROOT}/config-error.log"
+case_config_rc=$?
+if [[ "$case_config_rc" -eq 0 ]]; then
+	print_result "project timeout overrides environment" 0
+else
+	print_result "project timeout overrides environment" 1 "rc=${case_config_rc}"
+fi
+printf '%s\n' '{"validator_timeout_seconds":0}' >"$TIMEOUT_REPO/.aidevops.json"
+(
+	cd "$TIMEOUT_REPO" || exit 1
+	PATH="${FAKE_BIN}:$PATH" _run_project_validators 0
+) >/dev/null 2>"${TEST_ROOT}/invalid-timeout.log"
+case_invalid_rc=$?
+if [[ "$case_invalid_rc" -ne 0 ]] && grep -q 'must be a positive integer' "${TEST_ROOT}/invalid-timeout.log"; then
+	print_result "invalid project timeout fails clearly" 0
+else
+	print_result "invalid project timeout fails clearly" 1 "rc=${case_invalid_rc}"
+fi
+rm "$TIMEOUT_REPO/.aidevops.json"
+(
+	cd "$TIMEOUT_REPO" || exit 1
+	timeout_sec() { [[ "$1" == 420 ]] || return 1; shift; "$@"; }
+	PATH="${FAKE_BIN}:$PATH" AIDEVOPS_VALIDATOR_TIMEOUT=420 _run_project_validators 0
+) >/dev/null 2>"${TEST_ROOT}/env-timeout.log"
+case_env_rc=$?
+(
+	cd "$TIMEOUT_REPO" || exit 1
+	timeout_sec() { [[ "$1" == 300 ]] || return 1; shift; "$@"; }
+	PATH="${FAKE_BIN}:$PATH" _run_project_validators 0
+) >/dev/null 2>"${TEST_ROOT}/default-timeout.log"
+case_default_rc=$?
+if [[ "$case_env_rc" -eq 0 && "$case_default_rc" -eq 0 ]]; then
+	print_result "environment timeout and 300-second fallback" 0
+else
+	print_result "environment timeout and 300-second fallback" 1 "env=${case_env_rc} default=${case_default_rc}"
+fi
+
+# GH#34502: ignored canonical configuration survives linked-worktree creation.
+# Use spaces in paths to exercise canonical configuration path handling.
+CANONICAL_REPO="${TEST_ROOT}/canonical checkout"
+LINKED_REPO="${TEST_ROOT}/linked checkout"
+make_repo "$CANONICAL_REPO"
+(
+	cd "$CANONICAL_REPO" || exit 1
+	printf '%s\n' '.aidevops.json' >.gitignore
+	printf '%s\n' 'const answer = 42;' >index.ts
+	git add .gitignore index.ts
+	git -c user.name='Test User' -c user.email='test@example.invalid' commit -qm 'typescript change'
+	printf '%s\n' '{"validator_timeout_seconds":900}' >.aidevops.json
+	git worktree add -qb feature/linked "$LINKED_REPO" || exit 1
+)
+linked_setup_rc=$?
+NPM_CALL_LOG="${TEST_ROOT}/npm-linked.log"
+export NPM_CALL_LOG NPM_FAKE_RC=0
+(
+	[[ "$linked_setup_rc" -eq 0 ]] || exit 1
+	cd "$LINKED_REPO" || exit 1
+	[[ ! -e .aidevops.json ]] || exit 1
+	timeout_sec() {
+		local seconds="$1"
+		[[ "$seconds" == 900 ]] || return 1
+		shift
+		"$@"
+		return $?
+	}
+	PATH="${FAKE_BIN}:$PATH" AIDEVOPS_VALIDATOR_TIMEOUT=60 _run_project_validators 0
+) >/dev/null 2>"${TEST_ROOT}/canonical-timeout.log"
+print_result "linked worktree inherits canonical 900-second timeout over environment" "$?"
+(
+	cd "$LINKED_REPO" || exit 1
+	printf '%s\n' '{"validator_timeout_seconds":1500}' >.aidevops.json
+	timeout_sec() {
+		local seconds="$1"
+		[[ "$seconds" == 1500 ]] || return 1
+		shift
+		"$@"
+		return $?
+	}
+	PATH="${FAKE_BIN}:$PATH" AIDEVOPS_VALIDATOR_TIMEOUT=60 _run_project_validators 0
+) >/dev/null 2>"${TEST_ROOT}/linked-local-timeout.log"
+print_result "worktree-local timeout overrides canonical configuration and environment" "$?"
+(
+	cd "$LINKED_REPO" || exit 1
+	printf '%s\n' '{}' >.aidevops.json
+	timeout_sec() {
+		local seconds="$1"
+		[[ "$seconds" == 420 ]] || return 1
+		shift
+		"$@"
+		return $?
+	}
+	PATH="${FAKE_BIN}:$PATH" AIDEVOPS_VALIDATOR_TIMEOUT=420 _run_project_validators 0
+) >/dev/null 2>"${TEST_ROOT}/linked-empty-timeout.log"
+print_result "local config without timeout uses environment rather than canonical timeout" "$?"
+(
+	cd "$LINKED_REPO" || exit 1
+	rm .aidevops.json
+	timeout_sec() { return 124; }
+	PATH="${FAKE_BIN}:$PATH" _run_project_validators 0
+) >/dev/null 2>"${TEST_ROOT}/canonical-remedy.log"
+canonical_remedy_rc=$?
+if [[ "$canonical_remedy_rc" -ne 0 ]] &&
+	grep -q 'TIMEOUT after 900s' "${TEST_ROOT}/canonical-remedy.log" &&
+	grep -q 'aidevops project-config set validator_timeout_seconds <n>' "${TEST_ROOT}/canonical-remedy.log" &&
+	grep -q "validator_timeout_seconds.*${CANONICAL_REPO}/.aidevops.json" "${TEST_ROOT}/canonical-remedy.log"; then
+	print_result "timeout remedy identifies audited setter and canonical durable configuration" 0
+else
+	print_result "timeout remedy identifies audited setter and canonical durable configuration" 1
+fi
+printf '%s\n' '{"validator_timeout_seconds":0}' >"$CANONICAL_REPO/.aidevops.json"
+(
+	cd "$LINKED_REPO" || exit 1
+	PATH="${FAKE_BIN}:$PATH" AIDEVOPS_VALIDATOR_TIMEOUT=60 _run_project_validators 0
+) >/dev/null 2>"${TEST_ROOT}/canonical-invalid-timeout.log"
+canonical_invalid_rc=$?
+if [[ "$canonical_invalid_rc" -ne 0 ]] && grep -q 'must be a positive integer' "${TEST_ROOT}/canonical-invalid-timeout.log"; then
+	print_result "invalid canonical timeout fails closed" 0
+else
+	print_result "invalid canonical timeout fails closed" 1
+fi
+printf '%s\n' 'not-json' >"$CANONICAL_REPO/.aidevops.json"
+(
+	cd "$LINKED_REPO" || exit 1
+	PATH="${FAKE_BIN}:$PATH" _run_project_validators 0
+) >/dev/null 2>"${TEST_ROOT}/canonical-invalid-json.log"
+canonical_json_rc=$?
+if [[ "$canonical_json_rc" -ne 0 ]] && grep -q 'invalid .aidevops.json configuration' "${TEST_ROOT}/canonical-invalid-json.log"; then
+	print_result "invalid canonical JSON fails closed" 0
+else
+	print_result "invalid canonical JSON fails closed" 1
+fi
+
+# Case 7: a root/shared Node change visibly broadens to every declared workspace
+# without invoking the root's mutating-only lint:fix script.
+ROOT_SCOPE_REPO="${TEST_ROOT}/root-shared-scope"
+make_workspace_repo "$ROOT_SCOPE_REPO"
+NPM_CALL_LOG="${TEST_ROOT}/npm-root-scope.log"
+export NPM_CALL_LOG NPM_FAKE_ACTION='' NPM_FAKE_RC=0
+(
+	cd "$ROOT_SCOPE_REPO" || exit 1
+	cat >package.json <<'EOF'
+{"private":true,"workspaces":["packages/*"],"engines":{"node":">=20"},"scripts":{"lint:fix":"unsafe-root-fixer"}}
+EOF
+	git add package.json
+	git -c user.name='Test User' -c user.email='test@example.invalid' commit -qm 'change shared node contract'
+	PATH="${FAKE_BIN}:$PATH" _run_project_validators 0
+)
+case7_rc=$?
+if [[ "$case7_rc" -eq 0 && $(wc -l <"$NPM_CALL_LOG") -eq 3 ]] &&
+	grep -q '/packages/a|' "$NPM_CALL_LOG" && grep -q '/packages/b|' "$NPM_CALL_LOG" && ! grep -q 'unsafe-root-fixer' "$NPM_CALL_LOG"; then
+	print_result "root shared changes broaden to check-only workspace validation" 0
+else
+	print_result "root shared changes broaden to check-only workspace validation" 1 "rc=${case7_rc}, calls=$(wc -l <"$NPM_CALL_LOG")"
+fi
+
+# Case 8: mutating-only root scripts are never executed and cannot create a
+# false green; publication fails with check-only configuration guidance.
+UNSCOPED_REPO="${TEST_ROOT}/mutating-only"
+make_repo "$UNSCOPED_REPO"
+NPM_CALL_LOG="${TEST_ROOT}/npm-mutating-only.log"
+export NPM_CALL_LOG NPM_FAKE_ACTION='' NPM_FAKE_RC=0
+(
+	cd "$UNSCOPED_REPO" || exit 1
+	printf '%s\n' '{"scripts":{"format:fix":"prettier --write ."}}' >package.json
+	git add package.json
+	git -c user.name='Test User' -c user.email='test@example.invalid' commit -qm 'configure mutating-only formatter'
+	PATH="${FAKE_BIN}:$PATH" _run_project_validators 0
+) 2>"${TEST_ROOT}/unscoped-error.log"
+case8_rc=$?
+if [[ "$case8_rc" -ne 0 && ! -s "$NPM_CALL_LOG" ]] && grep -q 'NO SCOPED CHECKS AVAILABLE' "${TEST_ROOT}/unscoped-error.log"; then
+	print_result "mutating-only scripts fail with scoped-check guidance" 0
+else
+	print_result "mutating-only scripts fail with scoped-check guidance" 1 "rc=${case8_rc}, calls=$(wc -l <"$NPM_CALL_LOG" 2>/dev/null || printf 0)"
+fi
+
+# Case 9: a nested package with its own check-only test script remains a valid
+# validation scope even when it is intentionally outside the root workspaces.
+NESTED_PACKAGE_REPO="${TEST_ROOT}/nested-package"
+make_workspace_repo "$NESTED_PACKAGE_REPO"
+NPM_CALL_LOG="${TEST_ROOT}/npm-nested-package.log"
+export NPM_CALL_LOG NPM_FAKE_ACTION='' NPM_FAKE_RC=0
+(
+	cd "$NESTED_PACKAGE_REPO" || exit 1
+	mkdir -p .agents/plugins/example
+	printf '%s\n' '{"scripts":{"test":"node --test tests/*.mjs"}}' >.agents/plugins/example/package.json
+	printf '%s\n' 'export const example = true;' >.agents/plugins/example/index.mjs
+	git add .agents/plugins/example
+	git -c user.name='Test User' -c user.email='test@example.invalid' commit -qm 'add nested package'
+	PATH="${FAKE_BIN}:$PATH" _run_project_validators 0
+)
+case9_rc=$?
+if [[ "$case9_rc" -eq 0 && $(wc -l <"$NPM_CALL_LOG") -eq 1 ]] &&
+	grep -q '/.agents/plugins/example|run test' "$NPM_CALL_LOG" && ! grep -q '/packages/' "$NPM_CALL_LOG"; then
+	print_result "nested package test script defines a focused validation scope" 0
+else
+	print_result "nested package test script defines a focused validation scope" 1 "rc=${case9_rc}, calls=$(wc -l <"$NPM_CALL_LOG" 2>/dev/null || printf 0)"
+fi
+
+# Case 10: npm's generated failing test placeholder is not a scoped check.
+PLACEHOLDER_REPO="${TEST_ROOT}/npm-placeholder"
+make_repo "$PLACEHOLDER_REPO"
+NPM_CALL_LOG="${TEST_ROOT}/npm-placeholder.log"
+export NPM_CALL_LOG NPM_FAKE_ACTION='' NPM_FAKE_RC=0
+(
+	cd "$PLACEHOLDER_REPO" || exit 1
+	printf '%s\n' '{"scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}' >package.json
+	git add package.json
+	git -c user.name='Test User' -c user.email='test@example.invalid' commit -qm 'configure npm placeholder test'
+	PATH="${FAKE_BIN}:$PATH" _run_project_validators 0
+) 2>"${TEST_ROOT}/npm-placeholder-error.log"
+case10_rc=$?
+if [[ "$case10_rc" -ne 0 && ! -s "$NPM_CALL_LOG" ]] && grep -q 'NO SCOPED CHECKS AVAILABLE' "${TEST_ROOT}/npm-placeholder-error.log"; then
+	print_result "npm placeholder test fails with scoped-check guidance" 0
+else
+	print_result "npm placeholder test fails with scoped-check guidance" 1 "rc=${case10_rc}, calls=$(wc -l <"$NPM_CALL_LOG" 2>/dev/null || printf 0)"
+fi
+
+# Case 11: pnpm-only workspace declarations select changed packages on a
+# non-main base while preserving an unrelated staged and unstaged edit.
+PNPM_REPO="${TEST_ROOT}/pnpm-workspace"
+make_workspace_repo "$PNPM_REPO" pnpm
+NPM_CALL_LOG="${TEST_ROOT}/pnpm-workspace.log"
+export NPM_CALL_LOG NPM_FAKE_ACTION='' NPM_FAKE_RC=0
+(
+	cd "$PNPM_REPO" || exit 1
+	printf '%s\n' 'export const a = 2;' >packages/a/index.ts
+	git add packages/a/index.ts
+	git -c user.name='Test User' -c user.email='test@example.invalid' commit -qm 'change package a'
+	printf '%s\n' 'staged unrelated edit' >>packages/b/index.ts
+	git add packages/b/index.ts
+	printf '%s\n' 'unstaged unrelated edit' >>packages/b/index.ts
+	PATH="${FAKE_BIN}:$PATH" _run_project_validators 0
+)
+case11_rc=$?
+case11_cached=$(git -C "$PNPM_REPO" diff --cached --name-only)
+if [[ "$case11_rc" -eq 0 && "$case11_cached" == 'packages/b/index.ts' ]] &&
+	[[ $(git -C "$PNPM_REPO" show :packages/b/index.ts) == *'staged unrelated edit'* ]] &&
+	[[ $(git -C "$PNPM_REPO" diff -- packages/b/index.ts) == *'unstaged unrelated edit'* ]] &&
+	[[ $(wc -l <"$NPM_CALL_LOG") -eq 2 ]] && grep -q '/packages/a|run lint' "$NPM_CALL_LOG" &&
+	! grep -q '/packages/b|\|/pnpm-workspace|run' "$NPM_CALL_LOG"; then
+	print_result "pnpm-only workspace selects affected package and preserves index" 0
+else
+	print_result "pnpm-only workspace selects affected package and preserves index" 1 "rc=${case11_rc}, cached=${case11_cached}"
+fi
+
+# Case 12: lockfile-only changes run root checks once, skipping scriptless groups
+# and avoiding duplicate checks in their nested packages.
+PNPM_ROOT_REPO="${TEST_ROOT}/pnpm-root"
+make_workspace_repo "$PNPM_ROOT_REPO" pnpm
+NPM_CALL_LOG="${TEST_ROOT}/pnpm-root.log"
+export NPM_CALL_LOG NPM_FAKE_RC=0
+(
+	cd "$PNPM_ROOT_REPO" || exit 1
+	mkdir -p packages/analytics/web
+	printf '%s\n' '{"name":"analytics","private":true}' >packages/analytics/package.json
+	printf '%s\n' '{"scripts":{"lint":"eslint ."}}' >packages/analytics/web/package.json
+	printf '%s\n' '{"private":true,"scripts":{"lint":"turbo run lint","test":"turbo run test"}}' >package.json
+	printf '%s\n' "  - 'packages/analytics/*'" >>pnpm-workspace.yaml
+	git add package.json pnpm-workspace.yaml packages/analytics
+	git -c user.name='Test User' -c user.email='test@example.invalid' commit -qm 'add grouping workspace and root checks'
+	git update-ref refs/remotes/origin/develop HEAD
+	printf '%s\n' '# lockfile change' >>pnpm-lock.yaml
+	git add pnpm-lock.yaml
+	git -c user.name='Test User' -c user.email='test@example.invalid' commit -qm 'change lockfile only'
+	PATH="${FAKE_BIN}:$PATH" _run_project_validators 0
+)
+case12_rc=$?
+if [[ "$case12_rc" -eq 0 && $(wc -l <"$NPM_CALL_LOG") -eq 2 ]] &&
+	grep -q '/pnpm-root|run lint' "$NPM_CALL_LOG" && grep -q '/pnpm-root|run test' "$NPM_CALL_LOG" &&
+	! grep -q '/packages/' "$NPM_CALL_LOG"; then
+	print_result "pnpm lockfile change runs root checks once despite scriptless groups" 0
+else
+	print_result "pnpm lockfile change runs root checks once despite scriptless groups" 1 "rc=${case12_rc}"
+fi
+
+# Case 13: a pnpm workspace validator failure remains a hard failure.
+NPM_CALL_LOG="${TEST_ROOT}/pnpm-failure.log"
+export NPM_CALL_LOG NPM_FAKE_RC=2
+(
+	cd "$PNPM_ROOT_REPO" || exit 1
+	PATH="${FAKE_BIN}:$PATH" _run_project_validators 0
+)
+case13_rc=$?
+if [[ "$case13_rc" -ne 0 && -s "$NPM_CALL_LOG" ]]; then
+	print_result "pnpm validator failure blocks publication" 0
+else
+	print_result "pnpm validator failure blocks publication" 1 "rc=${case13_rc}"
+fi
+
+# Case 14: docs-only branches never launch pnpm validation.
+PNPM_DOCS_REPO="${TEST_ROOT}/pnpm-docs"
+make_workspace_repo "$PNPM_DOCS_REPO" pnpm
+NPM_CALL_LOG="${TEST_ROOT}/pnpm-docs.log"
+export NPM_CALL_LOG NPM_FAKE_RC=2
+(
+	cd "$PNPM_DOCS_REPO" || exit 1
+	printf '%s\n' '# Docs' >README.md
+	git add README.md
+	git -c user.name='Test User' -c user.email='test@example.invalid' commit -qm 'docs only'
+	PATH="${FAKE_BIN}:$PATH" _run_project_validators 0
+)
+case14_rc=$?
+if [[ "$case14_rc" -eq 0 && ! -s "$NPM_CALL_LOG" ]]; then
+	print_result "pnpm docs-only branch skips project validators" 0
+else
+	print_result "pnpm docs-only branch skips project validators" 1 "rc=${case14_rc}"
+fi
+
+# Case 15: a workspace manifest change broadens validation even if root has
+# no scripts or package.json workspaces; the manifest is a shared contract.
+PNPM_MANIFEST_REPO="${TEST_ROOT}/pnpm-manifest"
+make_workspace_repo "$PNPM_MANIFEST_REPO" pnpm
+NPM_CALL_LOG="${TEST_ROOT}/pnpm-manifest.log"
+export NPM_CALL_LOG NPM_FAKE_RC=0
+(
+	cd "$PNPM_MANIFEST_REPO" || exit 1
+	mkdir -p packages/analytics/web
+	printf '%s\n' '{"name":"analytics","private":true}' >packages/analytics/package.json
+	printf '%s\n' '{"scripts":{"test":"node --test"}}' >packages/analytics/web/package.json
+	printf '%s\n' "  - 'packages/analytics/*'" >>pnpm-workspace.yaml
+	printf '%s\n' '{"private":true}' >package.json
+	git add package.json pnpm-workspace.yaml packages/analytics
+	git -c user.name='Test User' -c user.email='test@example.invalid' commit -qm 'remove root check'
+	git update-ref refs/remotes/origin/develop HEAD
+	printf '%s\n' '# shared workspace change' >>pnpm-workspace.yaml
+	git add pnpm-workspace.yaml
+	git -c user.name='Test User' -c user.email='test@example.invalid' commit -qm 'change workspace declaration'
+	PATH="${FAKE_BIN}:$PATH" _run_project_validators 0
+)
+case15_rc=$?
+if [[ "$case15_rc" -eq 0 && $(wc -l <"$NPM_CALL_LOG") -eq 4 ]] &&
+	grep -q '/packages/a|run lint' "$NPM_CALL_LOG" && grep -q '/packages/b|run lint' "$NPM_CALL_LOG" &&
+	grep -q '/packages/analytics/web|run test' "$NPM_CALL_LOG" &&
+	! grep -q '/packages/analytics|run' "$NPM_CALL_LOG" &&
+	! grep -q '/pnpm-manifest|run' "$NPM_CALL_LOG"; then
+	print_result "pnpm manifest alone triggers shared package checks" 0
+else
+	print_result "pnpm manifest alone triggers shared package checks" 1 "rc=${case15_rc}"
+fi
+
+# Shared changes still fail closed if neither root nor any workspace has checks.
+NPM_CALL_LOG="${TEST_ROOT}/pnpm-no-checks.log"
+export NPM_CALL_LOG
+(
+	cd "$PNPM_MANIFEST_REPO" || exit 1
+	for manifest in packages/a/package.json packages/b/package.json packages/analytics/web/package.json; do
+		printf '%s\n' '{"private":true}' >"$manifest"
+	done
+	git add packages
+	git -c user.name='Test User' -c user.email='test@example.invalid' commit -qm 'remove workspace checks'
+	PATH="${FAKE_BIN}:$PATH" _run_project_validators 0
+)
+no_checks_rc=$?
+if [[ "$no_checks_rc" -ne 0 && ! -s "$NPM_CALL_LOG" ]]; then
+	print_result "shared changes without check-capable scopes fail closed" 0
+else
+	print_result "shared changes without check-capable scopes fail closed" 1 "rc=${no_checks_rc}"
+fi
+
+# A locked workspace in a fresh worktree installs once, then reuses its
+# installed lock marker. Install failures are environment failures, not tests.
+LOCK_REPO="${TEST_ROOT}/locked-workspace"
+make_repo "$LOCK_REPO"
+NPM_CALL_LOG="${TEST_ROOT}/npm-locked.log"
+export NPM_CALL_LOG NPM_FAKE_RC=0 NPM_INSTALL_FAIL=0
+(
+	cd "$LOCK_REPO" || exit 1
+	printf '%s\n' '{"lockfileVersion":3}' >package-lock.json
+	git add package-lock.json
+	git -c user.name='Test User' -c user.email='test@example.invalid' commit -qm 'add lockfile'
+	PATH="${FAKE_BIN}:$PATH" _run_project_validators 0 || exit 1
+	PATH="${FAKE_BIN}:$PATH" _run_project_validators 0
+)
+locked_rc=$?
+if [[ "$locked_rc" -eq 0 && $(grep -c '|ci --ignore-scripts --no-audit --no-fund' "$NPM_CALL_LOG") -eq 1 &&
+	$(grep -c '|run typecheck' "$NPM_CALL_LOG") -eq 2 ]]; then
+	print_result "locked worktree installs once before checks" 0
+else
+	print_result "locked worktree installs once before checks" 1 "rc=${locked_rc}"
+fi
+rm -rf "$LOCK_REPO/node_modules"
+NPM_CALL_LOG="${TEST_ROOT}/npm-install-failure.log"
+export NPM_CALL_LOG NPM_INSTALL_FAIL=1
+(
+	cd "$LOCK_REPO" || exit 1
+	PATH="${FAKE_BIN}:$PATH" _run_project_validators 0
+) 2>"${TEST_ROOT}/install-error.log"
+install_rc=$?
+if [[ "$install_rc" -ne 0 && $(wc -l <"$NPM_CALL_LOG") -eq 1 ]] &&
+	grep -q 'ENVIRONMENT FAILURE (exit 42): npm ci' "${TEST_ROOT}/install-error.log"; then
+	print_result "install failure is classified as environment failure" 0
+else
+	print_result "install failure is classified as environment failure" 1 "rc=${install_rc}"
 fi
 
 printf '\n%d tests run, %d failed\n' "$TESTS_RUN" "$TESTS_FAILED"

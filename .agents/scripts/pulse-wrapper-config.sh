@@ -24,6 +24,13 @@
 [[ -n "${_PULSE_WRAPPER_CONFIG_LOADED:-}" ]] && return 0
 _PULSE_WRAPPER_CONFIG_LOADED=1
 
+# Pulse identity for gh: every process that loads Pulse configuration (wrapper,
+# merge routine, merge webhook receiver, complexity scan, cleanup helpers via
+# pulse-cleanup.sh) enables the repository App read resolver here, once. The gh
+# shim selects credentials per invocation; reads it cannot prove repository
+# scoped keep existing auth, so no token is exported by these processes.
+export AIDEVOPS_PULSE_AUTH=1
+
 # Defensive SCRIPT_DIR fallback (matches issue-sync-lib.sh pattern)
 if [[ -z "${SCRIPT_DIR:-}" ]]; then
 	_lib_path="${BASH_SOURCE[0]%/*}"
@@ -35,6 +42,7 @@ fi
 #######################################
 # Configuration
 #######################################
+PULSE_ELASTIC_DISPATCH_ENABLED="${PULSE_ELASTIC_DISPATCH_ENABLED:-1}" # Fresh owner lease, not cycle age, bounds dispatch
 PULSE_STALE_THRESHOLD="${PULSE_STALE_THRESHOLD:-3600}"                                       # 60 min hard ceiling — workers need 10-20 min to solve issues; 15 min was killing active workers (GH#19166)
 PULSE_IDLE_TIMEOUT="${PULSE_IDLE_TIMEOUT:-1800}"                                             # 30 min idle before kill — the per-worker activity watchdog (300s) is the real stall detector
 PULSE_IDLE_CPU_THRESHOLD="${PULSE_IDLE_CPU_THRESHOLD:-2}"                                    # CPU% below this = idle (0-100 scale) — lowered from 5 to reduce false positives on I/O-bound work
@@ -51,27 +59,52 @@ PULSE_EVENT_REFILL_POLL_SECONDS="${PULSE_EVENT_REFILL_POLL_SECONDS:-1}"         
 PULSE_EVENT_REFILL_MAX_PASSES="${PULSE_EVENT_REFILL_MAX_PASSES:-2}"                            # Drain again when another exit lands during a refill
 PULSE_EVENT_REFILL_WAKE_PASSES="${PULSE_EVENT_REFILL_WAKE_PASSES:-2}"                          # Retry wrapper wake when a trigger remains after one refill invocation
 ORPHAN_MAX_AGE="${ORPHAN_MAX_AGE:-7200}"                                                     # 2 hours — kill orphans older than this
+ORPHAN_INACTIVITY_AGE="${ORPHAN_INACTIVITY_AGE:-259200}"                                   # 3 days — require session inactivity before orphan cleanup
 ORPHAN_WORKTREE_GRACE_SECS="${ORPHAN_WORKTREE_GRACE_SECS:-1800}"                             # 30 min grace for 0-commit worktrees with no open PR (t1884)
-RAM_PER_WORKER_MB="${RAM_PER_WORKER_MB:-512}"                                                # 512 MB per worker (opencode headless is lightweight)
+# GH#35537 worker resource policy: RAM is the only host resource that limits
+# workers. CPU load and core counts never cap, close or pace admission — Macs
+# and servers schedule their own CPU at sustained 100% per core. Do not
+# reintroduce a CPU/load term here; see reference/configuration.md "Worker
+# resource policy" and tests/test-pulse-ram-admission.sh.
+# 1536 MB per worker: measured headless worker process trees (opencode plus
+# git/node/test children) used 0.7-1.6 GB on 2026-10-23; the former 512 MB
+# estimate admitted about 3x more workers than RAM could hold.
+RAM_PER_WORKER_MB="${RAM_PER_WORKER_MB:-1536}"
 RAM_RESERVE_MB="${RAM_RESERVE_MB:-6144}"                                                     # 6 GB reserved for OS + user apps
-# Compute sensible default cap from total RAM (not free RAM — that's volatile).
-# Formula: (total_ram_mb - reserve) / ram_per_worker, clamped to [4, 64].
-# This replaces the old static default of 8 which silently throttled capable machines (t1532).
-# t2950: ceiling raised 32→64; on a 64GB runner (64*1024-6144)/512=116 workers fit physically — old clamp left >70% headroom unused.
-MAX_WORKERS_CAP_FLOOR=4
-MAX_WORKERS_CAP_CEILING=64                                                                           # t2950: raised from 32; modern 64GB+ runners support far more concurrency
-_default_cap=8
+# Automatic cap from total RAM (not free RAM — that's volatile):
+# (total_ram_mb - reserve) / ram_per_worker, clamped to [2, 64]. Live free RAM
+# bounds each pass further in calculate_max_workers / the refill cap.
+# t1532 replaced a static default of 8; t2950 raised the ceiling 32→64;
+# GH#35537 removed GH#32663's 50%-of-cores bound.
+MAX_WORKERS_CAP_FLOOR=2
+MAX_WORKERS_CAP_CEILING=64
+_default_cap="$MAX_WORKERS_CAP_CEILING"
 if [[ "$(uname)" == "Darwin" ]]; then
 	_total_mb=$(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%d", $1/1048576}')
 elif [[ -f /proc/meminfo ]]; then
 	_total_mb=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
 fi
-if [[ "${_total_mb:-0}" -gt 0 ]]; then
-	_default_cap=$(((_total_mb - RAM_RESERVE_MB) / RAM_PER_WORKER_MB))
-	[[ "$_default_cap" -lt "$MAX_WORKERS_CAP_FLOOR" ]] && _default_cap="$MAX_WORKERS_CAP_FLOOR"
-	[[ "$_default_cap" -gt "$MAX_WORKERS_CAP_CEILING" ]] && _default_cap="$MAX_WORKERS_CAP_CEILING"
+if [[ "${_total_mb:-0}" =~ ^[0-9]+$ && "${_total_mb:-0}" -gt 0 ]]; then
+	_ram_per_worker_for_cap="$RAM_PER_WORKER_MB"
+	[[ "$_ram_per_worker_for_cap" =~ ^[1-9][0-9]*$ ]] || _ram_per_worker_for_cap=1536
+	_default_cap=$(((_total_mb - RAM_RESERVE_MB) / _ram_per_worker_for_cap))
+else
+	_default_cap=8 # total RAM unreadable: modest ceiling; live RAM still bounds each pass
 fi
-MAX_WORKERS_CAP="${MAX_WORKERS_CAP:-$(config_get "orchestration.max_workers_cap" "$_default_cap")}"     # Derived from total RAM; override via config or env
+[[ "$_default_cap" -lt "$MAX_WORKERS_CAP_FLOOR" ]] && _default_cap="$MAX_WORKERS_CAP_FLOOR"
+[[ "$_default_cap" -gt "$MAX_WORKERS_CAP_CEILING" ]] && _default_cap="$MAX_WORKERS_CAP_CEILING"
+MAX_WORKERS_CAP="${MAX_WORKERS_CAP:-$(config_get "orchestration.max_workers_cap" "0")}" # 0/auto = total-RAM ceiling; override via config or env
+# Retain provenance after resolving auto: shared-host sizing must not divide an
+# operator's explicit per-runner ceiling (GH#33770).
+MAX_WORKERS_CAP_AUTO=0
+case "$MAX_WORKERS_CAP" in
+"" | 0 | auto)
+	MAX_WORKERS_CAP="$_default_cap"
+	MAX_WORKERS_CAP_AUTO=1
+	;;
+esac
+# orchestration.max_load_per_core / cpu_idle_admit_percent are deprecated and
+# inert (GH#35537): CPU never gates admission.
 VAULT_DEVICE_HELPER="${VAULT_DEVICE_HELPER:-${SCRIPT_DIR}/vault-device-helper.sh}"                         # Non-secret Vault fleet status helper; schedulers may call can-dispatch for Vault-sensitive work
 VAULT_DEVICE_DISPATCH_PREFLIGHT="${VAULT_DEVICE_DISPATCH_PREFLIGHT:-0}"                                    # 0=disabled until task metadata requires Vault routing; 1=consult local heartbeat/trust state
 VAULT_DEVICE_DISPATCH_NEEDS_UNLOCKED="${VAULT_DEVICE_DISPATCH_NEEDS_UNLOCKED:-0}"                          # 1=Vault-sensitive work requires a fresh unlocked heartbeat before local dispatch
@@ -145,14 +178,16 @@ MODEL_AVAILABILITY_HELPER="${MODEL_AVAILABILITY_HELPER:-${SCRIPT_DIR}/model-avai
 _pulse_warn_if_legacy_model_var_from_credentials "PULSE_MODEL" "${PULSE_MODEL:-}"
 _pulse_warn_if_legacy_model_var_from_credentials "AIDEVOPS_HEADLESS_MODELS" "${AIDEVOPS_HEADLESS_MODELS:-}"
 if [[ -z "${PULSE_MODEL:-}" ]] && [[ -x "$MODEL_AVAILABILITY_HELPER" ]]; then
-	PULSE_MODEL=$("$MODEL_AVAILABILITY_HELPER" resolve standard --quiet 2>/dev/null || true)
+	PULSE_MODEL=$("$MODEL_AVAILABILITY_HELPER" resolve thinking --quiet 2>/dev/null || true)
 fi
-# Absolute fallback if routing resolution fails entirely.
-PULSE_MODEL="${PULSE_MODEL:-anthropic/claude-sonnet-4-6}"
+# If pre-resolution fails, let the headless thinking route apply availability
+# and provider policy; never turn failure into an unrelated hardcoded model pin.
+PULSE_MODEL="${PULSE_MODEL:-}"
 PULSE_BACKFILL_MAX_ATTEMPTS="${PULSE_BACKFILL_MAX_ATTEMPTS:-3}"                                            # Additional pulse passes when below utilization target (t1453)
 PULSE_LAUNCH_GRACE_SECONDS="${PULSE_LAUNCH_GRACE_SECONDS:-35}"                                             # Max grace window for worker process to appear after dispatch (t1453) — raised from 20s to 35s: sandbox-exec + opencode cold-start takes ~25-30s
 PULSE_LAUNCH_SETTLE_BATCH_MAX="${PULSE_LAUNCH_SETTLE_BATCH_MAX:-5}"                                        # Dispatch count at which the full PULSE_LAUNCH_GRACE_SECONDS wait applies (t1887)
 PRE_RUN_STAGE_TIMEOUT="${PRE_RUN_STAGE_TIMEOUT:-600}"                                                      # 10 min cap per pre-run stage (cleanup/prefetch)
+PULSE_CACHE_PRIME_TIMEOUT="${AIDEVOPS_PULSE_CACHE_PRIME_TIMEOUT_S:-300}"                                   # In-cycle cache prime cap; also clamped to keep early-dispatch reserve (GH#33737)
 PULSE_STAGE_TIMINGS_LOG="${PULSE_STAGE_TIMINGS_LOG:-${HOME}/.aidevops/logs/pulse-stage-timings.log}"       # Structured TSV stage timing log (GH#20025)
 PULSE_LOCK_MAX_AGE_S="${AIDEVOPS_PULSE_LOCK_MAX_AGE_S:-1800}"                                              # Force-reclaim mkdir lock after this age in seconds (GH#20025)
 PULSE_MIN_INTERVAL_S="${AIDEVOPS_PULSE_MIN_INTERVAL_S:-90}"                                                # Entry-point rate-limit: skip cycle if last run was less than this many seconds ago (GH#20578)
@@ -219,6 +254,11 @@ PULSE_TIER_HOT_INTERVAL="${PULSE_TIER_HOT_INTERVAL:-0}"                         
 PULSE_TIER_WARM_INTERVAL="${PULSE_TIER_WARM_INTERVAL:-180}"                                               # t2831: warm repos: skip if last check < 180s ago (~3 cycles at 60s base)
 PULSE_TIER_COLD_INTERVAL="${PULSE_TIER_COLD_INTERVAL:-600}"                                               # t2831: cold repos: skip if last check < 600s ago (~10 cycles at 60s base)
 export PULSE_TIER_CLASSIFICATION_ENABLED PULSE_TIER_HOT_INTERVAL PULSE_TIER_WARM_INTERVAL PULSE_TIER_COLD_INTERVAL
+
+# t18604: idle-repo scheduling; independent of activity tiers and repos.json flags.
+PULSE_REPO_DORMANCY_ENABLED="${PULSE_REPO_DORMANCY_ENABLED:-1}"
+PULSE_DORMANCY_BACKSTOP_SECONDS="${PULSE_DORMANCY_BACKSTOP_SECONDS:-21600}"
+export PULSE_REPO_DORMANCY_ENABLED PULSE_DORMANCY_BACKSTOP_SECONDS
 
 # Per-issue retry state (t1888, GH#2076, GH#17384)
 #
@@ -287,10 +327,11 @@ PULSE_EVENT_REFILL_POLL_SECONDS=$(_validate_int PULSE_EVENT_REFILL_POLL_SECONDS 
 PULSE_EVENT_REFILL_MAX_PASSES=$(_validate_int PULSE_EVENT_REFILL_MAX_PASSES "$PULSE_EVENT_REFILL_MAX_PASSES" 2 1)
 PULSE_EVENT_REFILL_WAKE_PASSES=$(_validate_int PULSE_EVENT_REFILL_WAKE_PASSES "$PULSE_EVENT_REFILL_WAKE_PASSES" 2 1)
 ORPHAN_MAX_AGE=$(_validate_int ORPHAN_MAX_AGE "$ORPHAN_MAX_AGE" 7200)
+ORPHAN_INACTIVITY_AGE=$(_validate_int ORPHAN_INACTIVITY_AGE "$ORPHAN_INACTIVITY_AGE" 259200 86400)
 ORPHAN_WORKTREE_GRACE_SECS=$(_validate_int ORPHAN_WORKTREE_GRACE_SECS "$ORPHAN_WORKTREE_GRACE_SECS" 1800 60)
-RAM_PER_WORKER_MB=$(_validate_int RAM_PER_WORKER_MB "$RAM_PER_WORKER_MB" 512 1)
+RAM_PER_WORKER_MB=$(_validate_int RAM_PER_WORKER_MB "$RAM_PER_WORKER_MB" 1536 1)
 RAM_RESERVE_MB=$(_validate_int RAM_RESERVE_MB "$RAM_RESERVE_MB" 6144)
-MAX_WORKERS_CAP=$(_validate_int MAX_WORKERS_CAP "$MAX_WORKERS_CAP" "${_default_cap:-8}")
+MAX_WORKERS_CAP=$(_validate_int MAX_WORKERS_CAP "$MAX_WORKERS_CAP" "${_default_cap:-8}" 1)
 DAILY_PR_CAP=$(_validate_int DAILY_PR_CAP "$DAILY_PR_CAP" 5 1)
 PRODUCT_RESERVATION_PCT=$(_validate_int PRODUCT_RESERVATION_PCT "$PRODUCT_RESERVATION_PCT" 60 0)
 QUALITY_DEBT_CAP_PCT=$(_validate_int QUALITY_DEBT_CAP_PCT "$QUALITY_DEBT_CAP_PCT" 30 0)
@@ -301,6 +342,7 @@ PULSE_BACKFILL_MAX_ATTEMPTS=$(_validate_int PULSE_BACKFILL_MAX_ATTEMPTS "$PULSE_
 PULSE_LAUNCH_GRACE_SECONDS=$(_validate_int PULSE_LAUNCH_GRACE_SECONDS "$PULSE_LAUNCH_GRACE_SECONDS" 35 5)
 PULSE_LAUNCH_SETTLE_BATCH_MAX=$(_validate_int PULSE_LAUNCH_SETTLE_BATCH_MAX "$PULSE_LAUNCH_SETTLE_BATCH_MAX" 5 1)
 PRE_RUN_STAGE_TIMEOUT=$(_validate_int PRE_RUN_STAGE_TIMEOUT "$PRE_RUN_STAGE_TIMEOUT" 600 30)
+PULSE_CACHE_PRIME_TIMEOUT=$(_validate_int PULSE_CACHE_PRIME_TIMEOUT "$PULSE_CACHE_PRIME_TIMEOUT" 300 30)
 PULSE_PREFETCH_PR_LIMIT=$(_validate_int PULSE_PREFETCH_PR_LIMIT "$PULSE_PREFETCH_PR_LIMIT" 200 1)
 PULSE_PREFETCH_ISSUE_LIMIT=$(_validate_int PULSE_PREFETCH_ISSUE_LIMIT "$PULSE_PREFETCH_ISSUE_LIMIT" 200 1)
 PULSE_RUNNABLE_PR_LIMIT=$(_validate_int PULSE_RUNNABLE_PR_LIMIT "$PULSE_RUNNABLE_PR_LIMIT" 200 1)
@@ -388,8 +430,12 @@ OPENCODE_BIN="${OPENCODE_BIN:-$(command -v opencode 2>/dev/null || echo "opencod
 # with any specific managed repo in the host app's session database.
 # Previously defaulted to ~/Git/aidevops, which caused 155+ orphaned sessions
 # to accumulate under that project even when it had pulse:false (GH#5136).
+# Keep the runtime in the dedicated supervisor subtree rather than the whole
+# agent workspace: OpenCode gives FFF the --dir project as its base path, and
+# large-tree scans are reported to scale with that scope (GH#31842; upstream
+# anomalyco/opencode#46256).
 # Override via env var if a specific directory is needed.
-PULSE_DIR="${PULSE_DIR:-${HOME}/.aidevops/.agent-workspace}"
+PULSE_DIR="${PULSE_DIR:-${HOME}/.aidevops/.agent-workspace/supervisor}"
 # PULSE_MODEL is derived from routing table above (GH#17769) — no longer user-configurable
 HEADLESS_RUNTIME_HELPER="${HEADLESS_RUNTIME_HELPER:-${SCRIPT_DIR}/headless-runtime-helper.sh}"
 MODEL_AVAILABILITY_HELPER="${MODEL_AVAILABILITY_HELPER:-${SCRIPT_DIR}/model-availability-helper.sh}"
@@ -406,9 +452,6 @@ COMPLEXITY_DEBT_COUNT_FILE="${HOME}/.aidevops/logs/complexity-debt-count" # trac
 DEDUP_CLEANUP_LAST_RUN="${HOME}/.aidevops/logs/dedup-cleanup-last-run"
 DEDUP_CLEANUP_INTERVAL="${DEDUP_CLEANUP_INTERVAL:-86400}"  # 1 day in seconds
 DEDUP_CLEANUP_BATCH_SIZE="${DEDUP_CLEANUP_BATCH_SIZE:-50}" # Max issues to close per run
-CODERABBIT_REVIEW_LAST_RUN="${HOME}/.aidevops/logs/coderabbit-review-last-run"
-CODERABBIT_REVIEW_INTERVAL="${CODERABBIT_REVIEW_INTERVAL:-86400}" # 1 day in seconds
-CODERABBIT_REVIEW_ISSUE="2632"                                    # Issue where CodeRabbit full reviews are requested
 POST_MERGE_SCANNER_LAST_RUN="${HOME}/.aidevops/logs/post-merge-scanner-last-run"
 POST_MERGE_SCANNER_INTERVAL="${POST_MERGE_SCANNER_INTERVAL:-86400}"             # 1 day in seconds
 # t2949: parent-task nudge/re-file gate thresholds (reduced from 24h/86400 to 4h/14400).
@@ -443,12 +486,15 @@ DEP_GRAPH_CACHE_TTL_SECS="${DEP_GRAPH_CACHE_TTL_SECS:-300}"                     
 #   per cycle with timestamp, duration, dispatch/merge/kill counters, and
 #   worker utilisation. Enables fast cycle-level analytics without parsing
 #   the full log. Capped at PULSE_CYCLE_INDEX_MAX_LINES lines; oldest lines
-#   are pruned when the cap is exceeded.
+#   are archived before pruning, with 500 lines of hysteresis.
 PULSE_LOG_HOT_MAX_BYTES="${PULSE_LOG_HOT_MAX_BYTES:-52428800}"     # 50 MB hot log cap
 PULSE_LOG_COLD_MAX_BYTES="${PULSE_LOG_COLD_MAX_BYTES:-1073741824}" # 1 GB cold archive cap
 PULSE_LOG_ARCHIVE_DIR="${PULSE_LOG_ARCHIVE_DIR:-${HOME}/.aidevops/logs/pulse-archive}"
 PULSE_CYCLE_INDEX_FILE="${PULSE_CYCLE_INDEX_FILE:-${HOME}/.aidevops/logs/pulse-cycle-index.jsonl}"
 PULSE_CYCLE_INDEX_MAX_LINES="${PULSE_CYCLE_INDEX_MAX_LINES:-10000}" # ~10k cycles ≈ ~14 days at 2-min intervals
+PULSE_METRICS_ARCHIVE_DIR="${PULSE_METRICS_ARCHIVE_DIR:-${HOME}/.aidevops/logs/metrics-archive}"
+PULSE_METRICS_HOT_MAX_BYTES="${PULSE_METRICS_HOT_MAX_BYTES:-26214400}"    # 25 MiB per ledger
+PULSE_METRICS_COLD_MAX_BYTES="${PULSE_METRICS_COLD_MAX_BYTES:-524288000}" # 500 MiB combined
 
 # Per-cycle health counters — incremented by merge/cleanup/dispatch functions
 # and flushed to PULSE_HEALTH_FILE by write_pulse_health_file() at cycle end.
@@ -481,7 +527,6 @@ COMPLEXITY_LLM_SWEEP_INTERVAL=$(_validate_int COMPLEXITY_LLM_SWEEP_INTERVAL "$CO
 COMPLEXITY_FUNC_LINE_THRESHOLD=$(_validate_int COMPLEXITY_FUNC_LINE_THRESHOLD "$COMPLEXITY_FUNC_LINE_THRESHOLD" 100 50)
 COMPLEXITY_FILE_VIOLATION_THRESHOLD=$(_validate_int COMPLEXITY_FILE_VIOLATION_THRESHOLD "$COMPLEXITY_FILE_VIOLATION_THRESHOLD" 1 1)
 COMPLEXITY_MD_MIN_LINES=$(_validate_int COMPLEXITY_MD_MIN_LINES "$COMPLEXITY_MD_MIN_LINES" 500 10)
-CODERABBIT_REVIEW_INTERVAL=$(_validate_int CODERABBIT_REVIEW_INTERVAL "$CODERABBIT_REVIEW_INTERVAL" 86400 3600)
 POST_MERGE_SCANNER_INTERVAL=$(_validate_int POST_MERGE_SCANNER_INTERVAL "$POST_MERGE_SCANNER_INTERVAL" 86400 3600)
 AUTO_DECOMPOSER_INTERVAL=$(_validate_int AUTO_DECOMPOSER_INTERVAL "$AUTO_DECOMPOSER_INTERVAL" 14400 3600)
 FAST_FAIL_SKIP_THRESHOLD=$(_validate_int FAST_FAIL_SKIP_THRESHOLD "$FAST_FAIL_SKIP_THRESHOLD" 5 1)

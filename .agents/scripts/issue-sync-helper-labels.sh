@@ -48,7 +48,7 @@ gh_list_issues() {
 	local repo="$1" state="$2" limit="$3"
 	local -a args=(
 		--repo "$repo" --state "$state" --limit "$limit"
-		--json "number,title,assignees,state,labels"
+		--json "number,title,assignees,state,labels,createdAt"
 	)
 	if declare -F gh_issue_list >/dev/null 2>&1; then
 		gh_issue_list "${args[@]}" 2>/dev/null
@@ -306,10 +306,39 @@ gh_find_issue_by_title() {
 		--json number,title --jq "[.[] | select(.title | startswith(\"${prefix}\"))][0].number // empty" 2>/dev/null || echo ""
 }
 
-gh_find_merged_pr() {
+_gh_find_merged_pr_evidence() {
 	local repo="$1" task_id="$2"
-	gh pr list --repo "$repo" --state merged --search "$task_id in:title" \
-		--limit 1 --json number,url 2>/dev/null | jq -r '.[0] | select(. != null) | "\(.number)|\(.url)"' || true
+	local results="" pr_info=""
+
+	# GH#35973: planning PRs ("tNNN: plan: add ...") also carry the task ID in
+	# their title but never implement it; they are not completion evidence.
+	# Title search is fuzzy, so only a title that leads with the exact task ID
+	# (the issue-sync-relationships-backfill.sh ownership rule) counts.
+	if ! results=$(gh pr list --repo "$repo" --state merged --search "$task_id in:title" \
+		--limit 10 --json number,url,title 2>/dev/null); then
+		return 2
+	fi
+	if ! pr_info=$(printf '%s' "$results" | jq -er --arg tid "$task_id" '
+		if type != "array" then error("expected PR array")
+		else [.[]
+			| select((.title // "") as $t | $t == $tid or ($t | startswith($tid + ":")) or ($t | startswith($tid + " ")))
+			| select((.title // "") | test("(^|:[[:space:]]*)plan:"; "i") | not)
+			| select((.number | type) == "number" and (.url | type) == "string" and (.url | length) > 0)]
+			| if length == 0 then "" else .[0] | "\(.number)|\(.url)" end
+		end' 2>/dev/null); then
+		return 2
+	fi
+	[[ -n "$pr_info" ]] || return 1
+	printf '%s\n' "$pr_info"
+	return 0
+}
+
+gh_find_merged_pr() {
+	local repo="$1" task_id="$2" pr_info=""
+	if pr_info=$(_gh_find_merged_pr_evidence "$repo" "$task_id"); then
+		printf '%s\n' "$pr_info"
+	fi
+	return 0
 }
 
 ensure_labels_exist() {
@@ -329,10 +358,18 @@ ensure_labels_exist() {
 	for lbl in $labels; do
 		if [[ -n "$lbl" ]]; then
 			local _color="EDEDED"
-			if declare -F color_for_tag >/dev/null 2>&1; then
+			local _desc="Auto-created from TODO.md tag"
+			local _canonical_def=""
+			# GH#32654: catalogued labels keep their canonical colour and
+			# description; the forced create otherwise repaints them grey.
+			if declare -F canonical_label_definition >/dev/null 2>&1 &&
+				_canonical_def=$(canonical_label_definition "$lbl"); then
+				_color="${_canonical_def%%|*}"
+				[[ -n "${_canonical_def#*|}" ]] && _desc="${_canonical_def#*|}"
+			elif declare -F color_for_tag >/dev/null 2>&1; then
 				_color=$(color_for_tag "$lbl")
 			fi
-			gh_create_label "$repo" "$lbl" "$_color" "Auto-created from TODO.md tag"
+			gh_create_label "$repo" "$lbl" "$_color" "$_desc"
 		fi
 	done
 	IFS="$_saved_ifs"

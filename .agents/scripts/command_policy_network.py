@@ -8,10 +8,10 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
-import subprocess
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+from command_policy_git_query import _run_git_query_detailed
 
 
 def _normalize_host(value: str) -> str | None:
@@ -62,31 +62,69 @@ def _strip_host_path_and_port(candidate: str) -> str:
     return candidate.rstrip(".").lower()
 
 
-def _add_destination(result: dict[str, Any], value: str, label: str) -> None:
+_DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443}
+
+
+def _valid_port(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return None
+    return port if 0 < port < 65536 else None
+
+
+def _destination_port(value: str) -> int | None:
+    """Return the explicit or scheme-default TCP port, or None when unknown."""
+    candidate = value.strip()
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", candidate):
+        parsed = urlsplit(candidate)
+        try:
+            explicit = parsed.port
+        except ValueError:
+            return None
+        return explicit or _DEFAULT_SCHEME_PORTS.get(parsed.scheme.lower())
+    match = re.match(r"^(?:\[[^]]+\]|[^/:@\[\]]+):(\d+)(?:[/?#]|$)", candidate)
+    return _valid_port(match.group(1)) if match else None
+
+
+def _add_destination(
+    result: dict[str, Any],
+    value: str,
+    label: str,
+    context: dict[str, Any] | None = None,
+) -> None:
+    """Record a destination; context may carry an explicit port and logical host (via)."""
     host = _normalize_host(value)
     if host:
         result["destinations"].append(host)
+        context = context or {}
+        port = context.get("port")
+        result.setdefault("endpoints", []).append({
+            "host": host,
+            "label": label,
+            "port": port if port is not None else _destination_port(value),
+            "via": context.get("via"),
+        })
     else:
         result["unclassified"].append(f"{label}:{value}")
 
 
-def _resolve_git_remote(cwd: str, remote: str) -> list[str]:
-    git_binary = "/usr/bin/git" if Path("/usr/bin/git").is_file() else "git"
-    try:
-        resolved = subprocess.run(  # nosec B603 -- argv is fixed except validated cwd/remote data; shell execution is disabled.
-            [git_binary, "-C", cwd, "remote", "get-url", "--all", remote],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return []
-    return (
-        [line for line in resolved.stdout.splitlines() if line]
-        if resolved.returncode == 0
-        else []
-    )
+def _run_git_query(
+    cwd: str, args: list[str], ok_codes: tuple[int, ...] = (0,)
+) -> list[str] | None:
+    """Run a read-only git query; return stdout lines, or None when it fails."""
+    return _run_git_query_detailed(cwd, args, ok_codes)[0]
+
+
+def _resolve_git_remote(cwd: str, remote: str, include_push: bool = False) -> list[str]:
+    """Return a remote's URLs; with include_push, push URLs too or nothing."""
+    urls = _run_git_query(cwd, ["remote", "get-url", "--all", remote]) or []
+    if not urls or not include_push:
+        return urls
+    push_urls = _run_git_query(cwd, ["remote", "get-url", "--all", "--push", remote])
+    return urls + push_urls if push_urls else []
 
 
 def _git_effective_cwd(argv: list[str], cwd: str) -> str:

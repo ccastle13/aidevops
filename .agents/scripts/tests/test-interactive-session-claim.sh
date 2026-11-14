@@ -98,13 +98,30 @@ auth)
 			printf '5000\n'
 			exit 0
 		fi
+		# Current status transitions require an exact GraphQL label snapshot.
+		# Reuse the fixture contract below rather than silently returning no data.
+		if [[ "$2" == "graphql" && "$*" == *'label0: label(name:'* ]]; then
+			"$0" api '/repos/fixture/labels?per_page=100' | jq -Rn '
+				[inputs | split("\t") | {name: .[0], color: .[1], description: .[2]}]
+				| to_entries | map({key: ("label" + (.key | tostring)), value: .value})
+				| from_entries | {data: {repository: .}}'
+			exit $?
+		fi
 		# gh api user --jq '.login'
+		if [[ "$2" == "graphql" && "$*" == *'viewer { login }'* ]]; then
+			if [[ "${STUB_GH_MODE:-online}" == "graphql-only" ]]; then
+				printf '%s\n' "${STUB_VIEWER_LOGIN:-testuser}"
+				exit 0
+			fi
+			printf 'discard-failed-viewer-output\n'
+			exit 1
+		fi
 		if [[ "$2" == "user" ]]; then
 			if [[ "${STUB_GH_MODE:-online}" == "noisy-user-failure" ]]; then
 				printf 'synthetic-noisy-login\n'
 				exit 1
 			fi
-			if [[ "${STUB_GH_MODE:-online}" == "offline" ]]; then
+			if [[ "${STUB_GH_MODE:-online}" == "offline" || "${STUB_GH_MODE:-online}" == "graphql-only" ]]; then
 				exit 1
 			fi
 			printf 'testuser\n'
@@ -114,11 +131,11 @@ auth)
 			printf '%s\t%s\t%s\n' \
 				"status:available" "0e8a16" "Task is available for claiming" \
 				"status:queued" "fbca04" "Worker dispatched, not yet started" \
-				"status:claimed" "f9d0c4" "Interactive session claimed this task" \
+				"status:claimed" "f9d0c4" "Interactive implementation is actively claimed" \
 				"status:in-progress" "1d76db" "Worker actively running" \
-				"status:in-review" "5319e7" "PR open, awaiting review/merge" \
+				"status:in-review" "5319e7" "Non-draft PR ready for review/merge" \
 				"status:done" "6f42c1" "Task is complete" \
-				"status:blocked" "d93f0b" "Waiting on blocker task"
+				"status:blocked" "d93f0b" "Partial work blocked; inspect reason and next action"
 			exit 0
 		fi
 		if [[ "$2" == /repos/*/issues/* ]]; then
@@ -129,9 +146,12 @@ auth)
 				exit 0
 			fi
 			labels_arr=""
-			if [[ "${STUB_ISSUE_HAS_IN_REVIEW:-0}" == "1" ]]; then
-				labels_arr='{"name":"status:in-review"}'
-			fi
+		if [[ "${STUB_ISSUE_HAS_IN_REVIEW:-0}" == "1" ]]; then
+			labels_arr='{"name":"status:in-review"}'
+		fi
+		if [[ "${STUB_ISSUE_HAS_CLAIMED:-0}" == "1" ]]; then
+			labels_arr="${labels_arr:+$labels_arr,}{\"name\":\"status:claimed\"}"
+		fi
 			if [[ "${STUB_ISSUE_HAS_AUTO_DISPATCH:-0}" == "1" ]]; then
 				labels_arr="${labels_arr:+$labels_arr,}{\"name\":\"auto-dispatch\"}"
 			fi
@@ -149,6 +169,9 @@ auth)
 			exit 1
 		fi
 		if [[ "$2" == "-i" && "${3:-}" == */collaborators/*/permission ]]; then
+			if [[ "${STUB_PERMISSION_FAIL:-0}" == "75" ]]; then
+				exit 75
+			fi
 			if [[ "${STUB_PERMISSION_FAIL:-0}" == "1" ]]; then
 				printf 'HTTP/2.0 403 Forbidden\n\n{"message":"Forbidden"}\n'
 				exit 1
@@ -165,7 +188,20 @@ auth)
 		fi
 		exit 0
 		;;
-issue)
+	pr)
+		if [[ "$2" == "list" ]]; then
+			if [[ -n "${STUB_OPEN_PR_ISSUE:-}" ]]; then
+				printf '[{"number":77,"headRefName":"feature/existing","headRefOid":"1111111111111111111111111111111111111111","headRepository":{"nameWithOwner":"%s/%s"},"author":{"login":"other-human"},"closingIssuesReferences":[{"number":%s,"repository":{"owner":{"login":"%s"},"name":"%s"}}],"isDraft":false}]\n' \
+					"${STUB_OPEN_PR_OWNER:-regress}" "${STUB_OPEN_PR_REPO:-test}" "$STUB_OPEN_PR_ISSUE" \
+					"${STUB_OPEN_PR_OWNER:-regress}" "${STUB_OPEN_PR_REPO:-test}"
+			else
+				printf '[]\n'
+			fi
+			exit 0
+		fi
+		exit 1
+		;;
+	issue)
 	case "$2" in
 	view)
 		# GH#20946 PR #20977 review: STUB_GH_VIEW_FAILS=1 simulates a gh lookup
@@ -192,6 +228,9 @@ issue)
 		labels_arr=""
 		if [[ "${STUB_ISSUE_HAS_IN_REVIEW:-0}" == "1" ]]; then
 			labels_arr="${labels_arr:+$labels_arr,}{\"name\":\"status:in-review\"}"
+		fi
+		if [[ "${STUB_ISSUE_HAS_CLAIMED:-0}" == "1" ]]; then
+			labels_arr="${labels_arr:+$labels_arr,}{\"name\":\"status:claimed\"}"
 		fi
 		if [[ "${STUB_ISSUE_HAS_AUTO_DISPATCH:-0}" == "1" ]]; then
 			labels_arr="${labels_arr:+$labels_arr,}{\"name\":\"auto-dispatch\"}"
@@ -345,6 +384,21 @@ if [[ $claim_rc -eq 0 && -f "$STAMP_FILE" ]]; then
 	print_result "claim writes stamp file" 0
 else
 	print_result "claim writes stamp file" 1 "(rc=$claim_rc, stamp=$STAMP_FILE exists=$([[ -f "$STAMP_FILE" ]] && echo yes || echo no))"
+fi
+
+# A failed mutation must propagate through `_isc_cmd_claim`, including when
+# invoked in a conditional command substitution where `set -e` cannot do so.
+FAILED_CLAIM_STAMP="$HOME/.aidevops/.agent-workspace/interactive-claims/testowner-testrepo-31317.json"
+rm -f "$FAILED_CLAIM_STAMP"
+failed_claim_out=$(STUB_GH_EDIT_FAILS=1 \
+	_isc_cmd_claim 31317 testowner/testrepo --worktree /tmp/wt-failed 2>&1)
+failed_claim_rc=$?
+if [[ $failed_claim_rc -ne 0 && ! -f "$FAILED_CLAIM_STAMP" ]] &&
+	printf '%s' "$failed_claim_out" | grep -q 'ownership transition failed.*no stamp written'; then
+	print_result "GH#31317: failed new claim propagates from conditional caller without a stamp" 0
+else
+	print_result "GH#31317: failed new claim propagates from conditional caller without a stamp" 1 \
+		"(rc=$failed_claim_rc, stamp=$([[ -f "$FAILED_CLAIM_STAMP" ]] && echo yes || echo no), out=${failed_claim_out:0:300})"
 fi
 
 # Validate stamp schema
@@ -577,6 +631,60 @@ fi
 
 export STUB_GH_MODE=online
 
+# GH#36036: exercise the public command with REST identity unavailable, then
+# require a distinguishable failure when neither authenticated identity works.
+fallback_stamp=$(_isc_stamp_path 88890 testuser/repo)
+: >"$STUB_LOG"
+fallback_out=$(STUB_GH_MODE=graphql-only STUB_ISSUE_ASSIGNEES="" \
+	"$HELPER_PATH" claim 88890 testuser/repo --implementing 2>&1)
+fallback_rc=$?
+if [[ "$fallback_rc" -eq 0 && -f "$fallback_stamp" ]] &&
+	jq -e '.user == "testuser"' "$fallback_stamp" >/dev/null &&
+	grep -q 'viewer { login }' "$STUB_LOG" &&
+	grep -q 'issue edit 88890 .*--add-assignee testuser' "$STUB_LOG" &&
+	grep -q 'issue edit 88890 .*--add-label status:claimed' "$STUB_LOG"; then
+	print_result "REST identity failure uses GraphQL viewer to apply implementing claim" 0
+else
+	print_result "REST identity failure uses GraphQL viewer to apply implementing claim" 1 "$fallback_out"
+fi
+
+for identity_mode in offline noisy-user-failure; do
+	: >"$STUB_LOG"
+	unresolved_stamp=$(_isc_stamp_path 88891 testuser/repo)
+	unresolved_out=$(STUB_GH_MODE="$identity_mode" \
+		"$HELPER_PATH" claim 88891 testuser/repo --implementing 2>&1)
+	unresolved_rc=$?
+	if [[ "$unresolved_rc" -eq 75 && ! -f "$unresolved_stamp" &&
+		"$unresolved_out" == *"claim NOT applied for #88891"* &&
+		"$unresolved_out" == *"a worker may pick it up"* &&
+		"$unresolved_out" == *"interactive-session-helper.sh claim 88891 testuser/repo --implementing"* ]] &&
+		! grep -q 'issue edit\|issue comment' "$STUB_LOG"; then
+		print_result "unresolved implementing identity ($identity_mode) returns 75 without writes" 0
+	else
+		print_result "unresolved implementing identity ($identity_mode) returns 75 without writes" 1 "$unresolved_out (rc=$unresolved_rc)"
+	fi
+done
+
+for viewer_login in null 'bad/login' 'two logins' '-leading' 'trailing-'; do
+	invalid_login=$(STUB_GH_MODE=graphql-only STUB_VIEWER_LOGIN="$viewer_login" _isc_current_user)
+	if [[ -z "$invalid_login" ]]; then
+		print_result "malformed GraphQL viewer rejected ($viewer_login)" 0
+	else
+		print_result "malformed GraphQL viewer rejected ($viewer_login)" 1 "$invalid_login"
+	fi
+done
+
+for legacy_command in lockdown unlock; do
+	: >"$STUB_LOG"
+	STUB_GH_MODE=offline "$HELPER_PATH" "$legacy_command" 88892 testuser/repo >/dev/null 2>&1
+	legacy_rc=$?
+	if [[ "$legacy_rc" -eq 0 ]] && ! grep -q 'issue edit\|issue comment' "$STUB_LOG"; then
+		print_result "offline $legacy_command keeps exit 0 without writes" 0
+	else
+		print_result "offline $legacy_command keeps exit 0 without writes" 1 "rc=$legacy_rc"
+	fi
+done
+
 # =============================================================================
 # Test 8 — help subcommand
 # =============================================================================
@@ -672,18 +780,41 @@ fi
 # Verify the label-apply branch actually ran (gh issue edit was called with
 # the add-label flag). This closes the test gap where Test 1 only checks the
 # stamp, not whether the label transition API call happened.
-if grep -q 'issue edit 56001' "$STUB_LOG" && grep -q 'add-label status:in-review' "$STUB_LOG"; then
-	print_result "GH#18786: claim applies status:in-review when absent" 0
+if grep -q 'issue edit 56001' "$STUB_LOG" && grep -q 'add-label status:claimed' "$STUB_LOG"; then
+	print_result "GH#18786: claim applies status:claimed when absent" 0
 else
-	print_result "GH#18786: claim applies status:in-review when absent" 1 \
+	print_result "GH#18786: claim applies status:claimed when absent" 1 \
 		"(stub log: $(tr '\n' '|' <"$STUB_LOG"))"
+fi
+
+# --- t18895: live sessions on the issue are printed, then the claim proceeds ---
+: >"$STUB_LOG"
+bus_stub="${STUB_BIN}/session-bus-stub"
+cat >"$bus_stub" <<'SH'
+#!/usr/bin/env bash
+printf 'bus %s\n' "$*" >>"${STUB_LOG:-/dev/null}"
+printf 'regress-56014-worker [worker] · busy · #56014 · regress/test@feature/x · 9s ago\n'
+SH
+chmod +x "$bus_stub"
+bus_claim_out=$(AIDEVOPS_SESSION_BUS_HELPER="$bus_stub" STUB_ISSUE_HAS_IN_REVIEW=0 STUB_GH_MODE=online \
+	"$HELPER_PATH" claim 56014 regress/test --worktree /tmp/regress-wt 2>&1)
+bus_claim_rc=$?
+if [[ $bus_claim_rc -eq 0 ]] &&
+	grep -q 'other live session(s) already on #56014' <<<"$bus_claim_out" &&
+	grep -q 'regress-56014-worker \[worker\]' <<<"$bus_claim_out" &&
+	grep -qxF 'bus who #56014 --repo regress/test' "$STUB_LOG" &&
+	grep -q 'issue edit 56014 .*add-label status:claimed' "$STUB_LOG"; then
+	print_result "t18895: claim warns about live sessions on the issue and still claims" 0
+else
+	print_result "t18895: claim warns about live sessions on the issue and still claims" 1 \
+		"(rc=$bus_claim_rc out=${bus_claim_out:0:200} log=$(tr '\n' '|' <"$STUB_LOG"))"
 fi
 
 # --- Case (d): idempotent path — label already present, no transition ---
 rm -f "${claim_dir}"/*.json 2>/dev/null || true
 : >"$STUB_LOG"
 
-idempotent_out=$(STUB_ISSUE_HAS_IN_REVIEW=1 STUB_GH_MODE=online \
+idempotent_out=$(STUB_ISSUE_HAS_CLAIMED=1 STUB_GH_MODE=online \
 	"$HELPER_PATH" claim 56001 regress/test --worktree /tmp/regress-wt \
 	2>&1)
 idempotent_rc=$?
@@ -704,6 +835,132 @@ else
 		"(stub log: $(tr '\n' '|' <"$STUB_LOG"))"
 fi
 
+# GH#34915: a shared login must not turn worker ownership into an interactive
+# claim, even when --implementing is explicit. Exercise the real CLI with the
+# existing stub transport and assert no remote mutation or local stamp write.
+for worker_status in queued in-progress; do
+	for worker_claim_mode in default implementing; do
+		rm -f "${claim_dir}"/*.json 2>/dev/null || true
+		: >"$STUB_LOG"
+		worker_flags=()
+		[[ "$worker_claim_mode" == "implementing" ]] && worker_flags+=(--implementing)
+		printf '{"state":"OPEN","labels":[{"name":"status:%s"}],"assignees":[{"login":"testuser"}],"comments":[]}\n' \
+			"$worker_status" >"${STUB_STATE_DIR}/56013.json"
+		worker_before=$(jq -c . "${STUB_STATE_DIR}/56013.json")
+		worker_out=$("$HELPER_PATH" claim 56013 regress/test "${worker_flags[@]}" 2>&1)
+		worker_rc=$?
+		if [[ $worker_rc -eq 1 && ! -f "${claim_dir}/regress-test-56013.json" &&
+			"$worker_before" == "$(jq -c . "${STUB_STATE_DIR}/56013.json")" ]] &&
+			! grep -Eq 'issue (edit|comment)|api .* (POST|PATCH|DELETE) ' "$STUB_LOG" &&
+			[[ "$worker_out" == *'worker ownership under @testuser; refusing interactive claim'* ]]; then
+			print_result "GH#34915: same-login $worker_status $worker_claim_mode claim stays write-free" 0
+		else
+			print_result "GH#34915: same-login $worker_status $worker_claim_mode claim stays write-free" 1 \
+				"(rc=$worker_rc out=${worker_out:0:200})"
+		fi
+	done
+done
+
+# --- GH#33420: active status labels alone do not establish ownership ---
+for orphan_status in claimed in-progress in-review; do
+	rm -f "${claim_dir}"/*.json 2>/dev/null || true
+	: >"$STUB_LOG"
+	printf '{"state":"OPEN","labels":[{"name":"status:%s"},{"name":"origin:interactive"}],"assignees":[],"comments":[]}\n' \
+		"$orphan_status" >"${STUB_STATE_DIR}/56008.json"
+	orphan_out=$("$HELPER_PATH" claim 56008 regress/test 2>&1)
+	orphan_rc=$?
+	orphan_owner=$(jq -r '.assignees | map(.login) | join(",")' "${STUB_STATE_DIR}/56008.json")
+	if [[ $orphan_rc -eq 0 && "$orphan_owner" == "testuser" && -f "${claim_dir}/regress-test-56008.json" ]] &&
+		jq -e 'any(.labels[]?; .name == "status:claimed")' "${STUB_STATE_DIR}/56008.json" >/dev/null &&
+		grep -q 'add-assignee testuser' "$STUB_LOG"; then
+		print_result "GH#33420: unassigned status:$orphan_status claims normally" 0
+	else
+		print_result "GH#33420: unassigned status:$orphan_status claims normally" 1 \
+			"(rc=$orphan_rc owner=$orphan_owner out=${orphan_out:0:160})"
+	fi
+done
+
+# GH#33896: inactive status can retain multiple stale assignees, including self.
+# Exercise the normal claim entrypoint without requiring a worker takeover flag.
+for stale_case in foreign mixed expired; do
+	rm -f "${claim_dir}"/*.json 2>/dev/null || true
+	: >"$STUB_LOG"
+	stale_metadata='{"state":"OPEN","labels":[{"name":"status:available"}],"assignees":[{"login":"worker-runner"},{"login":"other-worker"}],"comments":[]}'
+	if [[ "$stale_case" == "mixed" ]]; then
+		stale_metadata=$(printf '%s' "$stale_metadata" | jq '.assignees += [{login:"testuser"}]')
+	elif [[ "$stale_case" == "expired" ]]; then
+		expired_time=$(date -u -v-3H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '3 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+		stale_metadata=$(printf '%s' "$stale_metadata" | jq --arg time "$expired_time" \
+			'.comments = [{author:{login:"worker-runner"},createdAt:$time,body:"Interactive session claimed by @worker-runner"}]')
+	fi
+	printf '%s\n' "$stale_metadata" >"${STUB_STATE_DIR}/56010.json"
+	stale_out=$("$HELPER_PATH" claim 56010 regress/test --defer-comment 2>&1)
+	stale_rc=$?
+	if [[ $stale_rc -eq 0 && -f "${claim_dir}/regress-test-56010.json" ]] &&
+		jq -e '([.assignees[].login] == ["testuser"]) and any(.labels[]; .name == "status:claimed") and all(.labels[]; .name != "status:available")' \
+			"${STUB_STATE_DIR}/56010.json" >/dev/null &&
+		grep -q 'remove-assignee worker-runner' "$STUB_LOG" &&
+		grep -q 'remove-assignee other-worker' "$STUB_LOG" &&
+		! grep -q 'remove-assignee testuser' "$STUB_LOG"; then
+		print_result "GH#33896: available $stale_case assignees replaced with sole caller" 0
+	else
+		print_result "GH#33896: available $stale_case assignees replaced with sole caller" 1 \
+			"(rc=$stale_rc out=${stale_out:0:200})"
+	fi
+done
+
+# A missing active status must not bypass the existing two-hour live-owner guard.
+rm -f "${claim_dir}"/*.json 2>/dev/null || true
+: >"$STUB_LOG"
+inactive_claim_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+printf '{"state":"OPEN","labels":[{"name":"status:available"}],"assignees":[{"login":"other-human"}],"comments":[{"author":{"login":"other-human"},"createdAt":"%s","body":"Interactive session claimed by @other-human"}]}\n' \
+	"$inactive_claim_time" >"${STUB_STATE_DIR}/56011.json"
+inactive_foreign_out=$("$HELPER_PATH" claim 56011 regress/test --implementing 2>&1)
+inactive_foreign_rc=$?
+if [[ $inactive_foreign_rc -eq 1 && ! -f "${claim_dir}/regress-test-56011.json" ]] &&
+	! grep -q 'issue edit 56011' "$STUB_LOG" &&
+	printf '%s' "$inactive_foreign_out" | grep -q 'live interactive owner @other-human'; then
+	print_result "GH#33896: available live foreign interactive claim stays write-free" 0
+else
+	print_result "GH#33896: available live foreign interactive claim stays write-free" 1 \
+		"(rc=$inactive_foreign_rc out=${inactive_foreign_out:0:200})"
+fi
+
+# An assigned issue still requires explicit takeover and names its owners.
+# A newer caller comment must not hide another assignee's still-live claim.
+: >"$STUB_LOG"
+older_live_time=$(date -u -v-1H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)
+jq --arg older "$older_live_time" --arg newer "$inactive_claim_time" \
+	'.assignees += [{login:"testuser"}] | .comments[0].createdAt = $older |
+	.comments += [{author:{login:"testuser"},createdAt:$newer,body:"Interactive session claimed by @testuser"}]' \
+	"${STUB_STATE_DIR}/56011.json" >"${STUB_STATE_DIR}/56012.json"
+mixed_live_out=$("$HELPER_PATH" claim 56012 regress/test --implementing 2>&1)
+mixed_live_rc=$?
+if [[ $mixed_live_rc -eq 1 && ! -f "${claim_dir}/regress-test-56012.json" ]] &&
+	! grep -q 'issue edit 56012' "$STUB_LOG" &&
+	printf '%s' "$mixed_live_out" | grep -q 'live interactive owner @other-human'; then
+	print_result "GH#33896: newer caller comment cannot hide live foreign claim" 0
+else
+	print_result "GH#33896: newer caller comment cannot hide live foreign claim" 1 \
+		"(rc=$mixed_live_rc out=${mixed_live_out:0:200})"
+fi
+
+# An assigned active issue still requires explicit takeover and names its owners.
+rm -f "${claim_dir}"/*.json 2>/dev/null || true
+: >"$STUB_LOG"
+printf '%s\n' '{"state":"OPEN","labels":[{"name":"status:in-progress"}],"assignees":[{"login":"worker-runner"},{"login":"other-worker"}],"comments":[]}' \
+	>"${STUB_STATE_DIR}/56009.json"
+assigned_out=$("$HELPER_PATH" claim 56009 regress/test 2>&1)
+assigned_rc=$?
+if [[ $assigned_rc -eq 1 && ! -f "${claim_dir}/regress-test-56009.json" ]] &&
+	! grep -q 'issue edit 56009' "$STUB_LOG" &&
+	printf '%s' "$assigned_out" | grep -q 'another principal (worker-runner,other-worker)'; then
+	print_result "GH#33420: assigned active issue refuses and names assignees" 0
+else
+	print_result "GH#33420: assigned active issue refuses and names assignees" 1 \
+		"(rc=$assigned_rc out=${assigned_out:0:200})"
+fi
+
 # --- Case (d2): explicit worker takeover replaces and verifies ownership ---
 rm -f "${claim_dir}"/*.json 2>/dev/null || true
 : >"$STUB_LOG"
@@ -721,6 +978,24 @@ if [[ $takeover_rc -eq 0 && "$takeover_owner" == "testuser" && -f "$takeover_sta
 else
 	print_result "foreign worker claim transfers to verified interactive owner" 1 \
 		"(rc=$takeover_rc owner=$takeover_owner stamp=$([[ -f "$takeover_stamp" ]] && echo yes || echo no) log=$(tr '\n' '|' <"$STUB_LOG") out=${takeover_out:0:120})"
+fi
+
+# --- Case (d2b): an old foreign claim with a linked open PR is durable work ---
+rm -f "${claim_dir}"/*.json 2>/dev/null || true
+: >"$STUB_LOG"
+old_claim_time=$(date -u -v-3H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '3 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+printf '{"state":"OPEN","labels":[{"name":"status:in-review"}],"assignees":[{"login":"other-human"}],"comments":[{"author":{"login":"other-human"},"createdAt":"%s","body":"> Interactive session claimed by @other-human on other-host."}]}\n' \
+	"$old_claim_time" >"${STUB_STATE_DIR}/56007.json"
+open_pr_out=$(STUB_OPEN_PR_ISSUE=56007 "$HELPER_PATH" claim 56007 regress/test --implementing --worktree /tmp/replacement-wt 2>&1)
+open_pr_rc=$?
+open_pr_stamp="${claim_dir}/regress-test-56007.json"
+if [[ $open_pr_rc -eq 1 && ! -f "$open_pr_stamp" ]] &&
+	! grep -q 'issue edit 56007' "$STUB_LOG" &&
+	printf '%s' "$open_pr_out" | grep -q "already has open PR #77"; then
+	print_result "old foreign claim with fresh open PR blocks interactive takeover" 0
+else
+	print_result "old foreign claim with fresh open PR blocks interactive takeover" 1 \
+		"(rc=$open_pr_rc stamp=$([[ -f "$open_pr_stamp" ]] && echo yes || echo no) out=${open_pr_out:0:180})"
 fi
 
 # --- Case (d3): a recent compatible foreign interactive claim is protected ---
@@ -776,22 +1051,22 @@ else
 		"(rc=$release_sub_rc, stamp exists=$([[ -f "$release_stamp" ]] && echo yes || echo no))"
 fi
 
-# --- Case (f): _isc_has_in_review jq query is not broken (dead-code gate) ---
+# --- Case (f): _isc_has_claimed jq query is not broken (dead-code gate) ---
 # The previous `any(.name; ...)` form raised "Cannot index array with string".
 # Assert the repaired query correctly distinguishes present from absent and
 # from lookup-failure by driving _isc_has_in_review directly with stub modes.
-export STUB_ISSUE_HAS_IN_REVIEW=1
-_isc_has_in_review 56003 regress/test
+export STUB_ISSUE_HAS_CLAIMED=1
+_isc_has_claimed 56003 regress/test
 jq_present_rc=$?
 
-export STUB_ISSUE_HAS_IN_REVIEW=0
-_isc_has_in_review 56003 regress/test
+export STUB_ISSUE_HAS_CLAIMED=0
+_isc_has_claimed 56003 regress/test
 jq_absent_rc=$?
 
 if [[ $jq_present_rc -eq 0 && $jq_absent_rc -eq 1 ]]; then
-	print_result "GH#18786: _isc_has_in_review jq query returns 0/1 correctly" 0
+	print_result "GH#18786: _isc_has_claimed jq query returns 0/1 correctly" 0
 else
-	print_result "GH#18786: _isc_has_in_review jq query returns 0/1 correctly" 1 \
+	print_result "GH#18786: _isc_has_claimed jq query returns 0/1 correctly" 1 \
 		"(present_rc=$jq_present_rc, absent_rc=$jq_absent_rc, expected 0/1)"
 fi
 
@@ -928,7 +1203,7 @@ ad_impl_stamp="${claim_dir}/carveout-test-60002.json"
 
 if [[ $ad_impl_rc -eq 0 && -f "$ad_impl_stamp" ]] &&
 	grep -q 'issue edit 60002' "$STUB_LOG" &&
-	grep -q 'add-label status:in-review' "$STUB_LOG"; then
+	grep -q 'add-label status:claimed' "$STUB_LOG"; then
 	print_result "GH#20946: auto-dispatch claim WITH --implementing proceeds" 0
 else
 	print_result "GH#20946: auto-dispatch claim WITH --implementing proceeds" 1 \
@@ -948,6 +1223,7 @@ rm -f "${claim_dir}"/*.json 2>/dev/null || true
 : >"$STUB_LOG"
 
 ad_pt_out=$(STUB_ISSUE_HAS_IN_REVIEW=0 STUB_ISSUE_HAS_AUTO_DISPATCH=1 STUB_ISSUE_HAS_PARENT_TASK=1 STUB_GH_MODE=online \
+	STUB_OPEN_PR_ISSUE=60003 STUB_OPEN_PR_OWNER=carveout STUB_OPEN_PR_REPO=test \
 	"$HELPER_PATH" claim 60003 carveout/test --worktree /tmp/carveout-wt 2>&1)
 ad_pt_rc=$?
 
@@ -955,7 +1231,7 @@ ad_pt_stamp="${claim_dir}/carveout-test-60003.json"
 
 if [[ $ad_pt_rc -eq 0 && -f "$ad_pt_stamp" ]] &&
 	grep -q 'issue edit 60003' "$STUB_LOG" &&
-	grep -q 'add-label status:in-review' "$STUB_LOG"; then
+	grep -q 'add-label status:claimed' "$STUB_LOG"; then
 	print_result "GH#20946: auto-dispatch + parent-task claim proceeds (no flag)" 0
 else
 	print_result "GH#20946: auto-dispatch + parent-task claim proceeds (no flag)" 1 \
@@ -1089,7 +1365,7 @@ external_stamp=$(_isc_stamp_path 61001 external/repo)
 rm -f "$external_stamp" >/dev/null 2>&1 || true
 : >"$STUB_LOG"
 external_out=$(STUB_PERMISSION=read STUB_ISSUE_HAS_IN_REVIEW=0 STUB_GH_MODE=online \
-	_isc_cmd_claim 61001 external/repo --worktree /tmp/external-wt 2>&1)
+	_isc_cmd_claim 61001 external/repo --implementing --worktree /tmp/external-wt 2>&1)
 external_rc=$?
 
 if [[ $external_rc -eq 0 ]] &&
@@ -1125,6 +1401,22 @@ else
 		"(rc=$lookup_fail_rc, stamp=$([[ -f "$lookup_fail_stamp" ]] && echo yes || echo no), log=${lookup_fail_log}, out=${lookup_fail_out:0:200})"
 fi
 
+# A deferred permission read is not a non-collaborator verdict. Exercise the
+# shared REST lookup through the public claim path and assert no lifecycle write.
+deferred_stamp=$(_isc_stamp_path 61003 external/deferred)
+rm -f "$deferred_stamp" >/dev/null 2>&1 || true
+: >"$STUB_LOG"
+deferred_out=$(STUB_PERMISSION_FAIL=75 STUB_ISSUE_HAS_IN_REVIEW=0 STUB_GH_MODE=online \
+	_isc_cmd_claim 61003 external/deferred --implementing --worktree /tmp/external-wt 2>&1)
+deferred_rc=$?
+if [[ "$deferred_rc" -eq 75 && ! -f "$deferred_stamp" && "$deferred_out" == *"deferred"* &&
+	"$deferred_out" != *"not a maintainer-equivalent collaborator"* ]] &&
+	! grep -q 'issue edit 61003\|issue comment 61003' "$STUB_LOG"; then
+	print_result "deferred permission claim reports deferral without lifecycle writes" 0
+else
+	print_result "deferred permission claim reports deferral without lifecycle writes" 1 "$deferred_out"
+fi
+
 # =============================================================================
 # Test 23 — GH#21805: release on an OPEN issue applies status:available
 # (existing behaviour preserved).
@@ -1134,7 +1426,7 @@ export STUB_PERMISSION=admin
 export STUB_GH_MODE=online
 _isc_cmd_claim 70001 testowner/testrepo --worktree /tmp/wt-fake >/dev/null 2>&1
 : >"$STUB_LOG"
-export STUB_ISSUE_HAS_IN_REVIEW=1
+export STUB_ISSUE_HAS_CLAIMED=1
 export STUB_ISSUE_STATE=OPEN
 _isc_cmd_release 70001 testowner/testrepo >/dev/null 2>&1
 release_open_rc=$?
@@ -1154,7 +1446,7 @@ fi
 # =============================================================================
 _isc_cmd_claim 70002 testowner/testrepo --worktree /tmp/wt-fake >/dev/null 2>&1
 : >"$STUB_LOG"
-export STUB_ISSUE_HAS_IN_REVIEW=1
+export STUB_ISSUE_HAS_CLAIMED=1
 export STUB_ISSUE_STATE=CLOSED
 _isc_cmd_release 70002 testowner/testrepo >/dev/null 2>&1
 release_closed_rc=$?
@@ -1173,7 +1465,7 @@ fi
 # same closed-issue invariant when that path supplies `closed` (GH#27869).
 _isc_cmd_claim 70004 testowner/testrepo --worktree /tmp/wt-fake >/dev/null 2>&1
 : >"$STUB_LOG"
-export STUB_ISSUE_HAS_IN_REVIEW=1
+export STUB_ISSUE_HAS_CLAIMED=1
 export STUB_ISSUE_STATE=closed
 _isc_cmd_release 70004 testowner/testrepo >/dev/null 2>&1
 release_rest_closed_rc=$?
@@ -1188,7 +1480,7 @@ else
 fi
 
 # Reset stub state
-export STUB_ISSUE_HAS_IN_REVIEW=0
+export STUB_ISSUE_HAS_CLAIMED=0
 
 # =============================================================================
 # Test 25 — GH#27834: release --unassign remains actionable after another

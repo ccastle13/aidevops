@@ -20,13 +20,16 @@ tools:
 
 - **Docs**: [docs.cloudron.io/packaging/cli](https://docs.cloudron.io/packaging/cli) | **Upstream skill**: [git.cloudron.io/docs/skills](https://git.cloudron.io/docs/skills)
 - **Install**: `sudo npm install -g cloudron` (on your PC/Mac, NOT the server)
-- **Login**: `cloudron login my.example.com` (browser-based; 9.1+ uses OIDC/passkey)
+- **Login**: `cloudron login my.example.com` (browser-based; 9.1+ uses OIDC/passkey). Do not request it solely because an existing CLI token is invalid: first preserve any valid scoped token and check authorised root SSH.
 - **Self-signed TLS**: `cloudron login my.example.com --allow-selfsigned`
 - **CI/CD**: `--server <domain> --token <api-token> --no-wait` (token from `https://my.<domain>/#/profile`); e.g. `cloudron update --server my.example.com --token <token> --app blog.example.com --image user/image:tag`
 - **Token**: `~/.cloudron.json`
 - **App targeting**: `--app` accepts FQDN, subdomain, or app ID; auto-detected from `CloudronManifest.json`
 - **Global flags**: `--server`, `--token`, `--allow-selfsigned`, `--no-wait`
 - **Also see**: `cloudron-helper.sh` for multi-server management via API
+- **Host OS upgrade (Ubuntu 22.04 -> 24.04 -> 26.04)**: `tools/deployment/cloudron-os-upgrade.md` (GRUB, network, API and agent-safety traps)
+- **Last upstream review**: `74e455bd03f5`; upstream server-ops skill unchanged in this delta; aligned install/update notes with the packaging skill's registry builder migration
+- **SSH recovery boundary**: With authorised root SSH, inspect the installed Cloudron version and `cloudron-support --help` before choosing a documented recovery flow; older developer-login endpoints may not exist. Keep support output and any temporary credential private, validate TLS origin and PKCE state, preserve an active ghost/support login, and revoke the temporary session when finished. Missing SSH, authority, or compatible installed support tooling means this route stops safely and ordinary login remains the fallback. Never reset owner passwords, write raw tokens to storage, bypass authentication, or disable host-key checking.
 
 <!-- AI-CONTEXT-END -->
 
@@ -45,14 +48,14 @@ cloudron inspect               # raw JSON of the Cloudron server
 ### App Lifecycle
 
 ```bash
-cloudron install               # install app (on-server build or --image)
-cloudron update --app <app>    # update app (rebuilds or uses --image)
+cloudron install               # install app (on-server build, last builder image, or --image)
+cloudron update --app <app>    # update app with the same image selection
 cloudron uninstall --app <app>
 cloudron repair --app <app>    # reconfigure without changing image
 cloudron clone --app <app> --location new-location
 ```
 
-Flags for `install`/`update`: `--image <repo:tag>`, `--no-backup`, `-l <subdomain>`, `-s <secondary-domains>`, `-p <port-bindings>`, `-m <memory-bytes>` / `--memory-limit <bytes>`, `--versions-url <url>`
+Flags for `install`/`update`: `--image <repo:tag>`, `--no-backup`, `-l <subdomain>`, `-s <secondary-domains>`, `-p <port-bindings>`, `-m <memory-bytes>` / `--memory-limit <bytes>`. `--versions-url <url>` installs from a community catalog; on CLI 9.0+ `cloudron update --app <app> --versions-url <url> --force` also switches an existing source-built app to that catalog in place (see `cloudron-app-publishing-skill.md`).
 
 **On-server build (9.1+)** — directory with `CloudronManifest.json` + `Dockerfile`:
 
@@ -60,6 +63,15 @@ Flags for `install`/`update`: `--image <repo:tag>`, `--no-backup`, `-l <subdomai
 cloudron install --location myapp   # upload source, build on server, install
 cloudron update --app myapp         # upload source, rebuild, update
 ```
+
+For registry builds, run `cloudron builder login` then `cloudron builder build`
+from the package directory. Install/update can select the last builder image
+(confirmation on a TTY); for automation, pass the verified image explicitly with
+`--image`. The old `cloudron build` command no longer exists in the current CLI.
+On-server builds do not produce publishable registry images. See
+`cloudron-app-packaging-skill.md` and `cloudron-app-publishing-skill.md` for the
+build/publication workflow; building and pushing still require the appropriate
+authority. Configure private-registry access before installing private images.
 
 ### Run State and Logs
 

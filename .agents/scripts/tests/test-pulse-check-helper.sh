@@ -121,8 +121,10 @@ cat <<'JSON'
   "current_state_guardrails": {"available_slots_last": 6},
   "pulse_gauges": {"dispatch_capacity_final_max_workers": 6},
   "worker_outcomes": {"spawned": 4},
+  "policy_holds": {"availability": "observed", "active_in_window": true, "count": 1, "last_observed_at": 1, "source": "pulse-stats", "window_seconds": 900},
   "worker_terminal_events": 0,
   "active_claim_state": {"active_workers": 0, "classification_counts": {"zero_worker_infrastructure_hold": 1}, "zero_worker_actionable": true, "live_owner_count": 0, "durable_launch_count": 0},
+  "zero_worker_underutilization": {"actionable": true, "consecutive_no_progress_cycles": 3, "minimum_cycles": 3},
   "canonical_reconciliation": {"refusal_count": 2, "classification": "dirty_or_uncommitted", "canonical_recovery_advisory_observed": true},
   "graphql_budget_status": "OK fixture"
 }
@@ -134,10 +136,53 @@ cat >"${TEST_ROOT}/worker-activity.sh" <<'SH'
 #!/usr/bin/env bash
 cmd="${1:-}"
 shift || true
+if [[ " $* " == *" --pr-check "* ]]; then
+  printf '%s\n' '{"delivery_stages":{"delivered_successes":30,"pr_merged":30,"check_state":"ok"}}'
+  exit 0
+fi
 if [[ "$cmd" == "providers" ]]; then
   cat <<'JSON'
 {"provider_diagnostics":{"provider_model_usage":[],"recent_events":[],"account_pool":[{"provider":"openai","total":1,"available":1,"capacity_slots":24,"active_idle":1,"rate_limited":0,"auth_errors":0}]}}
 JSON
+  exit 0
+fi
+if [[ "${PULSE_CHECK_HANDOFF_FAILURE_FIXTURE:-}" == "yes" ]]; then
+  cat <<'JSON'
+{"window":{"since":"24h"},"metrics":{"total":20,"terminal_session_total":20,"runtime_handoffs":17,"succeeded":null,"result_counts":{"success":5,"post_pr_handoff":12,"blocked":3},"diagnostic_focus":{},"timing_ms":{"samples":20,"avg":1000,"max":2000},"recent_examples":[],"failure_groups":[],"failure_families":[{"fingerprint":"ff-v1:launch-failure","family":"launch-failure","count":12,"distinct_sessions":12,"first_ts":1,"last_ts":2,"confidence":"high","recovery_outcome":"recurring","results":{"post_pr_handoff":12},"examples":[{"result":"post_pr_handoff","exit_code":0}]}]},"pulse_stats":{},"delivery_stages":{"pr_opened":null,"pr_merged":null,"issue_solved":null,"delivered_successes":null,"check_state":"skipped"}}
+JSON
+  exit 0
+fi
+if [[ -n "${PULSE_CHECK_PREMATURE_EXIT_FIXTURE:-}" ]]; then
+  jq -n --arg mode "$PULSE_CHECK_PREMATURE_EXIT_FIXTURE" --arg args " $* " '
+    (if ($args | contains(" --since 1h ")) then
+      (if $mode == "recovered" then 0 elif $mode == "below-threshold" then 1 else 4 end)
+    else 12 end) as $count
+    | {window:{since:"24h"}, metrics:{failure_families:[
+      {fingerprint:"ff-v1:premature-exit", family:"premature-exit", count:$count,
+       distinct_sessions:(if $mode == "single-session" then 1 else $count end),
+       confidence:"high", first_ts:1, last_ts:2,
+       launch_failure_cause:"model_stopped_before_completion", kill_reason:"natural",
+       next_action:"resume_session_with_completion_contract", recovery_outcome:"recurring",
+       results:{premature_exit:$count}, examples:[{result:"premature_exit",exit_code:1}]}
+    ] | map(select(.count > 0))}}'
+  exit 0
+fi
+if [[ -n "${PULSE_CHECK_WATCHDOG_FIXTURE:-}" ]]; then
+  # Canonical worker-activity family shape: identical result/exit routing,
+  # but liveness-backed cap kills have their own cause and fingerprint.
+  jq -n --arg mode "$PULSE_CHECK_WATCHDOG_FIXTURE" --arg args " $* " '
+    {window:{since:"24h"}, metrics:{failure_families:[
+      {fingerprint:"ff-v1:watchdog-stall", family:"watchdog-stall", count:4,
+       distinct_sessions:4, confidence:"high", first_ts:1, last_ts:2,
+       launch_failure_cause:"stall_hard_killed", kill_reason:"hard_kill_stall",
+       next_action:"redispatch_worker", recovery_outcome:"recurring",
+       results:{watchdog_stall_killed:4}, examples:[{result:"watchdog_stall_killed",exit_code:79}]},
+      {fingerprint:"ff-v1:elapsed-cap-active", family:"elapsed-cap-active", count:4,
+       distinct_sessions:4, confidence:"high", first_ts:1, last_ts:2,
+       launch_failure_cause:"elapsed_cap_while_active", kill_reason:"hard_kill_cap_active",
+       next_action:"redispatch_worker", recovery_outcome:"recurring",
+       results:{watchdog_stall_killed:4}, examples:[{result:"watchdog_stall_killed",exit_code:79}]}
+    ] | if $mode == "recovered" and ($args | contains(" --since 1h ")) then [] else . end}}'
   exit 0
 fi
 if [[ "${PULSE_CHECK_BLOCKER_FIXTURE:-}" == "retained" ]]; then
@@ -213,6 +258,9 @@ if [[ " $* " == *" api -i /repos/"*"/collaborators/fixture-user/permission "* ||
   exit 0
 fi
 if [[ " $* " == *" api graphql "* ]]; then
+  if [[ "${PULSE_CHECK_QUEUE_FIXTURE:-}" == "slow-dependency-scan" ]]; then
+    sleep 5
+  fi
   if [[ "${PULSE_CHECK_QUEUE_FIXTURE:-}" == "dependency-scan-error" ]]; then
     printf 'simulated dependency lookup failure\n' >&2
     exit 1
@@ -279,10 +327,11 @@ if [[ "${PULSE_CHECK_QUEUE_FIXTURE:-}" == "shortfall" || "${PULSE_CHECK_QUEUE_FI
   if [[ " $* " == *"private/repo-one"* ]]; then
     cat <<'JSON'
 [
-  {"number":11,"title":"private eligible","updatedAt":"2000-01-01T00:00:00Z","assignees":[],"labels":[{"name":"auto-dispatch"},{"name":"status:available"},{"name":"tier:standard"}]},
-  {"number":12,"title":"private assigned","updatedAt":"2000-01-01T00:00:00Z","assignees":[{"login":"worker"}],"labels":[{"name":"auto-dispatch"},{"name":"status:queued"},{"name":"tier:standard"}]},
-  {"number":13,"title":"private nmr","updatedAt":"2000-01-01T00:00:00Z","assignees":[],"labels":[{"name":"auto-dispatch"},{"name":"status:available"},{"name":"tier:thinking"},{"name":"needs-maintainer-review"}]},
-  {"number":14,"title":"private malformed","updatedAt":"2000-01-01T00:00:00Z","assignees":[],"labels":[{"name":"auto-dispatch"},{"name":"status:available"}]}
+  {"number":11,"title":"private eligible","createdAt":"2000-01-01T00:00:00Z","updatedAt":"2000-01-01T00:00:00Z","assignees":[],"labels":[{"name":"auto-dispatch"},{"name":"status:available"},{"name":"tier:standard"}]},
+  {"number":12,"title":"private assigned","createdAt":"2000-01-01T00:00:00Z","updatedAt":"2000-01-01T00:00:00Z","assignees":[{"login":"worker"}],"labels":[{"name":"auto-dispatch"},{"name":"status:queued"},{"name":"tier:standard"}]},
+  {"number":13,"title":"private nmr","createdAt":"2000-01-01T00:00:00Z","updatedAt":"2000-01-01T00:00:00Z","assignees":[],"labels":[{"name":"auto-dispatch"},{"name":"status:available"},{"name":"tier:thinking"},{"name":"needs-maintainer-review"}]},
+  {"number":14,"title":"private malformed","createdAt":"2000-01-01T00:00:00Z","updatedAt":"2000-01-01T00:00:00Z","assignees":[],"labels":[{"name":"auto-dispatch"},{"name":"status:available"}]},
+  {"number":15,"title":"private active review","createdAt":"2000-01-01T00:00:00Z","updatedAt":"2000-01-01T00:00:00Z","assignees":[{"login":"owner"}],"labels":[{"name":"auto-dispatch"},{"name":"status:in-review"},{"name":"tier:standard"}]}
 ]
 JSON
   else
@@ -344,13 +393,17 @@ COMMON_ENV=(
 	"PULSE_CHECK_GH_WRAPPERS=${TEST_ROOT}/wrappers.sh"
 	"PULSE_CHECK_CAPTURE=${TEST_ROOT}/capture.txt"
 	"PULSE_CHECK_PULSE_HEALTH_FILE=${TEST_ROOT}/missing-pulse-health.json"
+	"AIDEVOPS_GH_TRANSPORT_STATE_DIR=${TEST_ROOT}/transport-state"
+	"AIDEVOPS_GH_SECONDARY_COOLDOWN_FILE=${TEST_ROOT}/secondary-cooldown.json"
+	"AIDEVOPS_GH_SECONDARY_COOLDOWN_EVENTS_FILE=${TEST_ROOT}/secondary-events.jsonl"
+	"AIDEVOPS_GH_READ_RAMP_STATE_FILE=${TEST_ROOT}/read-ramp.state"
 )
 
 printf '%s=== pulse-check-helper.sh tests ===%s\n' "$TEST_BLUE" "$TEST_NC"
 
 OUT=$(env "${COMMON_ENV[@]}" "$HELPER" report 2>&1)
-assert_contains "text report shows empty active capacity" "Active workers: 0 / 6" "$OUT"
-assert_contains "text report distinguishes eligible work" "Auto-dispatch queue: 5 available (4 eligible) / 6 open" "$OUT"
+assert_contains "text report shows empty local active capacity" "Local active worker processes: 0 / 6" "$OUT"
+assert_contains "text report distinguishes eligible work" "Auto-dispatch queue: 5 available (4 label-eligible; launch admission not verified) / 6 open" "$OUT"
 assert_contains "underfilled finding appears" "pulse-underfilled-auto-dispatch-queue" "$OUT"
 assert_contains "launch accounting finding appears" "pulse-launch-accounting-gap" "$OUT"
 assert_contains "canonical reconciliation finding appears" "pulse-canonical-reconciliation-stops" "$OUT"
@@ -358,12 +411,23 @@ assert_not_contains "text report omits private slug" "private/repo-one" "$OUT"
 assert_not_contains "text report omits issue titles" "secret one" "$OUT"
 assert_not_contains "text report omits canonical branch detail" "origin/develop" "$OUT"
 
+mkdir -p "$TEST_ROOT/.aidevops/cache"
+jq -n --argjson now "$(date +%s)" '{timestamp:$now,streak:3,deficit:100,top:"local_capacity_gate:5"}' >"$TEST_ROOT/.aidevops/cache/pulse-underfill.json"
+UNDERFILL_OUT=$(env "${COMMON_ENV[@]}" "HOME=$TEST_ROOT" "$HELPER" report 2>&1)
+assert_contains "health summary names sustained capacity blocker" '"top":"local_capacity_gate:5"' "$UNDERFILL_OUT"
+UNDERFILL_JSON=$(env "${COMMON_ENV[@]}" "HOME=$TEST_ROOT" "$HELPER" json 2>&1)
+assert_eq "health JSON preserves sustained attribution" "local_capacity_gate:5" "$(jq -r '.current_state.underfill_attribution.top' <<<"$UNDERFILL_JSON")"
+jq '.timestamp = 1' "$TEST_ROOT/.aidevops/cache/pulse-underfill.json" >"$TEST_ROOT/.aidevops/cache/stale.json"
+mv "$TEST_ROOT/.aidevops/cache/stale.json" "$TEST_ROOT/.aidevops/cache/pulse-underfill.json"
+UNDERFILL_OUT=$(env "${COMMON_ENV[@]}" "HOME=$TEST_ROOT" "$HELPER" report 2>&1)
+assert_not_contains "health summary ignores stale attribution" '"top":"local_capacity_gate:5"' "$UNDERFILL_OUT"
+
 BLOCKER_OUT=$(env "${COMMON_ENV[@]}" "PULSE_CHECK_BLOCKER_FIXTURE=retained" "$HELPER" report --since 7d 2>&1)
 assert_contains "healthy idle report exposes retained supervisor blocker advisory" "retained-supervisor-permission-blockers" "$BLOCKER_OUT"
 assert_contains "retained blocker report preserves healthy runner state" "Runner health: HEALTHY" "$BLOCKER_OUT"
-assert_contains "retained blocker report shows zero active workers" "Active workers: 0 / 6" "$BLOCKER_OUT"
+assert_contains "retained blocker report shows zero local active workers" "Local active worker processes: 0 / 6" "$BLOCKER_OUT"
 assert_contains "retained blocker report gives no-source worker count command" "worker-activity-helper.sh live-workers" "$BLOCKER_OUT"
-assert_contains "retained blocker report gives audited reconciliation guidance" "worker-blocker-cli.mjs resolve-session" "$BLOCKER_OUT"
+assert_contains "retained blocker report gives audited reconciliation guidance" "worker-blocker-cli.mjs resolve-stale-supervisor-session" "$BLOCKER_OUT"
 assert_not_contains "retained blocker report omits private blocker slug" "private/repo-one" "$BLOCKER_OUT"
 assert_not_contains "retained blocker report omits private blocker path" "/private/path" "$BLOCKER_OUT"
 BLOCKER_JSON=$(env "${COMMON_ENV[@]}" "PULSE_CHECK_BLOCKER_FIXTURE=retained" "$HELPER" json --since 7d 2>&1)
@@ -381,10 +445,87 @@ HANDOFF_RATE=$(printf '%s' "$JSON_OUT" | jq -r '.summary.historical_runtime_hand
 assert_eq "json runtime handoff rate uses terminal session denominator" "90" "$HANDOFF_RATE"
 SUCCESS_RATE=$(printf '%s' "$JSON_OUT" | jq -r '.summary.historical_success_rate')
 assert_eq "json delivered success rate is unknown without GitHub delivery check" "null" "$SUCCESS_RATE"
+DELIVERY_JSON=$(env "${COMMON_ENV[@]}" "$HELPER" json --verify-delivery 2>&1)
+assert_eq "explicit delivery verification exposes observed GitHub deliveries" "30" "$(printf '%s' "$DELIVERY_JSON" | jq -r '.summary.historical_worker_delivered_successes')"
+assert_eq "independent delivery counts never create a 300 percent attempt success rate" "null" "$(printf '%s' "$DELIVERY_JSON" | jq -r '.summary.historical_delivery_success_rate')"
+assert_eq "delivery verification retains local terminal handoff denominator" "90" "$(printf '%s' "$DELIVERY_JSON" | jq -r '.summary.historical_runtime_handoff_rate')"
+assert_eq "delivery collection records verified state" "ok" "$(printf '%s' "$DELIVERY_JSON" | jq -r '.collection.delivery.state')"
+
+cat >"${TEST_ROOT}/slow-current.sh" <<'SH'
+#!/usr/bin/env bash
+sleep "${PULSE_CHECK_FIXTURE_DELAY:-10}"
+printf '{}\n'
+SH
+chmod +x "${TEST_ROOT}/slow-current.sh"
+bounded_start="$SECONDS"
+BOUNDED_JSON=$(env "${COMMON_ENV[@]}" "PULSE_CHECK_CURRENT_STATE_HELPER=${TEST_ROOT}/slow-current.sh" "$HELPER" json --budget 2 2>&1)
+assert_eq "slow collector returns a timed-out evidence record" "timed_out" "$(printf '%s' "$BOUNDED_JSON" | jq -r '.collection.current.state')"
+assert_eq "timed-out collector does not invent active worker count" "null" "$(printf '%s' "$BOUNDED_JSON" | jq -r '.summary.active_workers')"
+assert_eq "overall report deadline returns before the slow child completes" "true" "$([[ $((SECONDS - bounded_start)) -lt 9 ]] && printf true || printf false)"
+assert_eq "uncollected queue is explicitly unavailable" "queue_collection_unavailable" "$(printf '%s' "$BOUNDED_JSON" | jq -r '.summary.auto_dispatch_scan_state')"
+assert_eq "missing current measurements are not zero launches" "null" "$(printf '%s' "$BOUNDED_JSON" | jq -r '.summary.worker_launches_in_window')"
+assert_eq "missing queue measurements are not zero open work" "null" "$(printf '%s' "$BOUNDED_JSON" | jq -r '.summary.auto_dispatch_open')"
+
+NESTED_JSON=$(env "${COMMON_ENV[@]}" "PULSE_CHECK_CURRENT_STATE_HELPER=${TEST_ROOT}/slow-current.sh" \
+	"PULSE_CHECK_FIXTURE_DELAY=2" "PULSE_CHECK_QUEUE_FIXTURE=slow-dependency-scan" "$HELPER" json --budget 8 2>&1)
+assert_eq "nested queue deadline returns valid partial JSON before outer kill" "ok" "$(printf '%s' "$NESTED_JSON" | jq -r '.collection.queue.state')"
+assert_eq "nested deadline preserves collected inventories" "2" "$(printf '%s' "$NESTED_JSON" | jq -r '.queue.repos_scanned')"
+assert_eq "nested deadline marks incomplete enrichment" "queue_budget_exhausted" "$(printf '%s' "$NESTED_JSON" | jq -r '.summary.auto_dispatch_scan_state')"
+
+PARTIAL_JSON=$(env "${COMMON_ENV[@]}" "PULSE_CHECK_QUEUE_FIXTURE=slow-dependency-scan" "PULSE_CHECK_QUEUE_BUDGET_SECONDS=1" "$HELPER" json 2>&1)
+assert_eq "slow enrichment retains all repository inventories" "2" "$(printf '%s' "$PARTIAL_JSON" | jq -r '.queue.repos_scanned')"
+assert_eq "slow enrichment retains observed open issue counts" "6" "$(printf '%s' "$PARTIAL_JSON" | jq -r '.queue.auto_dispatch_open')"
+assert_eq "queue deadline is explicit instead of empty output" "queue_budget_exhausted" "$(printf '%s' "$PARTIAL_JSON" | jq -r '.summary.auto_dispatch_scan_state')"
+assert_eq "unknown dependency evidence is counted" "true" "$(printf '%s' "$PARTIAL_JSON" | jq -r '.queue.dependency_unknown > 0')"
+assert_eq "deadline exhaustion is not reported as a GitHub error" "0" "$(printf '%s' "$PARTIAL_JSON" | jq -r '.queue.gh_errors')"
+assert_not_contains "deadline exhaustion does not imply GitHub scan failures" "pulse-check-gh-scan-errors" "$PARTIAL_JSON"
+HANDOFF_FAMILY_JSON=$(env "${COMMON_ENV[@]}" "PULSE_CHECK_HANDOFF_FAILURE_FIXTURE=yes" "$HELPER" json 2>&1)
+assert_eq "post-PR handoff family is absent from remediation candidates" "0" \
+	"$(printf '%s' "$HANDOFF_FAMILY_JSON" | jq -r '.failure_family_remediation | length')"
+assert_eq "post-PR handoff family triggers no failure finding" "0" \
+	"$(printf '%s' "$HANDOFF_FAMILY_JSON" | jq -r '[.findings[] | select(.id == "worker-failure-family-launch-failure")] | length')"
+WATCHDOG_JSON=$(env "${COMMON_ENV[@]}" "PULSE_CHECK_WATCHDOG_FIXTURE=recurring" "$HELPER" json 2>&1)
+assert_eq "canonical genuine stalls remain actionable" "1" \
+	"$(printf '%s' "$WATCHDOG_JSON" | jq '[.findings[] | select(.id == "worker-failure-family-watchdog-stall")] | length')"
+assert_eq "active cap kills remain a separate family, not suppressed" "1" \
+	"$(printf '%s' "$WATCHDOG_JSON" | jq '[.findings[] | select(.id == "worker-failure-family-elapsed-cap-active")] | length')"
+assert_contains "watchdog finding preserves kill-path evidence" "kill_reason=hard_kill_stall" "$WATCHDOG_JSON"
+assert_contains "cap finding preserves active cause" "launch_failure_cause=elapsed_cap_while_active" "$WATCHDOG_JSON"
+assert_contains "family finding exposes recent count" "recent_failures_in_window=4" "$WATCHDOG_JSON"
+assert_eq "remediation record retains the canonical next action" "redispatch_worker" \
+	"$(printf '%s' "$WATCHDOG_JSON" | jq -r '.failure_family_remediation[] | select(.family == "watchdog-stall") | .next_action')"
+WATCHDOG_RECOVERED=$(env "${COMMON_ENV[@]}" "PULSE_CHECK_WATCHDOG_FIXTURE=recovered" "$HELPER" json 2>&1)
+assert_eq "historical watchdog failures are preserved after recent recovery" "4" \
+	"$(printf '%s' "$WATCHDOG_RECOVERED" | jq '.failure_family_remediation[] | select(.family == "watchdog-stall") | .count')"
+assert_eq "recent recovery clears watchdog finding without rewriting history" "0" \
+	"$(printf '%s' "$WATCHDOG_RECOVERED" | jq '[.findings[] | select(.id == "worker-failure-family-watchdog-stall")] | length')"
+assert_eq "recent recovery clears recurrent summary as well as findings" "0" \
+	"$(printf '%s' "$WATCHDOG_RECOVERED" | jq '.summary.recurrent_failure_families')"
+PREMATURE_JSON=$(env "${COMMON_ENV[@]}" "PULSE_CHECK_PREMATURE_EXIT_FIXTURE=recurring" "$HELPER" json 2>&1)
+assert_eq "canonical premature exits remain actionable" "1" \
+	"$(printf '%s' "$PREMATURE_JSON" | jq '[.findings[] | select(.id == "worker-failure-family-premature-exit")] | length')"
+assert_eq "premature-exit recurrence summary matches actionable findings" "1" \
+	"$(printf '%s' "$PREMATURE_JSON" | jq '.summary.recurrent_failure_families')"
+assert_contains "premature exits retain natural termination evidence" "kill_reason=natural" "$PREMATURE_JSON"
+assert_contains "premature exits retain model completion cause" "launch_failure_cause=model_stopped_before_completion" "$PREMATURE_JSON"
+assert_eq "premature exits preserve continuation rather than redispatch routing" "resume_session_with_completion_contract" \
+	"$(printf '%s' "$PREMATURE_JSON" | jq -r '.failure_family_remediation[0].next_action')"
+for premature_mode in recovered below-threshold single-session; do
+	PREMATURE_QUIET=$(env "${COMMON_ENV[@]}" "PULSE_CHECK_PREMATURE_EXIT_FIXTURE=$premature_mode" "$HELPER" json 2>&1)
+	assert_eq "${premature_mode} premature exits do not inflate recurrent summary" "0" \
+		"$(printf '%s' "$PREMATURE_QUIET" | jq '.summary.recurrent_failure_families')"
+	assert_eq "${premature_mode} premature exits trigger no actionable finding" "0" \
+		"$(printf '%s' "$PREMATURE_QUIET" | jq '[.findings[] | select(.id == "worker-failure-family-premature-exit")] | length')"
+	assert_eq "${premature_mode} premature exits preserve historical evidence" "12" \
+		"$(printf '%s' "$PREMATURE_QUIET" | jq '.failure_family_remediation[0].count')"
+done
 assert_eq "json reports canonical reconciliation refusal aggregate" "2" "$(printf '%s' "$JSON_OUT" | jq -r '.current_state.canonical_reconciliation.refusal_count')"
 assert_eq "json reports canonical reconciliation classification" "dirty_or_uncommitted" "$(printf '%s' "$JSON_OUT" | jq -r '.current_state.canonical_reconciliation.classification')"
+assert_eq "benign policy holds do not inflate worker failures" "0" "$(printf '%s' "$JSON_OUT" | jq -r '.summary.worker_terminal_events_in_window')"
 assert_eq "zero-worker active claim is actionable" "true" "$(printf '%s' "$JSON_OUT" | jq -r '.summary.zero_worker_active_claim_actionable')"
+assert_eq "sustained zero-worker underutilization is actionable" "true" "$(printf '%s' "$JSON_OUT" | jq -r '.summary.sustained_zero_worker_underutilization')"
 assert_contains "underfill preserves named active-claim evidence" "zero_worker_infrastructure_hold:1" "$JSON_OUT"
+assert_contains "underfill preserves sustained-cycle evidence" "consecutive_no_progress_cycles=3" "$JSON_OUT"
 assert_not_contains "json omits canonical branch detail" "origin/develop" "$JSON_OUT"
 
 cat >"${TEST_ROOT}/current-state-stale-runtime.sh" <<'SH'
@@ -418,6 +559,30 @@ assert_contains "stale runtime preserves safe operator action" "Preserve the loc
 STALE_RUNTIME_TEXT=$(env "${COMMON_ENV[@]}" \
 	"PULSE_CHECK_CURRENT_STATE_HELPER=${TEST_ROOT}/current-state-stale-runtime.sh" "$HELPER" report 2>&1)
 assert_contains "text report shows runtime freshness" "Runtime freshness: blocked_dirty_canonical" "$STALE_RUNTIME_TEXT"
+
+cat >"${TEST_ROOT}/current-state-runtime-equivalent.sh" <<'SH'
+#!/usr/bin/env bash
+cat <<'JSON'
+{
+  "dispatch_alive": true,
+  "active_worker_processes": 1,
+  "current_state_guardrails": {"available_slots_last": 5},
+  "pulse_gauges": {"dispatch_capacity_final_max_workers": 6},
+  "worker_outcomes": {"spawned": 0},
+  "runtime_freshness": {
+    "status": "current",
+    "stale": false,
+    "canonical_sha": "canonical-sha",
+    "deployed_sha": "deployed-sha"
+  },
+  "graphql_budget_status": "OK fixture"
+}
+JSON
+SH
+chmod +x "${TEST_ROOT}/current-state-runtime-equivalent.sh"
+RUNTIME_EQUIVALENT_JSON=$(env "${COMMON_ENV[@]}" \
+	"PULSE_CHECK_CURRENT_STATE_HELPER=${TEST_ROOT}/current-state-runtime-equivalent.sh" "$HELPER" json 2>&1)
+assert_eq "runtime-equivalent planning drift creates no stale finding" "0" "$(printf '%s' "$RUNTIME_EQUIVALENT_JSON" | jq -r '[.findings[] | select(.id == "pulse-runtime-stale")] | length')"
 
 SECONDARY_GH_CALL_LOG="${TEST_ROOT}/secondary-gh-calls.log"
 rm -f "$SECONDARY_GH_CALL_LOG"
@@ -470,10 +635,55 @@ ACTIVE_COUNT=$(printf '%s' "$JSON_ACTIVE_OUT" | jq -r '.summary.active_workers')
 ACTIVE_AVAILABLE=$(printf '%s' "$JSON_ACTIVE_OUT" | jq -r '.summary.available_slots')
 ACTIVE_IDS=$(printf '%s' "$JSON_ACTIVE_OUT" | jq -r '[.findings[].id] | sort | join(",")')
 assert_eq "json reports process-scan active workers" "2" "$ACTIVE_COUNT"
+assert_eq "json reports local worker processes separately" "2" "$(printf '%s' "$JSON_ACTIVE_OUT" | jq -r '.summary.local_active_worker_processes')"
+assert_eq "json reports fresh cross-runner durable claims separately" "1" "$(printf '%s' "$JSON_ACTIVE_OUT" | jq -r '.summary.fresh_cross_runner_durable_claims')"
+assert_eq "durable cross-runner claim proves fleet activity" "observed" "$(printf '%s' "$JSON_ACTIVE_OUT" | jq -r '.summary.fleet_activity_state')"
 assert_eq "json recomputes available slots from process count" "4" "$ACTIVE_AVAILABLE"
 assert_eq "process-scan active workers suppress underfill finding" "auto-dispatch-missing-tier-labels" "$ACTIVE_IDS"
 assert_eq "live-owner active claim remains non-actionable" "false" "$(printf '%s' "$JSON_ACTIVE_OUT" | jq -r '.summary.zero_worker_active_claim_actionable')"
 assert_eq "live-owner evidence remains visible" "1" "$(printf '%s' "$JSON_ACTIVE_OUT" | jq -r '.current_state.active_claim_state.live_owner_count')"
+
+cat >"${TEST_ROOT}/current-state-cross-runner.sh" <<'SH'
+#!/usr/bin/env bash
+cat <<'JSON'
+{
+  "dispatch_alive": true,
+  "dispatch_stage_events": 4,
+  "active_worker_processes": 0,
+  "pulse_gauges": {"dispatch_capacity_final_max_workers": 6},
+  "worker_outcomes": {"spawned": 0},
+  "worker_terminal_events": 0,
+  "active_claim_state": {"active_workers": 0, "classification_counts": {"durable_launch": 2}, "zero_worker_actionable": false, "live_owner_count": 0, "durable_launch_count": 2},
+  "graphql_budget_status": "OK fixture"
+}
+JSON
+SH
+chmod +x "${TEST_ROOT}/current-state-cross-runner.sh"
+JSON_CROSS_RUNNER_OUT=$(env "${COMMON_ENV[@]}" "PULSE_CHECK_CURRENT_STATE_HELPER=${TEST_ROOT}/current-state-cross-runner.sh" "$HELPER" json 2>&1)
+assert_eq "zero local processes remain distinct from remote fleet activity" "0" "$(printf '%s' "$JSON_CROSS_RUNNER_OUT" | jq -r '.summary.local_active_worker_processes')"
+assert_eq "fresh remote durable claims remain visible" "2" "$(printf '%s' "$JSON_CROSS_RUNNER_OUT" | jq -r '.summary.fresh_cross_runner_durable_claims')"
+assert_eq "remote durable claims prove fleet activity despite zero local processes" "observed" "$(printf '%s' "$JSON_CROSS_RUNNER_OUT" | jq -r '.summary.fleet_activity_state')"
+assert_not_contains "fresh remote durable claims suppress transient underfill" "pulse-underfilled-auto-dispatch-queue" "$JSON_CROSS_RUNNER_OUT"
+
+cat >"${TEST_ROOT}/current-state-transient-underfill.sh" <<'SH'
+#!/usr/bin/env bash
+cat <<'JSON'
+{
+  "dispatch_alive": true,
+  "dispatch_stage_events": 0,
+  "active_worker_processes": 0,
+  "pulse_gauges": {"dispatch_capacity_final_max_workers": 6},
+  "worker_outcomes": {"spawned": 0},
+  "worker_terminal_events": 0,
+  "zero_worker_underutilization": {"actionable": false, "consecutive_no_progress_cycles": 0, "minimum_cycles": 3},
+  "graphql_budget_status": "OK fixture"
+}
+JSON
+SH
+chmod +x "${TEST_ROOT}/current-state-transient-underfill.sh"
+JSON_TRANSIENT_UNDERFILL_OUT=$(env "${COMMON_ENV[@]}" "PULSE_CHECK_CURRENT_STATE_HELPER=${TEST_ROOT}/current-state-transient-underfill.sh" "$HELPER" json 2>&1)
+assert_eq "transient zero-worker state stays non-actionable" "false" "$(printf '%s' "$JSON_TRANSIENT_UNDERFILL_OUT" | jq -r '.summary.sustained_zero_worker_underutilization')"
+assert_not_contains "transient zero-worker state cannot trigger underfill" "pulse-underfilled-auto-dispatch-queue" "$JSON_TRANSIENT_UNDERFILL_OUT"
 
 cat >"${TEST_ROOT}/current-state-idle.sh" <<'SH'
 #!/usr/bin/env bash
@@ -531,12 +741,12 @@ JSON
 SH
 chmod +x "${TEST_ROOT}/current-state-active-no-gauge.sh"
 JSON_ACTIVE_NO_GAUGE_OUT=$(env "${COMMON_ENV[@]}" "PULSE_CHECK_CURRENT_STATE_HELPER=${TEST_ROOT}/current-state-active-no-gauge.sh" "$HELPER" json 2>&1)
-assert_eq "json falls back to process count when capacity gauge is absent" "2" "$(printf '%s' "$JSON_ACTIVE_NO_GAUGE_OUT" | jq -r '.summary.max_workers')"
-assert_eq "json absent capacity gauge avoids impossible active over max report" "Active workers: 2 / 2" "$(env "${COMMON_ENV[@]}" "PULSE_CHECK_CURRENT_STATE_HELPER=${TEST_ROOT}/current-state-active-no-gauge.sh" "$HELPER" report 2>&1 | grep -o 'Active workers: [0-9] / [0-9]')"
+assert_eq "json preserves unknown maximum when capacity gauge is absent" "null" "$(printf '%s' "$JSON_ACTIVE_NO_GAUGE_OUT" | jq -r '.summary.max_workers')"
+assert_eq "json does not equate unknown capacity with zero free slots" "null" "$(printf '%s' "$JSON_ACTIVE_NO_GAUGE_OUT" | jq -r '.summary.available_slots')"
+assert_eq "json retains the independently observed worker count" "2" "$(printf '%s' "$JSON_ACTIVE_NO_GAUGE_OUT" | jq -r '.summary.active_workers')"
+assert_contains "text explicitly reports unknown local capacity" "Local active worker processes: 2 / unknown" "$(env "${COMMON_ENV[@]}" "PULSE_CHECK_CURRENT_STATE_HELPER=${TEST_ROOT}/current-state-active-no-gauge.sh" "$HELPER" report 2>&1)"
 
-cat >"${TEST_ROOT}/pulse-health.json" <<'JSON'
-{"workers_active":1,"workers_max":2}
-JSON
+jq -n '{workers_active:1,workers_max:2,timestamp:(now | todateiso8601)}' >"${TEST_ROOT}/pulse-health.json"
 cat >"${TEST_ROOT}/current-state-active-health-only.sh" <<'SH'
 #!/usr/bin/env bash
 cat <<'JSON'
@@ -557,6 +767,18 @@ JSON_ACTIVE_HEALTH_OUT=$(env "${COMMON_ENV[@]}" \
 	"PULSE_CHECK_PULSE_HEALTH_FILE=${TEST_ROOT}/pulse-health.json" "$HELPER" json 2>&1)
 assert_eq "json falls back to pulse health max when capacity gauge is absent" "2" "$(printf '%s' "$JSON_ACTIVE_HEALTH_OUT" | jq -r '.summary.max_workers')"
 assert_eq "json derives available slots from pulse health when gauge is absent" "1" "$(printf '%s' "$JSON_ACTIVE_HEALTH_OUT" | jq -r '.summary.available_slots')"
+assert_eq "fresh health count is named as a snapshot not a process scan" "pulse_health_snapshot" "$(printf '%s' "$JSON_ACTIVE_HEALTH_OUT" | jq -r '.summary.active_workers_source')"
+assert_eq "health maximum is characterized as configured snapshot" "pulse_health_configured_snapshot" "$(printf '%s' "$JSON_ACTIVE_HEALTH_OUT" | jq -r '.summary.max_workers_source')"
+for health_age in stale missing future; do
+	jq -n --arg age "$health_age" '{workers_active:1,workers_max:2,
+      timestamp:(if $age == "missing" then null elif $age == "stale" then (now - 3600 | todateiso8601) else (now + 3600 | todateiso8601) end)}' >"${TEST_ROOT}/pulse-health.json"
+	HEALTH_UNKNOWN_JSON=$(env "${COMMON_ENV[@]}" \
+		"PULSE_CHECK_CURRENT_STATE_HELPER=${TEST_ROOT}/current-state-active-health-only.sh" \
+		"PULSE_CHECK_PULSE_HEALTH_FILE=${TEST_ROOT}/pulse-health.json" "$HELPER" json 2>&1)
+	assert_eq "$health_age health snapshot does not supply current workers" "null" "$(printf '%s' "$HEALTH_UNKNOWN_JSON" | jq -r '.summary.active_workers')"
+	assert_eq "$health_age health snapshot does not supply free slots" "null" "$(printf '%s' "$HEALTH_UNKNOWN_JSON" | jq -r '.summary.available_slots')"
+	assert_eq "$health_age health snapshot retains separately identified configured maximum" "2" "$(printf '%s' "$HEALTH_UNKNOWN_JSON" | jq -r '.summary.max_workers')"
+done
 
 cat >"${TEST_ROOT}/current-state-shortfall.sh" <<'SH'
 #!/usr/bin/env bash
@@ -577,12 +799,19 @@ chmod +x "${TEST_ROOT}/current-state-shortfall.sh"
 SHORTFALL_OUT=$(env "${COMMON_ENV[@]}" "PULSE_CHECK_QUEUE_FIXTURE=shortfall" \
 	"PULSE_CHECK_CURRENT_STATE_HELPER=${TEST_ROOT}/current-state-shortfall.sh" "$HELPER" json 2>&1)
 SHORTFALL_IDS=$(printf '%s' "$SHORTFALL_OUT" | jq -r '[.findings[].id] | sort | join(",")')
-assert_eq "active workers do not hide eligible queue shortfall" "auto-dispatch-missing-tier-labels,pulse-eligible-queue-under-target,pulse-inactive-nmr-holds" "$SHORTFALL_IDS"
+assert_eq "active workers do not hide eligible queue shortfall" "auto-dispatch-missing-tier-labels,pulse-eligible-queue-under-target,pulse-inactive-nmr-holds,pulse-no-durable-progress-hour" "$SHORTFALL_IDS"
 assert_eq "queue shortfall remains a maintainer advisory" "medium" "$(printf '%s' "$SHORTFALL_OUT" | jq -r '.findings[] | select(.id == "pulse-eligible-queue-under-target") | .severity')"
 assert_eq "queue shortfall does not auto-file a non-actionable issue" "false" "$(printf '%s' "$SHORTFALL_OUT" | jq -r '.findings[] | select(.id == "pulse-eligible-queue-under-target") | .autofile')"
 assert_eq "shortfall fixture has one eligible issue" "1" "$(printf '%s' "$SHORTFALL_OUT" | jq -r '.queue.eligible_available_unassigned')"
-assert_eq "shortfall fixture distinguishes assigned work" "1" "$(printf '%s' "$SHORTFALL_OUT" | jq -r '.queue.assigned_in_flight')"
+assert_eq "shortfall fixture distinguishes assigned work" "2" "$(printf '%s' "$SHORTFALL_OUT" | jq -r '.queue.assigned_in_flight')"
 assert_eq "shortfall fixture distinguishes held work" "1" "$(printf '%s' "$SHORTFALL_OUT" | jq -r '.queue.blocked_explicit_hold')"
+assert_eq "active review ownership is not an explicit hold" "2" "$(printf '%s' "$SHORTFALL_OUT" | jq -r '.queue.blocked_labels')"
+assert_eq "durable-progress finding distinguishes owned targets" "2" "$(printf '%s' "$SHORTFALL_OUT" | jq -r '.queue.no_durable_progress_owned')"
+assert_eq "durable-progress finding distinguishes unowned targets" "2" "$(printf '%s' "$SHORTFALL_OUT" | jq -r '.queue.no_durable_progress_unowned')"
+assert_contains "durable-progress recovery prioritizes verified ownership" "owned_without_durable_progress=2" "$SHORTFALL_OUT"
+assert_eq "durable-progress finding remains a maintainer advisory" "medium" "$(printf '%s' "$SHORTFALL_OUT" | jq -r '.findings[] | select(.id == "pulse-no-durable-progress-hour") | .severity')"
+assert_eq "durable-progress finding does not auto-file an unowned recovery" "false" "$(printf '%s' "$SHORTFALL_OUT" | jq -r '.findings[] | select(.id == "pulse-no-durable-progress-hour") | .autofile')"
+assert_contains "shortfall evidence does not claim assignment proves liveness" "assigned_or_in_flight=2" "$SHORTFALL_OUT"
 assert_contains "NMR advisory names updatedAt inactivity basis" "issue_updatedAt_not_label_application_time" "$SHORTFALL_OUT"
 assert_eq "inactive NMR holds remain visible" "1" "$(printf '%s' "$SHORTFALL_OUT" | jq -r '[.findings[] | select(.id == "pulse-inactive-nmr-holds")] | length')"
 assert_eq "inactive NMR holds remain medium severity" "medium" "$(printf '%s' "$SHORTFALL_OUT" | jq -r '.findings[] | select(.id == "pulse-inactive-nmr-holds") | .severity')"
@@ -608,7 +837,8 @@ assert_not_contains "incomplete dependency scan suppresses unverified finding" "
 TRUNCATED_OUT=$(env "${COMMON_ENV[@]}" "PULSE_CHECK_QUEUE_FIXTURE=truncation" \
 	"PULSE_CHECK_MAX_ISSUES_PER_REPO=3" \
 	"PULSE_CHECK_CURRENT_STATE_HELPER=${TEST_ROOT}/current-state-shortfall.sh" "$HELPER" json 2>&1)
-assert_contains "saturated scan reports bounded incompleteness" "pulse-check-gh-scan-errors" "$TRUNCATED_OUT"
+assert_eq "saturated scan reports bounded incompleteness" "queue_inventory_truncated" "$(printf '%s' "$TRUNCATED_OUT" | jq -r '.summary.auto_dispatch_scan_state')"
+assert_eq "saturated inventory is not reported as a GitHub error" "0" "$(printf '%s' "$TRUNCATED_OUT" | jq -r '.queue.gh_errors')"
 assert_not_contains "saturated scan suppresses queue shortfall" "pulse-eligible-queue-under-target" "$TRUNCATED_OUT"
 assert_not_contains "saturated scan suppresses NMR inactivity" "pulse-inactive-nmr-holds" "$TRUNCATED_OUT"
 
@@ -631,6 +861,7 @@ cat <<'JSON'
   "pulse_gauges": {"dispatch_capacity_final_max_workers": 6},
   "worker_outcomes": {"spawned": 4, "launch_validation_failed": 4},
   "worker_terminal_events": 0,
+  "zero_worker_underutilization": {"actionable": true, "consecutive_no_progress_cycles": 3, "minimum_cycles": 3},
   "graphql_budget_status": "OK fixture"
 }
 JSON
@@ -654,6 +885,18 @@ assert_contains "apply body carries marker" "aidevops:generator=pulse-check find
 assert_contains "apply body carries verification" ".agents/scripts/tests/test-pulse-check-helper.sh" "$BODY"
 assert_not_contains "apply body omits private slug" "private/repo-one" "$BODY"
 assert_not_contains "apply body omits issue title" "secret one" "$BODY"
+scope_rc=0
+bash "${SCRIPT_DIR}/brief-readiness-helper.sh" scope-check "$BODY" || scope_rc=$?
+assert_eq "generated finding has executable canonical scope" "0" "$scope_rc"
+format_rc=0
+AIDEVOPS_BODY_FORMAT_STRICT=1 bash "${SCRIPT_DIR}/issue-body-format-helper.sh" check "$BODY" || format_rc=$?
+assert_eq "generated finding passes strict execution body contract" "0" "$format_rc"
+assert_contains "generated recovery requires outcome evidence" "worker exits alone do not establish recovery" "$BODY"
+
+reproducer_rc=0
+bash "${SCRIPT_DIR}/log-issue-helper.sh" validate-brief "${TEST_ROOT}/capture.txt.body" || reproducer_rc=$?
+assert_eq "generated finding passes production framework-bug reproducer validation" "0" "$reproducer_rc"
+assert_contains "generated finding distinguishes symptom from cause" "**Causal status**: unconfirmed investigation" "$BODY"
 
 rm -f "${TEST_ROOT}/capture.txt" "${TEST_ROOT}/capture.txt.body"
 READ_APPLY_OUT=$(env "${COMMON_ENV[@]}" "PULSE_CHECK_PERMISSION_FIXTURE=read" "$HELPER" apply --repo owner/aidevops 2>&1)

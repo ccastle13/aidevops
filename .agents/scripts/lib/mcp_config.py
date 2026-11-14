@@ -12,6 +12,12 @@ import os
 import platform
 import sys
 
+from mcp_outscraper import (
+    LEGACY_OUTSCRAPER_UV_RUN,
+    OUTSCRAPER_UV_RUN,
+    register_outscraper as _register_outscraper,
+)
+
 
 # =============================================================================
 # MCP LOADING POLICY
@@ -23,36 +29,38 @@ EAGER_MCPS = set()
 
 # On-demand (enabled: False): remain disabled until an explicit runtime connector
 LAZY_MCPS = {
-    'MCP_DOCKER', 'ahrefs', 'amazon-order-history',
+    'MCP_DOCKER', 'ahrefs', 'amazon-order-history', 'browse',
     'chrome-devtools', 'claude-code-mcp', 'context7', 'dataforseo',
     'google-analytics-mcp', 'grep_app', 'gsc', 'ios-simulator', 'localwp',
-    'macos-automator', 'openapi-search', 'outscraper', 'playwriter', 'quickfile',
-    'sentry', 'shadcn', 'socket', 'websearch',
+    'macos-automator', 'mobile-mcp', 'openapi-search', 'outscraper', 'playwriter', 'quickfile',
+    'sentry', 'seo-utils', 'shadcn', 'socket', 'websearch',
 }
 
 # Oh-My-OpenCode tool patterns to disable globally
 OMO_TOOL_PATTERNS = ['grep_app_*', 'websearch_*']
-PLAYWRITER_MCP_PACKAGE = 'playwriter@0.5.0'
-LEGACY_PLAYWRITER_MCP_PACKAGE = 'playwriter@latest'
+PLAYWRITER_MCP_PACKAGE = 'playwriter@0.9.0'
+# Packages emitted by earlier aidevops generators (GH#30851, GH#34549, GH#35514).
+LEGACY_PLAYWRITER_MCP_PACKAGES = ('playwriter@latest', 'playwriter@0.5.0', 'playwriter@0.8.0')
+# Playwriter >= 0.8.0 relays send usage telemetry unless opted out (GH#34549).
+PLAYWRITER_TELEMETRY_OPT_OUT = {'PLAYWRITER_TELEMETRY': '0', 'DO_NOT_TRACK': '1'}
 
 
-def _is_legacy_generated_playwriter_command(command):
-    """Return whether command is an exact prior generated Playwriter launcher."""
-    if not isinstance(command, list) or not command:
+def _is_generated_playwriter_command(command, packages):
+    """Return whether command is an exact generated launcher for packages."""
+    if not isinstance(command, list) or not command or command[-1] not in packages:
         return False
-    runner = command[0]
-    is_runner = isinstance(runner, str) and (
-        runner == 'npx' or (os.path.isabs(runner) and os.path.basename(runner) == 'npx')
-    )
-    is_bun = isinstance(runner, str) and (
-        runner == 'bun' or (os.path.isabs(runner) and os.path.basename(runner) == 'bun')
-    )
-    return (
-        is_runner and command[1:] in (
-            [LEGACY_PLAYWRITER_MCP_PACKAGE],
-            ['-y', LEGACY_PLAYWRITER_MCP_PACKAGE],
-        )
-    ) or (is_bun and command[1:] == ['x', LEGACY_PLAYWRITER_MCP_PACKAGE])
+    runner = command[0] if isinstance(command[0], str) else ''
+    runner_name = os.path.basename(runner) if os.path.isabs(runner) else runner
+    package = command[-1]
+    allowed = {'npx': ([package], ['-y', package]), 'bun': (['x', package],)}
+    return command[1:] in allowed.get(runner_name, ())
+
+
+def _apply_playwriter_telemetry_opt_out(playwriter_config):
+    """Default telemetry off unless the operator set PLAYWRITER_TELEMETRY."""
+    environment = playwriter_config.get('environment') or {}
+    if isinstance(environment, dict) and 'PLAYWRITER_TELEMETRY' not in environment:
+        playwriter_config['environment'] = {**PLAYWRITER_TELEMETRY_OPT_OUT, **environment}
 
 
 def apply_mcp_loading_policy(config):
@@ -92,43 +100,26 @@ def remove_deprecated_mcps(config):
 
 
 def _register_playwriter(config, bun_path):
-    """Register playwriter MCP (browser automation)."""
+    """Retain the disabled Playwriter MCP for explicit legacy compatibility."""
     if 'playwriter' not in config['mcp']:
-        if bun_path:
-            config['mcp']['playwriter'] = {
-                "type": "local",
-                "command": ["bun", "x", PLAYWRITER_MCP_PACKAGE],
-                "enabled": False
-            }
-        else:
-            config['mcp']['playwriter'] = {
-                "type": "local",
-                "command": ["npx", PLAYWRITER_MCP_PACKAGE],
-                "enabled": False
-            }
-        print("  Added playwriter MCP (on demand - @playwriter only)")
+        runner = ["bun", "x"] if bun_path else ["npx"]
+        config['mcp']['playwriter'] = {
+            "type": "local",
+            "command": [*runner, PLAYWRITER_MCP_PACKAGE],
+            "environment": dict(PLAYWRITER_TELEMETRY_OPT_OUT),
+            "enabled": False
+        }
+        print("  Added legacy Playwriter compatibility MCP (explicit @playwriter requests only)")
     elif isinstance(config['mcp']['playwriter'], dict):
         playwriter_config = config['mcp']['playwriter']
         command = playwriter_config.get('command')
-        if _is_legacy_generated_playwriter_command(command):
-            command[command.index(LEGACY_PLAYWRITER_MCP_PACKAGE)] = PLAYWRITER_MCP_PACKAGE
-            print("  Pinned legacy playwriter MCP command to 0.5.0")
+        if _is_generated_playwriter_command(command, LEGACY_PLAYWRITER_MCP_PACKAGES):
+            command[-1] = PLAYWRITER_MCP_PACKAGE
+            print(f"  Pinned legacy playwriter MCP command to {PLAYWRITER_MCP_PACKAGE}")
+        if _is_generated_playwriter_command(command, (PLAYWRITER_MCP_PACKAGE,)):
+            _apply_playwriter_telemetry_opt_out(playwriter_config)
         playwriter_config['enabled'] = False
     config['tools']['playwriter_*'] = False
-
-
-def _register_outscraper(config):
-    """Register outscraper MCP (business intelligence)."""
-    if 'outscraper' not in config['mcp']:
-        config['mcp']['outscraper'] = {
-            "type": "local",
-            "command": ["/bin/bash", "-c",
-                        "OUTSCRAPER_API_KEY=$OUTSCRAPER_API_KEY uv tool run outscraper-mcp-server"],
-            "enabled": False
-        }
-        print("  Added outscraper MCP (lazy load - @outscraper subagent only)")
-    if 'outscraper_*' not in config['tools']:
-        config['tools']['outscraper_*'] = False
 
 
 def _register_dataforseo(config, pkg_runner):
@@ -136,11 +127,9 @@ def _register_dataforseo(config, pkg_runner):
     if 'dataforseo' not in config['mcp']:
         config['mcp']['dataforseo'] = {
             "type": "local",
-            "command": ["/bin/bash", "-c",
-                        f"source ~/.config/aidevops/credentials.sh && "
-                        f"DATAFORSEO_USERNAME=$DATAFORSEO_USERNAME "
-                        f"DATAFORSEO_PASSWORD=$DATAFORSEO_PASSWORD "
-                        f"{pkg_runner} dataforseo-mcp-server"],
+            "command": ["bash", "-c",
+                        f'source "$HOME/.aidevops/agents/scripts/dataforseo-credentials.sh" && '
+                        f'dataforseo_load_credentials && exec {pkg_runner} dataforseo-mcp-server'],
             "enabled": False
         }
         print("  Added dataforseo MCP (lazy load - SEO agent/@dataforseo subagent)")
@@ -198,6 +187,16 @@ def _register_macos_mcps(config):
         config['tools']['ios-simulator_*'] = False
 
 
+def _register_mobile_mcp(config):
+    """Offer the locally installed mobile server without starting it at launch."""
+    config['mcp']['mobile-mcp'] = {
+        "type": "local",
+        "command": [os.path.expanduser("~/.aidevops/agents/scripts/mobile-mcp-launcher.sh")],
+        "enabled": False,
+    }
+    config['tools']['mobile-mcp_*'] = False
+
+
 def _register_openapi_search(config):
     """Register openapi-search MCP (remote Cloudflare Worker)."""
     if 'openapi-search' not in config['mcp']:
@@ -227,5 +226,6 @@ def register_standard_mcps(config, bun_path, pkg_runner):
     _register_shadcn(config)
     _register_claude_code_mcp(config)
     _register_macos_mcps(config)
+    _register_mobile_mcp(config)
     _register_openapi_search(config)
     _disable_omo_tools(config)

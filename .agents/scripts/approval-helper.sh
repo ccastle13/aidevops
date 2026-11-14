@@ -79,6 +79,9 @@ readonly _APPROVAL_AUTO_DISPATCH_LABEL="auto-dispatch"
 readonly _APPROVAL_AVAILABLE_LABEL="status:available"
 readonly _APPROVAL_QUEUED_LABEL="status:queued"
 readonly _APPROVAL_IN_PROGRESS_LABEL="status:in-progress"
+# GH#37956: approval-only records (Cloudron release requests and standing
+# release policies) are authority evidence, never worker tasks.
+readonly _APPROVAL_ONLY_LABELS="release-approval-required,release-standing-policy"
 readonly _APPROVAL_GITHUB_ACTIONS_BOT_ID="41898282"
 readonly _APPROVAL_MISSING_FIELD="__missing__"
 readonly _APPROVAL_GH_INVALID_TOKEN="invalid-token"
@@ -88,8 +91,22 @@ readonly _APPROVAL_BATCH_FAILURE_SYSTEMIC="systemic-transport"
 readonly _APPROVAL_BATCH_FAILURE_RATE_LIMIT="shared-rate-limit"
 readonly _APPROVAL_BATCH_FAILURE_AUTH="shared-auth-failure"
 
+#aidevops:trust-boundary -- diagnostic only; a bundle mismatch cannot grant authority.
+_approval_warn_pinned_verifier() {
+	local verifier_dir="" active_dir="" verifier_bundle="" active_bundle=""
+	verifier_dir=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || return 0
+	[[ "$verifier_dir" == */runtime-bundles/*/agents/scripts ]] || return 0
+	active_dir=$(cd -P "${_APPROVAL_HOME}/.aidevops/agents/scripts" 2>/dev/null && pwd) || return 0
+	[[ "$active_dir" == */runtime-bundles/*/agents/scripts && "$active_dir" != "$verifier_dir" ]] || return 0
+	verifier_bundle=${verifier_dir%/agents/scripts}
+	active_bundle=${active_dir%/agents/scripts}
+	printf 'APPROVAL_NOTE: verifier bundle %s is older than active bundle %s; re-run with ~/.aidevops/agents/scripts/approval-helper.sh before re-signing\n' "${verifier_bundle##*/}" "${active_bundle##*/}" >&2
+	return 0
+}
+
 _APPROVAL_GH_RATE_LIMIT_RESET=""
 _APPROVAL_GH_AUTH_FAILURE=""
+_APPROVAL_LABEL_SETS_ENSURED=""
 
 # shellcheck source=approval-snapshot-v2.sh
 source "${SCRIPT_DIR}/approval-snapshot-v2.sh"
@@ -232,10 +249,31 @@ _approval_classify_batch_failure() {
 	return 0
 }
 
+# Render a reset epoch as local wall-clock time plus the remaining wait, so the
+# operator knows when to retry without converting the epoch by hand.
+# GNU `date -d @N` first: BSD `date -r N` means "reference file" on GNU.
+_approval_format_reset_time() {
+	local reset="$1"
+	local local_time=""
+	local now=""
+	[[ "$reset" =~ ^[0-9]+$ ]] || return 1
+	local_time=$(date -d "@${reset}" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null) ||
+		local_time=$(date -r "$reset" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null) || return 1
+	now=$(date +%s 2>/dev/null) || now=""
+	if [[ "$now" =~ ^[0-9]+$ ]] && ((reset > now)); then
+		printf '%s local time, in about %s min' "$local_time" "$(((reset - now + 59) / 60))"
+	else
+		printf '%s local time, already passed' "$local_time"
+	fi
+	return 0
+}
+
 _approval_report_core_rate_limit() {
 	local reset="$1"
+	local when=""
+	when=$(_approval_format_reset_time "$reset") || when="local time unavailable"
 	_print_error "GitHub core API rate limit is exhausted for the invoking user's credential (reset epoch: ${reset})"
-	_print_info "Wait until reset epoch ${reset} before retrying. Re-authentication or forwarding GH_TOKEN will not help before reset."
+	_print_info "Retry after ${when} (reset epoch ${reset}). Re-authentication or forwarding GH_TOKEN will not help before reset."
 	return 0
 }
 
@@ -750,16 +788,67 @@ _approval_verify_pr_state() {
 	return $?
 }
 
+# Return 0 when a comma-joined label list marks an approval-only issue.
+_approval_issue_is_approval_only() {
+	local labels_csv="$1"
+	local label=""
+	local -a approval_only_labels=()
+
+	IFS=',' read -r -a approval_only_labels <<<"$_APPROVAL_ONLY_LABELS"
+	for label in "${approval_only_labels[@]}"; do
+		[[ ",${labels_csv}," == *",${label},"* ]] && return 0
+	done
+	return 1
+}
+
+# GH#37956: signing an approval-only issue records authority; it must not turn
+# the record into dispatchable work. Clear only the NMR hold, never add status,
+# auto-dispatch or an assignee, then verify the final locked, unheld state.
+_approval_apply_approval_only_issue_updates() {
+	local target_number="$1"
+	local slug="$2"
+	local labels_csv="$3"
+	local edit_err=""
+	local restore_err=""
+	local issue_json=""
+
+	if [[ ",${labels_csv}," == *",${_APPROVAL_NMR_LABEL},"* ]]; then
+		edit_err=$(gh_issue_edit_safe "$target_number" --repo "$slug" \
+			--remove-label "$_APPROVAL_NMR_LABEL" 2>&1 >/dev/null) || {
+			_print_error "Failed to clear needs-maintainer-review on approval-only issue #$target_number"
+			[[ -n "$edit_err" ]] && _print_error "$edit_err"
+			restore_err=$(_approval_restore_nmr_hold issue "$target_number" "$slug" 2>&1 >/dev/null) || {
+				_print_error "Failed to restore needs-maintainer-review after uncertain update on issue #$target_number"
+				[[ -n "$restore_err" ]] && _print_error "$restore_err"
+			}
+			return 1
+		}
+	fi
+
+	issue_json=$(_approval_fetch_issue_json "$target_number" "$slug") || {
+		_print_error "Approval state verification failed: could not read issue #$target_number via REST"
+		_approval_restore_nmr_hold issue "$target_number" "$slug" >/dev/null 2>&1 || true
+		return 1
+	}
+	if ! printf '%s' "$issue_json" | jq -e --arg label "$_APPROVAL_NMR_LABEL" \
+		'((.labels // []) | any(.name == $label) | not) and .locked == true' >/dev/null 2>&1; then
+		_print_error "Approval state verification failed: approval-only issue #$target_number is not locked without needs-maintainer-review"
+		_approval_restore_nmr_hold issue "$target_number" "$slug" >/dev/null 2>&1 || true
+		return 1
+	fi
+	_print_info "Approval-only issue #$target_number: recorded authority without task lifecycle labels"
+	return 0
+}
+
 _approval_apply_issue_lifecycle_updates() {
 	local target_number="$1"
 	local slug="$2"
 	local gh_user=""
 	local edit_err=""
-	local lock_err=""
 	local status_err=""
 	local restore_err=""
 	local _ah_labels_json=""
-	local _ah_stamp_file=""
+	local _ah_issue_json=""
 	local _ah_had_in_review=0
 
 	gh_user=$(_approval_current_github_login) || {
@@ -771,7 +860,23 @@ _approval_apply_issue_lifecycle_updates() {
 	# authoritative status transition removes status:in-review.
 	_ah_labels_json=$(gh_issue_view "$target_number" --repo "$slug" \
 		--json labels --jq '[.labels[].name] | join(",")' 2>/dev/null || echo "")
+	# GH#37956: an empty result may be a failed read. Confirm it through REST
+	# before taking the dispatchable path, which would turn an approval-only
+	# record into worker work. An unreadable issue fails closed, unchanged.
+	if [[ -z "$_ah_labels_json" ]]; then
+		_ah_issue_json=$(_approval_fetch_issue_json "$target_number" "$slug") &&
+			_ah_labels_json=$(jq -er '[(.labels // [])[].name] | join(",")' <<<"$_ah_issue_json" 2>/dev/null) || {
+			_print_error "Could not read labels on issue #$target_number — approval state was not changed"
+			return 1
+		}
+	fi
 	[[ ",${_ah_labels_json}," == *",status:in-review,"* ]] && _ah_had_in_review=1
+
+	if _approval_issue_is_approval_only "$_ah_labels_json"; then
+		_approval_apply_approval_only_issue_updates "$target_number" "$slug" "$_ah_labels_json" || return 1
+		[[ "$_ah_had_in_review" -eq 0 ]] || _approval_release_claim_stamp "$target_number" "$slug"
+		return 0
+	fi
 
 	# Establish the final status while NMR still blocks dispatch. This prevents
 	# the default-status workflow from owning the normal handoff path.
@@ -799,17 +904,10 @@ _approval_apply_issue_lifecycle_updates() {
 	_print_info "Lifecycle updated: status:available, removed needs-maintainer-review, added auto-dispatch"
 	_print_info "Assigned to $gh_user"
 
-	lock_err=$(_approval_lock_issue "$target_number" "$slug" 2>&1 >/dev/null) || {
-		_print_error "Approval advisory lock failure: issue #$target_number could not be locked after approval state updates"
-		[[ -n "$lock_err" ]] && _print_error "$lock_err"
-		restore_err=$(_approval_restore_nmr_hold issue "$target_number" "$slug" 2>&1 >/dev/null) || {
-			_print_error "Failed to restore needs-maintainer-review after lock uncertainty on issue #$target_number"
-			[[ -n "$restore_err" ]] && _print_error "$restore_err"
-		}
-		return 1
-	}
-	_print_info "Issue #$target_number locked (scope finalized, unlocks after worker completion)"
-
+	# The issue was locked before its signed snapshot was built. Do not mutate
+	# it a second time here: the fresh final-state read below must still verify
+	# locked=true. If another actor unlocked it, restore the hold rather than
+	# relocking and hiding a break in signed-snapshot continuity.
 	if ! _approval_verify_issue_state "$target_number" "$slug" "$gh_user"; then
 		restore_err=$(_approval_restore_nmr_hold issue "$target_number" "$slug" 2>&1 >/dev/null) || {
 			_print_error "Failed to restore needs-maintainer-review after final-state uncertainty on issue #$target_number"
@@ -817,16 +915,24 @@ _approval_apply_issue_lifecycle_updates() {
 		}
 		return 1
 	fi
+	_print_info "Issue #$target_number locked and verified (scope finalized, unlocks after worker completion)"
 
 	# t2057: remove only the local claim stamp after the complete remote state is
 	# verified. Invoking `release` here would perform a second remote status write
 	# that can overwrite a concurrent queued worker claim. On uncertainty, retain
 	# the stamp as a durable ownership/recovery marker.
-	if [[ "$_ah_had_in_review" -eq 1 ]]; then
-		_ah_stamp_file="${_APPROVAL_HOME}/.aidevops/.agent-workspace/interactive-claims/${slug//\//-}-${target_number}.json"
-		rm -f "$_ah_stamp_file" 2>/dev/null || true
-		_print_info "Released the local interactive claim after the verified remote lifecycle handoff"
-	fi
+	[[ "$_ah_had_in_review" -eq 0 ]] || _approval_release_claim_stamp "$target_number" "$slug"
+	return 0
+}
+
+# Remove only the local interactive claim stamp for a verified handoff.
+_approval_release_claim_stamp() {
+	local target_number="$1"
+	local slug="$2"
+	local stamp_file="${_APPROVAL_HOME}/.aidevops/.agent-workspace/interactive-claims/${slug//\//-}-${target_number}.json"
+
+	rm -f "$stamp_file" 2>/dev/null || true
+	_print_info "Released the local interactive claim after the verified remote lifecycle handoff"
 	return 0
 }
 
@@ -852,6 +958,29 @@ _approval_apply_pr_lifecycle_updates() {
 	}
 	_approval_verify_pr_state "$target_number" "$slug" || return 1
 	_print_info "PR #$target_number NMR hold cleared and conversation locked"
+	return 0
+}
+
+_approval_ensure_lifecycle_labels() {
+	local target_type="$1"
+	local slug="$2"
+	local cache_key="${slug}:${target_type}"
+
+	case ",${_APPROVAL_LABEL_SETS_ENSURED}," in
+	*",${cache_key},"*) return 0 ;;
+	esac
+	if ! command -v managed_labels_ensure_approval_set >/dev/null 2>&1 ||
+		! command -v _gh_managed_label_names_snapshot >/dev/null 2>&1 ||
+		! command -v _gh_managed_label_create_runner >/dev/null 2>&1; then
+		_print_error "Managed approval label provisioning is unavailable; approval was not posted"
+		return 1
+	fi
+	if ! managed_labels_ensure_approval_set "$slug" "$target_type" \
+		_gh_managed_label_names_snapshot _gh_managed_label_create_runner; then
+		_print_error "Could not provision approval lifecycle labels in ${slug}; approval was not posted"
+		return 1
+	fi
+	_APPROVAL_LABEL_SETS_ENSURED="${_APPROVAL_LABEL_SETS_ENSURED:+${_APPROVAL_LABEL_SETS_ENSURED},}${cache_key}"
 	return 0
 }
 
@@ -995,20 +1124,34 @@ _approve_target_after_confirmation() {
 	local slug="$3"
 	local actual_key="$4"
 
-	local timestamp payload sig_file comment_body
+	local timestamp payload sig_file comment_body payload_rc=0
+	# #aidevops:trust-boundary — provision every repository-level label needed by the post-signature
+	# transition before creating irreversible approval evidence. This keeps a
+	# newly managed repository from ending in a signed but undispatchable state.
+	_approval_ensure_lifecycle_labels "$target_type" "$slug" || return 1
 	# #aidevops:trust-boundary — issue continuity can only begin from an
 	# authoritative locked snapshot. PR approval semantics remain unchanged.
 	if [[ "$target_type" == "$APPROVAL_TARGET_ISSUE" ]]; then
 		_approval_lock_issue "$target_number" "$slug" >/dev/null 2>&1 || {
-			_print_error "Could not lock issue before building its approval snapshot"
+			_print_error "Approval advisory lock failure: issue #$target_number could not be locked before building its approval snapshot"
 			return 1
 		}
 	fi
-	timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-	payload=$(approval_snapshot_v2_payload "$target_type" "$target_number" "$slug" "$timestamp") || {
+	if [[ "$target_type" == "$APPROVAL_TARGET_ISSUE" ]]; then
+		# GH#34554: an unanchored lock makes post-handoff verification impossible.
+		payload=$(_approval_build_anchored_issue_payload "$target_number" "$slug") || payload_rc=$?
+		if [[ "$payload_rc" -eq 1 ]]; then
+			_approval_report_unanchored_lock "$target_number" "$slug"
+			return 1
+		fi
+	else
+		timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+		payload=$(approval_snapshot_v2_payload "$target_type" "$target_number" "$slug" "$timestamp") || payload_rc=$?
+	fi
+	if [[ "$payload_rc" -ne 0 ]]; then
 		_print_error "Could not build the immutable approval snapshot; approval was not posted"
 		return 1
-	}
+	fi
 	sig_file=$(mktemp)
 
 	if ! _sign_approval_payload "$payload" "$actual_key" "$sig_file"; then
@@ -1358,7 +1501,7 @@ _approval_classify_signed_comment() {
 	if [[ "$target_type" == "$APPROVAL_TARGET_ISSUE" ]] && ! jq -e --arg object "$APPROVAL_JSON_OBJECT" '.issue.lifecycle | type == $object' <<<"$payload" >/dev/null 2>&1; then
 		issue_lifecycle_profile="$APPROVAL_SNAPSHOT_PROFILE_LEGACY"
 	fi
-	snapshot_json=$(approval_snapshot_v2_build "$target_type" "$target_number" "$slug" "$comment_id" "$issued_at" "stable" "$issue_lifecycle_profile") || {
+	snapshot_json=$(approval_snapshot_v2_build "$target_type" "$target_number" "$slug" "$comment_id" "$issued_at" "$APPROVAL_SNAPSHOT_PROFILE_SOURCE_STATE_UNBOUND" "$issue_lifecycle_profile") || {
 		printf 'API_ERROR\n'
 		return 0
 	}
@@ -1368,20 +1511,19 @@ _approval_classify_signed_comment() {
 	}
 	signed_digest=$(jq -r '.snapshot_sha256' <<<"$payload") || signed_digest=""
 	if [[ "$current_digest" != "$signed_digest" ]]; then
-		# #aidevops:trust-boundary — V2 approvals issued before GH#29009
-		# included mutable linked-source updated_at metadata. Accept that profile
-		# only when its complete current digest still matches the signed digest;
-		# new approvals always use the stable profile above.
+		# #aidevops:trust-boundary — older V2 approvals used the trusted-sources
+		# (pre-GH#34266), stable (pre-GH#32455) or legacy (pre-GH#29009)
+		# linked-source profiles. Accept those only on a complete exact digest
+		# match; new approvals always use the source-state-unbound profile above.
+		# Profiles differ only in linked references, so the head/base check
+		# below is profile-independent.
 		mismatch_classification=$(_approval_classify_digest_mismatch "$target_type" "$target_number" "$slug" "$comment_id" "$issued_at" \
 			"$issue_lifecycle_profile" "$payload" "$snapshot_json" "$signed_digest")
-		if [[ "$mismatch_classification" != "LEGACY_MATCH" ]]; then
+		if [[ "$mismatch_classification" != "TRUSTED_SOURCES_MATCH" && "$mismatch_classification" != "STABLE_MATCH" &&
+			"$mismatch_classification" != "LEGACY_MATCH" ]]; then
 			printf '%s\n' "$mismatch_classification"
 			return 0
 		fi
-		snapshot_json=$(approval_snapshot_v2_build "$target_type" "$target_number" "$slug" "$comment_id" "$issued_at" "$APPROVAL_SNAPSHOT_PROFILE_LEGACY" "$issue_lifecycle_profile") || {
-			printf 'API_ERROR\n'
-			return 0
-		}
 	fi
 
 	if [[ "$target_type" == "pr" ]]; then
@@ -1480,6 +1622,16 @@ cmd_setup() {
 # ── Approve Issue ────────────────────────────────────────────────────────────
 
 cmd_issue_approved() {
+	# A bundle uses the immutable broker's single confirmation, not the legacy
+	# issue-only prompt followed by a second source approval ceremony.
+	if [[ "${3:-}" == "--source-proposal" ]]; then
+		if [[ "$#" -ne 4 && "$#" -ne 6 ]] || [[ "$#" -eq 6 && "${5:-}" != "--ttl" ]]; then
+			printf '%s\n' 'Usage: aidevops approve issue <number> <owner/repo> --source-proposal <id> [--ttl 12h]' >&2
+			return 2
+		fi
+		"${SCRIPT_DIR}/source-access-helper.sh" approve-bundle "$4" --repo "$2" --issue "$1" --ttl "${6:-12h}"
+		return $?
+	fi
 	_approve_targets "issue" "$@"
 	return $?
 }
@@ -1599,7 +1751,10 @@ _approval_classify_marked_comments() {
 		fi
 		classification=$(_approval_classify_signed_comment "$target_type" "$target_number" "$slug" "$comment_id" "$body" "$pub_key" "$expected_head_sha")
 		case "$classification" in
-		VERIFIED) printf 'VERIFIED\n'; return 0 ;;
+		VERIFIED)
+			printf 'VERIFIED\n'
+			return 0
+			;;
 		API_ERROR) saw_api_error=1 ;;
 		STALE_APPROVAL) saw_stale=1 ;;
 		LEGACY_APPROVAL) saw_legacy=1 ;;
@@ -1607,10 +1762,22 @@ _approval_classify_marked_comments() {
 		esac
 	done <<<"$comment_rows"
 
-	[[ "$saw_api_error" -eq 0 ]] || { printf 'API_ERROR\n'; return 6; }
-	[[ "$saw_stale" -eq 0 ]] || { printf 'STALE_APPROVAL\n'; return 4; }
-	[[ "$saw_legacy" -eq 0 ]] || { printf 'LEGACY_APPROVAL\n'; return 3; }
-	[[ "$saw_untrusted" -eq 0 ]] || { printf 'UNTRUSTED_APPROVAL\n'; return 7; }
+	[[ "$saw_api_error" -eq 0 ]] || {
+		printf 'API_ERROR\n'
+		return 6
+	}
+	[[ "$saw_stale" -eq 0 ]] || {
+		printf 'STALE_APPROVAL\n'
+		return 4
+	}
+	[[ "$saw_legacy" -eq 0 ]] || {
+		printf 'LEGACY_APPROVAL\n'
+		return 3
+	}
+	[[ "$saw_untrusted" -eq 0 ]] || {
+		printf 'UNTRUSTED_APPROVAL\n'
+		return 7
+	}
 	[[ "$saw_malformed" -eq 1 ]] || saw_malformed=1
 	printf 'MALFORMED_APPROVAL\n'
 	return 5
@@ -1620,6 +1787,7 @@ _approval_classify_marked_comments() {
 # Legacy syntax (`verify N slug`) remains an issue verification request, but V1
 # signatures return LEGACY_APPROVAL and never authorize an external merge.
 cmd_verify() {
+	_approval_warn_pinned_verifier
 	local target_type="issue"
 	if [[ "${1:-}" == "issue" || "${1:-}" == "pr" ]]; then
 		target_type="$1"
@@ -1760,8 +1928,17 @@ cmd_reconcile() {
 	printf '%s' "$issue_json" | jq -e --arg label "$_APPROVAL_NMR_LABEL" \
 		'(.labels // []) | any(.name == $label)' >/dev/null 2>&1 || nmr_rc=$?
 	if [[ "$nmr_rc" -eq 1 ]]; then
-		printf 'NO_NMR\n'
-		return 3
+		# A failed pre-fix issue approval can have neither NMR nor auto-dispatch:
+		# status provisioning succeeded, then both lifecycle label writes failed.
+		# Recover that exact signed state instead of treating every absent NMR as
+		# an already completed handoff. PRs and dispatch-enabled issues stay no-op.
+		if [[ "$target_type" != "issue" ]] || printf '%s' "$issue_json" | jq -e \
+			--arg label "$_APPROVAL_AUTO_DISPATCH_LABEL" \
+			'(.labels // []) | any(.name == $label)' >/dev/null 2>&1; then
+			printf 'NO_NMR\n'
+			return 3
+		fi
+		nmr_rc=0
 	fi
 	if [[ "$nmr_rc" -ne 0 ]]; then
 		printf 'API_ERROR\n'
@@ -1779,6 +1956,12 @@ cmd_reconcile() {
 		return 6
 	fi
 
+	# #aidevops:trust-boundary — only provision labels after the existing signed
+	# approval and current maintainer authority have both been re-verified.
+	if ! _approval_ensure_lifecycle_labels "$target_type" "$slug" >/dev/null 2>&1; then
+		printf 'UPDATE_FAILED\n'
+		return 8
+	fi
 	if ! _post_issue_approval_updates "$target_type" "$target_number" "$slug" >/dev/null 2>&1; then
 		# A lifecycle writer may fail after partially clearing NMR (for example,
 		# issue label mutation succeeds but its advisory lock fails). Reassert the

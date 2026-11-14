@@ -20,17 +20,17 @@
 
 set -euo pipefail
 
-_aidevops_path_prefix="/opt/homebrew/bin:/usr/local/bin:/bin:/usr/bin"
-if [[ "$(uname -s 2>/dev/null || true)" != "Darwin" && -d "/home/linuxbrew/.linuxbrew/bin" ]]; then
-	_aidevops_path_prefix="/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin:/bin:/usr/bin"
-fi
-export PATH="${_aidevops_path_prefix}:${PATH}"
-unset _aidevops_path_prefix
+AIDEVOPS_PATH_PROFILE=daemon _aidevops_self="${BASH_SOURCE[0]:-$0}"
+[[ "$_aidevops_self" == */* ]] || _aidevops_self="./${_aidevops_self}"
+# shellcheck source=runtime-env.sh
+[[ ! -f "${_aidevops_self%/*}/runtime-env.sh" ]] || source "${_aidevops_self%/*}/runtime-env.sh"
 
 # Source config-helper for _jsonc_get (shared JSONC config reader)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/config-helper.sh" 2>/dev/null || true
+# shellcheck source=./worker-lifecycle-common.sh
+source "${SCRIPT_DIR}/worker-lifecycle-common.sh"
 
 # Configuration
 readonly SESSION_FLAG="${HOME}/.aidevops/logs/pulse-session.flag"
@@ -91,9 +91,7 @@ is_session_active() {
 # Returns: count via stdout
 #######################################
 count_workers() {
-	local count
-	count=$(ps axwwo command | grep '[/]full-loop' | grep -c '\.opencode') || count=0
-	echo "$count"
+	count_active_workers
 	return 0
 }
 
@@ -189,10 +187,10 @@ is_scheduler_installed() {
 	case "$os_type" in
 	Darwin)
 		# Check for launchd plist (both old and new label formats)
-		if launchctl list 2>/dev/null | grep -qF "com.aidevops.aidevops-supervisor-pulse"; then
+		if launchctl list 2>/dev/null | grep -F "com.aidevops.aidevops-supervisor-pulse" >/dev/null; then
 			return 0
 		fi
-		if launchctl list 2>/dev/null | grep -qF "com.aidevops.supervisor-pulse"; then
+		if launchctl list 2>/dev/null | grep -F "com.aidevops.supervisor-pulse" >/dev/null; then
 			return 0
 		fi
 		return 1
@@ -204,7 +202,7 @@ is_scheduler_installed() {
 			return 0
 		fi
 		# Fall back to cron entry check
-		if crontab -l 2>/dev/null | grep -qF "aidevops-supervisor-pulse"; then
+		if crontab -l 2>/dev/null | grep -F "aidevops-supervisor-pulse" >/dev/null; then
 			return 0
 		fi
 		return 1
@@ -427,13 +425,13 @@ _stop_force_kill_workers() {
 	print_warning "Force mode: sending SIGTERM to all workers..."
 	local killed=0
 	while IFS= read -r line; do
-		local pid
-		pid=$(echo "$line" | awk '{print $1}')
+		local pid="" _worker_details=""
+		read -r pid _worker_details <<<"$line"
 		if [[ -n "$pid" ]]; then
 			kill "$pid" 2>/dev/null || true
 			killed=$((killed + 1))
 		fi
-	done < <(ps axwwo pid,command | grep '[/]full-loop' | grep '\.opencode')
+	done < <(list_active_worker_processes)
 
 	if [[ "$killed" -gt 0 ]]; then
 		print_info "Sent SIGTERM to ${killed} worker(s)"
@@ -444,7 +442,7 @@ _stop_force_kill_workers() {
 		if [[ "$remaining" -gt 0 ]]; then
 			print_warning "${remaining} worker(s) still running after SIGTERM"
 			echo "  They will finish their current operation and exit."
-			echo "  Force kill with: kill -9 \$(ps axwwo pid,command | grep '[/]full-loop' | grep '\\.opencode' | awk '{print \$1}')"
+			echo "  Inspect with: worker-activity-helper.sh live-workers"
 		else
 			print_success "All workers stopped"
 		fi
@@ -622,7 +620,8 @@ _status_print_consent_layers() {
 }
 
 #######################################
-# Print pulse process status line
+# Print pulse supervisor status line. GH#32982: this describes only the
+# bounded supervisor pass; detached workers are reported separately.
 #######################################
 _status_print_process() {
 	if is_pulse_running; then
@@ -630,18 +629,18 @@ _status_print_process() {
 		pulse_pid_content=$(cat "$PIDFILE" || echo "?")
 		if [[ "$pulse_pid_content" == SETUP:* ]]; then
 			pulse_display_pid="${pulse_pid_content#SETUP:}"
-			echo -e "  Process:     ${YELLOW}setup${NC} (PID ${pulse_display_pid}, pre-flight stages)"
+			echo -e "  Supervisor:  ${YELLOW}setup${NC} (PID ${pulse_display_pid}, pre-flight stages)"
 		else
 			pulse_display_pid="$pulse_pid_content"
-			echo -e "  Process:     ${GREEN}running${NC} (PID ${pulse_display_pid})"
+			echo -e "  Supervisor:  ${GREEN}running${NC} (PID ${pulse_display_pid})"
 		fi
 	else
 		local idle_scheduler_name
 		idle_scheduler_name=$(get_scheduler_name)
 		if is_scheduler_installed; then
-			echo -e "  Process:     ${BLUE}idle${NC} (waiting for next ${idle_scheduler_name} cycle)"
+			echo -e "  Supervisor:  ${BLUE}waiting${NC} for next ${idle_scheduler_name} cycle"
 		else
-			echo -e "  Process:     ${RED}idle${NC} (scheduler: NOT INSTALLED)"
+			echo -e "  Supervisor:  ${RED}not scheduled${NC} (scheduler: NOT INSTALLED)"
 			local install_cmd
 			install_cmd=$(get_scheduler_install_cmd)
 			echo -e "               Install with: ${install_cmd}"
@@ -659,6 +658,7 @@ _status_print_workers_summary() {
 
 	if [[ "$worker_count" -gt 0 ]]; then
 		echo -e "  Workers:     ${GREEN}${worker_count} active${NC}"
+		echo "               Note: workers continue independently between supervisor cycles"
 	else
 		echo "  Workers:     0"
 	fi
@@ -691,7 +691,7 @@ _status_print_worker_details() {
 		echo -e "${BOLD}Active Workers${NC}"
 		echo "──────────────"
 		echo ""
-		ps axwwo pid,etime,command | grep '[/]full-loop' | grep '\.opencode' | while IFS= read -r line; do
+		list_active_worker_processes | while IFS= read -r line; do
 			local w_pid w_etime w_cmd
 			read -r w_pid w_etime w_cmd <<<"$line"
 

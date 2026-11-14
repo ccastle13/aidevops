@@ -30,6 +30,9 @@ if [[ "$endpoint" == "repos/owner/repo/pulls/42" ]]; then
 	fi
 	if [[ "${GH_TEST_MODE:-multipage}" == "identity-cooldown" ||
 		"${GH_TEST_MODE:-multipage}" == "identity-read-deferred" ]]; then
+		if [[ "${GH_TEST_MODE:-multipage}" == "identity-read-deferred" ]]; then
+			printf '%s\n' '[gh-transport] error_kind=github-api-read-deferred attempted=false deferred_by=local_admission retry_at=1893456000 reason="fixture"' >&2
+		fi
 		exit 75
 	fi
 	if [[ "${GH_TEST_MODE:-multipage}" == "identity-malformed" ]]; then
@@ -94,6 +97,12 @@ multipage)
 pending)
 	nodes='[{"__typename":"CheckRun","name":"pending","status":"IN_PROGRESS","conclusion":null,"startedAt":"2026-08-01T00:00:00Z","completedAt":null,"detailsUrl":"","isRequired":true,"checkSuite":{"workflowRun":{"event":"push","workflow":{"name":"CI"}}}}]'
 	;;
+queued-replacement)
+	nodes='[
+		{"__typename":"CheckRun","databaseId":101,"name":"build","status":"QUEUED","conclusion":null,"startedAt":null,"completedAt":null,"detailsUrl":"https://example.invalid/queued","isRequired":true,"checkSuite":{"workflowRun":{"event":"push","workflow":{"name":"CI"}}}},
+		{"__typename":"CheckRun","databaseId":100,"name":"build","status":"COMPLETED","conclusion":"CANCELLED","startedAt":"2026-08-01T00:00:00Z","completedAt":"2026-08-01T00:01:00Z","detailsUrl":"https://example.invalid/cancelled","isRequired":true,"checkSuite":{"workflowRun":{"event":"push","workflow":{"name":"CI"}}}}
+	]'
+	;;
 cancel)
 	nodes='[{"__typename":"CheckRun","name":"cancelled","status":"COMPLETED","conclusion":"CANCELLED","startedAt":"2026-08-01T00:00:00Z","completedAt":"2026-08-01T00:01:00Z","detailsUrl":"","isRequired":true,"checkSuite":{"workflowRun":{"event":"push","workflow":{"name":"CI"}}}}]'
 	;;
@@ -140,6 +149,10 @@ chmod +x "${TEST_ROOT}/bin/gh"
 
 export CALL_LOG
 export PATH="${TEST_ROOT}/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+export AIDEVOPS_GH_REQUEST_STATE_DIR="${TEST_ROOT}/request-state"
+export AIDEVOPS_GH_CHECKS_OBSERVATION_CACHE_DIR="${TEST_ROOT}/observation-cache"
+export AIDEVOPS_GH_AUTH_PRINCIPAL=fixture
+export AIDEVOPS_GH_SINGLEFLIGHT_WAIT_SECONDS=5
 # shellcheck source=../shared-gh-wrappers-checks.sh
 source "$LIB"
 
@@ -252,6 +265,12 @@ run_case pending required
 assert_eq "pending checks return eight" "8" "$CASE_RC"
 assert_json "in-progress CheckRun maps to pending" 'length == 1 and .[0].state == "IN_PROGRESS" and .[0].bucket == "pending"' "$CASE_OUT"
 
+run_case queued-replacement required
+assert_eq "queued replacement returns pending rather than cancelled" "8" "$CASE_RC"
+assert_json "newer queued CheckRun supersedes timestamped cancellation" \
+	'length == 1 and .[0].state == "QUEUED" and .[0].bucket == "pending" and .[0].link == "https://example.invalid/queued" and (.[0] | has("_sort_id") | not)' "$CASE_OUT"
+assert_contains "GraphQL query requests CheckRun recency ID" "databaseId name status" "$(<"$CALL_LOG")"
+
 run_case cancel required
 assert_eq "cancel-only output preserves native zero exit" "0" "$CASE_RC"
 assert_json "cancelled CheckRun maps to cancel" 'length == 1 and .[0].state == "CANCELLED" and .[0].bucket == "cancel"' "$CASE_OUT"
@@ -285,7 +304,125 @@ assert_contains "cooldown status-rollup read preserves a stable classification" 
 run_case identity-read-deferred required
 assert_eq "non-cooldown read deferral keeps the exact-check public exit contract" "2" "$CASE_RC"
 assert_contains "non-cooldown read deferral is not mislabeled as a cooldown" \
-	"error_kind=github-api-read-deferred operation=pull-request-identity-read" "$CASE_ERR"
+	"error_kind=github-api-read-deferred attempted=false deferred_by=local_admission retry_at=1893456000" "$CASE_ERR"
+
+HEAD_SHA='0123456789abcdef0123456789abcdef01234567'
+run_observed_case() {
+	local fixture_mode="$1" selection_mode="$2" expected_head="$3"
+	local out_file="${TEST_ROOT}/observed.out" err_file="${TEST_ROOT}/observed.err"
+	: >"$out_file"
+	: >"$err_file"
+	set +e
+	GH_TEST_MODE="$fixture_mode" gh_pr_checks_observed_json owner/repo 42 "$selection_mode" "$expected_head" >"$out_file" 2>"$err_file"
+	CASE_RC=$?
+	set -e
+	CASE_OUT=$(<"$out_file")
+	CASE_ERR=$(<"$err_file")
+	return 0
+}
+
+rm -rf "$AIDEVOPS_GH_REQUEST_STATE_DIR" "$AIDEVOPS_GH_CHECKS_OBSERVATION_CACHE_DIR"
+: >"$CALL_LOG"
+run_observed_case multipage required "$HEAD_SHA"
+observation_request_key="$(_gh_pr_checks_observation_request_key owner/repo 42 required "$HEAD_SHA")"
+observation_cache_path="$(_gh_pr_checks_observation_cache_path "$observation_request_key")"
+chmod 644 "$observation_cache_path"
+: >"$CALL_LOG"
+run_observed_case multipage required "$HEAD_SHA"
+assert_eq "permissive observation cache forces a fresh identity read" "1" "$(grep -c '^rest|' "$CALL_LOG" || true)"
+assert_eq "permissive observation cache forces fresh paginated collection" "2" "$(grep -c '^graphql|' "$CALL_LOG" || true)"
+assert_eq "fresh observation restores private cache permissions" "600" "$(_file_perms "$observation_cache_path")"
+
+rm -rf "$AIDEVOPS_GH_REQUEST_STATE_DIR" "$AIDEVOPS_GH_CHECKS_OBSERVATION_CACHE_DIR"
+: >"$CALL_LOG"
+run_observed_case multipage required "$HEAD_SHA"
+assert_eq "observed terminal failure preserves exit one" "1" "$CASE_RC"
+first_observation="$CASE_OUT"
+run_observed_case multipage required "$HEAD_SHA"
+assert_eq "cached observed terminal failure preserves exit one" "1" "$CASE_RC"
+assert_eq "cached observed payload matches the leader" "$first_observation" "$CASE_OUT"
+assert_eq "two sequential exact observations use one identity read" "1" "$(grep -c '^rest|' "$CALL_LOG" || true)"
+assert_eq "two sequential exact observations use one paginated collection" "2" "$(grep -c '^graphql|' "$CALL_LOG" || true)"
+
+gh_pr_checks_observation_invalidate owner/repo 42 required "$HEAD_SHA"
+run_observed_case multipage required "$HEAD_SHA"
+assert_eq "explicit invalidation forces a fresh identity read" "2" "$(grep -c '^rest|' "$CALL_LOG" || true)"
+
+run_observed_case multipage all "$HEAD_SHA"
+assert_eq "required and all observations use isolated identities" "3" "$(grep -c '^rest|' "$CALL_LOG" || true)"
+AIDEVOPS_GH_AUTH_PRINCIPAL=alternate
+run_observed_case multipage required "$HEAD_SHA"
+AIDEVOPS_GH_AUTH_PRINCIPAL=fixture
+assert_eq "auth scope changes isolate exact observations" "4" "$(grep -c '^rest|' "$CALL_LOG" || true)"
+
+run_observed_case pending required aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+assert_eq "head drift during leader fetch is indeterminate" "2" "$CASE_RC"
+assert_contains "head drift is diagnosed before cache publication" "pull-request-head-changed" "$CASE_ERR"
+
+rm -rf "$AIDEVOPS_GH_REQUEST_STATE_DIR" "$AIDEVOPS_GH_CHECKS_OBSERVATION_CACHE_DIR"
+: >"$CALL_LOG"
+declare -a observed_pids=()
+for worker in 1 2 3 4; do
+	(
+		set +e
+		GH_TEST_MODE=pending gh_pr_checks_observed_json owner/repo 42 required "$HEAD_SHA" \
+			>"${TEST_ROOT}/concurrent-${worker}.out" 2>"${TEST_ROOT}/concurrent-${worker}.err"
+		printf '%s\n' "$?" >"${TEST_ROOT}/concurrent-${worker}.rc"
+	) &
+	observed_pids+=("$!")
+done
+for observed_pid in "${observed_pids[@]}"; do
+	wait "$observed_pid"
+done
+assert_eq "four concurrent observers use one exact identity read" "1" "$(grep -c '^rest|' "$CALL_LOG" || true)"
+assert_eq "four concurrent observers use one GraphQL page" "1" "$(grep -c '^graphql|' "$CALL_LOG" || true)"
+for worker in 1 2 3 4; do
+	assert_eq "concurrent observer ${worker} preserves pending exit" "8" "$(<"${TEST_ROOT}/concurrent-${worker}.rc")"
+	assert_json "concurrent observer ${worker} reuses validated evidence" 'length == 1 and .[0].bucket == "pending"' "$(<"${TEST_ROOT}/concurrent-${worker}.out")"
+done
+
+run_coordination_fallback() {
+	local scenario="$1"
+	local expected_reads=1
+	[[ "$scenario" != "publication-failure" ]] || expected_reads=2
+	rm -rf "$AIDEVOPS_GH_REQUEST_STATE_DIR" "$AIDEVOPS_GH_CHECKS_OBSERVATION_CACHE_DIR"
+	: >"$CALL_LOG"
+	(
+		case "$scenario" in
+		begin-failure)
+			gh_request_state_singleflight_begin() { return 1; }
+			;;
+		unknown-role)
+			gh_request_state_singleflight_begin() {
+				_GHRS_BEGIN_ROLE=unexpected
+				_GHRS_BEGIN_GENERATION=fixture-generation
+				return 0
+			}
+			;;
+		invalidation-failure)
+			_gh_pr_checks_observation_invalidation_generation() { return 1; }
+			;;
+		publication-failure)
+			_gh_pr_checks_observation_cache_put() { return 1; }
+			;;
+		esac
+		set +e
+		GH_TEST_MODE=pending gh_pr_checks_observed_json owner/repo 42 required "$HEAD_SHA" \
+			>"${TEST_ROOT}/fallback-${scenario}.out" 2>"${TEST_ROOT}/fallback-${scenario}.err"
+		printf '%s\n' "$?" >"${TEST_ROOT}/fallback-${scenario}.rc"
+	)
+	assert_eq "${scenario} preserves the fresh exact exit" "8" "$(<"${TEST_ROOT}/fallback-${scenario}.rc")"
+	assert_json "${scenario} returns fresh exact evidence" 'length == 1 and .[0].bucket == "pending"' \
+		"$(<"${TEST_ROOT}/fallback-${scenario}.out")"
+	assert_eq "${scenario} performs the expected identity reads" "$expected_reads" "$(grep -c '^rest|' "$CALL_LOG" || true)"
+	assert_eq "${scenario} performs the expected status-rollup reads" "$expected_reads" "$(grep -c '^graphql|' "$CALL_LOG" || true)"
+	return 0
+}
+
+run_coordination_fallback begin-failure
+run_coordination_fallback unknown-role
+run_coordination_fallback invalidation-failure
+run_coordination_fallback publication-failure
 
 run_case multipage required 1
 assert_eq "page bound fails closed" "2" "$CASE_RC"

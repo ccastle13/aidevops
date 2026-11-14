@@ -170,11 +170,17 @@ _pmp_merge_pass_budget_deadline() {
 		fi
 	fi
 	[[ "$budget_seconds" =~ ^[0-9]+$ ]] || budget_seconds=0
+	local deadline=0 remaining="" now=""
 	if [[ "$budget_seconds" -gt 0 && "$pass_start" -gt 0 ]]; then
-		printf '%s' "$((pass_start + budget_seconds))"
-	else
-		printf '0'
+		deadline=$((pass_start + budget_seconds))
 	fi
+	if declare -F _pulse_cycle_remaining_seconds >/dev/null 2>&1 && remaining=$(_pulse_cycle_remaining_seconds "${AIDEVOPS_PULSE_CYCLE_FINALISE_RESERVE_S:-90}"); then
+		now=$(date +%s) || return 1
+		if [[ "$deadline" -eq 0 || "$((now + remaining))" -lt "$deadline" ]]; then
+			deadline=$((now + remaining))
+		fi
+	fi
+	printf '%s' "$deadline"
 	return 0
 }
 
@@ -357,6 +363,12 @@ _pmp_prepare_enriched_pr_backlog() {
 	local pr_count=0 cursor_index=0 pr_obj="" cached_obj="" enriched_obj="" enrichment_rc=0
 
 	[[ "$output_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+	# The reserve-limited fallback needs no expensive advisory snapshot. Each
+	# cursor item still receives authoritative enrichment before any action.
+	if [[ "${PULSE_MERGE_BACKLOG_ENRICHMENT:-1}" == 0 ]]; then
+		printf -v "$output_var" '%s' "$fresh_json"
+		return 0
+	fi
 	cache_file=$(_pmp_merge_enrichment_cache_file)
 	cursor_file=$(_pmp_merge_enrichment_cursor_file)
 	if [[ -f "$cache_file" ]]; then
@@ -743,15 +755,15 @@ _pmp_run_stuck_diagnostics_for_repos() {
 _pmp_log_repo_timing_rows() {
 	local primary_rows="$1"
 	local diagnostic_rows="$2"
-	local repo_slug="" total_s=0 list_s=0 mergeability_s=0 ruleset_s=0 branch_protection_s=0
-	local merged=0 closed=0 failed=0 pr_count=0 stuck_s=0
+	local repo_slug="" total_s=0 list_s=0 mergeability_s=0 ruleset_s=0 branch_protection_s=0 list_state="complete"
+	local merged=0 closed=0 failed=0 pr_count=0 stuck_s=0 enrichment_s=0 pr_s=0 slowest_pr="" trust_gate_s=0
 
-	while IFS='|' read -r repo_slug total_s list_s mergeability_s ruleset_s branch_protection_s merged closed failed pr_count; do
+	while IFS='|' read -r repo_slug total_s list_s mergeability_s ruleset_s branch_protection_s merged closed failed pr_count list_state enrichment_s pr_s slowest_pr trust_gate_s; do
 		[[ -n "$repo_slug" ]] || continue
 		stuck_s=$(_pmp_diagnostic_seconds_for_repo "$diagnostic_rows" "$repo_slug")
 		[[ "$total_s" =~ ^[0-9]+$ ]] || total_s=0
 		total_s=$((total_s + stuck_s))
-		_pmp_log_repo_timing_summary "$repo_slug" "$total_s" "$list_s" "$mergeability_s" "$ruleset_s" "$branch_protection_s" "$stuck_s" "$merged" "$closed" "$failed" "$pr_count"
+		_pmp_log_repo_timing_summary "$repo_slug" "$total_s" "$list_s" "$mergeability_s" "$ruleset_s" "$branch_protection_s" "$stuck_s" "$merged" "$closed" "$failed" "$pr_count" "$list_state" "$enrichment_s" "$pr_s" "$slowest_pr" "$trust_gate_s"
 	done <<<"$primary_rows"
 	return 0
 }
@@ -812,6 +824,10 @@ _pmp_process_merge_repo_for_pass() {
 	local completed_all_var="$8"
 	_PMP_LAST_REPO_TIMING_ROW=""
 
+	if _pmp_merge_pass_budget_exhausted; then
+		printf -v "$completed_all_var" '%s' '0'
+		return 0
+	fi
 	if ! declare -F repo_allows_pulse_write_actions >/dev/null 2>&1 \
 		|| ! repo_allows_pulse_write_actions "$repo_slug"; then
 		echo "[pulse-wrapper] Deterministic merge pass skipped ${repo_slug}: repo role is contributor/read-only" >>"$logfile"
@@ -825,7 +841,8 @@ _pmp_process_merge_repo_for_pass() {
 	fi
 
 	local repo_merged=0 repo_closed=0 repo_failed=0 _mr_repo_pr_count=0
-	local _mr_repo_list_s=0 _mr_repo_mergeability_s=0 _mr_repo_ruleset_s=0 _mr_repo_branch_protection_s=0
+	local _mr_repo_list_s=0 _mr_repo_mergeability_s=0 _mr_repo_ruleset_s=0 _mr_repo_branch_protection_s=0 _mr_repo_list_state="complete"
+	local _mr_repo_enrichment_s=0 _mr_repo_pr_s=0 _mr_repo_slowest_pr="" _mr_repo_trust_gate_s=0
 	local _mr_repo_start _mr_repo_total_s=0
 	_mr_repo_start=$(_pmp_now_epoch)
 
@@ -835,7 +852,7 @@ _pmp_process_merge_repo_for_pass() {
 	_pmp_add_counter_var "$total_closed_var" "$repo_closed"
 	_pmp_add_counter_var "$total_failed_var" "$repo_failed"
 	_pmp_add_elapsed_seconds _mr_repo_total_s "$_mr_repo_start"
-	_PMP_LAST_REPO_TIMING_ROW="${repo_slug}|${_mr_repo_total_s}|${_mr_repo_list_s}|${_mr_repo_mergeability_s}|${_mr_repo_ruleset_s}|${_mr_repo_branch_protection_s}|${repo_merged}|${repo_closed}|${repo_failed}|${_mr_repo_pr_count}"
+	_PMP_LAST_REPO_TIMING_ROW="${repo_slug}|${_mr_repo_total_s}|${_mr_repo_list_s}|${_mr_repo_mergeability_s}|${_mr_repo_ruleset_s}|${_mr_repo_branch_protection_s}|${repo_merged}|${repo_closed}|${repo_failed}|${_mr_repo_pr_count}|${_mr_repo_list_state}|${_mr_repo_enrichment_s}|${_mr_repo_pr_s}|${_mr_repo_slowest_pr}|${_mr_repo_trust_gate_s}"
 	if [[ "$_mr_repo_rc" -eq 5 ]]; then
 		echo "[pulse-wrapper] Deterministic merge pass paused mid-repo ${repo_slug}; PR cursor persisted" >>"$logfile"
 		printf -v "$completed_all_var" '%s' '0'

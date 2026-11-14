@@ -388,6 +388,25 @@ test_spoofed_author_fails() {
 	return 0
 }
 
+test_human_commit_sets_actionable_auth_failure() {
+	local pr_json=""
+
+	write_pr_fixture "dependabot" "alex" "requirements-lock.txt" "SUCCESS"
+	pr_json=$(<"${TEST_ROOT}/pr.json")
+	if _trusted_dependabot_snapshot_is_authentic \
+		"$pr_json" "owner/repo" "dependabot[bot]" "head-current"; then
+		print_result "human-modified Dependabot branch fails authenticity" 1 "Unexpected authentic result"
+		return 0
+	fi
+	if [[ "${_TRUSTED_DEPENDABOT_AUTH_FAILURE_REASON:-}" == "commit-author-mismatch" ]]; then
+		print_result "human-modified Dependabot branch exposes typed failure" 0
+		return 0
+	fi
+	print_result "human-modified Dependabot branch exposes typed failure" 1 \
+		"reason=${_TRUSTED_DEPENDABOT_AUTH_FAILURE_REASON:-empty}"
+	return 0
+}
+
 test_dependabot_login_with_user_type_fails() {
 	write_pr_fixture "dependabot" "dependabot[bot]" "requirements-lock.txt" "SUCCESS"
 	jq '.data.repository.pullRequest.author.__typename = "User"' \
@@ -461,6 +480,20 @@ test_repository_allows_types_bun() {
 	return 0
 }
 
+test_repository_allows_types_react_dom() {
+	local fixture_allowlist="$AIDEVOPS_TRUSTED_DEPENDABOT_UPDATES_CONF"
+
+	unset AIDEVOPS_TRUSTED_DEPENDABOT_UPDATES_CONF
+	if _trusted_dependabot_dependency_allowed "" "@types/react-dom"; then
+		export AIDEVOPS_TRUSTED_DEPENDABOT_UPDATES_CONF="$fixture_allowlist"
+		print_result "repository allowlist permits @types/react-dom updates" 0
+		return 0
+	fi
+	export AIDEVOPS_TRUSTED_DEPENDABOT_UPDATES_CONF="$fixture_allowlist"
+	print_result "repository allowlist permits @types/react-dom updates" 1
+	return 0
+}
+
 test_repository_allows_hono() {
 	local fixture_allowlist="$AIDEVOPS_TRUSTED_DEPENDABOT_UPDATES_CONF"
 
@@ -472,6 +505,20 @@ test_repository_allows_hono() {
 	fi
 	export AIDEVOPS_TRUSTED_DEPENDABOT_UPDATES_CONF="$fixture_allowlist"
 	print_result "repository allowlist permits hono updates" 1
+	return 0
+}
+
+test_repository_allows_react_icons() {
+	local fixture_allowlist="$AIDEVOPS_TRUSTED_DEPENDABOT_UPDATES_CONF"
+
+	unset AIDEVOPS_TRUSTED_DEPENDABOT_UPDATES_CONF
+	if _trusted_dependabot_dependency_allowed "bun" "react-icons"; then
+		export AIDEVOPS_TRUSTED_DEPENDABOT_UPDATES_CONF="$fixture_allowlist"
+		print_result "repository allowlist permits react-icons Bun updates" 0
+		return 0
+	fi
+	export AIDEVOPS_TRUSTED_DEPENDABOT_UPDATES_CONF="$fixture_allowlist"
+	print_result "repository allowlist permits react-icons Bun updates" 1
 	return 0
 }
 
@@ -587,6 +634,20 @@ test_repository_allows_secretlint_recommend() {
 	return 0
 }
 
+test_repository_allows_secretlint() {
+	local fixture_allowlist="$AIDEVOPS_TRUSTED_DEPENDABOT_UPDATES_CONF"
+
+	unset AIDEVOPS_TRUSTED_DEPENDABOT_UPDATES_CONF
+	if _trusted_dependabot_dependency_allowed "bun" "secretlint"; then
+		export AIDEVOPS_TRUSTED_DEPENDABOT_UPDATES_CONF="$fixture_allowlist"
+		print_result "repository allowlist permits Secretlint Bun updates" 0
+		return 0
+	fi
+	export AIDEVOPS_TRUSTED_DEPENDABOT_UPDATES_CONF="$fixture_allowlist"
+	print_result "repository allowlist permits Secretlint Bun updates" 1
+	return 0
+}
+
 test_repository_allows_trusted_actions() {
 	local fixture_allowlist="$AIDEVOPS_TRUSTED_DEPENDABOT_UPDATES_CONF"
 	local dependency_name=""
@@ -662,6 +723,21 @@ test_non_review_failure_blocks_required_check_bypass() {
 	return 0
 }
 
+test_superseded_non_review_cancel_does_not_block_required_check_bypass() {
+	local fixture_tmp="${TEST_ROOT}/pr-with-superseded-cancel.json"
+
+	write_pr_fixture "dependabot" "dependabot[bot]" "requirements-lock.txt" "SUCCESS"
+	jq '.statusCheckRollup += [{"name":"Framework Validation","conclusion":"CANCELLED","status":"COMPLETED"}]' \
+		"${TEST_ROOT}/pr.json" >"$fixture_tmp"
+	mv "$fixture_tmp" "${TEST_ROOT}/pr.json"
+	if _trusted_dependabot_non_review_checks_green "24473" "owner/repo"; then
+		print_result "superseded non-review cancellation does not block Dependabot required-check bypass" 0
+		return 0
+	fi
+	print_result "superseded non-review cancellation does not block Dependabot required-check bypass" 1 "Expected a same-name successful check to supersede cancellation. Log: $(<"$LOGFILE")"
+	return 0
+}
+
 main() {
 	setup_test_env
 	trap teardown_test_env EXIT
@@ -678,13 +754,16 @@ main() {
 	test_trusted_dependabot_rejects_paginated_snapshot
 	test_trusted_dependabot_rejects_incomplete_snapshot
 	test_spoofed_author_fails
+	test_human_commit_sets_actionable_auth_failure
 	test_dependabot_login_with_user_type_fails
 	test_security_failure_fails
 	test_non_dependency_file_fails
 	test_trusted_actions_dependabot_passes
 	test_unallowlisted_dependency_fails
 	test_repository_allows_types_bun
+	test_repository_allows_types_react_dom
 	test_repository_allows_hono
+	test_repository_allows_react_icons
 	test_repository_allows_vite_react_plugin
 	test_repository_allows_elysia
 	test_repository_allows_fontsource_ubuntu
@@ -693,11 +772,13 @@ main() {
 	test_repository_allows_fontsource_inter
 	test_repository_allows_fontsource_source_serif_4
 	test_repository_allows_secretlint_recommend
+	test_repository_allows_secretlint
 	test_repository_allows_trusted_actions
 	test_trusted_dependabot_can_be_approved
 	test_review_bot_failure_is_ignored_when_other_checks_green
 	test_precomputed_status_rollup_skips_graphql
 	test_non_review_failure_blocks_required_check_bypass
+	test_superseded_non_review_cancel_does_not_block_required_check_bypass
 
 	printf '\nTests run: %s\n' "$TESTS_RUN"
 	if [[ "$TESTS_FAILED" -gt 0 ]]; then

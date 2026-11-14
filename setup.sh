@@ -17,7 +17,7 @@ fi
 # AI Assistant Server Access Framework Setup Script
 # Helps developers set up the framework for their infrastructure
 #
-# Version: 3.32.298
+# Version: 3.39.187
 #
 # Quick Install:
 #   npm install -g aidevops && aidevops update          (recommended)
@@ -39,6 +39,7 @@ SETUP_EXPLICIT_NON_INTERACTIVE="${AIDEVOPS_NON_INTERACTIVE:-false}"
 UPDATE_TOOLS_MODE=false
 SETUP_STAGE=""
 SETUP_STAGE_OPENCODE="setup_opencode_cli"
+SETUP_STAGE_OPENCODE_SERVICE="setup_opencode_service"
 SETUP_STAGE_AGENTS="deploy_aidevops_agents"
 SETUP_STAGE_HOOKS="setup_safety_hooks"
 SETUP_STAGE_TABBY="setup_tabby"
@@ -156,17 +157,6 @@ if [[ -f "$_SHARED_CONSTANTS" ]]; then
 	source "$_SHARED_CONSTANTS"
 fi
 unset _SHARED_CONSTANTS
-
-# Secure the optional DSPy disk cache before setup installs or imports DSPy.
-_DSPY_CACHE_SECURITY="${INSTALL_DIR}/.agents/scripts/dspy-cache-security.sh"
-if [[ ! -f "$_DSPY_CACHE_SECURITY" ]]; then
-	_DSPY_CACHE_SECURITY="$HOME/.aidevops/agents/scripts/dspy-cache-security.sh"
-fi
-if [[ -f "$_DSPY_CACHE_SECURITY" ]]; then
-	# shellcheck disable=SC1090  # Dynamic path resolved at runtime
-	source "$_DSPY_CACHE_SECURITY"
-fi
-unset _DSPY_CACHE_SECURITY
 
 # Escape a string for safe embedding in XML (plist heredocs).
 # Prevents XML injection if paths contain &, <, >, ", or ' characters.
@@ -360,6 +350,12 @@ source "${SETUP_IMPL_MODULES_DIR}/core.sh"
 # shellcheck disable=SC1091
 source "${SETUP_IMPL_MODULES_DIR}/migrations.sh"
 # shellcheck disable=SC1091
+source "${SETUP_IMPL_MODULES_DIR}/migration-compaction-target.sh"
+# shellcheck disable=SC1091
+source "${SETUP_IMPL_MODULES_DIR}/migration-sonnet-5-5.sh"
+# shellcheck disable=SC1091
+source "${SETUP_IMPL_MODULES_DIR}/migration-haiku-5-5.sh"
+# shellcheck disable=SC1091
 source "${SETUP_IMPL_MODULES_DIR}/shell-env.sh"
 # shellcheck disable=SC1091
 source "${SETUP_IMPL_MODULES_DIR}/tool-install.sh"
@@ -369,8 +365,6 @@ source "${SETUP_IMPL_MODULES_DIR}/mcp-setup.sh"
 source "${SETUP_IMPL_MODULES_DIR}/agent-deploy.sh"
 # shellcheck disable=SC1091
 source "${SETUP_IMPL_MODULES_DIR}/agent-runtime.sh"
-# shellcheck disable=SC1091
-source "${SETUP_IMPL_MODULES_DIR}/tool-beads.sh"
 # shellcheck disable=SC1091
 source "${SETUP_IMPL_MODULES_DIR}/config.sh"
 # shellcheck disable=SC1091
@@ -744,6 +738,23 @@ _setup_install_pulse_plist_early() {
 	return 0
 }
 
+# GH#35788: surface stale/missing JS dependency install approvals for
+# dispatch-enabled repos so headless workers are not stranded with
+# runner_capability_unmet. Interactive setup offers renewal per repo;
+# non-interactive setup/update only reports (never writes repos.json).
+review_js_dependency_policies() {
+	local helper="${BASH_SOURCE[0]%/*}/.agents/scripts/worktree-js-readiness-helper.sh"
+	[[ -f "$helper" ]] || helper="$HOME/.aidevops/agents/scripts/worktree-js-readiness-helper.sh"
+	[[ -f "$helper" ]] || return 0
+	command -v jq &>/dev/null || return 0
+	if [[ "${NON_INTERACTIVE:-false}" == "true" ]]; then
+		bash "$helper" review --report-only || print_warning "JS dependency policy review failed (non-fatal)"
+	else
+		bash "$helper" review || print_warning "JS dependency policy review failed (non-fatal)"
+	fi
+	return 0
+}
+
 # Provision knowledge planes for all repos in repos.json where knowledge != "off".
 # Idempotent: already-provisioned directories are not modified.
 # Called from the non-interactive setup path (update) and after interactive init.
@@ -832,7 +843,7 @@ _setup_guard_active_release_lane() {
 	[[ "$repo_slug" == "marcusquinn/aidevops" ]] || return 0
 	# shellcheck source=.agents/scripts/release-lane-helper.sh
 	source "$lane_helper"
-	release_lane_setup_guard "$repo_slug"
+	release_lane_setup_guard "$repo_slug" "${BASH_SOURCE[0]%/*}"
 	return $?
 }
 
@@ -1116,16 +1127,34 @@ _setup_redact_secret_like_command_values() {
 	return 0
 }
 
+_setup_claim_noninteractive_setup_lock() {
+	local lock_dir="$1"
+	shift
+	local lane_rc=0
+
+	SETUP_NONINTERACTIVE_LOCK_DIR="$lock_dir"
+	SETUP_NONINTERACTIVE_LOCK_HELD=true
+	printf '%s\n' "$$" >"$lock_dir/owner.pid" 2>/dev/null || true
+	printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$lock_dir/started_at" 2>/dev/null || true
+	printf '%s\n' "$(date +%s 2>/dev/null || printf '0')" >"$lock_dir/started_at_epoch" 2>/dev/null || true
+	printf '%s\n' "$0 $*" >"$lock_dir/command" 2>/dev/null || true
+	_setup_guard_active_release_lane || lane_rc=$?
+	if [[ "$lane_rc" -ne 0 ]]; then
+		_setup_release_noninteractive_setup_lock
+		return "$lane_rc"
+	fi
+	trap '_setup_cleanup_noninteractive_children; _setup_release_noninteractive_setup_lock' EXIT
+	trap '_setup_noninteractive_signal_exit TERM' TERM
+	trap '_setup_noninteractive_signal_exit INT' INT
+	return 0
+}
+
 _setup_acquire_noninteractive_setup_lock() {
 	local lock_dir="${AIDEVOPS_SETUP_LOCK_DIR:-$HOME/.aidevops/locks/setup-noninteractive.lock.d}"
-	# Max seconds to wait for a live, non-stale owner before timing out.
 	local wait_ceiling="${AIDEVOPS_SETUP_WAIT_TIMEOUT_S:-900}"
-	# Max seconds a live owner may hold the lock before it is treated as
-	# stale and reclaimed (0 disables stale-live reclaim).
 	local stale_ceiling="${AIDEVOPS_SETUP_STALE_TIMEOUT_S:-1800}"
 	local owner_pid="" owner_cmd="" owner_age=0
 	local reclaim_attempts=0 waited=0
-	local lane_rc=0
 	local _diag_stl="$HOME/.aidevops/logs/setup-stage-timings.log"
 	local _diag_interval_s="${AIDEVOPS_SETUP_LOCK_DIAG_INTERVAL_S:-60}"
 	_setup_guard_active_release_lane || return $?
@@ -1133,24 +1162,10 @@ _setup_acquire_noninteractive_setup_lock() {
 	mkdir -p "$(dirname "$lock_dir")" 2>/dev/null || true
 	while true; do
 		if mkdir "$lock_dir" 2>/dev/null; then
-			SETUP_NONINTERACTIVE_LOCK_DIR="$lock_dir"
-			SETUP_NONINTERACTIVE_LOCK_HELD=true
-			printf '%s\n' "$$" >"$lock_dir/owner.pid" 2>/dev/null || true
-			printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$lock_dir/started_at" 2>/dev/null || true
-			printf '%s\n' "$(date +%s 2>/dev/null || printf '0')" >"$lock_dir/started_at_epoch" 2>/dev/null || true
-			printf '%s\n' "$0 $*" >"$lock_dir/command" 2>/dev/null || true
-			_setup_guard_active_release_lane || lane_rc=$?
-			if [[ "$lane_rc" -ne 0 ]]; then
-				_setup_release_noninteractive_setup_lock
-				return "$lane_rc"
-			fi
-			trap '_setup_cleanup_noninteractive_children; _setup_release_noninteractive_setup_lock' EXIT
-			trap '_setup_noninteractive_signal_exit TERM' TERM
-			trap '_setup_noninteractive_signal_exit INT' INT
-			return 0
+			_setup_claim_noninteractive_setup_lock "$lock_dir" "$@"
+			return $?
 		fi
 
-		# Lock exists — inspect owner.
 		owner_pid=""
 		if [[ -r "$lock_dir/owner.pid" ]]; then
 			owner_pid=$(tr -d '[:space:]' <"$lock_dir/owner.pid" 2>/dev/null || true)
@@ -1174,7 +1189,6 @@ _setup_acquire_noninteractive_setup_lock() {
 		fi
 
 		if ! _setup_lock_pid_alive "$owner_pid"; then
-			# Dead owner — reclaim the stale lock.
 			if [[ "$reclaim_attempts" -ge 2 ]]; then
 				print_error "Unable to acquire setup.sh --non-interactive lock at ${lock_dir} after ${reclaim_attempts} stale-lock removals"
 				return 75
@@ -1198,7 +1212,6 @@ _setup_acquire_noninteractive_setup_lock() {
 			continue
 		fi
 
-		# Owner is alive — compute age and read current setup stage.
 		owner_age=$(_setup_lock_owner_age "$lock_dir" "$owner_pid")
 		owner_cmd=""
 		[[ -r "$lock_dir/command" ]] && owner_cmd=$(tr '\n' ' ' <"$lock_dir/command" 2>/dev/null || true)
@@ -1210,7 +1223,6 @@ _setup_acquire_noninteractive_setup_lock() {
 			[[ -n "$_diag_cur_stage" ]] && _diag_stage=", stage: ${_diag_cur_stage}"
 		fi
 
-		# Stale-live reclaim: owner alive but running far too long.
 		if [[ "$stale_ceiling" -gt 0 && "$owner_age" -ge "$stale_ceiling" ]]; then
 			if [[ "$reclaim_attempts" -ge 2 ]]; then
 				print_error "Unable to acquire setup.sh --non-interactive lock: owner (pid ${owner_pid}, age ${owner_age}s) exceeds stale ceiling but reclaim limit reached. Diagnose: ${_diag_stl}"
@@ -1222,13 +1234,11 @@ _setup_acquire_noninteractive_setup_lock() {
 			continue
 		fi
 
-		# Live non-stale owner — check wait ceiling before sleeping.
 		if [[ "$waited" -ge "$wait_ceiling" ]]; then
 			print_error "Timed out waiting ${waited}s for setup.sh --non-interactive lock (owner pid ${owner_pid}, age ${owner_age}s${_diag_stage}${owner_cmd:+, command: ${owner_cmd}}). Increase AIDEVOPS_SETUP_WAIT_TIMEOUT_S (current: ${wait_ceiling}s) or kill pid ${owner_pid} to unblock. Diagnose: ${_diag_stl}"
 			return 75
 		fi
 
-		# Emit diagnostics on first block and every diagnostic interval thereafter.
 		if [[ "$waited" -eq 0 ]]; then
 			print_info "Another setup.sh --non-interactive is running (pid ${owner_pid}, age ${owner_age}s${_diag_stage}${owner_cmd:+, command: ${owner_cmd}}). Waiting up to ${wait_ceiling}s (AIDEVOPS_SETUP_WAIT_TIMEOUT_S). Diagnose: ${_diag_stl}"
 		elif [[ $((waited % _diag_interval_s)) -eq 0 ]]; then
@@ -1270,6 +1280,7 @@ _setup_ai_session_reset_plan() {
 	_SETUP_AI_SESSION_NEEDS_HOOKS=0
 	_SETUP_AI_SESSION_NEEDS_REPO_VERIFY=0
 	_SETUP_AI_SESSION_NEEDS_PULSE=0
+	_SETUP_AI_SESSION_NEEDS_SCHEDULERS=0
 	_SETUP_AI_SESSION_NEEDS_GUI=0
 	_SETUP_AI_SESSION_REQUIRES_FULL=0
 	return 0
@@ -1328,8 +1339,13 @@ _setup_ai_session_plan_file() {
 		.agents/scripts/aidevops-cli/aidevops-init-lib.sh | .agents/scripts/aidevops-cli/aidevops-update-lib.sh)
 		_SETUP_AI_SESSION_NEEDS_REPO_VERIFY=1
 		;;
-	.agents/scripts/setup/modules/schedulers*.sh | .agents/scripts/setup/_scheduler_runtime.sh)
+	.agents/scripts/setup/modules/schedulers-pulse.sh)
 		_SETUP_AI_SESSION_NEEDS_PULSE=1
+		;;
+	.agents/scripts/setup/modules/schedulers*.sh | .agents/scripts/setup/_scheduler_runtime.sh)
+		# Shared scheduler modules define non-pulse schedulers too (e.g. the
+		# Linux screen-activity sampler); refresh every installed one (GH#36709).
+		_SETUP_AI_SESSION_NEEDS_SCHEDULERS=1
 		;;
 	.agents/scripts/setup/modules/agent-deploy.sh | .agents/scripts/setup/modules/plugins.sh)
 		:
@@ -1391,8 +1407,24 @@ _setup_ai_session_verify_deploy() {
 		"$INSTALL_DIR" \
 		"$expected_sha" \
 		"$HOME/.aidevops/agents" \
-		"$HOME/.aidevops/.deployed-sha"
-	return $?
+		"$HOME/.aidevops/.deployed-sha" || {
+		_runtime_bundle_rollback "$HOME/.aidevops/agents" ||
+			print_error "Failed to roll back the runtime bundle after convergence failure"
+		return 1
+	}
+	return 0
+}
+
+# OpenCode DB archive (daily) and maintenance (weekly) schedulers keep the
+# session DB small enough to avoid "database is locked" stalls (GH#35492).
+# Both installers are idempotent content-diffs, so every auto-update ensures
+# they exist even when the incremental plan would not otherwise touch them.
+_setup_ensure_opencode_db_schedulers() {
+	_time_step "setup_opencode_db_maintenance" setup_opencode_db_maintenance ||
+		print_warning "OpenCode DB maintenance scheduler refresh failed (non-fatal)"
+	_time_step "setup_opencode_db_archive" setup_opencode_db_archive ||
+		print_warning "OpenCode DB archive scheduler refresh failed (non-fatal)"
+	return 0
 }
 
 _setup_run_ai_session_incremental() {
@@ -1402,6 +1434,10 @@ _setup_run_ai_session_incremental() {
 	local current_sha=""
 	local changed_files=""
 
+	# Updates must heal scheduler drift even when no deploy stage changed.
+	if [[ "$os" != "Darwin" ]]; then
+		_reconcile_linux_scheduler_duplicates
+	fi
 	print_info "AI-session setup mode: applying changed deploy stages only"
 	if ! _setup_git_checkout_available "$INSTALL_DIR" || [[ ! -f "$stamp_file" ]]; then
 		print_warning "AI-session incremental setup needs a git checkout and deployed SHA stamp"
@@ -1417,6 +1453,8 @@ _setup_run_ai_session_incremental() {
 
 	if [[ "$deployed_sha" == "$current_sha" ]]; then
 		print_success "AI-session setup: deployed SHA already matches current checkout"
+		_setup_ensure_opencode_db_schedulers
+		_time_step "$SETUP_STAGE_TABBY" setup_tabby
 		_setup_ai_session_verify_deploy "$current_sha" || return $?
 		return 0
 	fi
@@ -1434,7 +1472,8 @@ _setup_run_ai_session_incremental() {
 	_setup_init_stage_timing_log
 	if [[ "$_SETUP_AI_SESSION_NEEDS_AGENTS" -eq 1 ]]; then
 		_time_step "$SETUP_STAGE_AGENTS" deploy_aidevops_agents || return $?
-		_time_step "$SETUP_STAGE_OPENCODE_PLUGINS" setup_opencode_plugins || return $?
+		_time_step "$SETUP_STAGE_OPENCODE_PLUGINS" setup_opencode_runtime_plugins || return $?
+		_time_step "$SETUP_STAGE_OPENCODE_SERVICE" setup_opencode_service
 		_time_step "$SETUP_STAGE_HOTFIX_CONFIG" _deploy_hotfix_config || return $?
 		_time_step "$SETUP_STAGE_RUNTIME_CONFIG" _setup_reconcile_runtime_config || return $?
 	fi
@@ -1447,13 +1486,19 @@ _setup_run_ai_session_incremental() {
 	if [[ "$_SETUP_AI_SESSION_NEEDS_REPO_VERIFY" -eq 1 ]]; then
 		_time_step "setup_repo_verify_guard" setup_repo_verify_guard || return $?
 	fi
-	if [[ "$_SETUP_AI_SESSION_NEEDS_PULSE" -eq 1 ]]; then
+	if [[ "$_SETUP_AI_SESSION_NEEDS_SCHEDULERS" -eq 1 ]]; then
+		# Includes the consent-gated pulse refresh; each step is time-stepped.
+		_setup_noninteractive_schedulers "$os"
+	elif [[ "$_SETUP_AI_SESSION_NEEDS_PULSE" -eq 1 ]]; then
 		_time_step "$SETUP_STAGE_PULSE" setup_supervisor_pulse "$os" || return $?
 	fi
 	if [[ "$_SETUP_AI_SESSION_NEEDS_GUI" -eq 1 ]]; then
 		_time_step "setup_gui_desktop_app_opt_in" _setup_offer_gui_desktop_app || return $?
 	fi
+	# After agent deploy so the schedulers point at the freshly deployed helpers.
+	_setup_ensure_opencode_db_schedulers
 
+	_time_step "$SETUP_STAGE_TABBY" setup_tabby
 	_setup_ai_session_verify_deploy "$current_sha" || return $?
 	print_success "AI-session incremental setup complete (${deployed_sha:0:7}→${current_sha:0:7})"
 	return 0
@@ -1475,12 +1520,14 @@ _setup_run_scoped_stage() {
 	_setup_init_stage_timing_log
 	case "$stage" in
 	"$SETUP_STAGE_OPENCODE")
-		_time_step "$SETUP_STAGE_OPENCODE" setup_opencode_cli
+		_time_step "$SETUP_STAGE_OPENCODE" setup_opencode_runtimes
+		_time_step "$SETUP_STAGE_OPENCODE_SERVICE" setup_opencode_service
 		_time_step "setup_opencode_desktop_launcher" setup_opencode_desktop_launcher
 		;;
 	"$SETUP_STAGE_AGENTS")
 		_time_step "$SETUP_STAGE_AGENTS" deploy_aidevops_agents
-		_time_step "$SETUP_STAGE_OPENCODE_PLUGINS" setup_opencode_plugins
+		_time_step "$SETUP_STAGE_OPENCODE_PLUGINS" setup_opencode_runtime_plugins
+		_time_step "$SETUP_STAGE_OPENCODE_SERVICE" setup_opencode_service
 		_time_step "$SETUP_STAGE_HOTFIX_CONFIG" _deploy_hotfix_config
 		;;
 	"$SETUP_STAGE_RUNTIME_CONFIG")
@@ -1543,30 +1590,27 @@ reconcile_buzz_desktop_compatibility() {
 	esac
 }
 
-_setup_run_non_interactive() {
-	print_info "Non-interactive mode: deploying agents and running safe migrations only"
+# GH#33249: best-effort one-shot cleanup; a refusal must not abort deployment.
+_setup_cleanup_retired_prompt_tooling_nonfatal() {
+	cleanup_retired_prompt_tooling || print_warning "Retired prompt tooling cleanup incomplete; setup will retry next time"
+	return 0
+}
 
-	_setup_init_stage_timing_log
-
-	_time_step "protect_current_setup_worktree" protect_current_setup_worktree
-	_time_step "verify_location" verify_location
-	_time_step "check_requirements" check_requirements
-	# Run quality tool detection in non-interactive mode too (warn-only path).
-	_time_step "check_quality_tools" check_quality_tools
-	# Check setsid availability; auto-install util-linux on macOS if missing
-	# (GH#21102 / t2926: missing setsid kills workers on every pulse restart).
-	_time_step "setup_setsid_advisory" setup_setsid_advisory
-	_time_step "check_python_upgrade_available" check_python_upgrade_available
-	_time_step "setup_vault_python_env" setup_vault_python_env || print_warning "Vault crypto runtime setup encountered issues; Vault status remains metadata-only"
-	_time_step "set_permissions" set_permissions
+_setup_run_noninteractive_migrations() {
 	_time_step "migrate_old_backups" migrate_old_backups
 	_time_step "migrate_loop_state_directories" migrate_loop_state_directories
 	_time_step "migrate_agent_to_agents_folder" migrate_agent_to_agents_folder
 	_time_step "migrate_mcp_env_to_credentials" migrate_mcp_env_to_credentials
 	_time_step "migrate_pulse_repos_to_repos_json" migrate_pulse_repos_to_repos_json
 	_time_step "cleanup_deprecated_paths" cleanup_deprecated_paths
+	_time_step "cleanup_retired_prompt_tooling" _setup_cleanup_retired_prompt_tooling_nonfatal
 	_time_step "migrate_orphaned_supervisor" migrate_orphaned_supervisor
 	_time_step "migrate_custom_model_routing_reasoning_defaults" migrate_custom_model_routing_reasoning_defaults
+	_time_step "migrate_obsolete_settings_model_routing" migrate_obsolete_settings_model_routing
+	_time_step "migrate_worker_capacity_reset" migrate_worker_capacity_reset
+	_time_step "migrate_compaction_target_240k" migrate_compaction_target_240k
+	_time_step "migrate_sonnet_5_5_settings" migrate_sonnet_5_5_settings
+	_time_step "migrate_haiku_5_5_settings" migrate_haiku_5_5_settings
 	_time_step "backfill_issue_relationships" backfill_issue_relationships
 	_time_step "cleanup_deprecated_mcps" cleanup_deprecated_mcps
 	_time_step "cleanup_stale_bun_opencode" cleanup_stale_bun_opencode
@@ -1575,16 +1619,40 @@ _setup_run_non_interactive() {
 	_time_step "cleanup_worktree_entries_in_repos_json" cleanup_worktree_entries_in_repos_json
 	_time_step "_cleanup_legacy_model_config" _cleanup_legacy_model_config
 	_time_step "cleanup_legacy_dashboard_launchagent" cleanup_legacy_dashboard_launchagent
-	# t2888: install/heal opencode-ai. Companion to t2887's runtime canary
-	# fail-fast -- t2887 detects when $OPENCODE_BIN_DEFAULT is wrong, this
-	# one fixes it by reinstalling opencode-ai@latest (overwriting any bin
-	# collision with @anthropic-ai/claude-code or similar). Skipping this
-	# in non-interactive mode is the bug PR #20189 introduced and what
-	# alex-solovyev's runner spam stemmed from.
-	_time_step "$SETUP_STAGE_OPENCODE" setup_opencode_cli
+	_time_step "cleanup_legacy_agents_md_templates" cleanup_legacy_agents_md_templates
+	_time_step "review_js_dependency_policies" review_js_dependency_policies
+	return 0
+}
+
+# Optional user tools refreshed on every non-interactive setup/update. Each
+# stage is bounded and non-critical.
+_setup_run_noninteractive_optional_tools() {
+	# Update-if-installed only; never installs Nostr VPN (GH#23846).
+	_time_step "setup_nostr_vpn" _setup_run_noncritical_stage_bounded "Nostr VPN update check" "${AIDEVOPS_SETUP_NOSTR_VPN_TIMEOUT:-120}" setup_nostr_vpn
+	# Install-if-missing for supported browsers; browse self-updates (GH#37155).
+	_time_step "setup_opencode_browse" _setup_run_noncritical_stage_bounded "OpenCode browse setup" "${AIDEVOPS_SETUP_OPENCODE_BROWSE_TIMEOUT:-120}" setup_opencode_browse
+	return 0
+}
+
+_setup_run_non_interactive() {
+	print_info "Non-interactive mode: deploying agents and running safe migrations only"
+
+	_setup_init_stage_timing_log
+
+	_time_step "protect_current_setup_worktree" protect_current_setup_worktree
+	_time_step "verify_location" verify_location
+	_time_step "check_requirements" check_requirements
+	_time_step "check_quality_tools" check_quality_tools
+	_time_step "setup_setsid_advisory" setup_setsid_advisory
+	_time_step "check_python_upgrade_available" check_python_upgrade_available
+	_time_step "setup_vault_python_env" setup_vault_python_env || print_warning "Vault crypto runtime setup encountered issues; Vault status remains metadata-only"
+	_time_step "set_permissions" set_permissions
+	_setup_run_noninteractive_migrations
+	_time_step "$SETUP_STAGE_OPENCODE" setup_opencode_runtimes
 	_time_step "validate_opencode_config" validate_opencode_config
 	_time_step "$SETUP_STAGE_AGENTS" deploy_aidevops_agents
-	_time_step "$SETUP_STAGE_OPENCODE_PLUGINS" setup_opencode_plugins
+	_time_step "$SETUP_STAGE_OPENCODE_PLUGINS" setup_opencode_runtime_plugins
+	_time_step "$SETUP_STAGE_OPENCODE_SERVICE" setup_opencode_service
 	_time_step "reconcile_buzz_desktop_compatibility" reconcile_buzz_desktop_compatibility
 	_time_step "_setup_install_pulse_plist_early" _setup_install_pulse_plist_early
 	_time_step "$SETUP_STAGE_HOTFIX_CONFIG" _deploy_hotfix_config
@@ -1598,9 +1666,6 @@ _setup_run_non_interactive() {
 	fi
 	_time_step "init_settings_json" init_settings_json
 
-	# Parallelise independent skill operations (t1356: ~84s serial -> ~18s parallel)
-	# generate_agent_skills must complete before create_skill_symlinks (symlinks
-	# depend on generated SKILL.md files). scan_imported_skills is independent.
 	local _pid_symlinks=""
 	if _time_step "generate_agent_skills" generate_agent_skills; then
 		_time_step "create_skill_symlinks" create_skill_symlinks &
@@ -1629,6 +1694,7 @@ _setup_run_non_interactive() {
 	_time_step "update_codex_config" update_codex_config
 	_time_step "update_cursor_config" update_cursor_config
 	_time_step "disable_ondemand_mcps" disable_ondemand_mcps
+	_setup_run_noninteractive_optional_tools
 	# Scaffold personal routines repo if not already present (idempotent).
 	# Creates local git repo + private GitHub remote for personal repo only.
 	# Org repos require explicit: aidevops init-routines --org <name>
@@ -1675,11 +1741,8 @@ _setup_run_non_interactive() {
 _setup_run_interactive_runtime_tools() {
 	confirm_step "Deploy aidevops agents to runtime agent directories" && deploy_agents_to_runtimes
 	confirm_step "Setup isolated Vault crypto runtime" && setup_vault_python_env
-	confirm_step "Setup Python environment (DSPy, crawl4ai)" && setup_python_env
-	confirm_step "Setup Node.js environment" && setup_nodejs_env
 	confirm_step "Install MCP packages globally (fast startup)" && install_mcp_packages
 	confirm_step "Setup LocalWP MCP server" && setup_localwp_mcp
-	confirm_step "Setup Beads task management" && setup_beads
 	confirm_step "Setup SEO integrations (curl subagents)" && setup_seo_mcps
 	confirm_step "Setup Google Analytics MCP" && setup_google_analytics_mcp
 	confirm_step "Setup QuickFile MCP (UK accounting)" && setup_quickfile_mcp
@@ -1687,11 +1750,30 @@ _setup_run_interactive_runtime_tools() {
 	confirm_step "Setup AI orchestration frameworks info" && setup_ai_orchestration
 	confirm_step "Setup Ollama (local LLM for knowledge plane pii/sensitive/privileged tiers)" && setup_ollama_for_knowledge
 	confirm_step "Setup Google Workspace CLI (Gmail, Calendar, Drive)" && setup_google_workspace_cli
-	confirm_step "Setup OpenCode CLI (AI coding tool)" && setup_opencode_cli
+	confirm_step "Setup Cloudflare cf CLI (full Cloudflare API)" && setup_cloudflare_cf_cli
+	confirm_step "Setup OpenCode V1 and isolated V2 preview CLIs" && setup_opencode_runtimes
 	confirm_step "Install OpenCode AIDevOps Desktop app wrapper" && setup_opencode_desktop_launcher
-	confirm_step "Setup OpenCode plugins" && setup_opencode_plugins
+	confirm_step "Setup OpenCode plugins" && setup_opencode_runtime_plugins
+	confirm_step "Setup persistent OpenCode owner (preserve existing histories)" && setup_opencode_service
 	confirm_step "Setup Codex CLI (OpenAI AI coding tool)" && setup_codex_cli
 	confirm_step "Setup Droid CLI (Factory.AI coding tool)" && setup_droid_cli
+	confirm_step "Update Nostr VPN nvpn CLI (only if Nostr VPN is installed)" && setup_nostr_vpn
+	return 0
+}
+
+# Silent one-shot migrations for the interactive path (idempotent, flag-guarded
+# — no prompt needed). The non-interactive path times the same steps in
+# _setup_run_noninteractive_migrations.
+_setup_run_interactive_silent_migrations() {
+	_setup_cleanup_retired_prompt_tooling_nonfatal
+	cleanup_stale_health_issue_caches
+	cleanup_legacy_aidevops_temp_artifacts
+	cleanup_worktree_entries_in_repos_json
+	_cleanup_legacy_model_config
+	cleanup_legacy_dashboard_launchagent
+	cleanup_legacy_agents_md_templates
+	# Prompts (default No) only when a dispatch repo's JS install approval is stale.
+	review_js_dependency_policies
 	return 0
 }
 
@@ -1719,7 +1801,7 @@ _setup_run_interactive() {
 	confirm_step "Check Python version (recommend upgrade if outdated)" && check_python_upgrade_available
 	confirm_step "Setup recommended tools (Tabby, Zed, etc.)" && setup_recommended_tools
 	confirm_step "Setup PIM tools (Reminders, Calendar, Contacts)" && setup_pim_tools
-	confirm_step "Setup mobile simulator tools (MiniSim, serve-sim)" && setup_mobile_simulator_tools
+	confirm_step "Setup mobile tools (optional adb, Xcode guidance, MiniSim, serve-sim, Mobile MCP)" && setup_mobile_simulator_tools
 	confirm_step "Setup ClaudeBar (AI quota monitor in menu bar)" && setup_claudebar
 	confirm_step "Setup Git CLIs (gh, glab, tea)" && setup_git_clis
 	confirm_step "Setup file discovery tools (fd, ripgrep, ripgrep-all)" && setup_file_discovery_tools
@@ -1736,7 +1818,7 @@ _setup_run_interactive() {
 	confirm_step "Set secure permissions on config files" && set_permissions
 	confirm_step "Setup shell aliases" && setup_aliases
 	confirm_step "Setup terminal title integration" && setup_terminal_title
-	confirm_step "Deploy AI templates to home directories" && deploy_ai_templates
+	confirm_step "Deploy agent workspace template" && deploy_ai_templates
 	confirm_step "Migrate old backups to new structure" && migrate_old_backups
 	confirm_step "Migrate loop state from .claude/.agent/ to .agents/loop-state/" && migrate_loop_state_directories
 	confirm_step "Migrate .agent -> .agents in user projects" && migrate_agent_to_agents_folder
@@ -1745,15 +1827,15 @@ _setup_run_interactive() {
 	confirm_step "Cleanup deprecated agent paths" && cleanup_deprecated_paths
 	confirm_step "Migrate orphaned supervisor to pulse-wrapper" && migrate_orphaned_supervisor
 	migrate_custom_model_routing_reasoning_defaults
+	migrate_obsolete_settings_model_routing
+	migrate_worker_capacity_reset
+	migrate_compaction_target_240k
+	migrate_sonnet_5_5_settings
+	migrate_haiku_5_5_settings
 	confirm_step "Backfill GitHub issue relationships (blocked-by, sub-issues)" && backfill_issue_relationships
 	confirm_step "Cleanup deprecated MCP entries (hetzner, serper, etc.)" && cleanup_deprecated_mcps
 	confirm_step "Cleanup stale bun opencode install" && cleanup_stale_bun_opencode
-	# Silent one-shot migrations (idempotent, flag-guarded — no prompt needed).
-	cleanup_stale_health_issue_caches
-	cleanup_legacy_aidevops_temp_artifacts
-	cleanup_worktree_entries_in_repos_json
-	_cleanup_legacy_model_config
-	cleanup_legacy_dashboard_launchagent
+	_setup_run_interactive_silent_migrations
 	confirm_step "Validate and repair OpenCode config schema" && validate_opencode_config
 	confirm_step "Extract OpenCode prompts" && extract_opencode_prompts
 	confirm_step "Check OpenCode prompt drift" && check_opencode_prompt_drift
@@ -1836,7 +1918,8 @@ _setup_noninteractive_schedulers() {
 	if _should_setup_noninteractive_scheduler "Memory pressure" "sh.aidevops.memory-pressure-monitor" "aidevops: memory-pressure-monitor" "aidevops-memory-pressure-monitor"; then
 		_time_step "setup_memory_pressure_monitor" setup_memory_pressure_monitor
 	fi
-	if _should_setup_noninteractive_scheduler "Screen time" "sh.aidevops.screen-time-snapshot" "aidevops: screen-time-snapshot" "aidevops-screen-time-snapshot"; then
+	# GH#36709: Linux profile README installs also need the activity sampler.
+	if _should_setup_noninteractive_screen_time; then
 		_time_step "setup_screen_time_snapshot" setup_screen_time_snapshot
 	fi
 	if _should_setup_noninteractive_scheduler "Contribution watch" "sh.aidevops.contribution-watch" "aidevops: contribution-watch" "aidevops-contribution-watch"; then
@@ -1862,6 +1945,7 @@ _setup_noninteractive_schedulers() {
 	fi
 	# Repo sync handles non-interactive mode internally (systemd detection fixed in GH#17861)
 	_time_step "setup_repo_sync" setup_repo_sync
+	_time_step "setup_mirror_sync" setup_mirror_sync
 	# r914 repo-aidevops-health — daily drift keeper (t2366)
 	_time_step "setup_repo_aidevops_health" setup_repo_aidevops_health
 	if _should_setup_noninteractive_scheduler "Profile README" "sh.aidevops.profile-readme-update" "aidevops: profile-readme-update" "aidevops-profile-readme-update"; then
@@ -1876,6 +1960,8 @@ _setup_noninteractive_schedulers() {
 	# opencode DB archive/VACUUM (GH#25136). Dedicated low-priority scheduler;
 	# not tied to pulse preflight cadence.
 	_time_step "setup_opencode_db_archive" setup_opencode_db_archive
+	# r922 storage hygiene (GH#35245). Daily owning-cleaner run, Pulse-independent.
+	_time_step "setup_storage_hygiene" setup_storage_hygiene
 	# Migrate cron entries to systemd after schedulers are installed (GH#17695 Finding D)
 	_time_step "migrate_cron_to_systemd" migrate_cron_to_systemd
 	_time_step "$SETUP_STAGE_TABBY" setup_tabby
@@ -1917,6 +2003,7 @@ _setup_post_setup_steps() {
 	setup_stats_wrapper "${PULSE_ENABLED:-}"
 	setup_failure_miner "${PULSE_ENABLED:-}"
 	setup_repo_sync
+	setup_mirror_sync
 	# r914 repo-aidevops-health — daily drift keeper (t2366)
 	setup_repo_aidevops_health
 	setup_process_guard
@@ -1931,6 +2018,7 @@ _setup_post_setup_steps() {
 	setup_oauth_token_refresh
 	setup_opencode_db_maintenance
 	setup_opencode_db_archive
+	setup_storage_hygiene
 	# Migrate cron entries to systemd after schedulers are installed (GH#17695 Finding D)
 	migrate_cron_to_systemd
 	setup_tabby

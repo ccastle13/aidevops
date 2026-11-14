@@ -16,6 +16,9 @@ from discovery_utils import parse_frontmatter
 
 # Built-in agent types (general, explore) don't have .md files
 BUILTIN_SUBAGENTS = {"general", "explore"}
+# Bounded roles supplied by the OpenCode plugin, not standalone prompt copies.
+# Other runtimes retain their existing research-only fallback.
+PLUGIN_SUBAGENTS = {"domain-focused", "domain-light", "specialist-advisor"}
 
 # Files to skip during subagent scanning
 _SKIP_SUBAGENT_FILES = {"AGENTS.md", "README.md"}
@@ -133,7 +136,8 @@ def _collect_missing_for_agent(display_name, agent_config, display_to_filename_f
     agent_slug = display_to_filename_fn(display_name)
     missing = []
     for subagent_name in task_perms:
-        if subagent_name == '*' or subagent_name in BUILTIN_SUBAGENTS:
+        if (subagent_name == '*' or subagent_name in BUILTIN_SUBAGENTS
+                or subagent_name in PLUGIN_SUBAGENTS):
             continue
         if not subagent_ref_exists(display_name, subagent_name, agent_slug,
                                    all_subagent_files, all_subagent_paths):
@@ -141,7 +145,8 @@ def _collect_missing_for_agent(display_name, agent_config, display_to_filename_f
     return missing
 
 
-def validate_subagent_refs(primary_agents, agents_dir, display_to_filename_fn=None):
+def validate_subagent_refs(primary_agents, agents_dir, display_to_filename_fn=None,
+                           operator_subagents=frozenset()):
     """Validate subagent references against actual files.
 
     Args:
@@ -155,6 +160,9 @@ def validate_subagent_refs(primary_agents, agents_dir, display_to_filename_fn=No
     """
     resolved_fn = _resolve_display_to_filename_fn(display_to_filename_fn)
     all_subagent_files, all_subagent_paths = collect_subagent_files(agents_dir)
+    # Only the OpenCode discovery adapter passes opted-in external task names;
+    # other runtimes continue to validate against their own deployed sources.
+    all_subagent_files.update(operator_subagents)
 
     missing_refs = []
     for display_name, agent_config in primary_agents.items():

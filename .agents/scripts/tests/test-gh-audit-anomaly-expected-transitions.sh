@@ -73,12 +73,18 @@ cat >"$LOG_FILE" <<'EOF'
 {"ts":"2026-07-31T00:24:00Z","op":"issue_edit","repo":"example/repo","number":25,"caller_script":"/runtime/agents/scripts/planning-publication-reconcile.sh","caller_function":"_publication_reconcile_one","flags":{"planning_publication_verified":"v1-current-state"},"before":{"capture_status":"ok","title_len":1,"body_len":1,"labels":["no-auto-dispatch"]},"after":{"capture_status":"ok","title_len":1,"body_len":1,"labels":["auto-dispatch"]},"delta":{"comparable":true,"title_delta_pct":0,"body_delta_pct":0,"labels_removed":["no-auto-dispatch"],"labels_added":["auto-dispatch"]},"suspicious":["protected_label_removed:no-auto-dispatch"]}
 {"ts":"2026-07-31T00:25:00Z","op":"issue_edit","repo":"example/repo","number":26,"caller_script":"/runtime/agents/scripts/pulse-merge-feedback.sh","caller_function":"main","flags":{},"before":{"capture_status":"ok","title_len":1,"body_len":1,"labels":["origin:worker","source:ci-feedback","status:in-review"]},"after":{"capture_status":"ok","title_len":1,"body_len":1,"labels":["origin:worker","source:ci-feedback","status:available"]},"delta":{"comparable":true,"title_delta_pct":0,"body_delta_pct":0,"labels_removed":["status:in-review"],"labels_added":["status:available"]},"suspicious":["protected_label_removed:status:in-review"]}
 {"ts":"2026-07-31T00:26:00Z","op":"issue_edit","repo":"example/repo","number":27,"caller_script":"/runtime/agents/scripts/pulse-merge-feedback.sh","caller_function":"main","flags":{},"before":{"capture_status":"ok","title_len":1,"body_len":1,"labels":["origin:worker","status:in-review"]},"after":{"capture_status":"ok","title_len":1,"body_len":1,"labels":["origin:worker","source:ci-feedback","status:available"]},"delta":{"comparable":true,"title_delta_pct":0,"body_delta_pct":0,"labels_removed":["status:in-review"],"labels_added":["status:available","source:ci-feedback"]},"suspicious":["protected_label_removed:status:in-review"]}
+{"ts":"2026-07-31T00:27:00Z","op":"issue_edit","repo":"example/repo","number":28,"caller_script":"/runtime/agents/scripts/worker-permission-helper.sh","caller_function":"permission_apply_block","flags":{},"before":{"capture_status":"ok","title_len":1,"body_len":1,"labels":["status:in-review"]},"after":{"capture_status":"ok","title_len":1,"body_len":1,"labels":["needs-maintainer-permissions","status:blocked"]},"delta":{"comparable":true,"title_delta_pct":0,"body_delta_pct":0,"labels_removed":["status:in-review"],"labels_added":["needs-maintainer-permissions","status:blocked"]},"suspicious":["protected_label_removed:status:in-review"]}
+{"ts":"2026-07-31T00:28:00Z","op":"issue_edit","repo":"example/repo","number":29,"caller_script":"/runtime/agents/scripts/approval-helper-permissions.sh","caller_function":"_apply_permission_approval_state","flags":{"permission_approval_verified":"v1-current-state"},"before":{"capture_status":"ok","title_len":1,"body_len":1,"labels":["needs-maintainer-permissions","status:blocked"]},"after":{"capture_status":"ok","title_len":1,"body_len":1,"labels":["status:available","auto-dispatch"]},"delta":{"comparable":true,"title_delta_pct":0,"body_delta_pct":0,"labels_removed":["needs-maintainer-permissions","status:blocked"],"labels_added":["status:available","auto-dispatch"]},"suspicious":["protected_label_removed:needs-maintainer-permissions"]}
+{"ts":"2026-07-31T00:29:00Z","op":"issue_edit","repo":"example/repo","number":30,"caller_script":"/runtime/agents/scripts/approval-helper-permissions.sh","caller_function":"_apply_permission_approval_state","flags":{},"before":{"capture_status":"ok","title_len":1,"body_len":1,"labels":["needs-maintainer-permissions"]},"after":{"capture_status":"ok","title_len":1,"body_len":1,"labels":[]},"delta":{"comparable":true,"title_delta_pct":0,"body_delta_pct":0,"labels_removed":["needs-maintainer-permissions"],"labels_added":[]},"suspicious":["protected_label_removed:needs-maintainer-permissions"]}
+{"ts":"2026-07-31T00:30:00Z","op":"issue_edit","repo":"example/repo","number":31,"caller_script":"/runtime/agents/scripts/approval-helper-permissions.sh","caller_function":"_apply_permission_approval_state","flags":{"permission_approval_verified":"v1-current-state"},"before":{"capture_status":"ok","title_len":1,"body_len":1,"labels":["needs-maintainer-permissions","priority:high"]},"after":{"capture_status":"ok","title_len":1,"body_len":1,"labels":[]},"delta":{"comparable":true,"title_delta_pct":0,"body_delta_pct":0,"labels_removed":["needs-maintainer-permissions","priority:high"],"labels_added":[]},"suspicious":["protected_label_removed:needs-maintainer-permissions"]}
 EOF
 
 output=$(GH_AUDIT_LOG_FILE="$LOG_FILE" GH_ANOMALY_STATE_FILE="${TEST_ROOT}/state.json" \
 	GH_AUDIT_QUIET=true "$HELPER" scan --all --dry-run)
 
-[[ "$output" == *"**Anomalies found:** 15"* ]] || fail "expected transitions were not excluded exactly"
+[[ "$output" == *"**Anomalies found:** 17"* ]] || fail "expected transitions were not excluded exactly"
+[[ "$output" == *"| #30 |"* ]] || fail "unverified permission grant was hidden"
+[[ "$output" == *"| #31 |"* ]] || fail "permission grant with an extra label removal was hidden"
 [[ "$output" == *"| #3 |"* ]] || fail "unexpected lifecycle transition was hidden"
 [[ "$output" == *"| #4 |"* ]] || fail "approval transition with an additional signal was hidden"
 [[ "$output" == *"| #5 |"* ]] || fail "malformed provenance was dropped instead of retained"
@@ -102,7 +108,8 @@ output=$(GH_AUDIT_LOG_FILE="$LOG_FILE" GH_ANOMALY_STATE_FILE="${TEST_ROOT}/state
 [[ "$output" != *"| #1 |"* && "$output" != *"| #2 |"* && "$output" != *"| #7 |"* && "$output" != *"| #9 |"* &&
 	"$output" != *"| #12 |"* && "$output" != *"| #14 |"* && "$output" != *"| #17 |"* &&
 	"$output" != *"| #18 |"* && "$output" != *"| #20 |"* && "$output" != *"| #22 |"* &&
-	"$output" != *"| #24 |"* && "$output" != *"| #26 |"* ]] ||
+	"$output" != *"| #24 |"* && "$output" != *"| #26 |"* && "$output" != *"| #28 |"* &&
+	"$output" != *"| #29 |"* ]] ||
 	fail "an exact expected transition remained actionable"
 
 MALFORMED_LOG="${TEST_ROOT}/malformed-audit.log"
@@ -169,6 +176,34 @@ _gh_audit_record_op \
 	"_approval_apply_pr_lifecycle_updates" "1"
 jq -e -s 'map(select(.number == 22))[0].flags == {}' "$PROOF_LOG" >/dev/null ||
 	fail "failed approval verification produced trusted audit proof"
+
+# GH#37906: signed permission grants earn proof only from live re-verification.
+cmd_verify_permissions() {
+	local target_type="${1:-}"
+	local target_number="${2:-}"
+	# 42 verifies too: its foreign caller path alone must deny the proof.
+	if [[ "$target_type" == "issue" && ("$target_number" == "40" || "$target_number" == "42") ]]; then
+		printf 'VERIFIED\n'
+		return 0
+	fi
+	printf 'NO_APPROVAL\n'
+	return 1
+}
+for permission_case in "40|/runtime/agents/scripts/approval-helper-permissions.sh" \
+	"41|/runtime/agents/scripts/approval-helper-permissions.sh" \
+	"42|/tmp/approval-helper-permissions-copy.sh"; do
+	_gh_audit_record_op \
+		"issue_edit" "example/repo" "${permission_case%%|*}" \
+		'{"title_len":1,"body_len":1,"labels":["needs-maintainer-permissions"]}' \
+		'{"title_len":1,"body_len":1,"labels":[]}' \
+		"${permission_case#*|}" \
+		"_apply_permission_approval_state" "1"
+done
+jq -e -s 'map(select(.number == 40))[0].flags.permission_approval_verified == "v1-current-state"' "$PROOF_LOG" >/dev/null ||
+	fail "verified permission grant did not produce audit proof"
+jq -e -s 'map(select(.number == 41 or .number == 42) | .flags == {}) | length == 2 and all' "$PROOF_LOG" >/dev/null ||
+	fail "unverified or foreign permission grant produced trusted audit proof"
+unset -f cmd_verify_permissions
 
 CURRENT_ACTOR="trusted-runner"
 gh() {
@@ -275,6 +310,74 @@ GH_AUDIT_LOG_FILE="$HANDOFF_LOG" _gh_audit_record_op \
 	"_label_issue_in_review" "1"
 jq -e 'select(.number == 28) | .flags.pr_review_handoff_verified == "v1-current-state"' "$HANDOFF_LOG" >/dev/null ||
 	fail "verified full-loop handoff did not produce audit proof"
+
+# GH#34614: exercise the actual managed-write CLI dispatch and safe-edit audit,
+# not just a synthetic caller string. Only remote transport/privacy is stubbed.
+CLI_HANDOFF_LOG="${TEST_ROOT}/cli-handoff-audit.log"
+(
+	CLI_SCRIPT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+	# shellcheck source=../shared-gh-wrappers.sh
+	source "${CLI_SCRIPT_DIR}/shared-gh-wrappers.sh"
+	# Source the real CLI harmlessly to load its entrypoint and dispatch functions.
+	# shellcheck source=../gh-write-helper.sh
+	source "${CLI_SCRIPT_DIR}/gh-write-helper.sh" help >/dev/null
+	export GH_AUDIT_LOG_FILE="$CLI_HANDOFF_LOG"
+	HANDOFF_STAGE="status:in-progress"
+	HANDOFF_CASE="valid"
+	handoff_issue_json() {
+		jq -n --arg status "$HANDOFF_STAGE" --arg scenario "$HANDOFF_CASE" '
+			{state: (if $scenario == "closed" then "closed" else "open" end),
+			 title: "Owned issue", body: "Preserved body",
+			 assignees: [{login: (if $scenario == "unowned" then "other" else "runner" end)}],
+			 labels: [{name: $status}]}'
+		return 0
+	}
+	gh_issue_view() { handoff_issue_json; return 0; }
+	_gh_guard_public_write_args() { return 0; }
+	gh() {
+		local command="$1" resource="${2:-}"
+		[[ "$HANDOFF_CASE" != "unavailable" ]] || return 1
+		case "${command}:${resource}" in
+		api:user) printf '%s\n' runner ;;
+		api:repos/example/repo/issues/29) handoff_issue_json ;;
+		pr:view)
+			jq -n --arg scenario "$HANDOFF_CASE" --arg stage "$HANDOFF_STAGE" '
+				{state: (if $scenario == "merged" then "MERGED" else "OPEN" end),
+				 isDraft: ($scenario == "draft" or ($scenario == "race" and $stage == "status:in-review")),
+				 author: {login: (if $scenario == "other-author" then "other" else "runner" end)},
+				 closingIssuesReferences: [{number: (if $scenario == "unlinked" then 99 else 29 end),
+				 repository: {owner: {login: (if $scenario == "cross-repo" then "other" else "example" end)}, name: "repo"}}]}'
+			;;
+		issue:edit) HANDOFF_STAGE="status:in-review" ;;
+		*) return 1 ;;
+		esac
+		return 0
+	}
+	main issue review-handoff 29 --repo example/repo --pr 30 || fail "real CLI handoff failed"
+	jq -e '.caller_function == "_issue_review_handoff" and
+		.flags.pr_review_handoff_verified == "v2-owned-pr-current-state"' "$CLI_HANDOFF_LOG" >/dev/null ||
+		fail "real CLI handoff did not emit live verified provenance"
+	for HANDOFF_CASE in draft merged unlinked cross-repo unowned other-author closed unavailable; do
+		HANDOFF_STAGE="status:in-progress"
+		if main issue review-handoff 29 --repo example/repo --pr 30; then
+			fail "unsafe CLI handoff accepted: $HANDOFF_CASE"
+		fi
+		[[ "$HANDOFF_STAGE" == "status:in-progress" ]] || fail "failed preflight mutated labels"
+	done
+	HANDOFF_CASE="race"
+	HANDOFF_STAGE="status:in-progress"
+	main issue review-handoff 29 --repo example/repo --pr 30 || fail "race fixture mutation failed"
+	HANDOFF_CASE="valid"
+	HANDOFF_STAGE="status:in-progress"
+	_GH_REVIEW_HANDOFF_PR=30 main issue edit 29 --repo example/repo \
+		--remove-label status:in-progress --add-label status:in-review || fail "generic edit fixture failed"
+	jq -e -s 'length == 3 and .[1].flags == {} and .[2].flags == {}' "$CLI_HANDOFF_LOG" >/dev/null ||
+		fail "race or generic edit acquired verified provenance"
+)
+cli_output=$(GH_AUDIT_LOG_FILE="$CLI_HANDOFF_LOG" GH_ANOMALY_STATE_FILE="${TEST_ROOT}/cli-state.json" \
+	GH_AUDIT_QUIET=true "$HELPER" scan --all --dry-run)
+[[ "$cli_output" == *"**Anomalies found:** 2"* ]] ||
+	fail "scanner did not exclude exactly the verified real-path handoff"
 
 gh_issue_view() {
 	printf '%s\n' '{"title":"REST issue snapshot","body":"Protected body","labels":[{"name":"monitoring"}]}'
@@ -393,4 +496,137 @@ jq -e '
 	and .suspicious == ["state_capture_unavailable:before", "state_capture_unavailable:after"]
 ' "$MISSING_CAPTURE_LOG" >/dev/null || fail "omitted snapshots became synthetic empty state"
 
-printf 'PASS: expected approval transitions are retained in the log but excluded from alerts\n'
+# GH#34775: live release verification and exact-shape filtering, including the
+# mixed-version generic main path which must remain actionable.
+BLOCKED_LOG="${TEST_ROOT}/blocked-audit.log"
+(
+	export GH_AUDIT_LOG_FILE="$BLOCKED_LOG"
+	BLOCKED_CASE=valid
+	gh() {
+		local command="$1" endpoint="${2:-}"
+		[[ "$command" == api && "$BLOCKED_CASE" != unavailable ]] || return 1
+		case "$endpoint" in
+		user) printf 'runner\n' ;;
+		repos/example/repo/issues/80)
+			jq -cn --arg scenario "$BLOCKED_CASE" '{state:"open",labels:
+				([{name:"status:blocked"}] + if $scenario == "active" then [{name:"status:queued"}] else [] end)}'
+			;;
+		repos/example/repo/issues/80/comments*)
+			jq -cn --arg scenario "$BLOCKED_CASE" '[[
+				{id:1,author_association:"OWNER",body:"DISPATCH_CLAIM nonce=first"},
+				{id:2,author_association:(if $scenario == "untrusted" then "NONE" else "OWNER" end),
+				 body:"CLAIM_RELEASED reason=blocked runner=runner \n<!-- aidevops:terminal-blocker-observation revision=abc -->"}
+			] + if $scenario == "stale" then [{id:3,author_association:"OWNER",body:"DISPATCH_CLAIM nonce=next"}] else [] end]'
+			;;
+		*) return 1 ;;
+		esac
+		return 0
+	}
+	for BLOCKED_CASE in valid stale untrusted active unavailable; do
+		_gh_audit_record_op issue_edit example/repo 80 \
+			'{"capture_status":"ok","title_len":10,"body_len":10,"labels":["status:in-progress"]}' \
+			'{"capture_status":"ok","title_len":10,"body_len":10,"labels":["status:blocked"]}' \
+			"$(cd "${SCRIPT_DIR}/.." && pwd)/headless-runtime-failure.sh" _hrff_project_blocked_exit 1
+	done
+	jq -se '.[0].flags.worker_blocked_exit_verified == "v1-release-persisted" and all(.[1:4][]; .flags == {})' "$BLOCKED_LOG" >/dev/null ||
+		fail 'blocked exit provenance did not fail closed'
+	jq -c 'select(.flags.worker_blocked_exit_verified) |
+		(.caller_function="main" | .flags={}),
+		(.delta.title_delta_pct=10), (.delta.body_delta_pct=10),
+		(.delta.labels_added += ["extra-label"])' "$BLOCKED_LOG" >"${TEST_ROOT}/blocked-negatives"
+	cat "${TEST_ROOT}/blocked-negatives" >>"$BLOCKED_LOG"
+)
+blocked_output=$(GH_AUDIT_LOG_FILE="$BLOCKED_LOG" GH_ANOMALY_STATE_FILE="${TEST_ROOT}/blocked-state.json" \
+	GH_AUDIT_QUIET=true "$HELPER" scan --all --dry-run)
+[[ "$blocked_output" == *'**Anomalies found:** 8'* ]] || fail 'blocked exact-shape filter hid a generic or mutated edit'
+(
+	CLI_SCRIPT_DIR="${SCRIPT_DIR}/.."
+	# shellcheck source=../gh-write-helper.sh
+	source "${CLI_SCRIPT_DIR}/gh-write-helper.sh" help >/dev/null
+	WORKER_ISSUE_NUMBER=80
+	gh_issue_edit_safe() { return 0; }
+	for label_args in '--add-label=status:blocked' '--remove-label=bug,status:in-progress'; do
+		rc=0
+		main issue edit 80 --repo example/repo "$label_args" 2>"${TEST_ROOT}/guard-output" || rc=$?
+		[[ "$rc" == 2 ]] || fail 'worker status edit was accepted'
+	done
+	rc=0
+	main issue edit 80 --remove-label status:in-progress --add-label status:blocked 2>"${TEST_ROOT}/guard-output" || rc=$?
+	[[ "$rc" == 2 ]] || fail 'separate status args were accepted'
+	rc=0
+	main issue edit --repo example/repo 80 --add-label status:blocked 2>"${TEST_ROOT}/guard-output" || rc=$?
+	[[ "$rc" == 2 ]] || fail 'options-first status edit was accepted'
+	grep -q 'runtime projects lifecycle state' "${TEST_ROOT}/guard-output" || fail 'guard pointer missing'
+	main issue edit 80 --add-label needs-secret:CONFIG_NAME || fail 'non-status label edit blocked'
+	main issue edit 81 --add-label status:blocked || fail 'non-worker target changed by guard'
+)
+
+# GH#35881: exercise the real scan path with read-only timeline/user stubs.
+(
+	# shellcheck source=../gh-audit-anomaly-helper.sh
+	source "$HELPER" help >/dev/null
+	GH_AUDIT_LOG_FILE="${TEST_ROOT}/self-reversal.log"
+	GH_ANOMALY_STATE_FILE="${TEST_ROOT}/self-reversal-state.json"
+	GH_AUDIT_QUIET=false
+	TIMELINE_CALLS="${TEST_ROOT}/timeline-calls"
+	gh() {
+		local command="$1" endpoint="${2:-}"
+		[[ "$command" == api ]] || return 1
+		if [[ "$endpoint" == user ]]; then
+			[[ "$scenario" != user_error ]] || return 1
+			printf 'runner\n'
+			return 0
+		fi
+		[[ "$endpoint" == repos/example/repo/issues/90/timeline\?* ]] || return 1
+		printf '%s\n' "$endpoint" >>"$TIMELINE_CALLS"
+		[[ "$scenario" != api_error ]] || return 1
+		if [[ "$scenario" == truncated || ("$scenario" == paginated && "$endpoint" == *page=1) ]]; then
+			jq -cn '[range(100) | {event:"commented"}]'
+			return 0
+		fi
+		jq -cn --arg scenario "$scenario" '
+			[{event:"labeled",label:{name:"no-auto-dispatch"},actor:{login:"runner"},created_at:"2026-10-25T11:31:15Z"},
+			 {event:"unlabeled",label:{name:"no-auto-dispatch"},actor:{login:"runner"},created_at:"2026-10-25T11:36:28Z"}] |
+			if $scenario == "foreign_add" then .[0].actor.login="other"
+			elif $scenario == "foreign_remove" then .[1].actor.login="other"
+			elif $scenario == "expired" then .[0].created_at="2026-10-24T11:36:27Z"
+			elif $scenario == "boundary" then .[0].created_at="2026-10-24T11:36:28Z"
+			elif $scenario == "intervening" then . + [.[0] | .actor.login="other" | .event="unlabeled" | .created_at="2026-10-25T11:33:00Z"]
+			elif $scenario == "missing" then .[0:1]
+			elif $scenario == "stale" then .[1].created_at="2026-10-25T11:34:00Z"
+			elif $scenario == "future" then .[1].created_at="2026-10-25T11:37:00Z"
+			elif $scenario == "ambiguous" then . + [.[1] | .created_at="2026-10-25T11:36:29Z"]
+			elif $scenario == "readd" then . + [.[0] | .created_at="2026-10-25T11:36:29Z"]
+			elif $scenario == "foreign_readd" then . + [.[0] | .actor.login="other" | .created_at="2026-10-25T11:36:29Z"]
+			elif $scenario == "future_readd" then . + [.[0] | .actor.login="other" | .created_at="2026-10-25T11:37:00Z"]
+			elif $scenario == "malformed" then {error:"not an array"}
+			else . end'
+		return 0
+	}
+	# Any retained anomaly must reach the existing filing path, without a real write.
+	_cmd_scan_file_issue() {
+		printf 'ALERT_FILED\n'
+		return 0
+	}
+	for scenario in valid boundary paginated foreign_add foreign_remove expired intervening missing stale future ambiguous api_error user_error malformed truncated mixed capture multiple readd foreign_readd future_readd; do
+		jq -cn --arg scenario "$scenario" '{ts:"2026-10-25T11:36:30Z",op:"issue_edit",repo:"example/repo",number:90,
+			suspicious:(["protected_label_removed:no-auto-dispatch"] +
+				if $scenario == "mixed" then ["body_delta_pct=-100"]
+				elif $scenario == "capture" then ["state_capture_unavailable:after"]
+				elif $scenario == "multiple" then ["protected_label_removed:hold-for-review"] else [] end)}' >"$GH_AUDIT_LOG_FILE"
+		: >"$TIMELINE_CALLS"
+		output=$(cmd_scan --all 2>&1)
+		case "$scenario" in
+		valid | boundary | paginated | future_readd)
+			[[ "$output" == *self_reversal* && "$output" != *ALERT_FILED* ]] || fail "self-reversal not excluded: $scenario"
+			;;
+		*) [[ "$output" == *ALERT_FILED* && "$output" != *self_reversal* ]] || fail "self-reversal failed open: $scenario" ;;
+		esac
+		jq -e '.last_line == 1' "$GH_ANOMALY_STATE_FILE" >/dev/null || fail "excluded line did not advance cursor"
+		if [[ "$scenario" == truncated ]]; then
+			[[ "$(wc -l <"$TIMELINE_CALLS" | tr -d ' ')" == 5 ]] || fail 'timeline cap not enforced'
+		fi
+	done
+)
+
+printf 'PASS: expected approval, blocked and self-reversal transitions are retained in the log but excluded from alerts\n'

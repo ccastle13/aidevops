@@ -820,7 +820,9 @@ _fast_fail_age_out_locked() {
 			echo "[pulse-wrapper] fast_fail_age_out: #${issue_number} (${repo_slug}) reached ${max_resets} capacity resets — retaining bounded automatic recovery" >>"$LOGFILE"
 			;;
 		*)
-			echo "[pulse-wrapper] fast_fail_age_out: #${issue_number} (${repo_slug}) exceeded ${max_resets} auto-resets without success — applying status:blocked" >>"$LOGFILE"
+			printf '[pulse-wrapper] fast_fail_age_out: #%s (%s) DISPATCH_BLOCK_REASON reason=fast_fail_age_out_ceiling source=runner_local failure_reason=%q crash_type=%q count=%s reset_count=%s max_resets=%s age_seconds=%s action=apply_status_blocked\n' \
+				"$issue_number" "$repo_slug" "$existing_reason" "$existing_crash_type" \
+				"$existing_count" "$existing_reset_count" "$max_resets" "$age" >>"$LOGFILE"
 			if declare -F set_issue_status >/dev/null 2>&1; then
 				set_issue_status "$issue_number" "$repo_slug" "blocked" >>"$LOGFILE" 2>&1 || true
 			else
@@ -845,7 +847,8 @@ _fast_fail_age_out_locked() {
 
 	# Post an issue comment so operators see when auto-recovery fires.
 	local comment_body
-	comment_body=$(printf '<!-- fast-fail-age-out:%s -->\nFast-fail counter auto-reset after %sh quiet period (auto-reset #%s of max %s); pulse will retry dispatch.' \
+	comment_body="$(aidevops_ops_marker fast-fail-age-out)"$'\n'
+	comment_body+=$(printf '<!-- fast-fail-age-out:%s -->\nFast-fail counter auto-reset after %sh quiet period (auto-reset #%s of max %s); pulse will retry dispatch.' \
 		"$new_reset_count" "$hours" "$new_reset_count" "$max_resets")
 	gh issue comment "$issue_number" --repo "$repo_slug" --body "$comment_body" >>"$LOGFILE" 2>&1 || true
 	return 0
@@ -971,6 +974,31 @@ _fast_fail_prune_expired_locked() {
 	return 0
 }
 
+# Reserve before creation, under the fast-fail lock. A crashed/preparation-only
+# attempt still consumes its budget. Never let repeated dispatch prepasses
+# create unlimited trees for an unchanged failure record.
+_ff_reserve_enrichment_attempt() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local key=""
+	local state=""
+	local updated_state=""
+	local now=""
+	key=$(_ff_key "$issue_number" "$repo_slug") || return 1
+	state=$(_ff_load) || return 1
+	now=$(date +%s) || return 1
+	updated_state=$(printf '%s' "$state" | jq -e --arg k "$key" --argjson now "$now" '
+		select(.[$k].enrichment_needed == true)
+		| select((.[$k].enrichment_attempts // 0) < 3)
+		| select((.[$k].enrichment_retry_after // 0) <= $now)
+		| .[$k].enrichment_attempts = ((.[$k].enrichment_attempts // 0) + 1)
+		| .[$k].enrichment_retry_after = ($now + 3600)
+		| .[$k].enrichment_needed = (.[$k].enrichment_attempts < 3)
+	') || return 1
+	_ff_save "$updated_state" || return 1
+	return 0
+}
+
 # Mark enrichment as done in the fast-fail state (called under lock).
 _ff_mark_enrichment_done() {
 	local issue_number="$1"
@@ -983,7 +1011,11 @@ _ff_mark_enrichment_done() {
 	local updated_state
 	updated_state=$(printf '%s' "$state" | jq \
 		--arg k "$key" \
-		'if .[$k] then .[$k].enrichment_needed = false | .[$k].enrichment_done = true else . end' \
+		--arg legacy_key "${issue_number}:${repo_slug}" \
+		'reduce [$k, $legacy_key][] as $entry (. ;
+			if .[$entry] then
+				.[$entry].enrichment_needed = false | .[$entry].enrichment_done = true
+			else . end)' \
 		2>/dev/null) || return 0
 
 	_ff_save "$updated_state"

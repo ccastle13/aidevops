@@ -90,6 +90,9 @@ readonly LAUNCHD_DIR="$HOME/Library/LaunchAgents"
 readonly LAUNCHD_PLIST="${LAUNCHD_DIR}/${LAUNCHD_LABEL}.plist"
 readonly SYSTEMD_SERVICE_DIR="$HOME/.config/systemd/user"
 readonly SYSTEMD_UNIT_NAME="aidevops-auto-update"
+# Floor for the oneshot unit's TimeoutStartSec (GH#37991): a version update
+# (setup.sh ~80-110s) plus freshness checks must fit even at short intervals.
+readonly SYSTEMD_MIN_TIMEOUT_SEC=600
 
 #######################################
 # Logging
@@ -516,8 +519,14 @@ update_state() {
 # shellcheck disable=SC1091  # sub-library resolved at runtime via $SCRIPT_DIR
 source "${SCRIPT_DIR}/auto-update-freshness-lib.sh"
 
+# Update verification and rollback act on the global activation link, never on
+# the caller's runtime pin. pulse-wrapper.sh exports AIDEVOPS_AGENTS_DIR pinned
+# to its own physical bundle and routine r902 runs this updater as a Pulse
+# child, so resolving the pin after setup re-read the replaced bundle and rolled
+# back every verified Pulse-run update. Same rule as setup's
+# pin_aidevops_active_runtime_bundle_root (setup/modules/agent-runtime.sh).
 _auto_update_runtime_bundle_root() {
-	local agents_path="${AIDEVOPS_AGENTS_DIR:-${HOME}/.aidevops/agents}"
+	local agents_path="${HOME}/.aidevops/agents"
 	[[ -d "$agents_path" ]] || return 1
 	(cd "$agents_path" && pwd -P) || return 1
 	return 0
@@ -568,6 +577,58 @@ _run_setup_ai_session_with_fallback() {
 	log_warn "AI-session incremental setup failed or is unavailable; retrying full setup"
 	bash "$setup_script" --non-interactive >>"$LOG_FILE" 2>&1
 	return $?
+}
+
+#######################################
+# Return 0 when a same-version script-drift redeploy should wait because the
+# last successful deploy (the deployed-sha stamp mtime) is inside the batching
+# window. AIDEVOPS_SCRIPT_DRIFT_MIN_INTERVAL_SECONDS=0 disables batching.
+# Args: $1 = deployed-sha stamp file
+#######################################
+_script_drift_redeploy_debounced() {
+	local stamp_file="$1"
+	local min_interval="${AIDEVOPS_SCRIPT_DRIFT_MIN_INTERVAL_SECONDS:-3600}"
+	local stamp_epoch="" now_epoch="" age=0
+	[[ "$min_interval" =~ ^[0-9]+$ ]] || min_interval=3600
+	[[ "$min_interval" -gt 0 ]] || return 1
+	declare -F _file_mtime_epoch >/dev/null 2>&1 || return 1
+	stamp_epoch=$(_file_mtime_epoch "$stamp_file" 2>/dev/null) || return 1
+	[[ "$stamp_epoch" =~ ^[0-9]+$ && "$stamp_epoch" -gt 0 ]] || return 1
+	now_epoch=$(date +%s)
+	age=$((now_epoch - stamp_epoch))
+	# A future-dated stamp is not evidence of a recent deploy.
+	[[ "$age" -ge 0 && "$age" -lt "$min_interval" ]] || return 1
+	log_info "Script drift redeploy batched: last deploy ${age}s ago (< ${min_interval}s window)"
+	return 0
+}
+
+# Deploy-affecting paths compared for same-version drift (GH#35471).
+_DEPLOY_DRIFT_PATHS=(
+	.agents/scripts/ .agents/agents/ .agents/workflows/ .agents/prompts/ .agents/hooks/
+	.agents/plugins/ .agents/configs/ setup.sh .agents/scripts/setup/modules/ aidevops.sh
+)
+
+#######################################
+# True when every deploy-affecting path changed by a diverged deployed commit
+# (relative to its merge-base with HEAD) has identical content at HEAD, i.e.
+# the hotfix landed (e.g. squash-merged) in canonical main.
+# Args: $1 = deployed sha, $2 = canonical head sha
+# Returns: 0 if contained, 1 otherwise (including on any git failure)
+#######################################
+_deployed_changes_contained_in_head() {
+	local deployed_sha="$1"
+	local head_sha="$2"
+	local base changed path dep_obj head_obj
+	base=$(git -C "$INSTALL_DIR" merge-base "$deployed_sha" "$head_sha" 2>/dev/null) || return 1
+	[[ -n "$base" ]] || return 1
+	changed=$(git -C "$INSTALL_DIR" diff --name-only "$base" "$deployed_sha" -- "${_DEPLOY_DRIFT_PATHS[@]}" 2>/dev/null) || return 1
+	while IFS= read -r path; do
+		[[ -n "$path" ]] || continue
+		dep_obj=$(git -C "$INSTALL_DIR" rev-parse -q --verify "${deployed_sha}:${path}" 2>/dev/null || echo "missing")
+		head_obj=$(git -C "$INSTALL_DIR" rev-parse -q --verify "${head_sha}:${path}" 2>/dev/null || echo "missing")
+		[[ "$dep_obj" == "$head_obj" ]] || return 1
+	done <<<"$changed"
+	return 0
 }
 
 #######################################
@@ -624,22 +685,39 @@ _cmd_check_stale_agent_redeploy() {
 				log_info "Preserving deployed runtime ${deployed_sha:0:7}; it includes canonical HEAD ${head_sha:0:7}"
 				return 0
 			fi
+			local has_diverged_contained=0
 			# Diverged history is also not safe for unattended replacement. Normal
 			# stale deployments remain eligible when deployed_sha is an ancestor of
 			# head_sha, preserving the t2706 same-version repair path.
 			if ! git -C "$INSTALL_DIR" merge-base --is-ancestor "$deployed_sha" "$head_sha" 2>/dev/null; then
-				log_warn "Skipping script-drift redeploy: deployed runtime ${deployed_sha:0:7} diverges from canonical HEAD ${head_sha:0:7}"
-				return 0
+				# A worktree hotfix later squash-merged is not an ancestor of main,
+				# but its content is. Redeploy when every deploy-affecting path the
+				# hotfix changed is identical at canonical HEAD (GH#35471).
+				if ! _deployed_changes_contained_in_head "$deployed_sha" "$head_sha"; then
+					log_warn "Skipping script-drift redeploy: deployed runtime ${deployed_sha:0:7} diverges from canonical HEAD ${head_sha:0:7}"
+					return 0
+				fi
+				log_info "Deployed runtime ${deployed_sha:0:7} changes are contained in canonical HEAD ${head_sha:0:7}; treating as stale"
+				has_diverged_contained=1
 			fi
-			local has_code_drift=0
+			local has_code_drift="$has_diverged_contained"
 			# Per Gemini code-review on PR #20342: use git's path filter +
 			# `grep -q .` to detect drift across the full set of deploy-affecting
 			# paths (not just .agents/ subdirs — also setup.sh, .agents/scripts/setup/modules/,
 			# and aidevops.sh itself, which are deployed/sourced by setup).
-			if git -C "$INSTALL_DIR" diff --name-only "$deployed_sha" "$head_sha" -- \
-				.agents/scripts/ .agents/agents/ .agents/workflows/ .agents/prompts/ .agents/hooks/ \
-				setup.sh .agents/scripts/setup/modules/ aidevops.sh 2>/dev/null | grep -q .; then
+			local drift_files
+			drift_files=$(git -C "$INSTALL_DIR" diff --name-only "$deployed_sha" "$head_sha" -- \
+				"${_DEPLOY_DRIFT_PATHS[@]}" 2>/dev/null) || drift_files=""
+			if [[ -n "$drift_files" ]]; then
 				has_code_drift=1
+			fi
+			# Same-version drift redeploys restart the Pulse and discard its
+			# in-flight cycle. On busy days main moves every 20-40 minutes, so an
+			# undebounced redeploy kept every runner's Pulse from ever finishing a
+			# dispatch cycle. Releases (VERSION change, handled above) stay
+			# immediate; same-version drift is batched to one redeploy per window.
+			if [[ "$has_code_drift" -eq 1 ]] && _script_drift_redeploy_debounced "$stamp_file"; then
+				has_code_drift=0
 			fi
 			if [[ "$has_code_drift" -eq 1 ]]; then
 				log_warn "Script drift detected (${deployed_sha:0:7}→${head_sha:0:7} at v$current) — re-deploying agents..."
@@ -662,18 +740,32 @@ _cmd_check_stale_agent_redeploy() {
 #######################################
 _cmd_check_git_update() {
 	local remote="$1"
-
-	# Fetch before evaluating local blockers. A same-version release can still
-	# contain merged script fixes, so VERSION equality is not freshness proof.
-	if ! git -C "$INSTALL_DIR" fetch origin main --quiet 2>>"$LOG_FILE"; then
-		log_error "git fetch failed"
-		update_state "update" "$remote" "fetch_failed"
-		return 1
-	fi
+	local recovery_helper="${AIDEVOPS_CANONICAL_RECOVERY_HELPER:-${SCRIPT_DIR}/canonical-recovery-helper.sh}"
+	local fetch_failure_status="fetch_failed"
 	local local_hash=""
 	local remote_hash=""
+	local remote_tip=""
+
+	# The updater runs against a canonical checkout. Only the recovery helper may
+	# mutate it; that boundary pins aidevops identity, audits authorization, locks
+	# the operation, and verifies the updated worktree.
+	[[ -x "$recovery_helper" ]] || {
+		log_error "Audited canonical maintenance helper is unavailable"
+		update_state "update" "$remote" "$fetch_failure_status"
+		return 1
+	}
 	local_hash=$(git -C "$INSTALL_DIR" rev-parse HEAD 2>>"$LOG_FILE") || return 1
-	remote_hash=$(git -C "$INSTALL_DIR" rev-parse origin/main 2>>"$LOG_FILE") || return 1
+	remote_tip=$(git -C "$INSTALL_DIR" ls-remote origin refs/heads/main 2>>"$LOG_FILE") || {
+		log_error "Unable to inspect origin/main before audited maintenance"
+		update_state "update" "$remote" "$fetch_failure_status"
+		return 1
+	}
+	remote_hash="${remote_tip%%[[:space:]]*}"
+	[[ -n "$remote_hash" ]] || {
+		log_error "origin/main tip could not be resolved"
+		update_state "update" "$remote" "$fetch_failure_status"
+		return 1
+	}
 	# The install checkout may contain deliberate local fixes or diagnostics.
 	# Preserve them and record that they are blocking activation of upstream.
 	if ! git -C "$INSTALL_DIR" diff --quiet 2>/dev/null || ! git -C "$INSTALL_DIR" diff --cached --quiet 2>/dev/null; then
@@ -693,29 +785,16 @@ _cmd_check_git_update() {
 		update_state "update" "$remote" "runtime_stale_branch"
 		return 1
 	fi
-	if [[ "$local_hash" == "$remote_hash" ]]; then
-		return 0
-	fi
-
-	if git -C "$INSTALL_DIR" merge-base --is-ancestor "$remote_hash" "$local_hash" 2>/dev/null; then
-		log_error "Local commits exist on main; refusing unattended update"
-		update_state "update" "$remote" "runtime_stale_local_commits"
-		return 1
-	fi
-	if ! git -C "$INSTALL_DIR" merge-base --is-ancestor "$local_hash" "$remote_hash" 2>/dev/null; then
-		log_error "Canonical main has diverged from origin/main; refusing unattended update"
-		update_state "update" "$remote" "runtime_stale_diverged"
-		return 1
-	fi
-
-	if ! git -C "$INSTALL_DIR" merge --ff-only "$remote_hash" --quiet 2>>"$LOG_FILE"; then
-		log_error "git merge --ff-only failed; preserving local history"
+	if ! bash "$recovery_helper" fast-forward-current --repo "$INSTALL_DIR" --branch main \
+		--reason aidevops-update --confirm FAST_FORWARD_CANONICAL_BRANCH >>"$LOG_FILE" 2>&1; then
+		log_error "Audited canonical fast-forward failed; preserving local history"
 		update_state "update" "$remote" "pull_failed"
 		return 1
 	fi
 	local_hash=$(git -C "$INSTALL_DIR" rev-parse HEAD 2>>"$LOG_FILE") || return 1
+	remote_hash=$(git -C "$INSTALL_DIR" rev-parse origin/main 2>>"$LOG_FILE") || return 1
 	if [[ "$local_hash" != "$remote_hash" ]]; then
-		log_error "Updated HEAD does not match fetched origin/main; refusing to run setup"
+		log_error "Audited update HEAD does not match origin/main; refusing to run setup"
 		update_state "update" "$remote" "history_mismatch"
 		return 1
 	fi
@@ -970,33 +1049,38 @@ _cmd_enable_launchd() {
 # Returns: 0 on success, falls back to cron on failure
 # Modelled on worker-watchdog.sh:_install_systemd() (GH#17691)
 #######################################
-_cmd_enable_systemd() {
+_render_auto_update_systemd_units() {
 	local script_path="$1"
 	local interval="$2"
-	local service_file="${SYSTEMD_SERVICE_DIR}/${SYSTEMD_UNIT_NAME}.service"
-	local timer_file="${SYSTEMD_SERVICE_DIR}/${SYSTEMD_UNIT_NAME}.timer"
 	local interval_sec
 	interval_sec=$((interval * 60))
-
-	mkdir -p "${SYSTEMD_SERVICE_DIR}"
+	# TimeoutStartSec = one interval, floored at SYSTEMD_MIN_TIMEOUT_SEC: a version
+	# update (setup.sh ~80-110s) or the daily skill re-import routinely exceeded
+	# the former 120s and was killed. A oneshot unit never overlaps itself, so a
+	# timeout above the interval only delays the next tick.
+	local timeout_sec="$interval_sec"
+	if [[ "$timeout_sec" -lt "$SYSTEMD_MIN_TIMEOUT_SEC" ]]; then
+		timeout_sec="$SYSTEMD_MIN_TIMEOUT_SEC"
+	fi
 
 	# shellcheck disable=SC1078,SC1079  # multi-line printf with single quotes inside a double-quoted string; \"${script_path}\" expands to "path" in the service file, preserving space-safe quoting
-	printf '%s' "[Unit]
+	AUTO_UPDATE_SERVICE_CONTENT="[Unit]
 Description=aidevops auto-update
 After=network.target
 
 [Service]
 Type=oneshot
 KillMode=control-group
-ExecStart=/bin/bash -lc '\"${script_path}\" check'
-TimeoutStartSec=120
+ExecStart=/usr/bin/env bash -lc '\"${script_path}\" check'
+$(aidevops_systemd_path_env)
+TimeoutStartSec=${timeout_sec}
 Nice=10
 IOSchedulingClass=idle
 StandardOutput=append:${LOG_FILE}
 StandardError=append:${LOG_FILE}
-" >"$service_file"
+"
 
-	printf '%s' "[Unit]
+	AUTO_UPDATE_TIMER_CONTENT="[Unit]
 Description=aidevops auto-update Timer
 
 [Timer]
@@ -1006,9 +1090,62 @@ Persistent=true
 
 [Install]
 WantedBy=timers.target
-" >"$timer_file"
+"
+	return 0
+}
 
-	systemctl --user daemon-reload 2>/dev/null || true
+_refresh_auto_update_systemd_units() {
+	local script_path="$1" interval="$2"
+	local force_reload="${3:-0}"
+	local AUTO_UPDATE_SERVICE_CONTENT="" AUTO_UPDATE_TIMER_CONTENT=""
+	local pending_reload="${SYSTEMD_SERVICE_DIR}/${SYSTEMD_UNIT_NAME}.reload-pending"
+	local unit content target temp changed=0
+	_render_auto_update_systemd_units "$script_path" "$interval"
+	mkdir -p "$SYSTEMD_SERVICE_DIR" || return 1
+	for unit in service timer; do
+		target="${SYSTEMD_SERVICE_DIR}/${SYSTEMD_UNIT_NAME}.${unit}"
+		if [[ "$unit" == service ]]; then
+			content="$AUTO_UPDATE_SERVICE_CONTENT"
+		else
+			content="$AUTO_UPDATE_TIMER_CONTENT"
+		fi
+		if [[ -f "$target" ]] && printf '%s' "$content" | cmp -s - "$target"; then
+			continue
+		fi
+		# Persist before replacement so partial writes also trigger a later reload.
+		touch "$pending_reload" || return 1
+		temp=$(mktemp "${target}.tmp.XXXXXX") || return 1
+		if ! printf '%s' "$content" >"$temp" || ! chmod 644 "$temp" || ! mv -f "$temp" "$target"; then
+			rm -f "$temp"
+			return 1
+		fi
+		log_info "Updated systemd unit ${SYSTEMD_UNIT_NAME}.${unit}"
+		changed=1
+	done
+	if [[ "$changed" -eq 1 || "$force_reload" -eq 1 || -f "$pending_reload" ]]; then
+		touch "$pending_reload" || return 1
+		# Status 2 distinguishes manager failure from unit-file errors for fallback.
+		systemctl --user daemon-reload || return 2
+		rm -f "$pending_reload" || return 1
+	fi
+	return 0
+}
+
+_cmd_enable_systemd() {
+	local script_path="$1"
+	local interval="$2"
+	local service_file="${SYSTEMD_SERVICE_DIR}/${SYSTEMD_UNIT_NAME}.service"
+	local timer_file="${SYSTEMD_SERVICE_DIR}/${SYSTEMD_UNIT_NAME}.timer"
+	local refresh_status=0
+	_refresh_auto_update_systemd_units "$script_path" "$interval" 1 || refresh_status=$?
+	if [[ "$refresh_status" -eq 2 ]]; then
+		print_error "Failed to reload systemd user manager — falling back to cron" >&2
+		_cmd_enable_cron "$script_path" "$interval"
+		return $?
+	elif [[ "$refresh_status" -ne 0 ]]; then
+		return 1
+	fi
+
 	if ! systemctl --user enable --now "${SYSTEMD_UNIT_NAME}.timer" 2>/dev/null; then
 		print_error "Failed to enable systemd timer — falling back to cron" >&2
 		_cmd_enable_cron "$script_path" "$interval"
@@ -1148,9 +1285,14 @@ cmd_enable() {
 	# release so the daemon self-heals — but the existing user state must
 	# survive (custom intervals, env vars). "Loaded but stalled" is also a
 	# no-op here; the caller follows up with `health-check` to surface it.
+	local loaded=0 backend
 	if [[ "$idempotent" -eq 1 ]] && _daemon_is_loaded; then
-		log_info "auto-update daemon already loaded (idempotent enable — no-op)"
-		return 0
+		backend="$(_resolve_status_backend "$(_get_scheduler_backend)")"
+		if [[ "$backend" != "systemd" ]]; then
+			log_info "auto-update daemon already loaded (idempotent enable — no-op)"
+			return 0
+		fi
+		loaded=1
 	fi
 
 	# Read from JSONC config (handles env var > user config > defaults priority)
@@ -1173,8 +1315,11 @@ cmd_enable() {
 		fi
 	fi
 
-	local backend
 	backend="$(_get_scheduler_backend)"
+	if [[ "$loaded" -eq 1 ]]; then
+		_refresh_auto_update_systemd_units "$script_path" "$interval"
+		return $?
+	fi
 
 	if [[ "$backend" == "launchd" ]]; then
 		_cmd_enable_launchd "$script_path" "$interval"
@@ -1323,8 +1468,11 @@ _cmd_status_scheduler() {
 		if ! command -v systemctl &>/dev/null; then
 			echo -e "  Scheduler: systemd (not available on this host)"
 		else
-			local enabled_state
-			enabled_state=$(systemctl --user is-enabled "${SYSTEMD_UNIT_NAME}.timer" 2>/dev/null || echo "unknown")
+			local enabled_state active_state
+			enabled_state=$(systemctl --user is-enabled "${SYSTEMD_UNIT_NAME}.timer" 2>/dev/null || true)
+			enabled_state=${enabled_state:-unknown}
+			active_state=$(systemctl --user is-active "${SYSTEMD_UNIT_NAME}.timer" 2>/dev/null || true)
+			active_state=${active_state:-unknown}
 			local timer_props next_elapse last_trigger
 			# Request all NextElapse variants: NextElapse (pre-255) and
 			# NextElapseUSecRealtime/NextElapseUSecMonotonic (systemd 255+)
@@ -1345,6 +1493,7 @@ _cmd_status_scheduler() {
 			else
 				echo -e "  Status:    ${YELLOW}${enabled_state}${NC}"
 			fi
+			echo "  Active:    $active_state"
 			echo "  Unit:      ${SYSTEMD_UNIT_NAME}.timer"
 			if [[ -n "$next_elapse" ]] && [[ "$next_elapse" != "0" ]]; then
 				echo "  Next fire: $next_elapse"
@@ -1438,6 +1587,34 @@ _cmd_status_state() {
 }
 
 #######################################
+# Resolve the scheduler backend for status output (GH#37751).
+# platform-detect.sh falls back to "cron" when `systemctl --user status`
+# exits non-zero (degraded user manager, minimal env), even though enable
+# installed a working systemd user timer. If the detected backend is cron
+# but the timer unit is installed, report systemd instead.
+# Args: $1 = detected backend
+# Returns: backend name on stdout
+#######################################
+_resolve_status_backend() {
+	local backend="$1"
+
+	if [[ "$backend" != "systemd" && "$backend" != "launchd" && ( -z "${AIDEVOPS_SCHEDULER:-}" || "${AIDEVOPS_SCHEDULER:-}" == "${AIDEVOPS_SCHEDULER_DETECTED:-}" ) ]] && command -v systemctl &>/dev/null; then
+		local timer_state
+		timer_state=$(systemctl --user is-enabled "${SYSTEMD_UNIT_NAME}.timer" 2>/dev/null || true)
+		case "$timer_state" in
+		enabled | enabled-runtime) backend="systemd" ;;
+		*)
+			if systemctl --user is-active --quiet "${SYSTEMD_UNIT_NAME}.timer" 2>/dev/null; then
+				backend="systemd"
+			fi
+			;;
+		esac
+	fi
+	echo "$backend"
+	return 0
+}
+
+#######################################
 # Show status (platform-aware)
 #######################################
 cmd_status() {
@@ -1447,7 +1624,7 @@ cmd_status() {
 	current=$(get_local_version)
 
 	local backend
-	backend="$(_get_scheduler_backend)"
+	backend="$(_resolve_status_backend "$(_get_scheduler_backend)")"
 
 	echo ""
 	echo -e "${BOLD:-}Auto-Update Status${NC}"
@@ -1493,7 +1670,7 @@ cmd_status() {
 #######################################
 _daemon_is_loaded() {
 	local backend
-	backend="$(_get_scheduler_backend)"
+	backend="$(_resolve_status_backend "$(_get_scheduler_backend)")"
 
 	if [[ "$backend" == "launchd" ]]; then
 		_launchd_is_loaded
@@ -1720,7 +1897,7 @@ HOW IT WORKS:
        a. Reads last_tool_check from state file
        b. If >6h since last check AND user idle >6h, runs tool-version-check.sh --update --quiet
        c. Covers all installed tools: npm (OpenCode, MCP servers, etc.),
-          brew (gh, glab, shellcheck, jq, etc.), pip (DSPy, crawl4ai, etc.)
+           brew (gh, glab, shellcheck, jq, etc.), pip (Analytics MCP, etc.)
        d. Idle detection: macOS IOKit HIDIdleTime, Linux xprintidle/dbus/w(1),
           headless servers treated as always idle
        e. Opt-out: AIDEVOPS_TOOL_AUTO_UPDATE=false

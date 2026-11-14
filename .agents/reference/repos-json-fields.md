@@ -11,14 +11,32 @@ Config file: `~/.config/aidevops/repos.json`. Structure: `{"initialized_repos": 
 | `slug` | string | `owner/repo` — ALWAYS use this for `gh` commands, never guess org names |
 | `pulse` | bool | `true` = active development, tasks, issues. `false` = no task management |
 | `maintenance` | bool | Missing/`true` = include in recurring cross-repo maintenance. `false` = keep registered but omit from routine API scans, workflow/badge rollout, and Pulse. |
+| `actions` | string | Missing/`"available"` = normal remote CI. `"unavailable"` = run configured local checks from the start; full-loop requires trusted exact-head local evidence instead of polling Actions. |
+| `actions_reason` | string | Optional operator explanation for unavailable Actions, for example billing or spending blocked. Not a classifier or authority grant. |
 | `local_only` | bool | No remote; skip all `gh` operations |
+| `badges` | bool | Missing/`true` = README badge block managed by `aidevops badges`. `false` = README is hand-maintained; `badges check` reports `OPTED-OUT` and `badges sync` never writes. Repos with a string `mirror_upstream` (`owner/repo`) are always treated as opted out (`MIRROR`); boolean `mirror_upstream` is a privacy marker only. |
 | `priority` | string | `"tooling"` (infrastructure), `"product"` (user-facing), `"profile"` (docs-only) |
 | `maintainer` | string | GitHub username. Auto-detected from `gh api user`; falls back to slug owner |
+| `macos_maintainer` | string | Optional GitHub login for native macOS verification; overrides `maintainer` for `needs-macos-verification` review/assignment routing. |
 | `role` | string | `"maintainer"` or `"contributor"`. Controls which pulse scanners run |
 | `init_scope` | string | `"minimal"`, `"standard"` (default), or `"public"`. Controls `aidevops init` scaffolding |
 | `has_interface` | bool | Explicit GUI/interface flag. `true` forces DESIGN.md scaffolding/backfill; `false` suppresses heuristic interface detection. |
 | `agent_source` | bool | `true` = repo is a managed private agent source pack; `aidevops init` seeds core-style agent structure and `aidevops update` refreshes framework-owned organization templates |
 | `features` | array | Enabled registration capabilities. `"code-quality"` activates lint policy migration and repo-verify hook rollout unless `.aidevops.json` explicitly opts out. |
+
+### GitHub Actions availability
+
+Set `aidevops repos actions off owner/repo "billing blocked"` to record
+unavailability, or `aidevops repos actions on owner/repo` to restore the default
+(removes both fields). Omit the repository to select the registered current
+checkout, including linked worktrees. This changes neither maintenance nor Pulse.
+
+The field is explicit operator configuration, never inferred or automatically
+set from check failures. Unknown values, missing registrations and ambiguous
+duplicate slugs do not activate the exception. See
+[CI gate policy](ci-gate-policy.md#github-actions-unavailable) for the trusted
+local-verification receipt. Native branch protection remains enforced: this
+capability does not grant an admin bypass or make a required failed check green.
 
 ### `role` detail
 
@@ -38,7 +56,7 @@ always preserved.
 - `standard`: adds DESIGN.md, MODELS.md, collaborator pointers, README.md
 - `public`: adds LICENCE, CHANGELOG.md, CONTRIBUTING.md, SECURITY.md, CODE_OF_CONDUCT.md
 
-Auto-inferred when absent: `local_only`/no-remote → `minimal`; others → `standard`. Stored in `.aidevops.json` per project. Preserved on re-registration.
+Auto-inferred when absent: `local_only`/no-remote → `minimal`; a GitHub remote reporting `PUBLIC` via `gh repo view` → `public`; private or unknown visibility → `standard`. An explicit scope on the canonical main-worktree entry in `repos.json` also applies in linked worktrees. Stored in `.aidevops.json` per project. Preserved on re-registration.
 
 Repository-native verification policy lives in `.aidevops.json.features.code_quality`
 and `.aidevops.json.verify`. `aidevops lint audit` reports registration/config
@@ -48,6 +66,18 @@ configuration on canonical `main`/`master`; tracked changes require a linked-wor
 ### `has_interface` detail
 
 `aidevops init` records this field in `.aidevops.json` and mirrors it into `repos.json` during registration. When absent, design helpers infer it from UI markers such as Next/Vite/Nuxt/Astro/Svelte config, React/Vue/Svelte entry files, view templates, frontend/client/web directories, or UI dependencies. Minimal-scope repos with `has_interface: true` still receive a root `DESIGN.md`; standard/public scopes continue to seed it by default.
+
+### `keywords` object
+
+Search-targets standard (`seo/keywords-standard.md`). `aidevops init` scaffolds `context/keywords.md` for standard/public scopes; minimal scope only when `.aidevops.json` sets `"keywords": {"enabled": true}`.
+
+| Key | Where | Description |
+|-----|-------|-------------|
+| `data` | `.aidevops.json` or `repos.json` | `tracked` (commit registry) or `ignored` (gitignore it; share via the private hub). Absent → public scope or public GitHub repo resolves to `ignored`, otherwise `tracked`. |
+| `enabled` | `.aidevops.json` | `true` opts a minimal-scope repo into scaffolding. |
+| `budget_usd_month` | `repos.json` | Per-repo paid-provider cap; overrides config `keywords.monthly_budget_usd` (default 1). An explicit front matter `budget_usd_month` in `context/keywords.md` (shared team cap) wins over both. |
+
+The hub slug is global local config (`keywords.hub_slug`), never a repo field, so private hub names stay out of repositories.
 
 ### `agent_source` detail
 
@@ -61,6 +91,50 @@ Agent-source repos receive non-destructive template management:
 - Public TODO entries, issue text, logs, and comments must not include private repo slugs; use generic wording such as "a managed private agent source repo".
 
 ## Scheduling and Lifecycle Fields
+
+### `post_sync`: opt-in canonical maintenance
+
+Only a maintainer may manually declare `post_sync` in the local
+`~/.config/aidevops/repos.json` entry with explicit `"role": "maintainer"`.
+Workers must never add, edit, or execute these declarations. The registry must
+be owned by the current user, not group/world-writable, not a symlink, and outside
+the target repository. Project config and `AIDEVOPS_REPOS_CONFIG` overrides are
+not sources of post-sync authority. Local filesystem ownership is the trust
+boundary; this is not a sandbox against arbitrary programs running as that user.
+
+```json
+{
+  "post_sync": [{
+    "when_changed": "packages/db/migrations/meta/_journal.json",
+    "run": ["pnpm", "with-env", "pnpm", "-F", "@workspace/db", "db:migrate"],
+    "timeout_seconds": 60
+  }]
+}
+```
+
+The audited recovery helper executes each matching declaration once after a
+successful `fast-forward-current` or `sync-mirror` update, while holding its
+existing canonical lock. It compares the old and new commit trees, including
+deletions and both sides of renames. `when_changed` is a literal relative file
+or directory path (no glob/pathspec syntax or traversal). An unchanged commit,
+unborn checkout, undeclared repo, or worker/headless invocation runs no command.
+Merge output forwards the `POST_SYNC outcome=...` records before reporting
+`CANONICAL_SYNCED`; there is no second merge-layer hook execution.
+
+`run` must be a nonempty argv array, never a shell string. Commands run from the
+canonical checkout with closed stdin and suppressed output (to avoid credential
+leaks). They inherit the maintainer environment. Review the command and its
+project dependencies before enabling it; use idempotent, non-destructive commands.
+The default timeout is 60 seconds, allowed range 1–300; a whole invocation is
+limited to 300 seconds and 16 declarations. Timeout kills the command's process
+group. Detached/daemonizing commands are not supported.
+
+Failure, timeout, or invalid config warns without rolling back the successful
+sync. Outcomes and exit codes are recorded in a private
+`~/.aidevops/logs/canonical-post-sync.jsonl` ledger; argv/output are never logged.
+Failure is not retried on an unchanged checkout: resolve it through a separate
+maintainer-authorized operation. This feature grants no migration authority to
+workers.
 
 Registration, maintenance, and Pulse are separate scopes:
 
@@ -80,15 +154,51 @@ Registration, maintenance, and Pulse are separate scopes:
 Manage the state without hand-editing JSON:
 
 ```bash
-aidevops repos maintenance off owner/repo
-aidevops repos maintenance on owner/repo
+aidevops repos maintenance off owner/repo   # also sets pulse: false
+aidevops repos maintenance on owner/repo    # Pulse stays as it is
+aidevops repos pulse on owner/repo          # refused while maintenance is paused
+aidevops repos pulse off owner/repo
 ```
+
+### Sync-only registration
+
+Use `aidevops repos add <path> --sync-only` to register a third-party upstream
+without opting into automation. Omit `<path>` for the current checkout. This
+writes `pulse: false` and `maintenance: false` atomically with registration,
+including when updating an existing entry, and preserves an existing `role` or
+the normally detected role. Plain `repos add` keeps its existing defaults;
+re-registering without the flag does not resume paused maintenance or Pulse.
+
+Sync-only registration retains canonical path resolution for
+`canonical-recovery-helper.sh fast-forward-current` and explicit
+`worktree-helper.sh remove` (with the registered explicit-remove support from
+child B of #36561). Their normal cleanliness, ownership, preservation and
+permission guards still apply. It disables Pulse task/issue automation,
+recurring scanners, and workflow/badge rollout; it does not disable the
+registration-scoped safety hygiene described above or explicitly requested
+one-repository operations.
+
+The flag does not scaffold `.aidevops.json` or bypass bootstrap verification.
+For a config-free canonical checkout, use the existing confirmed bootstrap form:
+
+```bash
+aidevops repos add <path> --sync-only --slug OWNER/REPO --confirm REGISTER_CANONICAL_REPOSITORY
+```
+
+Repository layout migration treats every explicit `initialized_repos[].path` as
+authoritative. `aidevops repos migrate-layout plan` reports such entries as
+excluded unless `--include-registered-paths` is supplied. That flag approves
+only exact old-to-new paths embedded in the hashed plan. Apply atomically updates
+those exact entries while preserving every unrelated field; rollback restores
+the receipt-owned before-state only when no later config drift is present.
 
 | Field | Type | Example | Description |
 |-------|------|---------|-------------|
 | `pulse_hours` | object or array | `{"start": 17, "end": 5}` or `[17, 5]` | Limits dispatch to window (24h local time). Overnight supported. Omit for 24/7. Array form is accepted for compatibility; object form is preferred for readability. |
 | `pulse_interval` | integer | `600` | Minimum seconds between dispatch polls for this repo. Default: omit (poll every cycle). Min: 60. Useful for contributor-role repos with low activity — e.g. 600 polls every 5 cycles instead of every cycle, reducing GraphQL budget consumption ~5×. State: `~/.aidevops/logs/pulse-last-per-repo.json`. |
 | `pulse_expires` | string | `"2026-05-01"` | Past this date, pulse auto-sets `pulse: false`. Useful for temporary windows. |
+| `github_auth` | object | `{"pulse":{"read":{"provider":"github-app","profile":"team-agent-operator","installation_id":"987654"},"write":{"provider":"inherit"}}}` | Explicit per-consumer read/write identities. This stage supports App reads and inherited writes only. Manage with `aidevops github auth`; see [setup and migration](github-auth.md). |
+| `pulse_auth` | object | Legacy flat App binding | Compatibility input only. Stop old Pulse processes and run `aidevops github auth migrate --confirm-stopped`; simultaneous old/new Pulse bindings are rejected. |
 | `dependabot_alert_monitor` | bool | `true` | For `pulse: true` maintainer repos, pulse checks open GitHub Dependabot alerts and creates grouped, neutral, worker-ready remediation issues. Set `false` to opt out for repos that handle dependency alerts elsewhere. |
 
 ## PR Throughput Preferences
@@ -98,7 +208,15 @@ aidevops repos maintenance on owner/repo
 | `pr_base_branch` | string | GitHub default branch | Branch workers should target when creating or recovering PRs. Use for repos whose integration branch differs from the GitHub default branch, e.g. `"develop"`. Aliases accepted by orphan recovery: `pr_target_branch`, `base_branch`, `default_branch`. |
 | `interactive_pr_auto_merge` | bool | unset → global config/default | Per-repo preference for `origin:interactive` PR merge throughput. `true` allows pulse to merge maintainer-authored interactive PRs after normal gates pass and the PR is ready/non-draft. `false` keeps this repo manual even if global config is true. PR-specific `allow-auto-merge` still opts in one PR; `hold-for-review` or draft state still blocks. |
 
+| `dispatch_open_pr_threshold` | integer | unset → `PULSE_DISPATCH_GUARDRAIL_OPEN_PR_THRESHOLD` → `12` | Repository PR backlog guardrail. When this many open PRs are ready worker merge backlog, pulse suppresses ordinary dispatch for the repo (review/CI/conflict repair candidates stay exempt). Only non-draft PRs labelled `origin:worker`/`origin:worker-takeover` without `hold-for-review`/`needs-maintainer-review` count; interactive PRs and drafts never block dispatch. `0` disables the guardrail for this repo. Logs report `open_prs_total` and `open_prs_counted`. |
+
 Global equivalent: `orchestration.interactive_pr_auto_merge` in `~/.config/aidevops/config.jsonc`. Env override for the current pulse/session: `AIDEVOPS_INTERACTIVE_PR_AUTO_MERGE`.
+
+### Dispatch footprint overlap
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `footprint_low_info_paths` | array of basenames | unset | Extra file basenames (case-insensitive) that never serialise dispatch when they are the only files two briefs share, e.g. `["README.md"]` for repos whose briefs append rows to a README table. Adds to the built-in list (`VERSION`, `CHANGELOG.md`, `CHANGES.md`, `HISTORY.md`, WordPress `changelog.txt`/`readme.txt`, …); a shared implementation file still blocks. Global override of the built-in list: `AIDEVOPS_FOOTPRINT_LOW_INFO_BASENAMES`. Consumed by `dispatch-dedup-footprint.sh`. Footprint entries containing `*` (glob patterns such as `data/log/*/*/*.jsonl` declared for uniquely named new files) never overlap, so template-generated batch issues need no per-runner setting for them. |
 
 ## Workflow Runner Configuration
 
@@ -126,7 +244,10 @@ explicit values. Package slugs and paths remain local to `repos.json`.
 | `manifest` | `CloudronManifest.json` | Manifest path relative to the registered repository root. Absolute paths and `..` are rejected by monitors. |
 | `release_workflow` | `.github/workflows/cloudron-package-release.yml` | Thin tag-triggered caller scaffolded by `aidevops init`; existing files are never overwritten. |
 | `upstream_slug` | unset | Upstream GitHub `owner/repo` used for stable-release comparison. Monitoring stays disabled until this is explicitly configured. |
+| `upstream_source` | `releases` | `releases` reads GitHub releases and excludes drafts/prereleases; `tags` reads paginated GitHub tags (for upstreams without releases); `commits` follows a branch head for upstreams that publish neither (see `upstream_branch`). Other values fail closed. |
+| `upstream_branch` | upstream default branch | Only with `upstream_source: "commits"`. Branch whose head commit is compared with the manifest `upstreamVersion`, which must be a hex commit SHA prefix of at least 7 characters (otherwise the monitor fails closed). A head that does not start with that prefix files one finding fingerprinted by the head SHA, with the head date and first message line. |
 | `upstream_tag_prefixes` | `["v", ""]` | Non-empty array of tag-stream prefixes. Each value must be a string; ASCII control characters are rejected, while the empty string allows bare semantic tags. Only tags whose configured prefix leaves a semantic version are candidates. |
+| `upstream_image` | unset | Optional release-parent source gate: `{ "repository": "ghcr.io/owner/image", "signer_workflow": "owner/repo/.github/workflows/docker.yml", "qualification_annotation": "index.annotation.key", "eligibility_predicate_type": "https://example.org/attestations/deployment-eligibility/v1" }`. Requires an exact `sha-<first seven parent-SHA>` tag, a linux/amd64 + linux/arm64 OCI index with parent revision and success annotation, and matching upstream keyless SLSA provenance. The optional eligibility predicate requires an additional signed positive source/build/qualification claim. Use only when the upstream's release tag is a one-parent release-only commit and its Docker workflow publishes qualified images at the parent commit. |
 | `monitor_upstream` | `true` when `upstream_slug` is set; otherwise `false` | Include the package in the daily upstream-release routine. |
 | `monitor_compatibility` | `true` | Include the package in the weekly manifest and pinned-base audit. |
 
@@ -157,10 +278,19 @@ rejecting unrelated `v...` tags:
 }
 ```
 
-The upstream monitor paginates all GitHub releases, excludes drafts and
+The upstream monitor paginates all GitHub releases by default, excludes drafts and
 prereleases, and chooses the numerically highest stable semantic version from
 the configured streams. Invalid prefix configuration or no matching stable tag
 fails closed with a diagnostic rather than falling back to another stream.
+With `upstream_source: "tags"`, it instead paginates GitHub tags and applies
+the same prefix and stable-semver selection without release-only draft/prerelease flags.
+With `upstream_image` configured, the monitor waits without filing a worker
+issue when the exact release-parent image or required attestations are unavailable. A
+newer passing `main` image never stands in for that release's parent. When
+qualified proof appears, a previously blocked, unclaimed auto-dispatch issue
+may receive one signed retry for its exact source proof; permission holds are
+never retried. The setting is local to registered `repos.json` and does not
+publish, deploy, or relax the package's own release preflight.
 
 The monitors file deduplicated findings only in the package repository and only
 with `ADMIN` or `MAINTAIN` authority. They never build, tag, publish, deploy, or
@@ -205,7 +335,7 @@ mutate package source. See `tools/deployment/cloudron-app-packaging.md`.
 
 Resolution order (per field independently): per-tool > per-repo > env var (`REVIEW_GATE_RATE_LIMIT_BEHAVIOR`, `REVIEW_GATE_COMPLETION_BEHAVIOR`, or `REVIEW_BOT_MIN_EDIT_LAG_SECONDS`) > hard default.
 
-The reusable workflow exposes matching `rate_limit_behavior` and `completion_behavior` inputs for CI callers. Their defaults are `pass` and `fast`. The canonical caller maps the repository Actions variable `AIDEVOPS_REVIEW_GATE_COMPLETION_BEHAVIOR` to the completion input and falls back to `fast` when unset. `fast` never waits for add-on completion on trusted maintainer-controlled PRs; late findings are swept into follow-up issues. Set both the local `review_gate.completion_behavior` and the CI variable to `strict` only when a repository explicitly accepts the added delay of review-before-merge. External/unknown authors retain the GH#17671 defence-in-depth boundary, and per-tool `wait`/`strict` overrides remain fail-closed when provider identity cannot be evaluated.
+The reusable workflow exposes matching `rate_limit_behavior` and `completion_behavior` inputs for CI callers. Their defaults are `pass` and `fast`. The canonical caller maps the repository Actions variable `AIDEVOPS_REVIEW_GATE_COMPLETION_BEHAVIOR` to the completion input and falls back to `fast` when unset. `fast` never waits for add-on completion on trusted maintainer-controlled PRs; late findings are swept into follow-up issues. Set both the local `review_gate.completion_behavior` and the CI variable to `strict` only when a repository explicitly accepts the added delay of review-before-merge. External/unknown authors follow the same advisory default (GH#36931); their merge authority is exact-head maintainer crypto approval (GH#17671). Per-tool `wait`/`strict` overrides remain fail-closed when provider identity cannot be evaluated.
 
 CLI: `aidevops review-gate --help` — configure rate-limit/completion policy and add or remove exact advisory check contexts without hand-editing JSON.
 

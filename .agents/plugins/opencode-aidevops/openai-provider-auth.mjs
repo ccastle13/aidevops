@@ -4,16 +4,59 @@
  * The built-in OpenAI provider does not pass through the Anthropic AuthHook,
  * so interactive sessions need a response-aware fetch guard that marks
  * usage-limited accounts and retries once with another pooled account.
+ *
+ * The same guard zstd-compresses ChatGPT Codex backend request bodies (GH#34414).
+ * The backend rejects uncompressed bodies above 1 MiB with an HTTP 503
+ * "upstream connect error"; upstream Codex CLI compresses these requests by
+ * default (`enable_request_compression`), OpenCode's built-in provider does not.
+ *
+ * Metadata-only diagnostics (GH#34562) go to the plugin log
+ * (~/.aidevops/logs/opencode-plugin.log), never the TUI:
+ * - once per process: `fetch guard installed` with loaded version and compressor;
+ * - per Codex request, only on a 5xx/fetch error or an uncompressed body above
+ *   1 MiB (every request with AIDEVOPS_PLUGIN_DEBUG=1): `codex request` with the
+ *   compression reason, byte counts, encoding, attempt statuses and response
+ *   request id. Never bodies, headers, URLs, tokens or account identities.
+ * Reading a failed turn: no `fetch guard installed` line from that process means
+ * pre-GH#34562 code was loaded; no `codex request` line means the request never
+ * reached this guard (e.g. OPENCODE_EXPERIMENTAL_WEBSOCKETS transport);
+ * `reason=applied` with a small `encoded_bytes` points away from the size limit.
  */
 
-import { getAccounts, patchAccount, rotateOpenAIPoolToken } from "./oauth-pool.mjs";
+import {
+  applyOpenAIPoolAccount,
+  forceRefreshOpenAIToken,
+  getAccounts,
+  markRejectedTokenFailure,
+  patchAccount,
+  rotateOpenAIPoolToken,
+} from "./oauth-pool.mjs";
 import { handleOpenAITokenRefreshFailure, isOpenAITokenRefreshRequest, readOpenAITokenRefreshBody } from "./openai-auth-refresh-recovery.mjs";
-import { injectIntentSchemaProperty } from "./provider-auth-body.mjs";
+import {
+  codexRequestCompressionEnabled,
+  extendRequestInit,
+  headersFrom,
+  isOpenAIProviderRequest,
+  logCodexRequestDiagnostic,
+  prepareOpenAIRequest,
+  responseRequestId,
+  safeToken,
+  zstdCompressorKind,
+} from "./openai-codex-request.mjs";
+import { parseRetryAfterValue } from "./provider-auth-pool-recovery.mjs";
+import { recordCodexModelRejection } from "./openai-codex-model-fallback.mjs";
 
 export { isOpenAITokenRefreshRequest } from "./openai-auth-refresh-recovery.mjs";
+export {
+  codexRequestCompressionEnabled,
+  compressCodexRequestBody,
+  injectOpenAIIntentParameter,
+  isCodexBackendRequest,
+  isOpenAIProviderRequest,
+  transformOpenAIRequestBody,
+  zstdCompressorKind,
+} from "./openai-codex-request.mjs";
 
-const OPENAI_API_HOST = "api.openai.com";
-const OPENAI_API_PREFIX = "/v1/";
 const DEFAULT_OPENAI_COOLDOWN_MS = 300_000;
 const USAGE_LIMIT_MARKERS = [
   "usage limit",
@@ -23,63 +66,26 @@ const USAGE_LIMIT_MARKERS = [
   "insufficient_quota",
   "rate_limit_exceeded",
 ];
+const AUTH_FAILURE_MARKERS = [
+  "authentication token is expired",
+  "access token has expired",
+  "expired token",
+  "expired access token",
+  "invalid access token",
+  "invalid token",
+  "invalid_api_key",
+  "invalid_token",
+  "sign in again",
+  "token_expired",
+  "unauthorized",
+];
 
 let installed = false;
 
-function transformOpenAITool(tool) {
-  if (tool?.type !== "function") return tool;
-  if (tool.function?.parameters) {
-    const parameters = injectIntentSchemaProperty(tool.function.parameters);
-    if (parameters === tool.function.parameters) return tool;
-    return { ...tool, function: { ...tool.function, parameters } };
-  }
-  if (tool.parameters) {
-    const parameters = injectIntentSchemaProperty(tool.parameters);
-    if (parameters === tool.parameters) return tool;
-    return { ...tool, parameters };
-  }
-  return tool;
-}
-
-/** Inject intent into OpenAI Responses and Chat Completions function schemas. */
-export function injectOpenAIIntentParameter(tools) {
-  return tools.map(transformOpenAITool);
-}
-
-/** Transform a serialized OpenAI request body without retaining its contents. */
-export function transformOpenAIRequestBody(body) {
-  if (!body || typeof body !== "string") return body;
-  try {
-    const parsed = JSON.parse(body);
-    if (!Array.isArray(parsed.tools)) return body;
-    parsed.tools = injectOpenAIIntentParameter(parsed.tools);
-    return JSON.stringify(parsed);
-  } catch {
-    return body;
-  }
-}
-
 export function parseRetryAfterMs(response) {
   const raw = response.headers?.get?.("retry-after");
-  if (!raw) return DEFAULT_OPENAI_COOLDOWN_MS;
-  const seconds = parseInt(raw, 10);
-  if (Number.isFinite(seconds) && seconds > 0) return Math.max(seconds * 1000, DEFAULT_OPENAI_COOLDOWN_MS);
-  const date = Date.parse(raw);
-  if (Number.isFinite(date)) return Math.max(date - Date.now(), DEFAULT_OPENAI_COOLDOWN_MS);
-  return DEFAULT_OPENAI_COOLDOWN_MS;
-}
-
-function requestUrl(input) {
-  if (typeof input === "string") return input;
-  if (input instanceof URL) return input.toString();
-  return input?.url || "";
-}
-
-export function isOpenAIProviderRequest(input) {
-  try {
-    const url = new URL(requestUrl(input));
-    return url.hostname === OPENAI_API_HOST && url.pathname.startsWith(OPENAI_API_PREFIX);
-  } catch { return false; }
+  const parsed = raw ? parseRetryAfterValue(raw) : null;
+  return Math.max(parsed ?? DEFAULT_OPENAI_COOLDOWN_MS, DEFAULT_OPENAI_COOLDOWN_MS);
 }
 
 async function readOpenAIErrorPayload(response) {
@@ -101,10 +107,14 @@ export async function isOpenAIUsageLimitResponse(response) {
   return [code, message].some((text) => USAGE_LIMIT_MARKERS.some((marker) => text.includes(marker)));
 }
 
-function headersFrom(input, init) {
-  if (init?.headers) return new Headers(init.headers);
-  if (typeof Request !== "undefined" && input instanceof Request) return new Headers(input.headers);
-  return new Headers();
+export async function isOpenAIAuthFailureResponse(response) {
+  if (response.status === 401) return true;
+  if (response.status !== 403 || await isOpenAIUsageLimitResponse(response)) return false;
+  const payload = await readOpenAIErrorPayload(response);
+  const error = payload?.error || payload;
+  const code = String(error?.code || error?.type || "").toLowerCase();
+  const message = String(error?.message || error?.detail || payload?.detail || error || "").toLowerCase();
+  return [code, message].some((text) => AUTH_FAILURE_MARKERS.some((marker) => text.includes(marker)));
 }
 
 export function extractBearerToken(input, init) {
@@ -116,66 +126,109 @@ export function extractBearerToken(input, init) {
 export function resolveOpenAIAccount(accessToken) {
   const accounts = getAccounts("openai");
   if (accessToken) {
-    const byAccess = accounts.find((account) => account.access === accessToken);
-    if (byAccess) return byAccess;
+    return accounts.find((account) => account.access === accessToken)
+      ?? accounts.find((account) => account.previousAccess === accessToken)
+      ?? null;
   }
-  return [...accounts].sort((a, b) => new Date(b.lastUsed || 0) - new Date(a.lastUsed || 0))[0] || null;
+  return [...accounts].sort((a, b) => new Date(b.lastUsed || 0) - new Date(a.lastUsed || 0))[0] ?? null;
 }
 
 function isUnavailableAccount(account) {
   if (!account) return false;
   if (account.status === "auth-error") return true;
-  return !!(account.cooldownUntil && account.cooldownUntil > Date.now());
+  return Number(account.cooldownUntil) > Date.now();
 }
 
 function buildRetryRequest(input) {
-  if (typeof Request !== "undefined" && input instanceof Request) return input.clone();
-  return input;
+  return typeof Request !== "undefined" && input instanceof Request ? input.clone() : input;
 }
 
-function extendRequestInit(init, overrides) {
-  if (init == null) return { ...overrides };
-  return Object.assign(Object.create(Object(init)), overrides);
-}
-
-async function prepareOpenAIRequest(input, init) {
-  const initHasBody = init != null && "body" in Object(init);
-  if (initHasBody && typeof init.body !== "string") return { input, init };
-  let body = initHasBody ? init.body : "";
-  if (!initHasBody && typeof Request !== "undefined" && input instanceof Request) {
-    try {
-      body = await input.clone().text();
-    } catch {
-      return { input, init };
-    }
-  }
-  const transformedBody = transformOpenAIRequestBody(body);
-  if (!body || transformedBody === body) return { input, init };
-  return { input, init: extendRequestInit(init, { body: transformedBody }) };
-}
-
-function buildRetryInit(input, init, accessToken) {
+function buildRetryInit(input, init, account) {
   const retryHeaders = headersFrom(input, init);
-  retryHeaders.set("authorization", `Bearer ${accessToken}`);
+  retryHeaders.set("authorization", `Bearer ${account.access}`);
+  retryHeaders.delete("chatgpt-account-id");
+  if (account.accountId) retryHeaders.set("chatgpt-account-id", account.accountId);
   return extendRequestInit(init, { headers: retryHeaders });
 }
 
-async function handleOpenAIUsageLimit(ctx) {
-  const { client, originalFetch, input, init, response, retryInput } = ctx;
-  const current = resolveOpenAIAccount(extractBearerToken(input, init));
-  const currentEmail = current?.email || "unknown";
-  if (current) {
-    patchAccount("openai", current.email, {
-      status: "rate-limited",
-      cooldownUntil: Date.now() + parseRetryAfterMs(response),
-      lastUsed: new Date().toISOString(),
+/** Send one attempt and append `{ kind, status, requestId|error }` metadata. */
+async function recordAttempt(attempts, kind, send) {
+  try {
+    const response = await send();
+    attempts.push({ kind, status: response.status, requestId: responseRequestId(response) });
+    return response;
+  } catch (error) {
+    const aborted = error?.name === "AbortError";
+    attempts.push({
+      kind,
+      status: aborted ? "aborted" : "fetch-error",
+      error: error?.cause?.code || error?.code || error?.name,
     });
+    throw error;
   }
+}
+
+function retryOpenAIRequest(ctx, account, kind) {
+  const retryInit = buildRetryInit(ctx.input, ctx.init, account);
+  return recordAttempt(ctx.attempts, kind, () => ctx.originalFetch(buildRetryRequest(ctx.retryInput), retryInit));
+}
+
+async function handleOpenAIUsageLimit(ctx) {
+  const { client, input, init, response } = ctx;
+  const current = resolveOpenAIAccount(extractBearerToken(input, init));
+  if (!current) return response;
+  const currentEmail = current?.email || "unknown";
+  patchAccount("openai", current.email, {
+    status: "rate-limited",
+    cooldownUntil: Date.now() + parseRetryAfterMs(response),
+    lastUsed: new Date().toISOString(),
+  });
   console.error(`[aidevops] OpenAI provider: usage/rate limit for ${currentEmail} — rotating pool account`);
   const rotated = await rotateOpenAIPoolToken(client, current?.email);
   if (!rotated?.access) return response;
-  const retryInit = buildRetryInit(input, init, rotated.access);
-  return originalFetch(buildRetryRequest(retryInput), retryInit);
+  return retryOpenAIRequest(ctx, rotated, "usage-rotate");
+}
+
+// Adopt the pool account in the provider, then retry. On adoption failure keep
+// (or record) previousAccess so a later request can retry adoption.
+async function adoptAndRetryOpenAIAccount(ctx, current, kind, previousAccess) {
+  if (!await applyOpenAIPoolAccount(ctx.client, current)) {
+    if (previousAccess) patchAccount("openai", current.email, { previousAccess });
+    return ctx.response;
+  }
+  patchAccount("openai", current.email, { previousAccess: null });
+  const retryResponse = await retryOpenAIRequest(ctx, current, kind);
+  if (await isOpenAIAuthFailureResponse(retryResponse)) markRejectedTokenFailure("openai", current);
+  return retryResponse;
+}
+
+async function handleOpenAIAuthFailure(ctx) {
+  const { client, input, init, response } = ctx;
+  const current = resolveOpenAIAccount(extractBearerToken(input, init));
+  if (!current) return response;
+  const currentEmail = current?.email || "unknown";
+  const requestAccountId = headersFrom(input, init).get("chatgpt-account-id");
+  if (!current.accountId && requestAccountId) {
+    current.accountId = requestAccountId;
+    patchAccount("openai", current.email, { accountId: requestAccountId });
+  }
+  console.error(`[aidevops] OpenAI provider: rejected token for ${currentEmail} — forcing one refresh`);
+  const requestToken = extractBearerToken(input, init);
+  if (current.previousAccess && requestToken === current.previousAccess && current.access !== requestToken) {
+    // Already refreshed but not adopted: retry adoption before another refresh.
+    return adoptAndRetryOpenAIAccount(ctx, current, "auth-adopt");
+  }
+  const previousAccess = requestToken || current.previousAccess || current.access;
+  const refreshedAccess = await forceRefreshOpenAIToken(current);
+  if (refreshedAccess) return adoptAndRetryOpenAIAccount(ctx, current, "auth-refresh", previousAccess);
+  console.error(`[aidevops] OpenAI provider: refresh unavailable for ${currentEmail} — trying another pool account`);
+  const rotated = await rotateOpenAIPoolToken(client, current?.email);
+  if (!rotated?.access) return response;
+  const retryResponse = await retryOpenAIRequest(ctx, rotated, "auth-rotate");
+  if (await isOpenAIAuthFailureResponse(retryResponse)) {
+    markRejectedTokenFailure("openai", rotated);
+  }
+  return retryResponse;
 }
 
 async function maybeRotateBeforeOpenAIFetch(client, input, init) {
@@ -185,47 +238,62 @@ async function maybeRotateBeforeOpenAIFetch(client, input, init) {
   console.error(`[aidevops] OpenAI provider: current account ${currentEmail} unavailable before request — rotating pool account`);
   const rotated = await rotateOpenAIPoolToken(client, current?.email);
   if (!rotated?.access) return init;
-  return buildRetryInit(input, init, rotated.access);
+  return buildRetryInit(input, init, rotated);
+}
+
+async function handleOpenAIProviderFetch({ client, originalFetch, input, init }) {
+  // Snapshot the body reference (immutable string) before the first fetch so a
+  // caller mutating init.body in flight cannot change the fallback retry; parsing stays deferred.
+  const originalBody = init?.body;
+  const prepared = await prepareOpenAIRequest(input, init);
+  const retryInput = buildRetryRequest(prepared.input);
+  const firstInit = await maybeRotateBeforeOpenAIFetch(client, prepared.input, prepared.init);
+  const ctx = { client, originalFetch, input: prepared.input, init: firstInit, retryInput, attempts: [] };
+  const firstKind = firstInit === prepared.init ? "initial" : "preflight-rotate";
+  try {
+    ctx.response = await recordAttempt(ctx.attempts, firstKind, () => originalFetch(prepared.input, firstInit));
+    // GH#36698: record a definite model rejection for same-tier routing
+    // failover; the rejected response is returned unchanged.
+    ctx.response = await recordCodexModelRejection(ctx.response, retryInput, extendRequestInit(init, {
+      headers: headersFrom(prepared.input, firstInit),
+      ...(originalBody === undefined ? {} : { body: originalBody }),
+    }));
+    if (await isOpenAIUsageLimitResponse(ctx.response)) return await handleOpenAIUsageLimit(ctx);
+    if (await isOpenAIAuthFailureResponse(ctx.response)) return await handleOpenAIAuthFailure(ctx);
+    return ctx.response;
+  } finally {
+    logCodexRequestDiagnostic(prepared.compression, ctx);
+  }
 }
 
 async function handleOpenAIFetchRequest(ctx) {
   const { client, originalFetch, input, init } = ctx;
-  const openaiRequest = isOpenAIProviderRequest(input);
-  const tokenRefreshRequest = isOpenAITokenRefreshRequest(input);
-  const tokenRefreshBody = tokenRefreshRequest ? await readOpenAITokenRefreshBody(input, init) : "";
-  const prepared = openaiRequest ? await prepareOpenAIRequest(input, init) : { input, init };
-  const retryInput = openaiRequest ? buildRetryRequest(prepared.input) : prepared.input;
-  const firstInit = openaiRequest
-    ? await maybeRotateBeforeOpenAIFetch(client, prepared.input, prepared.init)
-    : prepared.init;
-  const response = await originalFetch(prepared.input, firstInit);
-  let result = response;
-
-  if (tokenRefreshRequest) {
-    result = await handleOpenAITokenRefreshFailure({
-      client,
-      response,
-      bodyText: tokenRefreshBody,
-    });
-  } else if (openaiRequest && await isOpenAIUsageLimitResponse(response)) {
-    result = await handleOpenAIUsageLimit({
-      client,
-      originalFetch,
-      input: prepared.input,
-      init: firstInit,
-      response,
-      retryInput,
-    });
+  if (isOpenAITokenRefreshRequest(input)) {
+    const bodyText = await readOpenAITokenRefreshBody(input, init);
+    const response = await originalFetch(input, init);
+    return handleOpenAITokenRefreshFailure({ client, response, bodyText });
   }
-  return result;
+  if (isOpenAIProviderRequest(input)) return handleOpenAIProviderFetch(ctx);
+  return originalFetch(input, init);
 }
 
-export function installOpenAIProviderFetchRotation(client) {
+/** GH#34562: one line per process proving which guard revision is loaded. */
+function logFetchGuardInstalled(version) {
+  const runtime = process.versions?.bun ? `bun-${process.versions.bun}` : `node-${process.versions?.node}`;
+  const compression = codexRequestCompressionEnabled() ? "enabled" : "disabled";
+  console.error(
+    `[aidevops] OpenAI provider: fetch guard installed version=${safeToken(version, "unknown")} `
+    + `runtime=${safeToken(runtime, "unknown")} zstd=${zstdCompressorKind()} codex_compression=${compression}`,
+  );
+}
+
+export function installOpenAIProviderFetchRotation(client, { version = "" } = {}) {
   if (installed || typeof globalThis.fetch !== "function") return false;
   installed = true;
   const originalFetch = globalThis.fetch.bind(globalThis);
   globalThis.fetch = async (input, init) => {
     return handleOpenAIFetchRequest({ client, originalFetch, input, init });
   };
+  logFetchGuardInstalled(version);
   return true;
 }

@@ -31,6 +31,12 @@ ordinary turns in one child route and increments only for an actual retry or
 capability escalation. Use `aidevops_version` to segment request, token, cost,
 error, and escalation outcomes before and after routing-policy releases.
 
+Each request also keeps nullable provenance: requested, routing-resolved and
+host-observed effort/model values remain distinct; provider-confirmed effort is
+null unless the host actually supplies it. Costs are local estimates and include
+`pricing_quality` (`exact_model`, `fallback`, or `unknown`), so a configured
+variant or fallback price is never reported as provider-confirmed usage.
+
 ### Runtime-event contract
 
 `.agents/scripts/runtime-events.mjs` owns the runtime-neutral envelope and uses
@@ -38,6 +44,37 @@ the same `llm-requests.db`; it does not create another database or state store.
 `llm_requests`, `tool_calls`, and `session_summaries` remain compatible. Runtime
 events are evidence and projections, not a task, mailbox, audit, transcript, or
 worker-state authority.
+
+Optional objective evidence is versioned and append-only: `objective.started`,
+`objective.session.attached`, `objective.outcome`, and `subagent.acceptance`.
+Attachments declare bounded request/message boundaries and are either uniquely
+allocated or explicitly unallocated, preventing a multi-objective session from
+being charged repeatedly. Outcomes remain `unknown` without evidence. `verified`
+requires an independent observer plus a check/receipt kind, fingerprint, policy
+version, and timestamp; host completion and a parent assertion alone never verify
+an objective. Parent acceptance records contribution outcome and repair linkage,
+not semantic success inferred from a child terminal state. Emit through
+`runtime-events.mjs emit --session <opaque-id>` and query with `--session` or
+`--objective`; malformed objective evidence fails visibly while legacy evidence
+writes remain fail-open. Objective and subagent lifecycle evidence is protected by
+retention; corrections supersede through new observations rather than mutation.
+
+The OpenCode plugin owns normal request-boundary production. A user request starts
+an objective boundary (or reuses the dispatch-provided issue/run identity), and
+each completed assistant request is attached with a source-qualified
+`opencode-message:<digest>` identity. Child routing inherits the parent's current
+objective before request recording; late child identity resolution flushes a
+bounded pending attachment rather than charging an entire session. The report
+resolves those identities through `llm_requests.message_id`; legacy numeric IDs
+remain compatible, while missing or conflicting joins remain explicitly partial.
+
+Task results expose `aidevopsObjective` metadata with the child contribution,
+objective and run IDs. The parent records its actual decision through the
+`aidevops_objective_receipt` tool: acceptance is one of accepted unchanged,
+accepted with repair, rejected, reused or unknown, with repair linkage where
+applicable. An outcome receipt is separate. `verified` still requires an
+independent observer, evidence kind and fingerprint; a child stop, command
+success, PR merge or caller-only assertion is insufficient.
 
 Envelope version 1 stores `event_id`, `event_type`, `correlation_id`,
 `causation_id`, `subject_id`, `session_id`, `worker_id`, `parent_worker_id`,
@@ -106,12 +143,7 @@ delete guard, restores it, and appends an immutable `runtime_event_archives`
 manifest row. A failed/corrupt archive leaves source rows intact. Interruption
 after file verification is resumable and reuses the verified partition.
 
-Core routine `r918` runs producer-owned maintenance daily through the shared
-Pulse scheduler. It repeatedly applies the same verified partition primitive
-until the backlog is clear or the default 20-partition/120-second run bound is
-reached; any residual backlog is reported and left for the next run. It does
-not install a dedicated launchd plist or systemd unit. The one-partition
-`retention` command remains explicit and dry-run-first.
+Core routine `r918` runs producer-owned maintenance daily through the shared Pulse scheduler. It repeatedly applies the same verified partition primitive until the backlog is clear or the default 20-partition/120-second run bound is reached; any residual backlog is reported and left for the next run. It does not install a dedicated launchd plist or systemd unit. The one-partition `retention` command remains explicit and dry-run-first.
 
 ```bash
 # Physical and classified bytes; never prints raw payloads
@@ -127,11 +159,9 @@ observability-helper.sh retention --apply --max-rows 5000
 observability-helper.sh retention-maintenance --apply --max-partitions 20 --max-duration-seconds 120
 ```
 
-The shared storage inventory reports active, archive, protected, reclaimable,
-candidate, and unknown bytes. Unattributed files and unavailable verification
-remain unknown; a verified archive or pinned state row is required before any
-byte is classified as protected, and source bytes are never called reclaimable
-before the archive transaction commits.
+The shared storage inventory reports active, archive, protected, reclaimable, candidate, and unknown bytes. Unattributed files and unavailable verification remain unknown; a verified archive or pinned state row is required before any byte is classified as protected, and source bytes are never called reclaimable before the archive transaction commits.
+
+Inventory aggregates scan the whole `runtime_events` table, so they use a separate 300-second budget (`AIDEVOPS_RUNTIME_EVENT_INVENTORY_TIMEOUT_SECONDS`, 1-3600). Failures report fixed reasons: `inventory-timeout`, `schema-unavailable`, or `inventory-unavailable`. A retention command that exits 0 without a JSON result fails instead of passing silently. Node CLIs run through the symlinked deploy path use `entrypoint-guard.mjs` (`isDirectEntrypoint(import.meta.url)`), never a raw `argv[1]` comparison.
 
 Full-loop keeps authoritative resumable state in `.agents/loop-state/full-loop.local.state` and appends local transition evidence to `full-loop-events.jsonl`. Schema v2 records the run ID, state revision, phase status/start/end/attempt, terminal evidence, next safe action, observed executor status/PID/heartbeat, manual resumes, reused subagent units, and duplicate work avoided. Status must validate executor liveness instead of trusting a stale PID. These records drive lifecycle recovery; runtime events and plugin cost/tool data remain fail-open reporting evidence. Aggregate phase wall time, active compute, CI wait/repair, release/cleanup time, calls by tier, retries/outcomes, reuse, false-positive gates, and manual resumes when producing performance reports.
 
@@ -166,6 +196,27 @@ Inspect recent events without exposing any other store:
 ```bash
 observability-helper.sh runtime-events 20
 ```
+
+### Rule-violation counts
+
+OpenCode TTSR emits one `rule.violation` runtime event per detected rule, with
+the rule ID in `subject_id`, `observation.count=1`, and the scan hook in `source`.
+Both `text.complete` and deduplicated `messages.transform` corrections emit
+evidence through the existing asynchronous, fail-open SQLite queue. Counts are
+scan detections, not distinct messages: the same output can be seen by both
+hooks. Assistant text, descriptions and corrections are not event payloads.
+
+```bash
+observability-helper.sh rule-violations 20
+```
+
+The report ranks rules in the active runtime-event store alongside
+`configs/prompt-hook-candidates.conf`. Registry sections use human-readable
+names, so the report does not infer a rule-ID mapping or promote candidates
+automatically. Counts cover retained events, not archived lifetime totals.
+Use them as evidence when deciding which prompt rules need deterministic hooks.
+Evidence-based tier step-down belongs to `model-ab-*.mjs` outcome data and
+`dispatch-tier-telemetry.jq`; the retired dormant hook is not reimplemented here.
 
 ### 2. OpenTelemetry spans (opt-in, opencode v1.4.7+)
 
@@ -431,6 +482,15 @@ If aidevops attributes are missing in a mode where they should work:
   `metrics.result_counts`, `progress_blockers.active_blockers`,
   `metrics.timing_ms`, and `metrics.recent_examples` with load context from
   `headless-runtime-metrics.jsonl`.
+- `~/.aidevops/logs/pulse-cycle-index.jsonl` (`PULSE_CYCLE_INDEX_FILE`) — historical per-cycle pulse throughput. Every admitted cycle appends exactly one record from its terminal path, including session-gate, dedup, preflight-failed, stop-flag and SIGTERM/`set -e` exits (canary, dry-run and lock-contention runs are not cycles; SIGKILL cannot be recorded). Retention archives the oldest rows as gzip before trimming to the newest 10,000 lines (`PULSE_CYCLE_INDEX_MAX_LINES`, minimum 100), only after exceeding that cap by 500 lines. Archive failures skip pruning and retry next cycle.
+  Fields: `ts`; `outcome` (`progressed`/`idle`/`blocked`/`partial`); `blocker` (cycle-state blocker kind or `null`); `wall_s` (since `PULSE_START_EPOCH`, including cache prime and other pre-dispatch stages); `duration_s` (legacy, from the end of pre-dispatch stages, `0` if the cycle ended earlier); `dispatched` (registrations this cycle, including LLM-supervisor launches); `dispatch_budget_skips` (`pulse_dispatch_cycle_budget_skipped` events this cycle); `inflight`; `workers` (`active/max`); `merged`; `closed`; `killed`; `prefetch_errors`.
+  Zero-dispatch triage: `jq -c 'select(.dispatched == 0) | {ts, outcome, blocker, dispatch_budget_skips, wall_s}' ~/.aidevops/logs/pulse-cycle-index.jsonl | tail -n 20`.
+- `headless-runtime-metrics.jsonl` and `resource-metrics.jsonl` have a 25 MiB hot-file cap each (`PULSE_METRICS_HOT_MAX_BYTES`). Pulse rotates them by rename, never truncation, into `~/.aidevops/logs/metrics-archive/` (`PULSE_METRICS_ARCHIVE_DIR`), shared with cycle-index archives. Compression failures preserve raw `.jsonl` segments; crash-left staged segments are retried next cycle. Recovery is at least once: interruption after archive publication but before hot swap/staged deletion can duplicate rows. The combined archive cap is 500 MiB (`PULSE_METRICS_COLD_MAX_BYTES`), pruning oldest timestamps first, so retention is not indefinite. Existing readers use only hot files; long-horizon analysis must explicitly read archives, e.g. `gzip -dc ~/.aidevops/logs/metrics-archive/headless-runtime-metrics-*.jsonl.gz | jq -c '{ts, result}'` (also include any raw `.jsonl` fallbacks).
+- `claude-code-diagnose.sh agent-summary` — read-only check of whether the
+  installed Claude Code CLI can spend tokens on background-agent progress
+  summaries (`query_source=agent_summary`), which session transcripts do not
+  show. Guidance: `tools/ai-assistants/claude-code.md` "Background agent
+  summaries".
 - `session-miner` routine — post-hoc mining of successful/failed sessions
   into the shared memory (SQLite FTS5). Different layer: session-miner
   extracts *lessons* across sessions; OTEL captures per-call *traces*

@@ -14,17 +14,25 @@
 
 set -euo pipefail
 
+# Resolve native Git once from the system default PATH (portable to non-FHS
+# hosts such as NixOS); fixtures must bypass the aidevops git wrapper.
+TEST_NATIVE_GIT=$(command -p -v git) || {
+	printf '%s\n' 'Native Git is unavailable on the system PATH' >&2
+	exit 1
+}
+export TEST_NATIVE_GIT
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit
 STASH_HELPER="${SCRIPT_DIR}/../stash-audit-helper.sh"
 
-GIT_BIN="${AIDEVOPS_TEST_GIT_BIN:-/usr/bin/git}"
+GIT_BIN="${AIDEVOPS_TEST_GIT_BIN:-${TEST_NATIVE_GIT}}"
 git() {
 	"$GIT_BIN" "$@"
 	return $?
 }
 export -f git
 
-# Source the helper so the test-local /usr/bin/git wrapper also applies to
+# Source the helper so the test-local native Git wrapper also applies to
 # helper calls under runtimes that install a canonical-repo git guard.
 # shellcheck source=../stash-audit-helper.sh
 source "$STASH_HELPER"
@@ -214,6 +222,51 @@ test_untracked_only_stash_is_preserved() {
 }
 
 #######################################
+# Test: dedupe-archives drops only exact duplicate cleanup archives (GH#34572)
+# Returns: 0 on success, 1 on failure
+#######################################
+test_dedupe_archives_keeps_distinct_content() {
+	local test_repo
+	test_repo=$(setup_test_repo)
+	cd "$test_repo" || return 1
+
+	local archive_msg="aidevops worktree cleanup archive"
+	local round=""
+	printf '%s\n' "dirty tracked" >file1.txt
+	printf '%s\n' "dirty untracked" >untracked.txt
+	# The pre-fix cleanup path pushed then re-applied the same dirty state on
+	# every run, producing identical archives with distinct tokens.
+	for round in 1 2 3; do
+		git stash push -q -u -m "${archive_msg} [token-${round}]: feature/gh-1"
+		[[ "$round" == "3" ]] || git stash apply -q --index 'stash@{0}'
+	done
+	printf '%s\n' "different dirty state" >file1.txt
+	git stash push -q -m "${archive_msg} [token-4]: feature/gh-1"
+	printf '%s\n' "manual work" >file1.txt
+	git stash push -q -m "manual work in progress"
+
+	local dry_run_count=""
+	local final_list=""
+	local result=1
+	cmd_dedupe_archives "$test_repo" "false" >/dev/null 2>&1
+	dry_run_count=$(git stash list | wc -l | tr -d ' ')
+	cmd_dedupe_archives "$test_repo" "true" >/dev/null 2>&1
+	final_list=$(git stash list --format='%gs')
+	if [[ "$dry_run_count" -eq 5 ]] &&
+		[[ "$(printf '%s\n' "$final_list" | grep -c .)" -eq 3 ]] &&
+		[[ "$final_list" == *"manual work in progress"* ]] &&
+		[[ "$final_list" == *"token-4"* ]] &&
+		[[ "$final_list" == *"token-3"* ]] &&
+		[[ "$final_list" != *"token-1"* && "$final_list" != *"token-2"* ]] &&
+		[[ "$(git show 'stash@{2}^3:untracked.txt' 2>/dev/null)" == "dirty untracked" ]]; then
+		result=0
+	fi
+
+	cleanup_test_repo "$test_repo"
+	return $result
+}
+
+#######################################
 # Test: list command
 # Arguments:
 #   None
@@ -374,6 +427,9 @@ main() {
 
 	test_untracked_only_stash_is_preserved
 	print_result "untracked-only stash remains needs-review and survives auto-clean" $?
+
+	test_dedupe_archives_keeps_distinct_content
+	print_result "dedupe-archives drops only exact duplicate cleanup archives" $?
 
 	test_list
 	print_result "list command" $?

@@ -6,7 +6,7 @@
 #
 # When N consecutive "zero-attempt" worker dispatches happen on this runner,
 # the breaker pauses dispatch on this machine and synchronously runs
-# `aidevops update`. If the update leaves the deployed agents aligned with
+# `aidevops update`. If the update changes the deployment and leaves it aligned with
 # the local repo, the next pause check auto-resumes the breaker before pulse
 # skips dispatch. If the update fails, the runner has a real local problem
 # (broken install, gh auth, MCP failures, network) — stay paused and post a
@@ -298,7 +298,7 @@ _rh_is_zero_attempt_signal() {
 
 #######################################
 # Resolve the trip threshold for a zero-attempt signal. Deterministic signing
-# preflight failure proves this runner cannot launch any worker, so one outcome
+# preflight failure in an issue worker proves this runner cannot launch it, so one outcome
 # must pause it immediately while healthy peers remain eligible.
 # Args: $1 = outcome signal
 # Outputs: positive integer threshold
@@ -314,6 +314,30 @@ _rh_failure_threshold_for_signal() {
 		;;
 	esac
 	return 0
+}
+
+#######################################
+# Audit-only outcomes: recorded in the ledger without incrementing OR
+# resetting the issue-worker failure streak, so they can never trip the
+# breaker. Routine launches use a different checkout/signing context;
+# a signing preflight failure on a continuation retry, after an earlier
+# attempt in the same worker process already ran with activity, does not
+# prove this runner cannot sign (GH#37597).
+# Args: $1 = outcome signal, $2 = issue identifier
+#######################################
+_rh_is_audit_only_outcome() {
+	local signal="$1"
+	local issue="$2"
+	case "$signal" in
+	worker_signing_unavailable_after_activity)
+		return 0
+		;;
+	worker_signing_unavailable)
+		# Repository-qualified issue identifiers contain #; routine session IDs do not.
+		[[ "$issue" != *'#'* && "$issue" == routine-* ]] && return 0
+		;;
+	esac
+	return 1
 }
 
 #######################################
@@ -358,21 +382,31 @@ cmd_record_outcome() {
 	now=$(_rh_now)
 	local is_zero=0
 	if _rh_is_zero_attempt_signal "$signal"; then is_zero=1; fi
+	# Audit-only outcomes stay in the ledger without incrementing OR resetting
+	# issue health (routine signing, post-activity continuation signing).
+	local audit_only=0
+	if _rh_is_audit_only_outcome "$signal" "$issue"; then
+		audit_only=1
+	fi
 
 	# Window expiry: if the rolling window has elapsed without tripping,
 	# zero out the counter and re-anchor the window. Done BEFORE applying
 	# the new outcome so a stale window doesn't carry an old counter.
-	if _rh_window_expired; then
+	if [[ "$audit_only" -eq 0 ]] && _rh_window_expired; then
 		# shellcheck disable=SC2016 # $now is a jq variable supplied by --arg.
 		_rh_state_apply '.consecutive_zero_attempts = 0 | .window_started_at = $now' --arg now "$now" || true
 	fi
 
 	# Append outcome to ledger and update counter.
 	local new_counter="" signal_threshold=""
-	if [[ "$is_zero" -eq 1 ]]; then
-		# Counter increments; the window may need to be re-anchored if it
-		# was idle through expiry above (already done) — otherwise keep it.
-		_rh_state_apply ".consecutive_zero_attempts += 1" || true
+	if [[ "$audit_only" -eq 1 ]]; then
+		: # Audit-only: do not change the issue-worker failure streak.
+	elif [[ "$is_zero" -eq 1 ]]; then
+		# Counter increments and the window re-anchors on every zero-attempt
+		# outcome, so expiry measures idleness of the streak (time since the
+		# last zero-attempt outcome), not its age. Slow failures still trip.
+		# shellcheck disable=SC2016 # $now is a jq variable supplied by --arg.
+		_rh_state_apply '.consecutive_zero_attempts += 1 | .window_started_at = $now' --arg now "$now" || true
 	else
 		# shellcheck disable=SC2016 # $now is a jq variable supplied by --arg.
 		_rh_state_apply '.consecutive_zero_attempts = 0 | .window_started_at = $now' --arg now "$now" || true
@@ -400,7 +434,7 @@ cmd_record_outcome() {
 	current_state=$(_rh_get_field '.circuit_breaker.state')
 	[[ -z "$current_state" ]] && current_state="closed"
 
-	if [[ "$is_zero" -eq 1 ]] \
+	if [[ "$is_zero" -eq 1 && "$audit_only" -eq 0 ]] \
 		&& [[ "$current_state" == "closed" ]] \
 		&& [[ "$new_counter" -ge "$signal_threshold" ]]; then
 		_rh_trip_breaker "$issue" "signal=${signal} consecutive_zero_attempts=${new_counter}"
@@ -410,10 +444,8 @@ cmd_record_outcome() {
 
 #######################################
 # Trip the breaker: write `tripped` state, post an advisory, and
-# synchronously run `aidevops update`. If the update changed VERSION
-# (exit 0 from cmd_check) the t2579 restart hook fires and the next
-# cycle will pick up new code; we leave the state as `tripped` and let
-# the resume path (next cmd_record_outcome non-zero) reopen it.
+# synchronously run `aidevops update`. Only a changed deployment can be
+# considered for automatic recovery; a successful check may be a no-op.
 # Args: $1 = triggering issue (audit only)
 #       $2 = reason string
 #######################################
@@ -441,14 +473,23 @@ _rh_trip_breaker() {
 	local update_helper="${HOME}/.aidevops/agents/scripts/auto-update-helper.sh"
 	local update_outcome="error"
 	if [[ -x "$update_helper" ]]; then
+		local version_before="" sha_before="" version_after="" sha_after=""
+		version_before=$(_rh_read_token_file "$RUNNER_HEALTH_DEPLOYED_VERSION_FILE")
+		sha_before=$(_rh_read_token_file "$RUNNER_HEALTH_DEPLOYED_SHA_FILE")
 		# Run check synchronously. Output to log only — never the user's
 		# session — to avoid noise from a per-issue trigger.
 		local update_log="${HOME}/.aidevops/logs/runner-health-update.log"
 		mkdir -p "$(dirname "$update_log")" 2>/dev/null || true
 		local update_rc=0
 		"$update_helper" check >>"$update_log" 2>&1 || update_rc=$?
+		version_after=$(_rh_read_token_file "$RUNNER_HEALTH_DEPLOYED_VERSION_FILE")
+		sha_after=$(_rh_read_token_file "$RUNNER_HEALTH_DEPLOYED_SHA_FILE")
 		if [[ "$update_rc" -eq 0 ]]; then
-			update_outcome="ran"
+			update_outcome="no_change"
+			if [[ -n "$version_after" && "$version_after" != "$version_before" ]] ||
+				[[ -n "$sha_after" && "$sha_after" != "$sha_before" ]]; then
+				update_outcome="ran"
+			fi
 		else
 			update_outcome="failed"
 		fi
@@ -704,7 +745,7 @@ _rh_count_log_no_worker_events() {
 #   $4 = tripped age in hours (integer or empty)
 #   $5 = last_update_outcome ("ran" | "failed" | "helper_missing" | "")
 #   $6 = update/deploy health ("healthy" | "")
-# Stdout: one of HEALTHY | BUILDING | WIRING_GAP | TRIGGER_MISSED | RECOVERABLE_TRIPPED | STUCK_TRIPPED
+# Stdout: HEALTHY | BUILDING | WIRING_GAP | TRIGGER_MISSED | RECOVERABLE_TRIPPED | STUCK_TRIPPED | PAUSED_NO_UPDATE | TRIPPED
 #######################################
 _rh_classify_diagnose() {
 	local recorded="${1:-0}"
@@ -714,6 +755,8 @@ _rh_classify_diagnose() {
 	local update_outcome="${5:-}"
 	local update_health="${6:-}"
 	local threshold="${RUNNER_HEALTH_FAILURE_THRESHOLD:-10}"
+	local pause_hours="${RUNNER_HEALTH_NO_UPDATE_PAUSE_HOURS:-24}"
+	[[ "$pause_hours" =~ ^[0-9]+$ ]] || pause_hours=24
 
 	# Guard: numeric coercion. Empty/non-numeric inputs treated as zero.
 	[[ "$recorded" =~ ^[0-9]+$ ]] || recorded=0
@@ -727,17 +770,22 @@ _rh_classify_diagnose() {
 			printf 'RECOVERABLE_TRIPPED\n'
 			return 0
 		fi
-		# STUCK_TRIPPED: tripped >24h AND update never succeeded. The breaker
-		# fired but the synchronous `aidevops update` failed, so resume hook
-		# can't fire. Operator must manually resume after fixing the install.
-		if [[ "$tripped_age_h" =~ ^[0-9]+$ ]] && [[ "$tripped_age_h" -gt 24 ]] \
+		# No update may mean an operator pause or an interrupted automatic trip;
+		# the persisted state does not distinguish these cases.
+		if [[ -z "$update_outcome" || "$update_outcome" == "never" ]]; then
+			if [[ "$tripped_age_h" =~ ^[0-9]+$ ]] && [[ "$tripped_age_h" -gt "$pause_hours" ]]; then
+				printf 'STUCK_TRIPPED\n'
+			else
+				printf 'PAUSED_NO_UPDATE\n'
+			fi
+			return 0
+		fi
+		if [[ "$tripped_age_h" =~ ^[0-9]+$ ]] && [[ "$tripped_age_h" -gt "$pause_hours" ]] \
 			&& [[ "$update_outcome" == "failed" || "$update_outcome" == "helper_missing" ]]; then
 			printf 'STUCK_TRIPPED\n'
 			return 0
 		fi
-		# Tripped but recent or not yet verified healthy: the breaker is doing
-		# its job. Map to BUILDING for transient state rather than manual action.
-		printf 'BUILDING\n'
+		printf 'TRIPPED\n'
 		return 0
 	fi
 
@@ -771,6 +819,8 @@ _rh_diagnose_advice() {
 	HEALTHY) printf 'no action — runner is healthy\n' ;;
 	BUILDING) printf 'monitor — counter is collecting evidence within the rolling window\n' ;;
 	RECOVERABLE_TRIPPED) printf 'auto-resume ready — next pulse pause check will clear the breaker after verified successful update/deploy\n' ;;
+	PAUSED_NO_UPDATE) printf 'dispatch paused (manual pause or interrupted update); review the reason and use pulse-runner-health-helper.sh resume --reason "<text>" when safe\n' ;;
+	TRIPPED) printf 'dispatch blocked — inspect update and deployment health; use pulse-runner-health-helper.sh resume --reason "<text>" when safe\n' ;;
 	WIRING_GAP)
 		printf 'check that pulse-cleanup.sh::_record_runner_health_zero_attempt is being called from recover_failed_launch_state — the log shows events the counter never saw\n'
 		;;
@@ -778,7 +828,7 @@ _rh_diagnose_advice() {
 		printf 'breaker did NOT trip at threshold — inspect _rh_trip_breaker call site and is_zero_attempt_signal predicate\n'
 		;;
 	STUCK_TRIPPED)
-		printf 'manual resume required: pulse-runner-health-helper.sh resume --reason "<text>" after fixing the underlying install/auth/network issue\n'
+		printf 'dispatch paused beyond the configured window; review the pause or update failure and use pulse-runner-health-helper.sh resume --reason "<text>" when safe\n'
 		;;
 	*) printf 'unknown finding\n' ;;
 	esac
@@ -786,32 +836,20 @@ _rh_diagnose_advice() {
 }
 
 #######################################
-# Read all state fields needed by diagnose in one jq pass. Result is
-# returned via name-ref out-parameters (bash 4.3+ via declare -n). Falls
-# back to per-field reads when declare -n is unavailable. Tab-separated
-# output makes the read split deterministic regardless of value contents.
+# Read state through the same accessor as status, preserving empty fields
+# and arbitrary reason text without shell word-splitting.
 # Args (out, by name): state recorded window_started tripped_at update_outcome reason
 #######################################
 _rh_diagnose_read_state() {
 	local _state_var="$1" _recorded_var="$2" _window_var="$3"
 	local _tripped_var="$4" _update_var="$5" _reason_var="$6"
 	local _state="" _recorded="" _window="" _tripped="" _update="" _reason=""
-	if [[ -f "$RUNNER_HEALTH_STATE_FILE" ]] && command -v jq >/dev/null 2>&1; then
-		# Single jq pass: emit tab-separated values for atomic split.
-		# `// ""` collapses null to empty so read doesn't choke.
-		local row
-		row=$(jq -r '.circuit_breaker as $cb | [
-				($cb.state // ""),
-				(.consecutive_zero_attempts // 0 | tostring),
-				(.window_started_at // ""),
-				($cb.tripped_at // ""),
-				($cb.last_update_outcome // ""),
-				($cb.reason // "")
-			] | @tsv' <"$RUNNER_HEALTH_STATE_FILE" 2>/dev/null || true)
-		if [[ -n "$row" ]]; then
-			IFS=$'\t' read -r _state _recorded _window _tripped _update _reason <<<"$row"
-		fi
-	fi
+	_state=$(_rh_get_field '.circuit_breaker.state')
+	_recorded=$(_rh_get_field '.consecutive_zero_attempts')
+	_window=$(_rh_get_field '.window_started_at')
+	_tripped=$(_rh_get_field '.circuit_breaker.tripped_at')
+	_update=$(_rh_get_field '.circuit_breaker.last_update_outcome')
+	_reason=$(_rh_get_field '.circuit_breaker.reason')
 	# Use printf -v + eval so we don't require declare -n (bash 3.2 safe).
 	printf -v "$_state_var" '%s' "$_state"
 	printf -v "$_recorded_var" '%s' "$_recorded"
@@ -842,9 +880,7 @@ cmd_diagnose() {
 		esac
 	done
 
-	# Read all state fields in one jq pass. Cuts six literal jq paths down
-	# to one and matches the existing _rh_state_apply / _rh_get_field
-	# convention. Empty bundle when the state file or jq is unavailable.
+	# Match the status accessor, including its empty-field handling.
 	local state="" recorded="" window_started="" tripped_at=""
 	local update_outcome="" reason=""
 	_rh_diagnose_read_state state recorded window_started tripped_at \
@@ -981,8 +1017,9 @@ USAGE:
 
 DIAGNOSE FINDINGS (categories surfaced for operator action):
   HEALTHY          — counter at zero, no recent zero-attempt events.
-  BUILDING         — counter > 0 and matches log evidence (or breaker
-                     recently tripped and not yet verified); no action needed.
+  BUILDING         — counter > 0 and matches log evidence; no action needed.
+  PAUSED_NO_UPDATE — dispatch paused without an update; review before resume.
+  TRIPPED          — dispatch blocked, update recovery not yet verified.
   RECOVERABLE_TRIPPED
                    — breaker is tripped, update ran, and deployed artifacts
                      match the local repo; the next pause check auto-resumes.
@@ -990,8 +1027,10 @@ DIAGNOSE FINDINGS (categories surfaced for operator action):
                      (recorder being skipped — likely caller-side bug).
   TRIGGER_MISSED   — counter reached threshold but breaker stayed closed
                      (trip path or signal predicate broken).
-  STUCK_TRIPPED    — breaker tripped >24h ago and last update failed;
-                     manual resume required after fixing the install.
+  STUCK_TRIPPED    — breaker tripped longer than RUNNER_HEALTH_NO_UPDATE_PAUSE_HOURS
+                     (default 24) ago and the last update outcome is empty,
+                     never, failed, or helper_missing; manual resume required
+                     after fixing the install.
 
 ZERO-ATTEMPT SIGNALS (reset counter when not one of these):
   no_worker_process          — worker process never spawned.

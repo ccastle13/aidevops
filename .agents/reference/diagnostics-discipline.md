@@ -12,6 +12,8 @@ When to load:
 - Answering productivity questions ("is the pulse working?", "are workers running?", "did we ship anything today?").
 - Drafting any public comment that blames a specific task ID, issue number, PR, or commit.
 
+- Answering status questions about PRs, issues, CI, releases, tags, deployments or branch heads (GH#35839).
+
 For prompt-economy reasons these rules live here rather than in always-on AGENTS.md context. The pointer in AGENTS.md (`### Diagnostics discipline`) names all four task IDs so a `grep` for any of them in AGENTS.md still hits a forwarding address.
 
 ## Stale-symptom investigations (runtime debugging, t2036)
@@ -22,6 +24,20 @@ The deployed copy at `~/.aidevops/agents/scripts/FILE` may differ from source at
 - When symptom timestamps in logs predate the deployed file mtime, the symptom is historical — it reflects pre-deploy behaviour. Verify the symptom still reproduces against the current deploy before filing an investigation issue.
 - Scope: source-only debugging is fine for design, refactoring, and new code. This rule applies to runtime diagnostics rooted in logs/artifacts.
 - Related: "Pre-implementation discovery (t2046)" — complementary rule for checking git log before WRITING new code. Both check "is the world what I think it is?"; this one fires during investigation, t2046 fires before implementation.
+
+### When an existing repair does not run
+
+Before rewriting or duplicating recovery logic, trace the deployed entry point
+through its caller, prerequisite checks, and repair invocation. Capture the exit
+status and diagnostic output: an unavailable dependency or early return can
+prevent a correct repair from executing. Test through the original user-facing
+command with the failing prerequisite state, then verify the repaired artifact
+and preservation on failure. Distinguish source merged, runtime deployed, and
+affected-environment confirmation; none alone proves the others.
+
+Example: Tabby already had narrow malformed-YAML recovery, but missing PyYAML
+blocked it before invocation. PR #32328 added dependency bootstrap during sync;
+see `reference/tabby-profiles.md` for the operational contract.
 
 ## Attribution before verification (t2204 — MANDATORY before publishing blame)
 
@@ -63,3 +79,50 @@ For provider/model/account questions, use `worker-activity-helper.sh providers -
 - Listing aggregate failure-mode counts ("66 circuit-breaker trips in 48h") without checking whether they fired in the last 10 min.
 
 This rule sits alongside t3215 (canonical sources) and t2204 (attribution before verification) — all three fire at the diagnosis-publish step, all three demand evidence-then-claim.
+
+## Remote state is a current-state query (GH#35839 — MANDATORY)
+
+PR/issue status, CI runs, releases, tags, deployments and branch heads change between turns, and the session shows the date but no per-message time. Before answering about any of them, or basing a repair, rebase or new code on them:
+
+- **Query in this turn.** Never repeat an earlier turn's result as current; when citing one, state when it was observed.
+- **Timestamp it.** Run `date -u` first and give observation times in the answer. Label point-in-time results (for example "not merged as of 14:02 UTC").
+- **Tags before releases.** A tag can exist while its release is still a draft. Check `git ls-remote --tags <remote>` (or `git fetch --tags`) as well as `gh release list`.
+- **Deploys need the right run class.** List several runs with valid event filters (`--event push` covers both branch and tag pushes; query `--event workflow_dispatch` separately), then inspect each run's ref (`headBranch`) or SHA instead of generalising from `--limit 1`; a manual or skipped run says nothing about a tag-triggered deploy.
+- **Newer evidence invalidates the old picture.** An unseen SHA, tag or newer run means re-fetch and re-check before concluding.
+
+Related: `reference/session.md` "Context Compaction Resilience" (revalidate after rollover) and t3222 above.
+
+## Actionable productivity measurements
+
+Use `pulse-check-helper.sh report --window 15m --since 6h --budget 60 --verify-delivery`
+for a bounded combined observation. The default collection budget is 45 seconds;
+each component also has a ceiling. The report returns partial evidence rather
+than waiting indefinitely. `collection` records component state and elapsed
+seconds; a timeout is missing evidence, not zero activity or an empty queue.
+
+- **Capacity:** active processes are a local snapshot. Missing maximum/free-slot
+  evidence remains unknown, not a claim that capacity equals current activity.
+  A cycle heartbeat outside the requested window is stale; its retained progress
+  history cannot trigger current under-utilisation conclusions.
+- **Work supply:** inventory coverage and dependency/progress enrichment are
+  separate. Partial counts do not establish the total ready backlog. Issue entries
+  are not independent work targets: duplicate intakes can name the same PR, and
+  assigned work may have a live owner. Verify both before filling slots.
+- **Flow:** use stage durations and their sample counts to locate admission delays.
+  Nested stage times overlap; do not sum them into an invented end-to-end latency.
+  Compare current launches/completions with ready supply and live ownership before
+  attributing a quiet interval to a broken dispatcher.
+- **Delivery:** optional GitHub verification reports deliveries independently of
+  local terminal attempt records. A blocked attempt may later produce a merged
+  PR; multiple attempts may contribute to one delivery. Do not divide these
+  unmatched counts into a success percentage. Existing compatibility percentage
+  fields remain null until a matched cohort is available; runtime handoff rate
+  retains its own terminal-attempt denominator.
+- **Next action:** insufficient independent authorized supply calls for reviewing
+  existing plans and blockers, not manufacturing tasks. Ready work with idle slots
+  calls for tracing admission. High occupancy with low delivery calls for reviewing
+  progress, quality and integration waits. Include evidence gaps and the next
+  bounded verification, rather than declaring health from occupancy alone.
+
+The objective is verified useful delivery with less user time and avoidable cost,
+not maximum processes, comments, attempts, or tokens.

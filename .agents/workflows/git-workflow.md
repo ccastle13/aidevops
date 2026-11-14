@@ -32,6 +32,8 @@ ${AIDEVOPS_DIR:-$HOME/.aidevops}/agents/scripts/pre-edit-check.sh  # Verifies br
 
 If the gate reports the canonical checkout: STOP and create a safe linked worktree for the task before editing. This technical gate checks both branch and worktree location; `git status` alone cannot prove the checkout is canonical versus linked. For releases, first verify the canonical checkout is clean and synchronized, then create a fresh detached linked worktree at `origin/main`; the version manager refuses canonical execution and requires source-PR merge provenance.
 
+**Same-session recovery:** When a session started outside the repository already owns a verified linked worktree, keep the session. Use absolute target paths and pass that verified path as `workdir` to `apply_patch` and Bash; the unchanged session root is not a reason to relocate the chat. Explicit context does not bypass canonical or escape protections.
+
 **First Actions** (before any code changes):
 
 ```bash
@@ -40,6 +42,8 @@ git log --oneline HEAD..origin/$(git branch --show-current) 2>/dev/null
 ```
 
 Inside an existing linked worktree, refresh and rebase before editing. From the canonical checkout, let `worktree-helper.sh add` refresh `origin/<default>` while creating the linked worktree. Preserve unrelated uncommitted work; never stash/reset/clean another session's changes.
+
+**Stale remote branches (GH#33381):** `full-loop-helper.sh commit-and-pr` classifies the remote branch before pushing. It overwrites only its own history, using a lease on the observed SHA. A diverged foreign branch, such as one left by a dead worker, stays untouched, and the work is published as `<branch>-rN`. A foreign branch backing an open PR is refused unless you pass `--replace-pr`. PR creation passes the exact pushed head as `--head`. If the push succeeds but PR creation fails, the helper prints one `PR_CREATE_NEXT=` retry command. Linked worktrees on a bare common Git directory report `CANONICAL_SYNC_NOT_APPLICABLE` instead of a sync failure.
 
 **Canonical synchronization after a merge (explicit authorization only):** direct `git pull`, `fetch`, reset, clean, and merge remain blocked in canonical checkouts. A full-loop request for a maintained non-aidevops repository authorizes synchronization of the merged PR base; a standalone request to update a canonical checkout has the same narrow scope. For a clean, non-diverged mirror, use:
 
@@ -55,9 +59,10 @@ the helper by name keeps the command portable and parseable by command policy.
 The asserted branch must equal the branch resolved from registered config,
 committed project config, or `origin/HEAD`. The helper refuses arbitrary branch
 names, linked/detached checkouts, divergence, concurrent recovery, stale refs,
-and audit failures.
+and audit failures. Untracked-only state is allowed: it is backed up, then
+non-colliding files are reinstated after the verified fast-forward.
 
-If unexpected tracked, staged, untracked, or local-commit state exists, use the
+If unexpected tracked, staged, or local-commit state exists, use the
 lossless route instead of waiting, stashing, resetting, or cleaning:
 
 ```bash
@@ -73,6 +78,11 @@ compare-and-swaps the mirror to the exact pinned tip. Interrupted runs retain a
 backup ID and restore command and are safe to retry. Use `restore-default` only
 when the canonical checkout is on the wrong branch. Full details:
 `reference/dirty-worktree-preservation.md`.
+
+Local-only repos (`"local_only": true`, no `origin`): complete a user-authorized
+full-loop with `canonical-recovery-helper.sh fast-forward-local --repo PATH
+--from-branch BRANCH --task tNNN --confirm FAST_FORWARD_LOCAL_CANONICAL`
+instead of handing raw `git stash`/`git merge` to the user.
 
 **Worktrees** (DEFAULT for all feature work):
 
@@ -132,9 +142,9 @@ Slugification: lowercase, hyphens for spaces, remove special chars, truncate ~50
 Parse issue URLs to extract platform, owner, repo, and issue number, then create a safe linked worktree:
 
 ```bash
-# Clone if not local. Use grouped parents for ecosystem repos:
-# WordPress -> ~/Git/wordpress/{repo}; EspoCRM -> ~/Git/espocrm/{repo}; MCP -> ~/Git/mcp/{repo}
-# Other repos -> ~/Git/{repo}. Details: reference/repo-organization.md
+# Clone if not local. Configured personal owner -> ~/Git/{repo};
+# organization or third party -> ~/Git/{owner}/{repo}.
+# Explicit repos.json paths remain authoritative. Details: reference/repo-organization.md
 ${AIDEVOPS_DIR:-$HOME/.aidevops}/agents/scripts/worktree-helper.sh add {type}/{issue_number}-{slug-from-title}
 # Then cd into the printed linked worktree path before editing.
 ```
@@ -217,8 +227,9 @@ Git is the audit trail. Procedures: see the "## AGENTS.md User Guide Git Workflo
 
 **Origin labelling (MANDATORY):**
 
-- In managed repos, never use raw `gh pr create` or `gh issue create` directly. Always use the wrappers: `gh_create_pr` and `gh_create_issue` (defined in `shared-constants.sh`, sourced via PATH). The wrappers automatically apply `origin:interactive` or `origin:worker` based on the session context. Raw `gh` calls produce unlabelled PRs that the pulse may auto-close.
-- In managed repos, if `gh_create_pr` is unavailable (e.g. not sourced), pass `--label origin:interactive` explicitly when creating PRs in an interactive session.
+- In managed repos, never use raw `gh pr create` or `gh issue create` directly. Prefer the executable `gh-write-helper.sh issue create` / `gh-write-helper.sh pr create`; scripts that source `shared-gh-wrappers.sh` may call `gh_create_issue` / `gh_create_pr`. Both routes automatically apply `origin:interactive` or `origin:worker` and the signature footer based on session context. Adding an origin label manually is not a substitute for the wrapper.
+- In OpenCode or any runtime that cannot source shell functions, use a single-line argv command: `gh-write-helper.sh issue create --repo owner/repo --title 'Issue title' --body-file /absolute/path/brief.md --label bug --assignee @me`. Write the body file in a separate tool call first; use the installed executable path if it is not on PATH. No `bash -c`, shell variables, redirects, or caller-side `source` are needed.
+- Use `gh-write-helper.sh issue comment` / `gh-write-helper.sh pr comment` for comments and `gh-write-helper.sh pr create` for PRs with the same body-file pattern (see `reference/gh-command-discipline.md`). This helper uses existing `gh` authentication, not the optional legacy `github-cli-helper.sh` multi-account config. Use `claim-task-id.sh --brief-file` when creating a tracked task that also needs a task ID.
 
 **External upstream repos (non-maintainer etiquette):**
 
@@ -270,6 +281,8 @@ Worktrees: `wt switch -c {type}/{name}`. Keep the canonical repo directory on `m
 **Traceability and signature footer:** Hard rules: see "Traceability" above and "Framework Rules > Signature footer hallucination" in `.agents/AGENTS.md`. Link both sides when closing (issue→PR, PR→issue). Do NOT pass `--issue` when creating new issues (the issue doesn't exist yet). See `scripts/commands/pulse.md` for dispatch/kill/merge comment templates.
 
 **Stacked PRs (t2412):** Stacked PRs (`--base feature/<other-branch>`) are auto-retargeted to the default branch before the parent merges — handled automatically by `pulse-merge.sh` and `full-loop-helper.sh merge`. Direct `gh pr merge` is blocked because it skips this retargeting and the other lifecycle gates. Only direct children are retargeted; grandchildren are handled when their own parent merges.
+
+**Creating a stacked PR:** `full-loop-helper.sh commit-and-pr --issue N --message "..." --base feature/<parent-branch>` rebases onto `origin/<parent-branch>` and opens the PR against it. The parent must already be pushed to `origin` and differ from the current branch; without `--base` the remote default branch is used. Keep `Resolves #N` in the body: closing keywords on a non-default base do not auto-close until retargeting.
 
 **Interactive admin merge authority:** In managed repos where the session has admin/maintainer access, branch-policy review-count or self-approval blocks are not user blockers after review-bot, CI, draft, and NMR gates pass. Use the sanctioned wrapper path; it may fall through to `--admin` automatically for interactive sessions. `needs-maintainer-review` still requires crypto approval before any admin merge. Full decision tree: `reference/auto-merge.md`.
 

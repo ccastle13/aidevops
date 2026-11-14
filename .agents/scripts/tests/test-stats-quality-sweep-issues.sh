@@ -255,9 +255,9 @@ gh() {
 		printf ''
 		return 0
 		;;
-	*"issue list"*"Code Audit Routines"*"[.[].number]"*)
-		# Sibling search in _quality_issue_close_duplicates (--jq '[.[].number]'):
-		# return a JSON array containing the new issue (999) plus two siblings
+	*"issue list"*"Code Audit Routines"*"--json number,title"*)
+		# Sibling search in _quality_issue_close_duplicates (exact-title jq
+		# filter applied by gh): the new issue (999) plus two siblings
 		printf '[100,200,999]\n'
 		return 0
 		;;
@@ -335,6 +335,113 @@ else
 fi
 
 # =============================================================================
+# Test (c2): GH#37957 — reusing a cached dashboard proven OPEN also closes
+# duplicates; an unverifiable cached dashboard never closes anything.
+# =============================================================================
+printf '\n%s[c2] reuse-path-closes-siblings%s\n' "$TEST_BLUE" "$TEST_NC"
+
+REUSE_STATE_RC=0
+gh() {
+	echo "gh $*" >>"$GH_CALLS"
+	case "$*" in
+	*"issue view"*"--json state"*)
+		[[ "$REUSE_STATE_RC" -eq 0 ]] || return 1
+		printf 'OPEN\n'
+		return 0
+		;;
+	*"issue list"*"Code Audit Routines"*"--json number,title"*)
+		printf '[33,4]\n'
+		return 0
+		;;
+	*"issue close"*)
+		local num
+		num=$(printf '%s' "$*" | grep -oE '[0-9]+' | head -1)
+		echo "close:$num" >>"$CLOSE_CALLS"
+		return 0
+		;;
+	esac
+	return 0
+}
+export -f gh
+
+for REUSE_STATE_RC in 0 1; do
+	true >"$CREATE_CALLS"
+	true >"$CLOSE_CALLS"
+	export HOME="$TMP"
+	mkdir -p "${TMP}/.aidevops/logs"
+	printf '33\n' >"${TMP}/.aidevops/logs/quality-issue-test-repo"
+	result=$(_ensure_quality_issue "test/repo" 2>/dev/null)
+	rc=$?
+	export HOME="$_original_home"
+	if [[ "$REUSE_STATE_RC" -eq 0 ]]; then
+		if [[ "$rc" -eq 0 && "$result" == "33" ]] && grep -q "close:4" "$CLOSE_CALLS" &&
+			! grep -q "close:33" "$CLOSE_CALLS" && [[ ! -s "$CREATE_CALLS" ]]; then
+			pass "reuse-verified-closes-stale-sibling"
+		else
+			fail "reuse-verified-closes-stale-sibling" "rc=$rc result=$result closes=$(cat "$CLOSE_CALLS")"
+		fi
+	elif [[ "$rc" -eq 0 && "$result" == "33" && ! -s "$CLOSE_CALLS" ]]; then
+		pass "reuse-unverified-closes-nothing"
+	else
+		fail "reuse-unverified-closes-nothing" "rc=$rc result=$result closes=$(cat "$CLOSE_CALLS")"
+	fi
+done
+
+# =============================================================================
+# Test (c3): real --jq filters ignore non-dashboard titles, and every sweep
+# converges on the highest-numbered open dashboard (no mutual closure).
+# =============================================================================
+printf '\n%s[c3] dashboard-title-filter-and-canonical-survivor%s\n' "$TEST_BLUE" "$TEST_NC"
+
+gh() {
+	echo "gh $*" >>"$GH_CALLS"
+	local prev="" arg="" jq_expr=""
+	for arg in "$@"; do
+		[[ "$prev" == "--jq" ]] && jq_expr="$arg"
+		prev="$arg"
+	done
+	case "$*" in
+	*"issue list"*"Code Audit Routines"*)
+		printf '%s' '[{"number":50,"title":"Fix Code Audit Routines scheduling"},{"number":33,"title":"Code Audit Routines — quality debt: 0 open, 18 closed"},{"number":4,"title":"Code Audit Routines"}]' |
+			command jq -c "$jq_expr"
+		return 0
+		;;
+	*"issue view"*"--json state"*)
+		printf 'OPEN\n'
+		return 0
+		;;
+	*"issue close"*)
+		local num
+		num=$(printf '%s' "$*" | grep -oE '[0-9]+' | head -1)
+		echo "close:$num" >>"$CLOSE_CALLS"
+		return 0
+		;;
+	esac
+	return 0
+}
+export -f gh
+
+title_pick=$(_quality_issue_title_search "test/repo")
+if [[ "$title_pick" == "33" ]]; then
+	pass "title-fallback-skips-unrelated-title"
+else
+	fail "title-fallback-skips-unrelated-title" "expected 33, got '$title_pick'"
+fi
+
+true >"$CLOSE_CALLS"
+export HOME="$TMP"
+printf '4\n' >"${TMP}/.aidevops/logs/quality-issue-test-repo"
+result=$(_ensure_quality_issue "test/repo" 2>/dev/null)
+rc=$?
+export HOME="$_original_home"
+if [[ "$rc" -eq 0 && "$result" == "33" ]] && grep -q "close:4" "$CLOSE_CALLS" &&
+	! grep -q -e "close:33" -e "close:50" "$CLOSE_CALLS"; then
+	pass "lower-survivor-adopts-newest-dashboard"
+else
+	fail "lower-survivor-adopts-newest-dashboard" "rc=$rc result=$result closes=$(cat "$CLOSE_CALLS")"
+fi
+
+# =============================================================================
 # Test (d): Sonar gate blocker issue is created only for failing gates
 # =============================================================================
 printf '\n%s[d] sonar-gate-blocker-create-on-failure%s\n' "$TEST_BLUE" "$TEST_NC"
@@ -381,6 +488,108 @@ if [[ ! -s "$CREATE_CALLS" ]]; then
 	pass "sonar-gate-ok-no-create"
 else
 	fail "sonar-gate-ok-no-create" "gh_create_issue was called: $(cat "$CREATE_CALLS")"
+fi
+
+# =============================================================================
+# Test (f): multi-line bot coverage does not shift later dashboard fields
+# GH#32730: newline-delimited transport rendered an empty badge row and the
+# title "Simplified: | Metric | Count |".
+# =============================================================================
+printf '\n%s[f] quality-stats-multiline-transport%s\n' "$TEST_BLUE" "$TEST_NC"
+
+_compute_debt_stats() { printf '1|2039|2040|99'; return 0; }
+_compute_bot_coverage() { printf '### Bot Review Coverage\n\n| Metric | Count |\n| --- | --- |\n| Open PRs | 3 |\n'; return 0; }
+_compute_badge_indicator() { printf 'GREEN (all badges passing)'; return 0; }
+
+export HOME="$TMP"
+stats_file="${TMP}/quality-stats.bin"
+_gather_quality_issue_stats "test/repo" "OK" "A" >"$stats_file"
+export HOME="$_original_home"
+fields=()
+while IFS= read -r -d '' field; do
+	fields+=("$field")
+done <"$stats_file"
+
+if [[ "${#fields[@]}" -eq 9 && "${fields[7]}" == "GREEN (all badges passing)" && "${fields[8]}" == "0" && "${fields[6]}" == *"| Open PRs | 3 |"* ]]; then
+	pass "multi-line-coverage-keeps-badge-and-simplified-fields"
+else
+	fail "multi-line-coverage-keeps-badge-and-simplified-fields" "count=${#fields[@]} badge='${fields[7]:-}' simplified='${fields[8]:-}'"
+fi
+
+title=$(_build_quality_issue_title "1" "2039" "C" "82" "OK")
+if [[ "$title" == "Code Audit Routines — Qlty C (82 smells) · Sonar OK · quality debt: 1 open, 2039 closed" ]]; then
+	pass "quality-title-carries-grade-gate-and-backlog"
+else
+	fail "quality-title-carries-grade-gate-and-backlog" "title='${title}'"
+fi
+
+title=$(_build_quality_issue_title "0" "0" "UNKNOWN" "0" "UNKNOWN")
+if [[ "$title" == "Code Audit Routines — quality debt: 0 open, 0 closed" ]]; then
+	pass "quality-title-omits-unknown-signals"
+else
+	fail "quality-title-omits-unknown-signals" "title='${title}'"
+fi
+
+# =============================================================================
+# Test (g): superseded automation comments are selected; humans are not
+# =============================================================================
+printf '\n%s[g] superseded-dashboard-comment-selection%s\n' "$TEST_BLUE" "$TEST_NC"
+
+comments_json='[
+ {"id":"legacy","isMinimized":false,"createdAt":"2026-06-01T00:00:00Z","body":"## Daily Code Quality Sweep\nold"},
+ {"id":"sweep-old","isMinimized":false,"createdAt":"2026-07-01T00:00:00Z","body":"<!-- quality-sweep-latest -->\n## Daily Code Quality Sweep"},
+ {"id":"sweep-new","isMinimized":false,"createdAt":"2026-08-01T00:00:00Z","body":"<!-- quality-sweep-latest -->\n## Daily Code Quality Sweep"},
+ {"id":"nmr","isMinimized":false,"createdAt":"2026-07-02T00:00:00Z","body":"<!-- nmr-decision-packet reason=authority -->\n## Maintainer decision required"},
+ {"id":"ops","isMinimized":false,"createdAt":"2026-07-03T00:00:00Z","body":"<!-- ops:start — workers: skip -->\nDISPATCH_CLAIM"},
+ {"id":"hidden","isMinimized":true,"createdAt":"2026-07-04T00:00:00Z","body":"<!-- nmr-decision-packet reason=secret -->"},
+ {"id":"human","isMinimized":false,"createdAt":"2026-07-05T00:00:00Z","body":"Thanks, looks good."},
+ {"id":"approval","isMinimized":false,"createdAt":"2026-07-06T00:00:00Z","body":"<!-- aidevops-signed-approval -->\napproved"}
+]'
+selected=$(_select_superseded_dashboard_comments "$comments_json" | sort | tr '\n' ' ')
+if [[ "$selected" == "legacy nmr ops sweep-old " ]]; then
+	pass "selects-superseded-automation-only"
+else
+	fail "selects-superseded-automation-only" "selected='${selected}'"
+fi
+
+# =============================================================================
+# Test (h): large comment bodies do not abort hygiene (GH#32752)
+# 150 automation comments x 20 KB bodies exceed the argument-size limit when
+# full bodies are merged through jq --argjson.
+# =============================================================================
+printf '\n%s[h] large-thread-comment-hygiene%s\n' "$TEST_BLUE" "$TEST_NC"
+
+LARGE_PAGE="${TMP}/large-page.json"
+MINIMIZED="${TMP}/minimized.log"
+true >"$MINIMIZED"
+command jq -n '{data:{repository:{issue:{comments:{
+	pageInfo:{hasNextPage:false,endCursor:null},
+	nodes:[range(0;150) | {id:"c\(.)", isMinimized:false, createdAt:"2026-07-01T00:00:00Z",
+		body:("<!-- nmr-decision-packet reason=authority -->\n" + ("x" * 20000))}]
+}}}}}' >"$LARGE_PAGE"
+
+gh() {
+	case "$*" in
+	*"minimizeComment"*)
+		printf '%s\n' "$*" >>"$MINIMIZED"
+		printf '{"data":{"minimizeComment":{"clientMutationId":null}}}\n'
+		return 0
+		;;
+	*"api graphql"*)
+		cat "$LARGE_PAGE"
+		return 0
+		;;
+	esac
+	return 0
+}
+export -f gh
+
+QUALITY_DASHBOARD_MINIMIZE_MAX=200 _minimize_superseded_dashboard_comments 24670 "test/repo"
+minimized_count=$(grep -c 'minimizeComment(input' "$MINIMIZED")
+if [[ "$minimized_count" == "150" ]]; then
+	pass "large-thread-minimizes-all-superseded-comments"
+else
+	fail "large-thread-minimizes-all-superseded-comments" "minimized=${minimized_count}; log=$(tail -3 "$LOGFILE" 2>/dev/null)"
 fi
 
 # =============================================================================

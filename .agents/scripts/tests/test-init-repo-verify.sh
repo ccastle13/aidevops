@@ -3,6 +3,14 @@
 # SPDX-FileCopyrightText: 2025-2026 Marcus Quinn
 
 set -u
+
+# Resolve native Git once from the system default PATH (portable to non-FHS
+# hosts such as NixOS); fixtures must bypass the aidevops git wrapper.
+TEST_NATIVE_GIT=$(command -p -v git) || {
+	printf '%s\n' 'Native Git is unavailable on the system PATH' >&2
+	exit 1
+}
+export TEST_NATIVE_GIT
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 1
 INSTALL_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)" || exit 1
 AGENTS_DIR="${INSTALL_DIR}/.agents"
@@ -32,48 +40,20 @@ assert_equal() {
 	return 0
 }
 
-test_beads_hook_integrity() {
+test_retired_beads_compatibility() {
 	local repo_root="$1"
 	local common_dir="$2"
 	local hook_file="${repo_root}/${common_dir}/hooks/pre-push"
-	local stub_bin="${TEST_TMP_DIR}/bin"
-	local beads_args="${TEST_TMP_DIR}/beads-args"
-	mkdir -p "$stub_bin"
-	cat >"${stub_bin}/bd" <<'BDEOF'
-#!/usr/bin/env bash
-set -euo pipefail
-if [[ "${1:-}" == "init" && "${2:-}" == "--help" ]]; then
-	[[ "${BEADS_LEGACY:-false}" == "true" ]] || printf '%s\n' '      --skip-hooks   Skip git hooks installation'
-	exit 0
-fi
-printf '%s\n' "$*" >"$BEADS_ARGS"
-if [[ "${BEADS_LEGACY:-false}" == "true" ]]; then
-	printf '%s\n' '#!/usr/bin/env bash' '# replaced by legacy Beads' 'exit 0' >"$BEADS_HOOK"
-	chmod +x "$BEADS_HOOK"
-fi
-mkdir -p .beads
-exit 0
-BDEOF
-	chmod +x "${stub_bin}/bd"
-	local original_path="$PATH" original_agents_dir="$AGENTS_DIR"
-	PATH="${stub_bin}:${PATH}"
-	AGENTS_DIR="${TEST_TMP_DIR}/empty-agents"
-	mkdir -p "$AGENTS_DIR"
-	export BEADS_ARGS="$beads_args" BEADS_HOOK="$hook_file"
-	local enable_database=false enable_beads=true enable_sops=false
+	local enable_database=false enable_sops=false
 	local project_root="$repo_root"
 	_init_sops_support() { return 0; }
-	_init_database_and_beads
-	assert_equal "init --skip-hooks" "$(<"$beads_args")" "init prevents modern Beads from replacing the managed hook"
+	mkdir -p "${repo_root}/.beads"
+	_init_database_support
+	assert_equal "true" "$([[ -d "${repo_root}/.beads" ]] && printf true || printf false)" "retired feature preserves existing task data"
 	assert_equal "0" "$(
 		_init_finalize_repo_verify "$repo_root" >/dev/null 2>&1
 		printf '%s' "$?"
-	)" "final hook integrity passes after modern Beads setup"
-
-	rm -rf "${repo_root}/.beads"
-	BEADS_LEGACY=true _init_database_and_beads
-	assert_equal "init" "$(<"$beads_args")" "legacy Beads initializes without unsupported flags"
-	assert_equal "true" "$(_init_repo_verify_hook_integrity "$repo_root" && printf true || printf false)" "legacy Beads hook replacement is restored"
+	)" "final hook integrity passes without task integration"
 
 	printf '%s\n' '#!/usr/bin/env bash' '# aidevops-pre-push-guards' '# guard:repo-verify' 'exit 0' >"$hook_file"
 	chmod +x "$hook_file"
@@ -85,8 +65,6 @@ BDEOF
 	local final_status=0
 	_init_finalize_repo_verify "$repo_root" >/dev/null 2>&1 || final_status=$?
 	assert_equal "1" "$final_status" "init fails when an unmanaged final hook postcondition is lost"
-	AGENTS_DIR="$original_agents_dir"
-	PATH="$original_path"
 	return 0
 }
 
@@ -133,10 +111,10 @@ main() {
 	trap 'rm -rf "$TEST_TMP_DIR"' EXIT
 	local repo_root="${TEST_TMP_DIR}/repo"
 	mkdir -p "$repo_root"
-	/usr/bin/git -C "$repo_root" init -q
+	"$TEST_NATIVE_GIT" -C "$repo_root" init -q
 	printf '%s\n' '{"custom":{"keep":true},"features":{"planning":false}}' >"$repo_root/.aidevops.json"
 	printf '%s\n' '{"scripts":{"lint":"eslint .","typecheck":"tsc --noEmit"}}' >"$repo_root/package.json"
-	/usr/bin/git -C "$repo_root" add package.json
+	"$TEST_NATIVE_GIT" -C "$repo_root" add package.json
 
 	_init_write_project_config "$repo_root/.aidevops.json" "9.9.9" "standard" false false true true true false false false false true false false
 	assert_equal "true" "$(jq -r '.custom.keep' "$repo_root/.aidevops.json")" "init preserves unknown configuration keys"
@@ -147,10 +125,17 @@ main() {
 	assert_equal "npm run lint" "$(jq -r '.verify.lint' "$repo_root/.aidevops.json")" "init seeds exact lint command"
 	assert_equal "npm run typecheck" "$(jq -r '.verify.typecheck' "$repo_root/.aidevops.json")" "init seeds exact typecheck command"
 	local common_dir
-	common_dir=$(/usr/bin/git -C "$repo_root" rev-parse --git-common-dir)
+	common_dir=$("$TEST_NATIVE_GIT" -C "$repo_root" rev-parse --git-common-dir)
 	assert_equal "1" "$(grep -c '# guard:repo-verify' "${repo_root}/${common_dir}/hooks/pre-push" 2>/dev/null || printf 0)" "init immediately installs repo-verify hook"
 
-	test_beads_hook_integrity "$repo_root" "$common_dir"
+	assert_equal "null" "$(jq -r '.beads // null' "$repo_root/.aidevops.json")" "fresh config omits retired integration"
+	assert_equal "null" "$(jq -r '.features.beads // null' "$repo_root/.aidevops.json")" "fresh features omit retired integration"
+	assert_equal "beads planning" "$(_init_parse_features beads)" "legacy feature name remains accepted"
+	jq '.features.beads = true | .beads = {"enabled":true}' "$repo_root/.aidevops.json" >"${TEST_TMP_DIR}/legacy-config.json"
+	mv "${TEST_TMP_DIR}/legacy-config.json" "$repo_root/.aidevops.json"
+	_init_write_project_config "$repo_root/.aidevops.json" "9.9.9" "standard" false false true true true false false false false true false false
+	assert_equal "true" "$(jq -r '.features.beads' "$repo_root/.aidevops.json")" "legacy feature config preserved"
+	test_retired_beads_compatibility "$repo_root" "$common_dir"
 
 	local invalid_config="${TEST_TMP_DIR}/invalid.json"
 	printf '{invalid\n' >"$invalid_config"
@@ -163,13 +148,13 @@ main() {
 
 	local opted_out="${TEST_TMP_DIR}/opted-out"
 	mkdir -p "$opted_out"
-	/usr/bin/git -C "$opted_out" init -q
+	"$TEST_NATIVE_GIT" -C "$opted_out" init -q
 	printf '%s\n' '{"features":{"code_quality":true},"verify":{"enabled":false}}' >"$opted_out/.aidevops.json"
 	printf '%s\n' '{"scripts":{"lint":"eslint ."}}' >"$opted_out/package.json"
-	/usr/bin/git -C "$opted_out" add package.json
+	"$TEST_NATIVE_GIT" -C "$opted_out" add package.json
 	_init_configure_repo_verify "$opted_out"
 	_init_finalize_repo_verify "$opted_out"
-	common_dir=$(/usr/bin/git -C "$opted_out" rev-parse --git-common-dir)
+	common_dir=$("$TEST_NATIVE_GIT" -C "$opted_out" rev-parse --git-common-dir)
 	if [[ -f "${opted_out}/${common_dir}/hooks/pre-push" ]]; then
 		assert_equal "0" "$(grep -c '# guard:repo-verify' "${opted_out}/${common_dir}/hooks/pre-push" 2>/dev/null || printf 0)" "init does not install hook for verify opt-out"
 	else

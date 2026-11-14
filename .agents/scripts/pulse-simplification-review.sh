@@ -4,7 +4,7 @@
 # =============================================================================
 # Pulse Simplification — Review Scanners
 # =============================================================================
-# Daily codebase review (CodeRabbit), post-merge review scanner, active-PR
+# Post-merge review scanner, active-PR
 # review-thread response scanner, and auto-decomposer scanner. Extracted from pulse-simplification.sh as part
 # of the file-size-debt split (GH#21306, parent #21146).
 #
@@ -32,102 +32,6 @@ if [[ -z "${SCRIPT_DIR:-}" ]]; then
     unset _lib_path
 fi
 
-# Check if the daily CodeRabbit codebase review interval has elapsed.
-# Models on _complexity_scan_check_interval which has never regressed (GH#17640).
-# Arguments: $1 - now_epoch (current epoch seconds)
-# Returns: 0 if review is due, 1 if not yet due
-_coderabbit_review_check_interval() {
-	local now_epoch="$1"
-	if [[ ! -f "$CODERABBIT_REVIEW_LAST_RUN" ]]; then
-		return 0
-	fi
-	local last_run
-	last_run=$(cat "$CODERABBIT_REVIEW_LAST_RUN" 2>/dev/null || echo "0")
-	[[ "$last_run" =~ ^[0-9]+$ ]] || last_run=0
-	local elapsed=$((now_epoch - last_run))
-	if [[ "$elapsed" -lt "$CODERABBIT_REVIEW_INTERVAL" ]]; then
-		local remaining=$(((CODERABBIT_REVIEW_INTERVAL - elapsed) / 3600))
-		echo "[pulse-wrapper] CodeRabbit codebase review not due yet (${remaining}h remaining)" >>"$LOGFILE"
-		return 1
-	fi
-	return 0
-}
-
-#######################################
-# Daily full codebase review via CodeRabbit (GH#17640).
-#
-# Posts "@coderabbitai Please run a full codebase review" on issue #2632
-# once per 24h. Uses a simple timestamp file gate (same pattern as
-# _complexity_scan_check_interval) to avoid duplicate posts.
-#
-# Previous implementations regressed because they checked complex quality
-# gate status instead of a plain time-based interval. This version uses
-# the same pattern as the complexity scan which has never regressed.
-#
-# Actionable findings from the review are routed through
-# quality-feedback-helper.sh to create tracked issues.
-#######################################
-run_daily_codebase_review() {
-	local aidevops_slug="marcusquinn/aidevops"
-
-	# t2145: CodeRabbit review triggers issue-creating scanners — maintainer-only.
-	local _cr_role
-	_cr_role=$(get_repo_role_by_slug "$aidevops_slug")
-	if [[ "$_cr_role" != "maintainer" ]]; then
-		return 0
-	fi
-
-	local now_epoch
-	now_epoch=$(date +%s)
-
-	# Time gate: skip if last review was <24h ago
-	_coderabbit_review_check_interval "$now_epoch" || return 0
-
-	# Permission gate: only collaborators with write+ may trigger reviews
-	local current_user
-	current_user=$(gh api user --jq '.login' 2>/dev/null) || current_user=""
-	if [[ -z "$current_user" ]]; then
-		echo "[pulse-wrapper] CodeRabbit review: skipped — cannot determine current user" >>"$LOGFILE"
-		return 0
-	fi
-	local perm_level
-	# #aidevops:trust-boundary — review-trigger comments require confirmed
-	# collaborator write access; API lookup failures skip with explicit wording.
-	if ! _gh_collaborator_permission_lookup "$aidevops_slug" "$current_user" perm_level; then
-		echo "[pulse-wrapper] CodeRabbit review: skipped — permission check failed for user '$current_user' on $aidevops_slug (HTTP ${AIDEVOPS_GH_COLLAB_PERMISSION_HTTP:-unknown})" >>"$LOGFILE"
-		return 0
-	fi
-	case "$perm_level" in
-	admin | maintain | write) ;; # allowed
-	*)
-		echo "[pulse-wrapper] CodeRabbit review: skipped — user '$current_user' has '$perm_level' permission on $aidevops_slug (need write+)" >>"$LOGFILE"
-		return 0
-		;;
-	esac
-
-	echo "[pulse-wrapper] Posting daily CodeRabbit full codebase review request on #${CODERABBIT_REVIEW_ISSUE} (GH#17640)..." >>"$LOGFILE"
-
-	# Post the review trigger comment
-	if gh_issue_comment "$CODERABBIT_REVIEW_ISSUE" \
-		--repo "$aidevops_slug" \
-		--body "@coderabbitai Please run a full codebase review" 2>>"$LOGFILE"; then
-		# Update timestamp only on successful post
-		printf '%s\n' "$now_epoch" >"$CODERABBIT_REVIEW_LAST_RUN"
-		echo "[pulse-wrapper] CodeRabbit review: posted successfully, next review in ~24h" >>"$LOGFILE"
-	else
-		echo "[pulse-wrapper] CodeRabbit review: failed to post comment on #${CODERABBIT_REVIEW_ISSUE}" >>"$LOGFILE"
-		return 1
-	fi
-
-	# Route actionable findings through quality-feedback-helper if available
-	local qfh="${SCRIPT_DIR}/quality-feedback-helper.sh"
-	if [[ -x "$qfh" ]]; then
-		echo "[pulse-wrapper] CodeRabbit review: findings will be processed by quality-feedback-helper.sh on next cycle" >>"$LOGFILE"
-	fi
-
-	return 0
-}
-
 #######################################
 # Daily post-merge review scanner (t1993).
 #
@@ -137,7 +41,7 @@ run_daily_codebase_review() {
 # post-merge-review-scanner.sh's issue_exists() guard.
 #
 # Time-gated to run at most once per POST_MERGE_SCANNER_INTERVAL (default 24h).
-# Reference pattern: run_daily_codebase_review.
+# Reference pattern: _complexity_scan_check_interval.
 #######################################
 _post_merge_scanner_scan_repo() {
 	local slug="$1" scanner="$2" scanner_cursor_dir="$3" stage_start_epoch="$4" stage_budget="$5" stage_reserve="$6"
@@ -154,6 +58,15 @@ _post_merge_scanner_scan_repo() {
 	now_for_budget=$(date +%s)
 	elapsed_for_budget=$((now_for_budget - stage_start_epoch))
 	remaining_budget=$((stage_budget - elapsed_for_budget))
+	# The watchdog may shorten this stage to fit the remaining Pulse cycle.
+	# Recompute at each repo so setup and earlier scans consume that deadline.
+	local stage_deadline="${PULSE_STAGE_DEADLINE_EPOCH:-}" deadline_remaining=""
+	if [[ "$stage_deadline" =~ ^[0-9]+$ ]]; then
+		deadline_remaining=$((stage_deadline - now_for_budget))
+		if [[ "$deadline_remaining" -lt "$remaining_budget" ]]; then
+			remaining_budget="$deadline_remaining"
+		fi
+	fi
 	if [[ "$remaining_budget" -le "$stage_reserve" ]]; then
 		echo "[pulse-wrapper] Post-merge scanner: yielding before $slug (remaining=${remaining_budget}s reserve=${stage_reserve}s)" >>"${LOGFILE:-/dev/null}"
 		return 2
@@ -161,15 +74,27 @@ _post_merge_scanner_scan_repo() {
 
 	repo_budget=$((remaining_budget - stage_reserve))
 	echo "[pulse-wrapper] Post-merge scanner: scanning $slug" >>"${LOGFILE:-/dev/null}"
+	# The scan is deferrable maintenance: share the REST-core priority budget so
+	# it yields with a cursor before draining quota needed by dispatch/merge.
 	SCANNER_DAYS="${SCANNER_DAYS:-7}" \
 		SCANNER_BUDGET_SECONDS="$repo_budget" \
 		SCANNER_CURSOR_DIR="$scanner_cursor_dir" \
+		SCANNER_REST_CORE_GATE="${SCANNER_REST_CORE_GATE:-1}" \
 		"$scanner" scan "$slug" >>"${LOGFILE:-/dev/null}" 2>&1 || true
 
 	local safe_slug="" repo_scan_cursor=""
 	safe_slug=$(printf '%s' "$slug" | tr '/: ' '___')
 	repo_scan_cursor="${scanner_cursor_dir}/${safe_slug}.cursor"
 	if [[ -f "$repo_scan_cursor" ]]; then
+		# A repository-local listing failure must not pin the traversal here.
+		# Retain its PR cursor for the next scheduled traversal, but continue
+		# other repos now. Global cooldown/budget yields still stop the stage.
+		local cursor_reason=""
+		cursor_reason=$(jq -r '.reason // empty' "$repo_scan_cursor" 2>/dev/null) || cursor_reason=""
+		if [[ "$cursor_reason" == "merged-pr-list-failed" ]]; then
+			echo "[pulse-wrapper] Post-merge scanner: deferred $slug to next scheduled traversal; continuing other repos" >>"${LOGFILE:-/dev/null}"
+			return 0
+		fi
 		echo "[pulse-wrapper] Post-merge scanner: yielded in $slug; cursor preserved for next cycle" >>"${LOGFILE:-/dev/null}"
 		return 2
 	fi
@@ -185,6 +110,65 @@ _pulse_slug_list_contains() {
 		[[ "$slug" == "$needle" ]] && return 0
 	done <<<"$slugs"
 	return 1
+}
+
+#######################################
+# GH#37555: round-robin repo order for scanners without per-repo cursors.
+# Housekeeping slices (GH#37501) are shorter than a full traversal, so a
+# scanner that restarts at the first repo never reaches the rest. Emit the
+# slugs starting after the cursor slug, wrapping around; a missing or stale
+# cursor (repo no longer enabled) keeps the original order.
+#
+# Args:
+#   $1 - cursor file path
+#   $2 - newline-separated enabled slugs
+# Stdout: rotated newline-separated slugs
+# Returns 0 always.
+#######################################
+_pulse_scanner_rotated_slugs() {
+	local cursor_file="$1"
+	local slugs="$2"
+	local last_slug="" slug="" before="" after="" seen=0
+	if [[ -f "$cursor_file" ]]; then
+		last_slug=$(sed -n '1p' "$cursor_file" 2>/dev/null || true)
+	fi
+	if [[ -z "$last_slug" ]] || ! _pulse_slug_list_contains "$last_slug" "$slugs"; then
+		printf '%s\n' "$slugs"
+		return 0
+	fi
+	while IFS= read -r slug; do
+		[[ -n "$slug" ]] || continue
+		if [[ "$seen" -eq 1 ]]; then
+			after="${after}${slug}"$'\n'
+			continue
+		fi
+		before="${before}${slug}"$'\n'
+		if [[ "$slug" == "$last_slug" ]]; then
+			seen=1
+		fi
+	done <<<"$slugs"
+	printf '%s%s' "$after" "$before"
+	return 0
+}
+
+#######################################
+# GH#37555: record a repo as started before scanning it. Advancing before the
+# scan means a repo slower than the whole slice cannot pin the rotation.
+#
+# Args:
+#   $1 - cursor file path
+#   $2 - slug about to be scanned
+# Returns 0 always (cursor persistence is best-effort, but a failure is logged
+# because an unwritable cursor silently restores first-repo starvation).
+#######################################
+_pulse_scanner_mark_started() {
+	local cursor_file="$1"
+	local slug="$2"
+	if mkdir -p "${cursor_file%/*}" 2>/dev/null && printf '%s\n' "$slug" >"$cursor_file" 2>/dev/null; then
+		return 0
+	fi
+	echo "[pulse-wrapper] Scanner rotation: cursor write failed (${cursor_file}); next slice restarts at the first repo" >>"${LOGFILE:-/dev/null}"
+	return 0
 }
 
 _run_post_merge_review_scanner() {
@@ -312,7 +296,9 @@ _run_pr_review_thread_response_scanner() {
 
 	local total_repos=0
 	local skipped_contributor=0
-	local slug="" repo_path="" repo_role=""
+	local slug="" repo_path="" repo_role="" enabled_slugs=""
+	local cursor_file="${AIDEVOPS_PR_REVIEW_THREAD_RESPONSE_CURSOR_DIR:-${HOME:-}/.aidevops/logs/pr-review-thread-response-scanner}/repo.cursor"
+	enabled_slugs=$(_pulse_enabled_repo_slugs "$repos_json" || echo "")
 	while IFS= read -r slug; do
 		[[ -n "$slug" ]] || continue
 		repo_role=$(get_repo_role_by_slug "$slug")
@@ -323,9 +309,10 @@ _run_pr_review_thread_response_scanner() {
 		repo_path=$(jq -r --arg s "$slug" 'first(.initialized_repos[]? | select(.slug == $s)) | .path // ""' "$repos_json" 2>/dev/null) || repo_path=""
 		repo_path="${repo_path/#\~/$HOME}"
 		total_repos=$((total_repos + 1))
+		_pulse_scanner_mark_started "$cursor_file" "$slug"
 		echo "[pulse-wrapper] PR review-thread response: scanning $slug" >>"$LOGFILE"
 		"$scanner" dispatch "$slug" "$repo_path" >>"$LOGFILE" 2>&1 || true
-	done < <(_pulse_enabled_repo_slugs "$repos_json")
+	done < <(_pulse_scanner_rotated_slugs "$cursor_file" "$enabled_slugs")
 	if [[ "$skipped_contributor" -gt 0 ]]; then
 		echo "[pulse-wrapper] PR review-thread response: skipped ${skipped_contributor} contributor-role repo(s) (t2145)" >>"$LOGFILE"
 	fi
@@ -369,6 +356,9 @@ _run_auto_decomposer_scanner() {
 
 	local total_repos=0
 	local skipped_contributor=0
+	local enabled_slugs=""
+	local cursor_file="${AIDEVOPS_AUTO_DECOMPOSER_CURSOR_DIR:-${HOME:-}/.aidevops/logs/auto-decomposer-scanner}/repo.cursor"
+	enabled_slugs=$(_pulse_enabled_repo_slugs "$repos_json" || echo "")
 	while IFS= read -r slug; do
 		[[ -n "$slug" ]] || continue
 		# t2145 parity with post-merge-review-scanner: skip contributor-role
@@ -381,9 +371,10 @@ _run_auto_decomposer_scanner() {
 			continue
 		fi
 		total_repos=$((total_repos + 1))
+		_pulse_scanner_mark_started "$cursor_file" "$slug"
 		echo "[pulse-wrapper] Auto-decomposer: scanning $slug" >>"$LOGFILE"
 		"$scanner" scan "$slug" >>"$LOGFILE" 2>&1 || true
-	done < <(_pulse_enabled_repo_slugs "$repos_json")
+	done < <(_pulse_scanner_rotated_slugs "$cursor_file" "$enabled_slugs")
 	if [[ "$skipped_contributor" -gt 0 ]]; then
 		echo "[pulse-wrapper] Auto-decomposer: skipped ${skipped_contributor} contributor-role repo(s) (t2145)" >>"$LOGFILE"
 	fi

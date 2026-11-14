@@ -58,6 +58,27 @@ else
 	_fail "REST-first GraphQL-only pr list preservation" "argv: $argv log: $(cat "$AIDEVOPS_GH_API_LOG" 2>/dev/null || true)"
 fi
 
+_reset_log
+AIDEVOPS_GH_REST_FIRST_READS=1 AIDEVOPS_GH_REST_FALLBACK_DISABLE_CACHE=1 \
+	STUB_RATE_LIMIT_REMAINING=5000 "$SHIM_RUN" pr list --repo owner/repo \
+	--state closed --json number >/dev/null 2>/dev/null || true
+argv=$(_read_argv)
+if [[ "$argv" == $'pr\nlist\n--repo\nowner/repo\n--state\nclosed\n--json\nnumber' ]]; then
+	_pass "healthy closed-unmerged reads use the server-side GraphQL filter despite REST-first mode"
+else
+	_fail "closed-unmerged query scanned merged REST history instead of using native filtering" "$argv"
+fi
+
+_reset_log
+AIDEVOPS_GH_REST_FIRST_READS=1 _GH_SHOULD_FALLBACK_OVERRIDE=1 \
+	"$SHIM_RUN" pr list --repo owner/repo --state closed --json number >/dev/null 2>/dev/null || true
+argv=$(_read_argv)
+if [[ "$argv" == *'/repos/owner/repo/pulls?state=closed'* ]]; then
+	_pass "closed-unmerged reads retain the semantically correct low-GraphQL REST fallback"
+else
+	_fail "closed-unmerged low-budget fallback was lost" "$argv"
+fi
+
 echo ""
 echo "Test 15g: native read attribution is caller-aware and privacy-safe"
 _reset_log
@@ -379,6 +400,16 @@ if [[ "$argv" != *"origin:interactive"* ]] && [[ "$argv" != *"status:in-review"*
 	_pass "headless issue creation is not normalized as interactive"
 else
 	_fail "headless label normalization bypass" "argv: $argv"
+fi
+
+_reset_log
+"$SHIM_RUN" issue create --repo owner/repo --title "t3565: Pending publication" \
+	--label "tier:standard,publication:pending,origin:interactive" --body "tracking body" 2>/dev/null
+argv=$(_read_argv)
+if [[ "$argv" != *"status:in-review"* ]]; then
+	_pass "publication:pending issue creation gets no injected active status (GH#32703)"
+else
+	_fail "pending publication status injection" "argv: $argv"
 fi
 
 _reset_log

@@ -4,16 +4,20 @@
 // ---------------------------------------------------------------------------
 
 import { existsSync, readFileSync } from "fs";
+import { registerGpt6Budget } from "./context-budget-gpt6.mjs";
 import { homedir } from "os";
 import { join } from "path";
 import { applyAgentMcpTools } from "./agent-loader.mjs";
 import { registerMcpServers } from "./mcp-registry.mjs";
+import { captureLocalOnlyMcpConfig } from "./local-only-policy.mjs";
 import { registerPoolProvider, getAccounts, ensureValidToken } from "./oauth-pool.mjs";
 import { getCursorProxyPort, registerCursorProvider } from "./cursor-proxy.mjs";
 import { getGoogleProxyPort, registerGoogleProvider } from "./google-proxy.mjs";
 import { getClaudeProxyPort, registerClaudeProvider } from "./claude-proxy.mjs";
 import { checkOpenCodeVersionDriftAsync } from "./version-tracking.mjs";
 import { registerApprovedWorkerPermissions } from "./config-worker-permissions.mjs";
+import { applyCompactionRouting } from "./compaction-routing.mjs";
+import { registerPendingAnthropicModels } from "./anthropic-catalog-bridge.mjs";
 import {
   registerAgentRoutingIntent,
   registerAgents,
@@ -28,6 +32,9 @@ import {
   registerManagedDirectoryPermissions,
 } from "./config-safety-guards.mjs";
 import {
+  ASTRA_COMPACTION_BUDGET_TARGET,
+  ASTRA_COMPACTION_TARGET,
+  ASTRA_OUTPUT_DEFAULT,
   CLAUDE_MODEL_LIMITS,
   GPT56_CONTEXT_DEFAULT,
   GPT56_INPUT_DEFAULT,
@@ -36,6 +43,7 @@ import {
 } from "./model-limits.mjs";
 
 export { registerApprovedWorkerPermissions };
+export { getGpt6ContextHealth } from "./context-budget-gpt6.mjs";
 export {
   enforcePublicTriageIsolation,
   enforceTeamInterfaceConversationIsolation,
@@ -64,8 +72,7 @@ function claudeModelDef(overrides) {
 
 /**
  * Build a provider model map from CLAUDE_MODEL_LIMITS with provider-specific
- * display names. Preserves backward compatibility with the previous
- * ANTHROPIC_MODELS / CLAUDECLI_MODELS shapes.
+ * display names for the separate Claude CLI proxy transport.
  *
  * Note: CLAUDE_MODEL_LIMITS lives in `model-limits.mjs` so claude-proxy.mjs
  * (the Claude CLI proxy provider drift-copy that previously hardcoded the
@@ -82,45 +89,28 @@ function buildClaudeModelMap(names) {
   return out;
 }
 
-/** Models registered under the built-in anthropic provider (via aidevops OAuth pool). */
-const ANTHROPIC_MODELS = buildClaudeModelMap({
-  "claude-haiku-4-5":  "Claude Haiku 4.5 (via aidevops)",
-  "claude-sonnet-4-5": "Claude Sonnet 4.5 (via aidevops)",
-  "claude-sonnet-4-6": "Claude Sonnet 4.6 (via aidevops)",
-  "claude-opus-4-5":   "Claude Opus 4.5 (via aidevops)",
-  "claude-opus-4-6":   "Claude Opus 4.6 (via aidevops)",
-  "claude-opus-4-7":   "Claude Opus 4.7 (via aidevops)",
-});
-
 /** Models registered under the claudecli provider (via Claude CLI proxy). */
 const CLAUDECLI_MODELS = buildClaudeModelMap({
   "claude-haiku-4-5":  "Claude Haiku 4.5 (via CLI)",
+  "claude-haiku-5-5":  "Claude Haiku 5.5 (via CLI)",
   "claude-sonnet-4-5": "Claude Sonnet 4.5 (via CLI)",
   "claude-sonnet-4-6": "Claude Sonnet 4.6 (via CLI)",
+  "claude-sonnet-5-5": "Claude Sonnet 5.5 (via CLI)",
   "claude-opus-4-5":   "Claude Opus 4.5 (via CLI)",
   "claude-opus-4-6":   "Claude Opus 4.6 (via CLI)",
   "claude-opus-4-7":   "Claude Opus 4.7 (via CLI)",
 });
 
 /**
- * Upsert aidevops-managed models into the anthropic and claudecli providers.
- * Preserves any user options already set on the providers.
+ * Upsert models for the separate Claude CLI proxy, preserving user options.
+ * Do not add or override built-in anthropic models: OAuth pooling is attached
+ * to that provider by its auth hook, not by picker model definitions.
  * @param {object} config - OpenCode Config object (mutable)
  * @returns {number} number of model entries upserted
  */
-function registerAnthropicModels(config) {
+export function registerClaudeCliFallbackModels(config) {
   if (!config.provider) config.provider = {};
   let count = 0;
-
-  // anthropic provider — via aidevops OAuth pool
-  if (!config.provider.anthropic) config.provider.anthropic = {};
-  if (!config.provider.anthropic.models) config.provider.anthropic.models = {};
-  for (const [id, def] of Object.entries(ANTHROPIC_MODELS)) {
-    const existing = config.provider.anthropic.models[id];
-    // Always merge — ensures stale fields (modalities, attachment) get updated
-    config.provider.anthropic.models[id] = { ...existing, ...def };
-    if (!existing) count++;
-  }
 
   // claudecli provider — via Claude CLI proxy
   if (!config.provider.claudecli) {
@@ -148,20 +138,50 @@ function registerAnthropicModels(config) {
 }
 
 /**
+ * Drop Anthropic model overrides persisted by plugin versions before GH#32447.
+ * Those entries carried Claude CLI proxy metadata (`family: claudecli`,
+ * `tool_call: false`, text-only input, zero cost) and masked OpenCode's native
+ * Anthropic model metadata. Only the exact legacy shape is removed; user-authored
+ * entries are preserved.
+ * @param {object} config - OpenCode Config object (mutable)
+ * @returns {number} number of legacy entries removed
+ */
+export function removeLegacyAnthropicModelOverrides(config) {
+  const models = config?.provider?.anthropic?.models;
+  if (!models || typeof models !== "object") return 0;
+  let removed = 0;
+  for (const [id, def] of Object.entries(models)) {
+    if (def?.family !== "claudecli") continue;
+    if (!String(def?.name || "").endsWith("(via aidevops)")) continue;
+    delete models[id];
+    removed += 1;
+  }
+  return removed;
+}
+
+/**
  * Return whether aidevops should advertise a cost-aware 300K GPT-5.6 window.
  * The feature defaults on; users can opt out with `aidevops gpt56-context
  * disable`, which writes the durable preference consumed here on startup.
  * @returns {boolean}
  */
 export function gpt56ContextCapEnabled() {
+  return contextCapEnabled("gpt56_context_cap");
+}
+
+function contextCapEnabled(key) {
+  return readContextSettings()?.[key] !== false;
+}
+
+function readContextSettings() {
   const settingsPath = process.env.AIDEVOPS_SETTINGS_FILE ||
     join(homedir(), ".config", "aidevops", "settings.json");
   try {
-    if (!existsSync(settingsPath)) return true;
+    if (!existsSync(settingsPath)) return {};
     const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
-    return settings?.runtime?.opencode?.gpt56_context_cap !== false;
+    return settings?.runtime?.opencode ?? {};
   } catch {
-    return true;
+    return {};
   }
 }
 
@@ -191,6 +211,42 @@ export function registerGpt56ContextLimits(config) {
     };
   }
   return GPT56_MODEL_IDS.length;
+}
+
+// Receipts describe the settings actually consumed, not a later settings read.
+const astraContextHealth = new WeakMap();
+
+export function getAstraContextHealth(config) {
+  return astraContextHealth.get(config) ?? null;
+}
+
+/** Keep Astra at the selected usable input target without changing global reserve. */
+export function registerAstraContextLimits(config) {
+  const settings = readContextSettings();
+  const target = settings.astra_compaction_target === ASTRA_COMPACTION_TARGET
+    ? ASTRA_COMPACTION_TARGET : ASTRA_COMPACTION_BUDGET_TARGET;
+  const managed = settings.astra_context_cap !== false;
+  const health = { managed, target, auto: config.compaction?.auto !== false };
+  astraContextHealth.set(config, health);
+  if (!managed) return 0;
+  config.provider ??= {};
+  config.provider.openai ??= {};
+  config.provider.openai.models ??= {};
+  const models = config.provider.openai.models;
+  const existing = models["gpt-6-astra"] || {};
+  const output = existing.limit?.output ?? ASTRA_OUTPUT_DEFAULT;
+  const reserve = config.compaction?.reserved ?? Math.min(20000, output);
+  const input = target + reserve;
+  models["gpt-6-astra"] = {
+    ...existing,
+    limit: { ...existing.limit, context: input + output, input, output },
+  };
+  Object.assign(health, { reserve, limits: { ...models["gpt-6-astra"].limit } });
+  return 1;
+}
+
+export function registerGpt6ContextLimits(config) {
+  return registerGpt6Budget(config, readContextSettings());
 }
 
 /**
@@ -228,7 +284,7 @@ async function discoverAndRegisterModels(opts) {
  *
  * When the proxy is NOT yet running (lazy-start path, GH#21944), the
  * `claudecli` provider entry was already eagerly registered by
- * `registerAnthropicModels` above with the hardcoded default port — leave
+ * `registerClaudeCliFallbackModels` above with the hardcoded default port — leave
  * it intact so the models stay visible in the picker. The proxy will be
  * brought up by the system.transform hook on the first claudecli/* request.
  *
@@ -243,7 +299,7 @@ async function discoverAndRegisterModels(opts) {
 function registerClaudeCliModels(config) {
   const claudeProxyPort = getClaudeProxyPort();
   if (!claudeProxyPort) {
-    // Proxy not running yet — registerAnthropicModels already populated the
+    // Proxy not running yet — registerClaudeCliFallbackModels already populated the
     // provider with the hardcoded default port; lazy-start will bring up
     // the listener on the same port when needed.
     return 0;
@@ -272,7 +328,8 @@ function logConfigSummary(counts) {
     [counts.directories, "managed directory perms"],
     [counts.permissionGrants, "signed worker permission grants"],
     [counts.poolCleaned, `cleaned ${counts.poolCleaned} stale pool provider${counts.poolCleaned === 1 ? "" : "s"}`],
-    [counts.anthropic, "anthropic models"],
+    [counts.anthropicLegacyCleaned, `cleaned ${counts.anthropicLegacyCleaned} legacy Anthropic model override${counts.anthropicLegacyCleaned === 1 ? "" : "s"}`],
+    [counts.anthropicPending, "pending Anthropic catalog models"],
     [counts.openai, "OpenAI context limits"],
     [counts.cursor, "Cursor models"],
     [counts.google, "Google models"],
@@ -330,7 +387,6 @@ export function createConfigHook(deps) {
         directories: 0,
         permissionGrants: 0,
         poolCleaned: 0,
-        anthropic: 0,
         openai: 0,
         cursor: 0,
         google: 0,
@@ -347,6 +403,7 @@ export function createConfigHook(deps) {
     ensureAgentGuard(config, workspaceDir);
 
     const mcps = registerMcpServers(config, { runtime: mcpRuntime });
+    captureLocalOnlyMcpConfig(config.mcp, repositoryDir);
     const agentTools = applyAgentMcpTools(config);
     const directories = registerManagedDirectoryPermissions(config);
     const permissionGrants = registerApprovedWorkerPermissions(config, { repositoryDir });
@@ -359,8 +416,12 @@ export function createConfigHook(deps) {
       modelRouting,
     );
     const poolCleaned = registerPoolProvider(config);
-    const anthropic = registerAnthropicModels(config);
-    const openai = registerGpt56ContextLimits(config);
+    const anthropicLegacyCleaned = removeLegacyAnthropicModelOverrides(config);
+    const anthropicPending = registerPendingAnthropicModels(config);
+    const claudeFallback = registerClaudeCliFallbackModels(config);
+    const openai = registerGpt56ContextLimits(config) + registerAstraContextLimits(config) +
+      registerGpt6ContextLimits(config);
+    applyCompactionRouting(config, modelRouting);
     // Discover and register proxy provider models only when a proxy listener is
     // already active. The normal startup path intentionally leaves these ports
     // null until first use, so unconditional imports/discovery here made config
@@ -392,7 +453,7 @@ export function createConfigHook(deps) {
       });
     }
 
-    const claude = registerClaudeCliModels(config);
+    const claude = claudeFallback + registerClaudeCliModels(config);
     enforcePublicTriageIsolation(config);
     const conversationIsolation = enforceTeamInterfaceConversationIsolation(config, conversation);
     const remoteInteractiveSelection = enforceTeamInterfaceRemoteInteractiveSelection(config, conversation);
@@ -405,7 +466,8 @@ export function createConfigHook(deps) {
         directories,
         permissionGrants,
         poolCleaned,
-        anthropic,
+        anthropicLegacyCleaned,
+        anthropicPending,
         openai,
         cursor,
         google,

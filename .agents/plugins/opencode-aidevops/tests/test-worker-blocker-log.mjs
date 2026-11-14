@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -16,11 +16,33 @@ import {
 } from "../../../scripts/worker-blocker-log.mjs";
 import {
   listActiveWorkerBlockerIssues,
+  resolveStaleSupervisorWorkerBlockers,
   resolveWorkerBlockersForIssue,
   resolveWorkerBlockersForSession,
 } from "../../../scripts/worker-blocker-reconcile.mjs";
 
 const LOGGER_PATH = fileURLToPath(new URL("../../../scripts/worker-blocker-log.mjs", import.meta.url));
+const CLI_PATH = fileURLToPath(new URL("../../../scripts/worker-blocker-cli.mjs", import.meta.url));
+
+test("deployed symlink entrypoints execute commands and report invalid commands", () => {
+  const root = mkdtempSync(join(tmpdir(), "aidevops-blocker-entry-"));
+  try {
+    const scriptsLink = join(root, "deployed scripts");
+    symlinkSync(dirname(CLI_PATH), scriptsLink, "dir");
+    for (const name of ["worker-blocker-cli.mjs", "worker-blocker-log.mjs"]) {
+      const entry = join(scriptsLink, name);
+      const logPath = join(root, `${name}.jsonl`);
+      const result = spawnSync(process.execPath, [entry, "append", "--log-file", logPath,
+        "--event", "permission_request_captured", "--repo-slug", "owner/repo", "--issue-number", "123"], { encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(JSON.parse(readFileSync(logPath, "utf8")).event, "permission_request_captured");
+      const invalid = spawnSync(process.execPath, [entry, "unknown-command"], { encoding: "utf8" });
+      assert.equal(invalid.status, 2, invalid.stderr);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 function appendInSubprocess(logPath, event) {
   return new Promise((resolve, reject) => {
@@ -270,6 +292,91 @@ test("resolve-session CLI appends a terminal event for a null-issue identity", (
   assert.equal(terminal.session_key, "routine-r005");
   assert.equal(terminal.request_id, "request-cli");
   assert.equal(terminal.blocking, false);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("stale supervisor reconciliation preserves evidence and fails closed for current or scoped records", () => {
+  const root = mkdtempSync(join(tmpdir(), "aidevops-worker-blocker-stale-supervisor-"));
+  const logPath = join(root, "events.jsonl");
+  const base = {
+    event: "permission_request_captured",
+    reason: "permission_required",
+    source: "opencode-permission-broker",
+    issue_number: null,
+    repo_slug: " ",
+    session_key: "supervisor-pulse",
+  };
+  assert.equal(appendWorkerBlockerEvent({ ...base, request_id: "stale" }, {
+    logPath,
+    now: new Date("2026-07-24T12:00:00Z"),
+  }), true);
+  assert.equal(appendWorkerBlockerEvent({ ...base, request_id: "current" }, {
+    logPath,
+    now: new Date("2026-07-24T12:01:00Z"),
+  }), true);
+  assert.equal(appendWorkerBlockerEvent({ ...base, repo_slug: "owner/repo", request_id: "scoped" }, {
+    logPath,
+    now: new Date("2026-07-24T12:00:00Z"),
+  }), true);
+  assert.equal(appendWorkerBlockerEvent({ ...base, session_key: "supervisor-pulse-retry", request_id: "other-session" }, {
+    logPath,
+    now: new Date("2026-07-24T12:00:00Z"),
+  }), true);
+
+  const result = spawnSync(process.execPath, [
+    CLI_PATH,
+    "resolve-stale-supervisor-session",
+    "--log-file", logPath,
+    "--repo-slug", "",
+    "--session-key", "supervisor-pulse",
+    "--stale-before", "1784894400",
+  ], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "1");
+
+  const events = readFileSync(logPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  const terminal = events.at(-1);
+  assert.equal(events.length, 5);
+  assert.equal(terminal.event, "stale_supervisor_session_terminal_reconciled");
+  assert.equal(terminal.request_id, "stale");
+  assert.equal(terminal.repo_slug, "");
+  assert.equal(terminal.blocking, false);
+  assert.equal(events.some((event) => event.request_id === "other-session" && event.blocking === false), false);
+  assert.deepEqual(resolveStaleSupervisorWorkerBlockers({
+    repo_slug: "",
+    session_key: "supervisor-pulse",
+    stale_before: "1784894400",
+  }, { logPath, now: new Date("2026-07-24T12:02:01Z") }), { ok: true, resolvedCount: 0 });
+  assert.deepEqual(resolveStaleSupervisorWorkerBlockers({
+    repo_slug: "owner/repo",
+    session_key: "supervisor-pulse",
+    stale_before: "1784894460",
+  }, { logPath }), { ok: false, resolvedCount: 0 });
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("worker-blocker CLI runs directly and rejects unknown commands", () => {
+  const root = mkdtempSync(join(tmpdir(), "aidevops-worker-blocker-direct-cli-"));
+  const logPath = join(root, "events.jsonl");
+  assert.equal(appendWorkerBlockerEvent({
+    event: "permission_request_captured",
+    reason: "permission_required",
+    issue_number: 701,
+    repo_slug: "owner/repo",
+    session_key: "issue-701",
+  }, { logPath }), true);
+
+  const listed = spawnSync(process.execPath, [
+    CLI_PATH,
+    "list-active-issues",
+    "--log-file", logPath,
+    "--repo-slug", "owner/repo",
+  ], { encoding: "utf8" });
+  assert.equal(listed.status, 0);
+  assert.equal(listed.stdout.trim(), "701");
+
+  const invalid = spawnSync(process.execPath, [CLI_PATH, "unknown-command"], { encoding: "utf8" });
+  assert.equal(invalid.status, 2);
   rmSync(root, { recursive: true, force: true });
 });
 

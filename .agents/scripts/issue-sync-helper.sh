@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2025-2026 Marcus Quinn
 # Intentionally using /bin/bash (not /usr/bin/env bash) for headless compatibility.
@@ -70,6 +70,8 @@ issue_sync_prepare_ci_context
 source "${_issue_sync_script_dir}/shared-constants.sh"
 # shellcheck source=issue-sync-lib.sh
 source "${_issue_sync_script_dir}/issue-sync-lib.sh"
+# shellcheck source=./task-target-repo-lib.sh
+source "${_issue_sync_script_dir}/task-target-repo-lib.sh"
 
 # =============================================================================
 # Sub-library sourcing
@@ -95,6 +97,9 @@ source "${_issue_sync_script_dir}/issue-sync-helper-enrich.sh"
 # shellcheck disable=SC1091  # sub-library resolved at runtime via $SCRIPT_DIR
 source "${_issue_sync_script_dir}/issue-sync-helper-body.sh"
 
+# shellcheck source=./issue-sync-helper-refresh.sh
+source "${_issue_sync_script_dir}/issue-sync-helper-refresh.sh"
+
 # shellcheck source=./issue-sync-helper-commands.sh
 # shellcheck disable=SC1091  # sub-library resolved at runtime via $SCRIPT_DIR
 source "${_issue_sync_script_dir}/issue-sync-helper-commands.sh"
@@ -117,6 +122,7 @@ FORCE_ENRICH="${FORCE_ENRICH:-false}"
 ALLOW_CLOSED_BODY_SYNC="${ALLOW_CLOSED_BODY_SYNC:-false}"
 REPO_SLUG=""
 PROJECT_ROOT_ARG=""
+REBIND_FROM_TASK=""
 
 log_verbose() {
 	local msg="$1"
@@ -305,7 +311,7 @@ _push_process_task() {
 	_push_warn_if_task_id_collides "$repo" "$task_id"
 
 	if [[ "$DRY_RUN" == "true" ]]; then
-		print_info "[DRY-RUN] Would create: $title"
+		print_info "[DRY-RUN] Would create in $repo: $title"
 		echo "CREATED"
 		return 0
 	fi
@@ -444,6 +450,14 @@ main() {
 			REPO_SLUG="$val"
 			shift 2
 			;;
+		--body-file)
+			REFRESH_BODY_FILE="$val"
+			shift 2
+			;;
+		--from)
+			REBIND_FROM_TASK="$val"
+			shift 2
+			;;
 		--project-root)
 			PROJECT_ROOT_ARG="$val"
 			shift 2
@@ -471,6 +485,7 @@ main() {
 			;;
 		help | --help | -h)
 			cmd_help
+			printf '%s\n' '  refresh-body <issue> --repo <owner/repo> --body-file <path> [--dry-run] — refresh generated issue body, preserving framework appendages'
 			return 0
 			;;
 		*)
@@ -490,6 +505,17 @@ main() {
 		}
 		cmd_sync_body "${positional_args[1]}"
 		;;
+	rebind-task)
+		[[ ${#positional_args[@]} -eq 2 && -n "${REBIND_FROM_TASK:-}" ]] || {
+			print_error "rebind-task requires <new-task> --from <old-task>"
+			return 1
+		}
+		cmd_rebind_task "${positional_args[1]}" "$REBIND_FROM_TASK"
+		;;
+	refresh-body)
+		[[ ${#positional_args[@]} -eq 2 && -n "${REFRESH_BODY_FILE:-}" ]] || { print_error "refresh-body requires issue and --body-file"; return 1; }
+		cmd_refresh_body "${positional_args[1]}" "$REFRESH_BODY_FILE"
+		;;
 	pull) cmd_pull ;; close) cmd_close "${positional_args[1]:-}" ;; reopen) cmd_reopen ;;
 	reconcile) cmd_reconcile ;;
 	relationships) run_relationship_scoped_command cmd_relationships "${positional_args[1]:-}" ;;
@@ -507,7 +533,7 @@ main() {
 			cmd_backfill_cross_phase_blocked_by
 		fi
 		;;
-	status) cmd_status ;; help) cmd_help ;;
+	status) cmd_status ;; help) cmd_help; printf '%s\n' '  refresh-body <issue> --repo <owner/repo> --body-file <path> [--dry-run] — refresh generated issue body, preserving framework appendages' ;;
 	*)
 		print_error "Unknown command: $command"
 		cmd_help

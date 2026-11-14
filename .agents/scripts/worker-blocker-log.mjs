@@ -11,13 +11,13 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 
 import {
   acquireWorkerBlockerLock as acquireLock,
@@ -81,6 +81,10 @@ export function resolveWorkerBlockerMaxBytes(options = {}) {
   return parsed;
 }
 
+function cleanWorkerBlockerFingerprint(value) {
+  return typeof value === "string" && /^[a-f0-9]{24}$/.test(value) ? value : "";
+}
+
 export function normalizeWorkerBlockerEvent(input = {}, options = {}) {
   const now = options.now instanceof Date ? options.now : new Date();
   const issueValue = Object.hasOwn(input, "issue_number")
@@ -97,6 +101,7 @@ export function normalizeWorkerBlockerEvent(input = {}, options = {}) {
     reason: cleanText(input.reason || "unknown", MAX_FIELD_LENGTH, options),
     blocking: input.blocking !== false,
     source: cleanText(input.source || "unknown", MAX_FIELD_LENGTH, options),
+    blocker_fingerprint: cleanWorkerBlockerFingerprint(input.blocker_fingerprint),
     issue_number: issueNumber,
     repo_slug: normalizeWorkerBlockerRepoSlug(input.repo_slug || process.env.WORKER_REPO_SLUG || process.env.DISPATCH_REPO_SLUG || "", options),
     session_key: normalizeWorkerBlockerSessionKey(input.session_key || process.env.WORKER_SESSION_KEY || "", options),
@@ -177,12 +182,22 @@ export function appendWorkerBlockerEvent(input, options = {}) {
   }
 }
 
+export function isWorkerBlockerEntrypoint(moduleUrl) {
+  try {
+    // Deployment symlinks may remain in argv while Node resolves import.meta.url.
+    return Boolean(process.argv[1])
+      && realpathSync(process.argv[1]) === realpathSync(new URL(moduleUrl));
+  } catch {
+    return false;
+  }
+}
+
 async function main() {
   const { runWorkerBlockerCli } = await import("./worker-blocker-cli.mjs");
   return runWorkerBlockerCli(process.argv.slice(2));
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isWorkerBlockerEntrypoint(import.meta.url)) {
   main()
     .then((exitCode) => { process.exitCode = exitCode; })
     .catch(() => { process.exitCode = 1; });

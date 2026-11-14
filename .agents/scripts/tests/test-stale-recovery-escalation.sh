@@ -53,7 +53,9 @@ print_result() {
 TEST_ROOT=$(mktemp -d)
 trap 'rm -rf "$TEST_ROOT"' EXIT
 export HOME="${TEST_ROOT}/home"
-mkdir -p "${HOME}/.aidevops/logs" "${HOME}/.aidevops/.agent-workspace/supervisor"
+mkdir -p "${HOME}/.aidevops/logs" "${HOME}/.aidevops/.agent-workspace/supervisor" "${HOME}/.config/aidevops"
+# Public-write privacy guard fails closed without a readable repo inventory.
+printf '{"initialized_repos":[]}\n' >"${HOME}/.config/aidevops/repos.json"
 
 STUB_DIR="${TEST_ROOT}/bin"
 mkdir -p "$STUB_DIR"
@@ -91,7 +93,23 @@ fi
 
 # Status-label contract lookup used by set_issue_status.
 if [[ "\$1" == "api" && "\$2" == *"/labels?per_page=100"* ]]; then
-	printf 'status:available\t0e8a16\tTask is available for claiming\nstatus:queued\tfbca04\tWorker dispatched, not yet started\nstatus:claimed\tf9d0c4\tInteractive session claimed this task\nstatus:in-progress\t1d76db\tWorker actively running\nstatus:in-review\t5319e7\tPR open, awaiting review/merge\nstatus:done\t6f42c1\tTask is complete\nstatus:blocked\td93f0b\tWaiting on blocker task\n'
+	printf 'status:available\t0e8a16\tTask is available for claiming\nstatus:queued\tfbca04\tWorker dispatched, not yet started\nstatus:claimed\tf9d0c4\tInteractive implementation is actively claimed\nstatus:in-progress\t1d76db\tWorker actively running\nstatus:in-review\t5319e7\tNon-draft PR ready for review/merge\nstatus:done\t6f42c1\tTask is complete\nstatus:blocked\td93f0b\tPartial work blocked; inspect reason and next action\n'
+	exit 0
+fi
+
+# Current status transitions read an exact GraphQL label snapshot (GH#34003).
+# Reuse the REST label fixture above rather than silently returning no data.
+if [[ "\$1" == "api" && "\$2" == "graphql" && "\$*" == *'label0: label(name:'* ]]; then
+	"\$0" api 'repos/owner/repo/labels?per_page=100' | jq -Rn '
+		[inputs | split("\t") | {name: .[0], color: .[1], description: .[2]}]
+		| to_entries | map({key: ("label" + (.key | tostring)), value: .value})
+		| from_entries | {data: {repository: .}}'
+	exit \$?
+fi
+
+# Public-write privacy guard target probe: the fixture repo is public.
+if [[ "\$1" == "api" && "\$2" == "repos/owner/repo" ]]; then
+	printf '%s\n' false
 	exit 0
 fi
 
@@ -158,6 +176,13 @@ PY
 	draft_checkpoint) printf '%s\n' '[{"number":${open_pr_number},"closingIssuesReferences":[{"number":99999,"repository":{"name":"repo","owner":{"login":"owner"}}}],"isDraft":true,"labels":[{"name":"origin:worker"}],"statusCheckRollup":[]}]' ;;
 	protected_draft) printf '%s\n' '[{"number":${open_pr_number},"closingIssuesReferences":[{"number":99999,"repository":{"name":"repo","owner":{"login":"owner"}}}],"isDraft":true,"labels":[{"name":"origin:interactive"}],"statusCheckRollup":[]}]' ;;
 	draft_bare) printf '%s\n' '[{"number":${open_pr_number},"closingIssuesReferences":[],"isDraft":true,"labels":[{"name":"origin:worker"}],"statusCheckRollup":[]}]' ;;
+	recovery_for) printf '%s\n' '[{"number":${open_pr_number},"closingIssuesReferences":[],"isDraft":true,"isCrossRepository":false,"body":"Recovered dirty worktree.\nFor #99999","labels":[{"name":"origin:worker-takeover"}],"statusCheckRollup":[]}]' ;;
+	recovery_for_worker) printf '%s\n' '[{"number":${open_pr_number},"closingIssuesReferences":[],"isDraft":true,"isCrossRepository":false,"body":"For #99999","labels":[{"name":"origin:worker"}],"statusCheckRollup":[]}]' ;;
+	recovery_for_ready) printf '%s\n' '[{"number":${open_pr_number},"closingIssuesReferences":[],"isDraft":false,"isCrossRepository":false,"body":"For #99999","labels":[{"name":"origin:worker-takeover"}],"statusCheckRollup":[]}]' ;;
+	recovery_for_cross) printf '%s\n' '[{"number":${open_pr_number},"closingIssuesReferences":[],"isDraft":true,"isCrossRepository":true,"body":"For #99999","labels":[{"name":"origin:worker-takeover"}],"statusCheckRollup":[]}]' ;;
+	recovery_for_protected) printf '%s\n' '[{"number":${open_pr_number},"closingIssuesReferences":[],"isDraft":true,"isCrossRepository":false,"body":"For #99999","labels":[{"name":"origin:worker-takeover"},{"name":"no-takeover"}],"statusCheckRollup":[]}]' ;;
+	recovery_bare) printf '%s\n' '[{"number":${open_pr_number},"closingIssuesReferences":[],"isDraft":true,"isCrossRepository":false,"body":"Recovered work for #99999","labels":[{"name":"origin:worker-takeover"}],"statusCheckRollup":[]}]' ;;
+	recovery_for_other_closing) printf '%s\n' '[{"number":${open_pr_number},"closingIssuesReferences":[{"number":123,"repository":{"name":"repo","owner":{"login":"owner"}}}],"isDraft":true,"isCrossRepository":false,"body":"For #99999\nResolves #123","labels":[{"name":"origin:worker-takeover"}],"statusCheckRollup":[]}]' ;;
 	draft_mismatch) printf '%s\n' '[{"number":${open_pr_number},"closingIssuesReferences":[{"number":123,"repository":{"name":"repo","owner":{"login":"owner"}}}],"isDraft":true,"labels":[{"name":"origin:worker"}],"statusCheckRollup":[]}]' ;;
 	draft_ambiguous) printf '%s\n' '[{"number":${open_pr_number},"closingIssuesReferences":[{"number":99999,"repository":{"name":"repo","owner":{"login":"owner"}}},{"number":123,"repository":{"name":"repo","owner":{"login":"owner"}}}],"isDraft":true,"labels":[{"name":"origin:worker"}],"statusCheckRollup":[]}]' ;;
 	multiple_linked) printf '%s\n' '[{"number":${open_pr_number},"closingIssuesReferences":[{"number":99999,"repository":{"name":"repo","owner":{"login":"owner"}}}],"isDraft":true,"labels":[{"name":"origin:worker"}],"statusCheckRollup":[]},{"number":${second_pr_number},"closingIssuesReferences":[{"number":99999,"repository":{"name":"repo","owner":{"login":"owner"}}}],"isDraft":false,"labels":[{"name":"origin:worker"}],"statusCheckRollup":[]}]' ;;
@@ -341,7 +366,7 @@ else
 	print_result "Reset path: STALE_ESCALATED NOT emitted" 1 "(got: '$output')"
 fi
 
-if grep -q -- "--json number,closingIssuesReferences,isDraft,labels,statusCheckRollup" "$GH_CALLS_FILE" &&
+if grep -q -- "--json number,closingIssuesReferences,isDraft,isCrossRepository,labels,body,statusCheckRollup" "$GH_CALLS_FILE" &&
 	! grep -q -- "--search" "$GH_CALLS_FILE"; then
 	print_result "Open PR lookup scans authoritative metadata without body-search filtering" 0
 else
@@ -388,6 +413,42 @@ fi
 for unsafe_kind in draft_bare draft_mismatch; do
 	run_recover 0 "77|${unsafe_kind}" 1
 	if ! echo "$output" | grep -q "STALE_PR_CONTINUATION"; then
+		print_result "${unsafe_kind} cannot authorize stale PR continuation" 0
+	else
+		print_result "${unsafe_kind} cannot authorize stale PR continuation" 1 "(got: '$output')"
+	fi
+done
+
+# GH#34008: the pulse's own orphan-recovery draft links only through `For #N`.
+# Stale recovery must classify it as draft_checkpoint and preserve it.
+run_recover 0 "85|recovery_for" 1
+if grep -q "STALE_PR_CONTINUATION: issue #99999 in owner/repo — PR #85" <<<"$output" &&
+	grep -q "assignee=stale-runner" <<<"$output" && ! grep -q "^issue edit" "$GH_CALLS_FILE"; then
+	print_result "For #N recovery draft requests exact-head continuation without reset" 0
+else
+	print_result "For #N recovery draft requests exact-head continuation without reset" 1 "(got: '$output')"
+fi
+for_open_pr=$(PATH="${STUB_DIR}:${OLD_PATH}" bash -c 'source "$1"; _stale_recovery_find_open_pr 99999 owner/repo' \
+	bash "${TEST_SCRIPTS_DIR}/dispatch-dedup-stale.sh" 2>/dev/null)
+if [[ "$for_open_pr" == "85|draft_checkpoint" ]]; then
+	print_result "Sweep classifier sees For #N recovery draft and skips reset" 0
+else
+	print_result "Sweep classifier sees For #N recovery draft and skips reset" 1 "(got: '$for_open_pr')"
+fi
+
+# A worker's own `For #N` checkpoint draft is the same durable checkpoint that
+# has-open-pr holds the issue for; preserve it for continuation, never reset.
+run_recover 0 "87|recovery_for_worker" 1
+if grep -q "STALE_PR_CONTINUATION: issue #99999 in owner/repo — PR #87" <<<"$output" &&
+	! grep -q "^issue edit" "$GH_CALLS_FILE"; then
+	print_result "worker For #N checkpoint draft requests exact-head continuation without reset" 0
+else
+	print_result "worker For #N checkpoint draft requests exact-head continuation without reset" 1 "(got: '$output')"
+fi
+
+for unsafe_kind in recovery_for_ready recovery_for_cross recovery_for_protected recovery_bare recovery_for_other_closing; do
+	run_recover 0 "86|${unsafe_kind}" 1
+	if ! grep -q "STALE_PR_CONTINUATION" <<<"$output"; then
 		print_result "${unsafe_kind} cannot authorize stale PR continuation" 0
 	else
 		print_result "${unsafe_kind} cannot authorize stale PR continuation" 1 "(got: '$output')"
@@ -479,6 +540,50 @@ else
 fi
 
 export PATH="$OLD_PATH"
+
+# Release accounting is independent of the status-label contract fixture above.
+# An untrusted forged marker must not erase the historic tick count.
+# shellcheck source=../dispatch-dedup-stale.sh
+source "${TEST_SCRIPTS_DIR}/dispatch-dedup-stale.sh"
+ticks='[[{"created_at":"2026-01-01T00:00:01Z","body":"<!-- stale-recovery-tick:1 -->"},{"created_at":"2026-01-01T00:00:02Z","body":"<!-- stale-recovery-tick:2 -->"},{"created_at":"2026-01-01T00:00:03Z","body":"<!-- stale-recovery-release:verified -->","author_association":"NONE"}]]'
+if [[ "$(_stale_recovery_count_ticks_from_pages "$ticks")" == 2 ]]; then
+	print_result "Untrusted release marker cannot reset ticks" 0
+else
+	print_result "Untrusted release marker cannot reset ticks" 1
+fi
+ticks='[[{"created_at":"2026-01-01T00:00:01Z","body":"<!-- stale-recovery-tick:1 -->"},{"created_at":"2026-01-01T00:00:02Z","body":"<!-- stale-recovery-tick:2 -->"},{"created_at":"2026-01-01T00:00:03Z","body":"<!-- stale-recovery-release:verified -->","author_association":"OWNER"},{"created_at":"2026-01-01T00:00:04Z","body":"<!-- stale-recovery-tick:1 -->"}]]'
+if [[ "$(_stale_recovery_count_ticks_from_pages "$ticks")" == 1 ]]; then
+	print_result "Maintainer release resets only prior ticks" 0
+else
+	print_result "Maintainer release resets only prior ticks" 1
+fi
+
+for initial_state in blocked available; do
+	release_result=$(GH_TEST_STATE="$initial_state" bash -c '
+	source "$1" help >/dev/null
+	gh() {
+		case "$2" in
+		user) printf "maintainer\n" ;;
+		*/permission) printf "%s\n" "${GH_TEST_PERMISSION:-admin}" ;;
+		*/comments) printf "%s\n" '\''[[{"created_at":"2026-01-01T00:00:02Z","body":"<!-- stale-recovery-tick:escalated -->"}]]'\'' ;;
+		*/issues/99999)
+			if [[ "${GH_TEST_STATE:-blocked}" == available ]]; then
+				printf "%s\n" "{\"state\":\"open\",\"labels\":[{\"name\":\"status:available\"}${GH_TEST_DISPATCH:-}],\"assignees\":[]}"
+			else
+				printf "%s\n" '\''{"state":"open","labels":[{"name":"status:blocked"}],"assignees":[]}'\''
+			fi ;;
+		esac
+	}
+	gh_issue_comment() { printf "COMMENT\n" >&2; return 0; }
+	set_issue_status() { printf "STATUS\n" >&2; GH_TEST_STATE=available; GH_TEST_DISPATCH=",{\"name\":\"auto-dispatch\"}"; return 0; }
+	_ddh_release_stale_recovery 99999 owner/repo reviewed
+' bash "${TEST_SCRIPTS_DIR}/dispatch-dedup-helper.sh" 2>&1)
+	if [[ "$release_result" == *COMMENT* && "$release_result" == *STATUS* ]]; then
+		print_result "Reviewed release from ${initial_state} posts audit marker before label change" 0
+	else
+		print_result "Reviewed release from ${initial_state} posts audit marker before label change" 1 "$release_result"
+	fi
+done
 
 # =============================================================================
 # Summary

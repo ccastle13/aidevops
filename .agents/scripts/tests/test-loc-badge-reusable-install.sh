@@ -31,7 +31,8 @@ _fail() {
 _assert_contains() {
 	local _name="$1"
 	local _pattern="$2"
-	if grep -Fq -- "$_pattern" "$WORKFLOW"; then
+	local _file="${3:-$WORKFLOW}"
+	if grep -Fq -- "$_pattern" "$_file"; then
 		_pass "$_name"
 		return 0
 	fi
@@ -50,6 +51,36 @@ _assert_not_regex() {
 	return 0
 }
 
+# GH#34276: an existing non-comment caller must suppress loc-badge.yml install.
+_test_existing_caller_detection() {
+	local _tmp
+	_tmp=$(mktemp -d) || return 0
+	local _helper="$SCRIPT_DIR/../badges-sync-helper.sh"
+	local _fn
+	_fn=$(sed -n '/^_find_metrics_caller() {/,/^}/p' "$_helper")
+	eval "$_fn"
+
+	mkdir -p "$_tmp/real/.github/workflows" "$_tmp/commented/.github/workflows"
+	printf 'jobs:\n  m:\n    uses: marcusquinn/aidevops/.github/workflows/loc-badge-reusable.yml@abc\n' \
+		>"$_tmp/real/.github/workflows/repo-metrics.yml"
+	printf '# example:\n#   uses: marcusquinn/aidevops/.github/workflows/loc-badge-reusable.yml@abc\n' \
+		>"$_tmp/commented/.github/workflows/other.yml"
+
+	local _found=""
+	if _found=$(_find_metrics_caller "$_tmp/real") && [[ "$_found" == "repo-metrics.yml" ]]; then
+		_pass "detects existing metrics caller"
+	else
+		_fail "detects existing metrics caller" "got: $_found"
+	fi
+	if _find_metrics_caller "$_tmp/commented" >/dev/null; then
+		_fail "ignores commented example" "commented uses: line was detected"
+	else
+		_pass "ignores commented example"
+	fi
+	rm -rf "$_tmp"
+	return 0
+}
+
 main() {
 	local _installer_pipe_pattern="curl.*rust""up|rust""up.*curl"
 	if [[ ! -f "$WORKFLOW" ]]; then
@@ -65,12 +96,16 @@ main() {
 	_assert_contains "declares private mirror read token" "AIDEVOPS_READ_TOKEN:"
 	_assert_contains "checks out configured helper repository" "repository: \${{ inputs.aidevops_repository || 'marcusquinn/aidevops' }}"
 	_assert_contains "keeps runtime bounded" "timeout-minutes: 5"
-	_assert_contains "detects untracked generated metrics" "git status --porcelain"
+	_assert_contains "delegates metrics publication" "bash __aidevops/.agents/scripts/repo-metrics-git-push-helper.sh"
+	_assert_contains "detects untracked generated metrics" "git status --porcelain" \
+		"$SCRIPT_DIR/../repo-metrics-git-push-helper.sh"
 	_assert_not_regex "does not apt-install tokei" 'apt(-get)? install.*tokei'
 	_assert_not_regex "does not install jq" 'apt(-get)? install.*jq'
 	_assert_not_regex "does not cargo-install tokei" 'cargo install.*tokei'
 	_assert_not_regex "does not invoke tokei" 'tokei --version|\btokei\b'
 	_assert_not_regex "does not pipe remote Rust installer" "$_installer_pipe_pattern"
+
+	_test_existing_caller_detection
 
 	printf 'Tests run: %d, failed: %d\n' "$TESTS_RUN" "$TESTS_FAILED"
 	if [[ "$TESTS_FAILED" -ne 0 ]]; then

@@ -6,6 +6,8 @@
 # =============================================================================
 # Manages ~/.claude/settings.json:
 #   - Safety hooks (PreToolUse — git safety guard)
+#   - Session continuation (Stop — keep going while todos remain open)
+#   - Compaction replay (SessionStart compact — verbatim user input, GH#35189)
 #   - Tool permissions (allow/deny/ask rules per Claude Code syntax)
 #   - Preserves user customizations (model, etc.)
 #
@@ -18,7 +20,6 @@
 
 import json
 import os
-import sys
 
 settings_path = os.path.expanduser("~/.claude/settings.json")
 
@@ -32,7 +33,8 @@ changed = False
 
 # --- Safety hooks: PreToolUse for Bash ---
 # Ensures the git safety guard hook is always present
-hook_command = "$HOME/.aidevops/hooks/git_safety_guard.py"
+legacy_hook_command = "$HOME/.aidevops/hooks/git_safety_guard.py"
+hook_command = "exec " + legacy_hook_command
 hook_entry = {
     "type": "command",
     "command": hook_command
@@ -42,6 +44,12 @@ if "hooks" not in settings:
     settings["hooks"] = {}
 if "PreToolUse" not in settings["hooks"]:
     settings["hooks"]["PreToolUse"] = []
+
+for rule in settings["hooks"]["PreToolUse"]:
+    for hook in rule.get("hooks", []):
+        if hook.get("command") == legacy_hook_command:
+            hook["command"] = hook_command
+            changed = True
 
 # Bash consumes the shared command policy. Edit|Write remains the distinct
 # canonical-workspace file protection surface in the same hook.
@@ -58,6 +66,33 @@ for required_matcher in ("Bash", "Edit|Write"):
     if not has_matcher:
         settings["hooks"]["PreToolUse"].append({"matcher": required_matcher, "hooks": [hook_entry]})
         changed = True
+
+# --- Stop hook: keep going while tracked todos remain open (GH#33143) ---
+# Mirrors the OpenCode session-continuation guard. Stop events take no matcher.
+stop_hook_command = "$HOME/.aidevops/hooks/session_continuation_stop.py"
+stop_rules = settings["hooks"].setdefault("Stop", [])
+stop_registered = any(
+    "session_continuation_stop" in h.get("command", "")
+    for rule in stop_rules
+    for h in rule.get("hooks", [])
+)
+if not stop_registered:
+    stop_rules.append({"hooks": [{"type": "command", "command": stop_hook_command}]})
+    changed = True
+
+# --- SessionStart (compact): replay verbatim user input (GH#35189) ---
+# Mirrors the OpenCode compaction replay so aims, standing instructions and
+# authorisations survive compaction as the user's own words.
+replay_hook_command = "$HOME/.aidevops/hooks/compaction_user_input_replay.py"
+start_rules = settings["hooks"].setdefault("SessionStart", [])
+replay_registered = any(
+    "compaction_user_input_replay" in h.get("command", "")
+    for rule in start_rules
+    for h in rule.get("hooks", [])
+)
+if not replay_registered:
+    start_rules.append({"matcher": "compact", "hooks": [{"type": "command", "command": replay_hook_command}]})
+    changed = True
 
 # --- Tool permissions (allow / deny / ask) ---
 # Claude Code permission rule syntax: Tool or Tool(specifier)

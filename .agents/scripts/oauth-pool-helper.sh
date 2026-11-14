@@ -32,7 +32,8 @@ IFS=$'\n\t'
 # Constants
 # ---------------------------------------------------------------------------
 
-POOL_FILE="${HOME}/.aidevops/oauth-pool.json"
+# OpenCode V2 and headless runtimes can supply an isolated credential pool.
+POOL_FILE="${AIDEVOPS_OAUTH_POOL_FILE:-${HOME}/.aidevops/oauth-pool.json}"
 # t2249: XDG-aware auth path. Resolves to the isolated per-worker auth.json
 # when called from a headless worker context (XDG_DATA_HOME set by
 # headless-runtime-helper.sh invoke_opencode), and to the shared interactive
@@ -93,8 +94,11 @@ GOOGLE_HEALTH_CHECK_URL="https://generativelanguage.googleapis.com/v1beta/models
 # The "(external, cli)" suffix is our addition — not sent by the real CLI.
 # FALLBACK: if UA filtering ever causes issues, try removing the suffix or
 # switching to an axios-style UA like "axios/1.7.9".
-CLAUDE_VERSION="2.1.80"
-if command -v claude &>/dev/null; then
+# Keep this at or above the highest model gate the API enforces: Anthropic
+# rejects claude-opus-5-5 for clients below 2.1.280.
+CLAUDE_VERSION="2.1.280"
+# The offline diagnostic must not start a credential-bearing CLI even for version detection.
+if [[ "${1:-}" != "probe-rotation" ]] && command -v claude &>/dev/null; then
 	local_ver=$(claude --version 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
 	if [[ -n "${local_ver:-}" ]]; then
 		CLAUDE_VERSION="$local_ver"
@@ -205,19 +209,63 @@ save_pool() {
 	return 0
 }
 
-# Open URL in browser (best-effort, never fatal — cascades on failure)
+# Prompt and read one line of interactive input; prints the line to stdout.
+# Prefers the controlling terminal (/dev/tty) so nested command substitutions,
+# wrappers, or browser launchers cannot swallow stdin or hide the prompt.
+# Falls back to stderr/stdin when no controlling terminal exists (headless).
+oauth_prompt_read() {
+	local prompt_text="$1"
+	local line=""
+	if { : </dev/tty >/dev/tty; } 2>/dev/null; then
+		printf '%s' "$prompt_text" >/dev/tty
+		IFS= read -r line </dev/tty || true
+	else
+		printf '%s' "$prompt_text" >&2
+		IFS= read -r line || true
+	fi
+	# Trim pasted surrounding whitespace, including a CRLF carriage return.
+	line="${line#"${line%%[![:space:]]*}"}"
+	line="${line%"${line##*[![:space:]]}"}"
+	printf '%s' "$line"
+	return 0
+}
+
+# Return 0 when a graphical browser can plausibly be launched.
+# Linux consoles/SSH sessions without DISPLAY/WAYLAND_DISPLAY make xdg-open
+# fall back to text browsers (lynx/w3m/links), which hijack the terminal.
+_oauth_can_open_gui_browser() {
+	case "$(uname -s)" in
+	Darwin) return 0 ;;
+	esac
+	if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" || -n "${WSL_DISTRO_NAME:-}" ]]; then
+		return 0
+	fi
+	return 1
+}
+
+# Open URL in browser (best-effort, never fatal).
+# The URL is always printed first so console-only sessions can copy it.
+# Launchers get detached stdio: callers run inside $(...), and an inherited
+# stdout pipe would capture the browser's output (and the auth prompt would
+# never appear) or keep the command substitution open.
 open_browser() {
 	local url="$1"
 	local cmd
-	for cmd in open xdg-open wslview; do
-		if command -v "$cmd" &>/dev/null && "$cmd" "$url" 2>/dev/null; then
+	print_info "Open this URL in a browser to authorize:"
+	printf '%s\n' "$url" >&2
+	if ! _oauth_can_open_gui_browser; then
+		print_info "No graphical display detected; open the URL above manually."
+		return 0
+	fi
+	# macOS uses open(1); on Linux 'open' is often openvt(1), so never try it.
+	local -a launchers=(wslview xdg-open)
+	[[ "$(uname -s)" == "Darwin" ]] && launchers=(open)
+	for cmd in "${launchers[@]}"; do
+		if command -v "$cmd" &>/dev/null && "$cmd" "$url" </dev/null >/dev/null 2>&1; then
 			return 0
 		fi
 	done
-	print_warning "Cannot open browser automatically."
-	# Always print URL so user can open manually if browser launch failed
-	print_info "If the browser didn't open, visit this URL:"
-	printf '%s\n' "$url" >&2
+	print_warning "Cannot open browser automatically; open the URL above manually."
 	return 0
 }
 
@@ -320,6 +368,7 @@ main() {
 	assign-pending | assign_pending) cmd_assign_pending "$@" ;;
 	check | test) cmd_check "$@" ;;
 	diagnose) cmd_diagnose "$@" ;;
+	probe-rotation) cmd_probe_rotation "$@" ;;
 	import) cmd_import "$@" ;;
 	list) cmd_list "$@" ;;
 	mark-failure | mark_failure) cmd_mark_failure "$@" ;;

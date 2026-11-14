@@ -28,11 +28,14 @@ tools:
 | Category | Integration | Key Requirement |
 |----------|-------------|-----------------|
 | Browser & Web | Chrome DevTools MCP | `npx chrome-devtools-mcp@latest` |
-| | Playwright MCP | `npm install -g playwright-mcp` |
+| | Playwright MCP | `npx -y @playwright/mcp@0.0.79 --headless --isolated` |
 | | Cloudflare Browser Rendering | Server-side scraping (account ID + API token) |
 | SEO & Research | Ahrefs MCP | `AHREFS_API_KEY` (passed as `API_KEY` via wrapper) |
 | | Perplexity MCP | `PERPLEXITY_API_KEY` |
 | | Google Search Console | `GOOGLE_APPLICATION_CREDENTIALS` (service account JSON) |
+| | Rank Math MCP | Per-site WordPress Application Password via `wordpress-mcp-helper.sh rankmath-config` |
+| | SEO Utils MCP | SEO Utils desktop app (>2.5.0) + MCP access; local stdio via `seo-utils-mcp-launcher.sh`, no token (`seo/seo-utils.md`) |
+| CRM & Business | Fluent plugins MCP (CRM, Boards, Forms, Support, Booking) | Per-site WordPress Application Password via `wordpress-mcp-helper.sh plugin-mcp-config <preset>` |
 | Document Processing | Unstract MCP | `UNSTRACT_API_KEY` + `API_BASE_URL` (Docker, self-hosted default) |
 | Mobile Testing | iOS Simulator MCP | macOS + Xcode + Facebook IDB |
 | Development | Claude Code MCP | Forked server (`github:marcusquinn/claude-code-mcp`) |
@@ -42,6 +45,7 @@ tools:
 | | Cloudflare Code Mode MCP | OAuth via `mcp.cloudflare.com` |
 | | MCPorter | Discover, call, compose, generate CLIs for MCP servers |
 | | OpenAPI Search MCP | Remote Cloudflare Worker, no auth |
+| Media Generation | Higgsfield MCP | Browser OAuth state + request-bound refresh proxy |
 
 **Config Location**: `configs/mcp-templates/` beneath the aidevops repository or deployed `~/.aidevops/` root, independent of the caller's working directory.
 
@@ -74,10 +78,19 @@ Full options (headless, viewport, logging):
 ### Playwright MCP
 
 ```bash
-npm install -g playwright-mcp
-playwright-mcp --install-browsers
-claude mcp add playwright npx playwright-mcp@latest
+npx -y playwright@latest install
+claude mcp add playwright -- npx -y @playwright/mcp@0.0.79 --headless --isolated
 ```
+
+The portable config above launches a separate isolated bundled browser because
+static cross-platform client configs cannot safely encode an OS-specific Brave
+path. Managed OpenCode and Browser QA automatically prefer installed Brave;
+other clients should append `--executable-path <brave-path>` for headed or
+headless work. Only during an interactive session with an available user, store
+`PLAYWRIGHT_MCP_EXTENSION_TOKEN` with `aidevops secret`, explicitly request
+extension mode, and add `--extension` to the MCP command.
+Never place the token in MCP config or command arguments. See
+`tools/browser/playwright.md`.
 
 ### iOS Simulator MCP
 
@@ -140,6 +153,37 @@ Config for other runtimes (OpenCode uses `~/.config/opencode/opencode.json`; Cla
 
 Per-agent enablement: `tools/context/openapi-search.md` (disabled globally, enabled on-demand).
 
+### Higgsfield MCP
+
+Higgsfield's hosted MCP endpoint uses OAuth with the `openid`, `email`, and
+`offline_access` scopes. The tracked local proxy preserves the existing schema
+compatibility fixes while refreshing an expired access token at the request
+boundary. It refreshes before known expiry, or once after an authentication
+rejection, and then retries the original MCP request once.
+
+```json
+{
+  "higgsfield": {
+    "type": "local",
+    "command": ["node", "/absolute/home/path/.aidevops/agents/scripts/higgsfield-mcp-proxy.mjs"],
+    "enabled": false
+  }
+}
+```
+
+The default OAuth state path is
+`~/.config/aidevops/higgsfield-mcp-proxy/state.json`. Set the absolute
+`HIGGSFIELD_MCP_STATE_PATH` only when migrating an existing connector state.
+Use the absolute proxy path printed by the setup command because MCP command
+arrays do not consistently expand `~` or `${HOME}` across clients.
+Complete initial browser authorization before starting the proxy. A missing,
+revoked, or invalid refresh token fails closed with reauthorization guidance;
+token values are never logged.
+
+Run `bash .agents/scripts/setup-mcp-integrations.sh higgsfield` for setup details
+and `node --test .agents/scripts/tests/test-higgsfield-mcp-proxy.mjs` for the
+credential-free lifecycle checks.
+
 ### Cloudflare Code Mode MCP
 
 No installation -- remote server, OAuth-authenticated. First connection opens browser OAuth flow to `dash.cloudflare.com`; token stored automatically.
@@ -201,35 +245,29 @@ export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"
 claude mcp add google-search-console npx mcp-server-gsc@latest
 ```
 
-### FluentCRM MCP
+### Fluent plugins MCP (FluentCRM, Boards, Forms, Support, Booking)
 
-Not published to npm -- requires local build:
+Current Fluent plugins ship native MCP servers on plugin routes (`/wp-json/fluent-crm/mcp`, `fluent-boards/mcp`, `fluentform/mcp`, `fluent-support/mcp`, `fluent-booking/mcp`) through the WordPress MCP Adapter. Add one server per site and plugin with the same helper as Rank Math; no local build is needed:
 
 ```bash
-mkdir -p ~/.local/share/mcp-servers
-cd ~/.local/share/mcp-servers
-git clone https://github.com/netflyapp/fluentcrm-mcp-server.git
-cd fluentcrm-mcp-server && npm install && npm run build
-
-# Store in ~/.config/aidevops/credentials.sh:
-export FLUENTCRM_API_URL="https://your-domain.com/wp-json/fluent-crm/v2"
-export FLUENTCRM_API_USERNAME="your_username"
-export FLUENTCRM_API_PASSWORD="your_application_password"
+aidevops secret set EXAMPLE_WP_APP_PASSWORD   # run in your terminal
+~/.aidevops/agents/scripts/wordpress-mcp-helper.sh plugin-mcp-check fluentcrm https://example.com aidevops-bot EXAMPLE_WP_APP_PASSWORD
+~/.aidevops/agents/scripts/wordpress-mcp-helper.sh plugin-mcp-config fluentcrm example https://example.com aidevops-bot EXAMPLE_WP_APP_PASSWORD opencode
 ```
 
-OpenCode config (bash wrapper, disabled globally):
+Presets: `fluentcrm`, `fluentboards`, `fluentforms`, `fluentsupport`, `fluentbooking`. Forms, Support and Booking ship with MCP off. Template: `configs/mcp-templates/fluentcrm.json`. Setup, operating rules and REST/WP-CLI fallback: `tools/wordpress/fluent-mcp.md`; FluentCRM tools: `services/crm/fluentcrm.md`.
 
-```json
-{
-  "fluentcrm": {
-    "type": "local",
-    "command": ["/bin/bash", "-c", "source ~/.config/aidevops/credentials.sh && node ~/.local/share/mcp-servers/fluentcrm-mcp-server/dist/fluentcrm-mcp-server.js"],
-    "enabled": false
-  }
-}
+### Rank Math MCP
+
+Rank Math SEO exposes `rank-math/*` abilities through the WordPress MCP Adapter; add one server per site. The generated entry launches `serve-http`, which resolves the Application Password at start-up, so no secret is written to runtime config:
+
+```bash
+aidevops secret set RANKMATH_EXAMPLE_WP_APP_PASSWORD   # run in your terminal
+~/.aidevops/agents/scripts/wordpress-mcp-helper.sh rankmath-check https://example.com aidevops-bot RANKMATH_EXAMPLE_WP_APP_PASSWORD
+~/.aidevops/agents/scripts/wordpress-mcp-helper.sh rankmath-config example https://example.com aidevops-bot RANKMATH_EXAMPLE_WP_APP_PASSWORD opencode
 ```
 
-Per-agent enablement: `services/crm/fluentcrm.md`. Tools: Contacts, Tags, Lists, Campaigns, Email Templates, Automations, Webhooks, Smart Links, Dashboard Stats.
+`rankmath-check`/`rankmath-config` are aliases for `plugin-mcp-check rankmath`/`plugin-mcp-config rankmath`. Template: `configs/mcp-templates/rankmath.json`. Abilities, write-safety rules and OAuth connector notes: `tools/wordpress/rankmath-mcp.md`.
 
 ### Unstract MCP
 

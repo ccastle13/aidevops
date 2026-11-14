@@ -9,6 +9,11 @@ Maximise output per token. Compress prose, not results.
 expansion, grouping/subshell syntax, background execution, and unquoted globs.**
 Split blocked operations into separate calls and use file tools for persisted content.
 
+When `AIDEVOPS_MANAGED_WORKTREE=pulse-cgroup-v1`, keep all worktree processes
+inside the inherited cgroup: no handoff to external services, containers or
+separate systemd units. If required, report the unsupported handoff instead of
+escaping containment. See `reference/worktree-registry.md` for the lifetime contract.
+
 ## 1. Ship early, keep the audit trail intact
 
 - Start with `TodoWrite`: 3-7 subtasks, exactly one `in_progress`, last subtask `gh pr ready`.
@@ -41,15 +46,28 @@ gh pr create --draft --title 'GH#123: description' --body-file '/path/to/pr-body
 
 ## 2. Spend tokens where they change outcomes
 
-- Files over 200 lines you will not edit: use `ai_research` (~100 tokens vs ~5000). Do not offload files you need to edit.
+- Keep the lowest credible parent tier; thinking uses the daily driver, not the
+  largest model. Bounded independent work may use simple/standard children. For an
+  evidenced specialist gap, use `specialist-advisor` when available, with the JSON
+  evidence contract in `reference/agent-routing.md`. Retain implementation and
+  acceptance ownership; children never recurse. No automatic whole-session Astra
+  promotion. Exception at the decision boundary: if current-model uncertainty alone
+  would make the worker export an in-scope technical, product or architectural
+  choice, gather the narrow evidence and consult the highest configured and
+  authorized capable advisory route once. Validate its answer and proceed when the
+  decision is safe, reversible and evidence-backed; do not repeat an unchanged
+  consultation or turn routine uncertainty into promotion.
+- Delegate output-heavy independent analysis only when it saves total work. Supply
+  actual excerpts through `files`/`agents` to inference-only `ai_research`; paths
+  mentioned only in its prompt are not loaded. Do not offload files you need to edit.
 
 ```text
-ai_research(prompt: "Find all functions that dispatch workers in pulse-wrapper.sh. Return: function name, line number, key variables.", domain: "orchestration")
+ai_research(prompt: "Review the supplied dispatch function. Return: decision, evidence, uncertainty and next check.", files: "path/to/relevant-source.sh:100-180", domain: "orchestration", model: "simple")
 ```
 
 - Rate limit: 10 per session. Default workload tier: `simple`; OpenCode selects
   an available configured provider/model through canonical routing.
-- Domain shorthand auto-loads agent files: `git=git-workflow,github-cli,conflict-resolution`; `planning=plans,beads`; `code=code-standards,code-simplifier`; `seo=seo,dataforseo,google-search-console`; `content=content,research,writing`; `wordpress=wp-dev,mainwp`; `browser=browser-automation,playwright`; `deploy=coolify,coolify-cli,vercel`; `security=tirith,encryption-stack`; `mcp=build-mcp,server-patterns`; `agent=build-agent,agent-review`; `framework=architecture,setup`; `release=release,version-bump`; `pr=pr,preflight`; `orchestration=headless-dispatch`; `context=model-routing,toon,mcp-discovery`; `video=video-prompt-design,remotion,wavespeed`; `voice=speech-to-speech,voice-bridge`; `mobile=agent-device,maestro,serve-sim`; `hosting=hostinger,cloudflare,hetzner`; `email=email-testing,email-delivery-test`; `accessibility=accessibility,accessibility-audit`; `containers=orbstack`; `vision=overview,image-generation`.
+- Domain shorthand auto-loads agent files: `git=git-workflow,github-cli,conflict-resolution`; `planning=plans`; `code=code-standards,code-simplifier`; `seo=seo,dataforseo,google-search-console`; `content=content,research,writing`; `wordpress=wp-dev,mainwp`; `browser=browser-automation,playwright`; `deploy=coolify,coolify-cli,vercel`; `security=tirith,encryption-stack`; `mcp=build-mcp,server-patterns`; `agent=build-agent,agent-review`; `framework=architecture,setup`; `release=release,version-bump`; `pr=pr,preflight`; `orchestration=headless-dispatch`; `context=model-routing,toon,mcp-discovery`; `video=video-prompt-design,remotion,wavespeed`; `voice=speech-to-speech,voice-bridge`; `mobile=agent-device,maestro,serve-sim`; `hosting=hostinger,cloudflare,hetzner`; `email=email-testing,email-delivery-test`; `accessibility=accessibility,accessibility-audit`; `containers=orbstack`; `vision=overview,image-generation`.
 - Parameters: `prompt` required; optional `domain`, `agents` (paths relative to `~/.aidevops/agents/`), `files` (line ranges allowed, e.g. `src/foo.ts:10-50`), `model` (`simple|standard|thinking`), `max_tokens` (default 500, max 4096).
 - `haiku|sonnet|opus` remain compatibility aliases. `max_tokens` is an advisory
   generation budget plus a bounded transport ceiling when the selected OpenCode
@@ -70,6 +88,13 @@ ai_research(prompt: "Find all functions that dispatch workers in pulse-wrapper.s
 
 `BLOCKED` is only valid after exhausting all autonomous solution paths. If the only remaining blocker is the current model's inability to reason through the task safely, emit the exact structured marker `BLOCKED: capability limit - <evidence>`; runtime routing advances to the next configured capability tier. Review-policy metadata, nominal GitHub states, and lower-tier model limits are **not** valid blockers. Permission, authentication, provider, rate-limit, secret, policy, trust-boundary, and locality failures never use the capability marker. A genuine terminal blocker requires evidence: failing check, missing permission, unresolved conflict, or explicit policy gate.
 
+Before either marker for an unresolved in-scope decision, apply the decision-only
+consultation in `reference/agent-routing.md` when its configured route is available
+and safe. Keep authority, consent, taste or values, inaccessible context, unknown
+secrets, irreversible commitments, privacy/locality, billing and explicit model
+pins outside model escalation. Advisory output cannot grant any of them, and
+provider, authentication, rate-limit or tool failures use their own recovery path.
+
 ```text
 BLOCKED: capability limit - bounded attempts could not establish a safe implementation
 ```
@@ -80,7 +105,7 @@ BLOCKED: capability limit - bounded attempts could not establish a safe implemen
 | Review-policy state (e.g. "changes requested") | Continue — address findings, do not stop |
 | Rate limit / auth error | Rotate provider (handled by headless-runtime-helper.sh) |
 | Missing credentials | EXIT BLOCKED (genuine blocker) |
-| Architectural decision needed | EXIT BLOCKED (genuine blocker) |
+| Architectural decision remains after bounded authorized advice, or advice is unavailable/unsafe | EXIT BLOCKED with the evidenced non-capability boundary; use the capability marker only when model capability alone remains |
 | Failing CI check | Fix the check, do not stop |
 
 ## Headless session awareness (GH#17436 — CRITICAL)

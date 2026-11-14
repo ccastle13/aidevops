@@ -32,7 +32,7 @@ tools:
 
 Manages separate credential sets for multiple clients, environments, or accounts. For encrypted storage, see `tools/credentials/gopass.md` — use `aidevops secret` for encrypted secrets alongside `credential-helper.sh` for tenant switching.
 
-**Switch vs simultaneous**: This page covers *switching* between credential sets — one active at a time, same env var names (`GITHUB_TOKEN`) in different tenants. If you instead need multiple accounts for the same provider active **simultaneously** (e.g. personal + work GitHub tokens both in env at once), use the per-account suffix convention in `gopass.md` "Naming with multiple accounts" — `GITHUB_TOKEN_PERSONAL`, `GITHUB_TOKEN_WORK`, etc. — within a single tenant.
+**Switch vs simultaneous**: This page covers *switching* between credential sets — one active at a time, same env var names (`GITHUB_TOKEN`) in different tenants. If you instead need multiple accounts for the same provider active **simultaneously** (e.g. personal + work GitHub tokens both in env at once), use account-tagged names within a single tenant — `GITHUB_PERSONAL_TOKEN`, `GITHUB_WORK_TOKEN`, etc. — per `credential-inventory.md` "Naming new credentials", and declare any default explicitly with `aidevops secret default`.
 
 ## Architecture
 
@@ -58,6 +58,7 @@ cd ~/projects/acme && credential-helper.sh use client-acme        # per-project
 ## Usage Patterns
 
 **Agency/Freelance**:
+
 ```bash
 credential-helper.sh create client-acme
 credential-helper.sh set VERCEL_TOKEN xxx --tenant client-acme
@@ -65,12 +66,14 @@ cd ~/projects/acme-webapp && credential-helper.sh use client-acme
 ```
 
 **Environment separation**:
+
 ```bash
 credential-helper.sh set DATABASE_URL "postgres://prod..." --tenant production
 credential-helper.sh set DATABASE_URL "postgres://staging..." --tenant staging
 ```
 
 **Copy keys between tenants**:
+
 ```bash
 credential-helper.sh copy default client-acme --key OPENAI_API_KEY
 credential-helper.sh copy default client-acme   # copy all
@@ -103,6 +106,12 @@ credential-helper.sh copy default client-acme   # copy all
 **CI/CD**: Use GitHub Secrets — multi-tenant is for local development only.
 
 **MCP** (`api-keys` tool): `action:list` reads active tenant; `action:set service:KEY_NAME` sets in active tenant.
+
+**`aidevops secret` plaintext fallback** (no gopass; GH#34806):
+
+- **Writes**: `secret set` stores in the tenant named by the loader's `AIDEVOPS_ACTIVE_TENANT` marker (else `active-tenant`, else `default`) and removes any same-name `export` line from the loader, which would otherwise shadow it. The `.aidevops-tenant` project override does not change where `secret set` writes.
+- **Reads** (`check`, `list`, `get`, injection): the active tenant first, then other tenants in name order, so the active tenant wins for duplicate names. The loader is parsed as text, never sourced, and is not a store. gopass entries still take precedence and fail closed when locked.
+- **Stranded exports**: `secret status` lists names exported directly in the loader (values are never shown). `credential-helper.sh switch` rewrites the loader and drops them, so move them first with `aidevops secret migrate-loader`. Names whose tenant entry differs stay in the loader and are reported; resolve each with `aidevops secret set NAME`.
 
 ## Security
 

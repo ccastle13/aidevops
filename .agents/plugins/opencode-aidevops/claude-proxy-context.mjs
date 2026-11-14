@@ -16,9 +16,10 @@
  * Extracted from claude-proxy.mjs as part of t2070 to drop file complexity.
  */
 
-import { mkdirSync, readFileSync, writeFileSync } from "fs";
+import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
+import { compactExactInstructionDocument } from "./context-catalogue.mjs";
 
 // ---------------------------------------------------------------------------
 // Framework system prompt cache
@@ -150,17 +151,25 @@ const AGENT_MCPS = new Map([
 const MCP_DEFINITIONS = new Map([
   ["context7", { command: "npx", args: ["-y", "@upstash/context7-mcp@latest"], type: "stdio" }],
   ["gsc", {
-    command: "/bin/bash",
+    command: "bash",
     args: ["-c", "GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-~/.config/aidevops/gsc-credentials.json} npx -y mcp-server-gsc"],
     type: "stdio",
   }],
   ["dataforseo", {
-    command: "/bin/bash",
+    command: "bash",
     args: ["-c", "source ~/.config/aidevops/credentials.sh && DATAFORSEO_USERNAME=$DATAFORSEO_USERNAME DATAFORSEO_PASSWORD=$DATAFORSEO_PASSWORD npx -y dataforseo-mcp-server"],
     type: "stdio",
   }],
   ["shadcn", { command: "npx", args: ["shadcn@latest", "mcp"], type: "stdio" }],
-  ["playwright", { command: "npx", args: ["-y", "@playwright/mcp@latest"], type: "stdio" }],
+  // GH#34111: launch from a private artifact cwd, never the project checkout.
+  ["playwright", {
+    command: "bash",
+    args: [
+      join(homedir(), ".aidevops", "agents", "scripts", "browser-mcp-launcher.sh"),
+      "playwright", "npx", "-y", "@playwright/mcp@0.0.79", "--headless", "--isolated",
+    ],
+    type: "stdio",
+  }],
 ]);
 
 const MCP_CONFIG_DIR = join(homedir(), ".aidevops", ".agent-workspace", "tmp");
@@ -268,13 +277,50 @@ export function parseChatMessages(messages) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-request working directory
+// ---------------------------------------------------------------------------
+
+const WORKING_DIRECTORY_LINE = /^[ \t]*Working directory:[ \t]*(\/[^\r\n]*?)[ \t]*$/m;
+
+/**
+ * Resolve the directory the `claude` child should run in for this request.
+ *
+ * The proxy listens on one fixed port and later OpenCode processes adopt the
+ * first live listener (proxy-lifecycle.mjs), so the `directory` captured at
+ * launch belongs to whichever session started it. Every other session —
+ * including headless workers in pre-created worktrees — then ran Claude's
+ * tools in the wrong checkout and reported the worktree as unreachable.
+ * OpenCode's own system prompt carries the requesting session's
+ * `Working directory:`; use it when it names an existing absolute directory,
+ * otherwise keep the launch directory.
+ *
+ * @param {string} systemPrompt  System text from the incoming request
+ * @param {string} fallback      Directory captured when the proxy launched
+ * @returns {string}
+ */
+export function resolveRequestDirectory(systemPrompt, fallback) {
+  const match = typeof systemPrompt === "string" ? WORKING_DIRECTORY_LINE.exec(systemPrompt) : null;
+  if (!match) return fallback;
+  const candidate = match[1];
+  if (candidate.includes("\0") || candidate.split("/").includes("..")) return fallback;
+  try {
+    const resolved = realpathSync(candidate);
+    return statSync(resolved).isDirectory() ? resolved : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Agent + model + effort resolution
 // ---------------------------------------------------------------------------
 
 const MODEL_ALIASES = new Map([
-  ["haiku",    "claude-haiku-4-5"],
+  ["haiku45",  "claude-haiku-4-5"],
+  ["haiku",    "claude-haiku-5-5"],
   ["sonnet45", "claude-sonnet-4-5"],
-  ["sonnet",   "claude-sonnet-4-6"],
+  ["sonnet46", "claude-sonnet-4-6"],
+  ["sonnet",   "claude-sonnet-5-5"],
   ["opus45",   "claude-opus-4-5"],
   ["opus",     "claude-opus-4-6"],
 ]);
@@ -352,11 +398,16 @@ export function buildClaudeArgs(body, systemPrompt, streaming) {
     args.push("--mcp-config", mcpConfig);
   }
 
-  // Combine: framework base (build.txt + AGENTS.md) + agent prompt + request system prompt.
-  // Framework and agent go first (static), OpenCode's context-specific prompt last.
+  // Combine proxy-owned guidance with context-specific input. The exact canonical
+  // framework document may already be in OpenCode's system context.
   const frameworkPrompt = getFrameworkPrompt();
   const agentPrompt = getAgentPrompt(agentName);
-  const combinedPrompt = [frameworkPrompt, agentPrompt, systemPrompt].filter(Boolean).join("\n\n");
+  const incomingPrompt = compactExactInstructionDocument(
+    frameworkPrompt,
+    join(agentsDir, "AGENTS.md"),
+    systemPrompt,
+  );
+  const combinedPrompt = [frameworkPrompt, agentPrompt, incomingPrompt].filter(Boolean).join("\n\n");
   if (combinedPrompt) {
     args.push("--append-system-prompt", combinedPrompt);
   }

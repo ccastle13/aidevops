@@ -37,8 +37,12 @@ get_max_workers_target() {
 	local max_workers
 	max_workers=$(cat "$max_workers_file" 2>/dev/null || echo "1")
 	[[ "$max_workers" =~ ^[0-9]+$ ]] || max_workers=1
-	if [[ "$max_workers" -lt 1 ]]; then
-		max_workers=1
+	# Zero is a closed admission gate, not a corrupt/missing target.
+	# The file is only rewritten by the preflight_capacity stage. Clamp to the
+	# live ceiling so a lowered cap (config change, GH#32663 reset) applies to
+	# refill/drain dispatch before the next full preflight recomputes it.
+	if [[ "${MAX_WORKERS_CAP:-}" =~ ^[1-9][0-9]*$ ]] && ((max_workers > MAX_WORKERS_CAP)); then
+		max_workers="$MAX_WORKERS_CAP"
 	fi
 	echo "$max_workers"
 	return 0
@@ -66,6 +70,65 @@ _pulse_capacity_selected_provider() {
 }
 
 #######################################
+# GH#36707: the planning provider comes from credential presence, which never
+# sees pool exhaustion. When its account pool has no usable account, plan for
+# the provider the worker selector would actually launch; that selector applies
+# pool cooldowns, model backoff and AIDEVOPS_HEADLESS_PROVIDER_ALLOWLIST. An
+# explicit PULSE_DISPATCH_CAPACITY_PROVIDER remains authoritative.
+# Arguments:
+#   $1 - exhausted planning provider
+# Stdout: alternative provider token, or nothing when none applies.
+#######################################
+_pulse_capacity_fallback_provider() {
+	local provider="$1"
+	local helper="${PULSE_CAPACITY_SELECT_HELPER:-${BASH_SOURCE[0]%/*}/headless-runtime-helper.sh}"
+	local selected="" fallback=""
+	[[ -z "${PULSE_DISPATCH_CAPACITY_PROVIDER:-}" && -n "$provider" && -f "$helper" ]] || return 0
+	selected=$(timeout_sec 20 bash "$helper" select --role worker --tier standard 2>/dev/null) || return 0
+	fallback="${selected%%/*}"
+	[[ "$selected" == */* && "$fallback" =~ ^[a-zA-Z0-9_-]+$ && "$fallback" != "$provider" ]] || return 0
+	printf '%s\n' "$fallback"
+	return 0
+}
+
+#######################################
+# Resolve the capacity-planning provider and its normalised account counts,
+# including auth-error refresh recovery and the GH#36707 exhausted-pool
+# fallback to the worker selector's provider.
+# Stdout: "<provider|-> <total> <available> <rate_limited> <auth_errors>".
+#######################################
+_pulse_capacity_resolve_provider_accounts() {
+	local provider="" total="" available="" limited="" auth_errors=""
+	local fallback="" fb_total="" fb_available="" fb_limited="" fb_auth_errors=""
+	provider=$(_pulse_capacity_selected_provider)
+	read -r total available limited auth_errors <<<"$(_pulse_capacity_provider_account_counts "$provider")"
+	[[ "$total" =~ ^[0-9]+$ ]] || total=0
+	[[ "$available" =~ ^-?[0-9]+$ ]] || available=-1
+	[[ "$limited" =~ ^[0-9]+$ ]] || limited=0
+	[[ "$auth_errors" =~ ^[0-9]+$ ]] || auth_errors=0
+	if _pulse_capacity_auth_error_recovery "$provider" "$total" "$available" "$auth_errors"; then
+		read -r total available limited auth_errors <<<"$(_pulse_capacity_provider_account_counts "$provider")"
+	fi
+	if ((available == 0)); then
+		fallback=$(_pulse_capacity_fallback_provider "$provider")
+		if [[ -n "$fallback" ]]; then
+			read -r fb_total fb_available fb_limited fb_auth_errors <<<"$(_pulse_capacity_provider_account_counts "$fallback")"
+			if [[ "$fb_available" =~ ^-?[0-9]+$ && "$fb_available" -ne 0 ]]; then
+				printf '[pulse-wrapper] Dispatch_capacity: provider_fallback from=%s to=%s reason=no_available_accounts from_rate_limited=%s from_auth_errors=%s\n' \
+					"$provider" "$fallback" "$limited" "$auth_errors" >>"${LOGFILE:-/dev/null}" 2>/dev/null || true
+				[[ "$fb_total" =~ ^[0-9]+$ ]] || fb_total=0
+				[[ "$fb_limited" =~ ^[0-9]+$ ]] || fb_limited=0
+				[[ "$fb_auth_errors" =~ ^[0-9]+$ ]] || fb_auth_errors=0
+				provider="$fallback" total="$fb_total" available="$fb_available"
+				limited="$fb_limited" auth_errors="$fb_auth_errors"
+			fi
+		fi
+	fi
+	printf '%s %s %s %s %s\n' "${provider:--}" "$total" "$available" "$limited" "$auth_errors"
+	return 0
+}
+
+#######################################
 # Summarise provider account-pool availability without secrets.
 # Arguments:
 #   $1 - provider token
@@ -75,7 +138,7 @@ _pulse_capacity_selected_provider() {
 _pulse_capacity_provider_account_counts() {
 	local provider="$1"
 	local unavailable_counts='0 -1 0 0'
-	local pool_file="${PULSE_DISPATCH_OAUTH_POOL_FILE:-${HOME}/.aidevops/oauth-pool.json}"
+	local pool_file="${PULSE_DISPATCH_OAUTH_POOL_FILE:-${AIDEVOPS_OAUTH_POOL_FILE:-${HOME}/.aidevops/oauth-pool.json}}"
 	if [[ -z "$provider" || ! -f "$pool_file" ]] || ! command -v jq >/dev/null 2>&1; then
 		printf '%s\n' "$unavailable_counts"
 		return 0
@@ -145,10 +208,298 @@ _pulse_capacity_recent_health_counts() {
 	return 0
 }
 
+# The capacity caller runs in a command substitution, so cross-cycle health
+# must be persisted rather than returned through shell globals.
+_pulse_capacity_auth_error_state_dir() {
+	printf '%s/pulse-auth-error-recovery\n' "${AIDEVOPS_TEMP_DIR:-$HOME/.aidevops/.agent-workspace/tmp}"
+	return 0
+}
+
+_pulse_capacity_auth_error_only() {
+	local total="$1" available="$2" auth_errors="$3"
+	((total > 0 && available == 0 && auth_errors == total))
+}
+
+# Return success only when this invocation actually attempts a refresh.
+_pulse_capacity_auth_error_recovery() {
+	local provider="$1" total="$2" available="$3" auth_errors="$4"
+	[[ "$provider" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+	_pulse_capacity_auth_error_only "$total" "$available" "$auth_errors" || return 1
+	local state_dir stamp lock now last=0 throttle="${PULSE_AUTH_ERROR_REFRESH_THROTTLE_SECONDS:-300}"
+	local pool_file="${PULSE_DISPATCH_OAUTH_POOL_FILE:-${AIDEVOPS_OAUTH_POOL_FILE:-$HOME/.aidevops/oauth-pool.json}}"
+	# An unexpired backoff is not an attempt: do not consume the throttle
+	# window before the pool's refresh eligibility can recover.
+	jq -e --arg provider "$provider" --argjson now "$(($(date +%s) * 1000))" \
+		'([.[$provider][]? | select(.status == "auth-error" and ((.cooldownUntil // 0 | tonumber? // 0) <= $now))] | length) > 0' \
+		"$pool_file" >/dev/null 2>&1 || return 1
+	state_dir=$(_pulse_capacity_auth_error_state_dir)
+	stamp="${state_dir}/${provider}.last-refresh"
+	lock="${state_dir}/${provider}.refresh-lock"
+	[[ "$throttle" =~ ^[0-9]+$ ]] || throttle=300
+	mkdir -p "$state_dir" 2>/dev/null || return 1
+	# Claim atomically across overlapping pulse invocations. A crashed claimant
+	# leaves a lock; fail closed instead of repeatedly contacting the endpoint.
+	mkdir "$lock" 2>/dev/null || return 1
+	now=$(date +%s)
+	if [[ -f "$stamp" ]]; then
+		IFS= read -r last <"$stamp" || true
+	fi
+	[[ "$last" =~ ^[0-9]+$ ]] || last=0
+	if ((now - last < throttle)); then
+		rmdir "$lock" 2>/dev/null || true
+		return 1
+	fi
+	if ! printf '%s\n' "$now" >"$stamp"; then
+		rmdir "$lock" 2>/dev/null || true
+		return 1
+	fi
+	rmdir "$lock" 2>/dev/null || true
+	local helper="${BASH_SOURCE[0]%/*}/oauth-pool-helper.sh"
+	# Refresh is serialized by the pool's own lock. Never let a token endpoint
+	# stall the dispatch cycle; the pool helper owns credential transitions.
+	if ! AIDEVOPS_OAUTH_POOL_FILE="$pool_file" timeout_sec 20 "$helper" refresh "$provider" >>"${LOGFILE:-/dev/null}" 2>&1; then
+		printf '[pulse-wrapper] auth-error refresh failed or timed out: provider=%s\n' "$provider" >>"${LOGFILE:-/dev/null}" 2>/dev/null || true
+	fi
+	return 0
+}
+
+_pulse_capacity_auth_error_cycles() {
+	local provider="$1" total="$2" available="$3" auth_errors="$4"
+	local state_dir stamp cycles=0 previous_cycle="" cycle_id="${_PULSE_CYCLE_ID:-}"
+	[[ "$provider" =~ ^[a-zA-Z0-9_-]+$ ]] || { printf '0\n'; return 0; }
+	state_dir=$(_pulse_capacity_auth_error_state_dir)
+	stamp="${state_dir}/${provider}.cycles"
+	if ! _pulse_capacity_auth_error_only "$total" "$available" "$auth_errors"; then
+		rm -f "$stamp"
+		printf '0\n'
+		return 0
+	fi
+	mkdir -p "$state_dir" 2>/dev/null || { printf '0\n'; return 0; }
+	if [[ -f "$stamp" ]]; then
+		read -r cycles previous_cycle <"$stamp" || true
+	fi
+	[[ "$cycles" =~ ^[0-9]+$ ]] || cycles=0
+	if [[ -z "$cycle_id" || "$previous_cycle" != "$cycle_id" ]]; then
+		cycles=$((cycles + 1))
+	fi
+	printf '%s %s\n' "$cycles" "$cycle_id" >"$stamp" || true
+	printf '%s\n' "$cycles"
+	return 0
+}
+
+_pulse_capacity_account_multiplier() {
+	local multiplier="${PULSE_PROVIDER_ACCOUNT_SLOT_MULTIPLIER:-}" source="env:PULSE_PROVIDER_ACCOUNT_SLOT_MULTIPLIER"
+	if [[ -z "$multiplier" ]] && declare -F config_get >/dev/null 2>&1; then
+		multiplier=$(config_get "orchestration.provider_account_slot_multiplier" "24")
+		source="config:orchestration.provider_account_slot_multiplier"
+	elif [[ -z "$multiplier" ]]; then
+		source="default:24"
+	fi
+	[[ "$multiplier" =~ ^[0-9]+$ ]] || multiplier=24
+	((multiplier < 1)) && multiplier=1
+	printf '%s %s\n' "$multiplier" "$source"
+	return 0
+}
+
+_pulse_capacity_emit_gauges() {
+	local available="$1" failures="$2" final_max="$3"
+	if declare -F _dispatch_stats_gauge >/dev/null 2>&1; then
+		_dispatch_stats_gauge "dispatch_capacity_provider_accounts_available" "$((available < 0 ? 0 : available))"
+		_dispatch_stats_gauge "dispatch_capacity_recent_failures" "$failures"
+		_dispatch_stats_gauge "dispatch_capacity_recent_worker_terminal_failures" "$failures"
+		_dispatch_stats_gauge "dispatch_capacity_final_max_workers" "$final_max"
+	fi
+	return 0
+}
+
 #######################################
-# Apply a provider/account/terminal-health-aware cap to the raw dispatch target.
-# The historical function name remains for sourced-call compatibility; host
-# load is diagnostic-only and does not participate in capacity decisions.
+# Worker resource policy (owner directive, GH#35537): admission is RAM-only.
+# Macs and servers schedule their own CPU, and sustained 100% use of every
+# core is acceptable. CPU load, CPU idle and core counts must never close, cap
+# or pace new-worker admission (supersedes GH#33570, GH#33754 and the
+# GH#32663 core-derived cap; restores t3549/t3558). The host limit is RAM
+# headroom; explicit caps, provider/account health and shared-host division
+# are the other limits. Policy: reference/configuration.md "Worker resource
+# policy". Regression guard: tests/test-pulse-ram-admission.sh.
+#######################################
+
+#######################################
+# Reclaimable RAM in MB. macOS: free + inactive + speculative + purgeable pages
+# (the kernel drops speculative/purgeable file cache on demand). Linux:
+# MemAvailable. Unreadable telemetry falls back to 8192 so a broken probe
+# degrades to a small admission budget instead of closing dispatch forever.
+# Stdout: integer MB.
+#######################################
+_pulse_ram_available_mb() {
+	local free_mb=""
+	if [[ "$(uname)" == "Darwin" ]]; then
+		local page_size="" vm_out="" reclaimable_pages=""
+		page_size=$(sysctl -n hw.pagesize 2>/dev/null || echo 16384)
+		vm_out=$(vm_stat 2>/dev/null) || vm_out=""
+		reclaimable_pages=$(printf '%s\n' "$vm_out" | awk '
+			/^Pages (free|inactive|speculative|purgeable):/ { gsub(/\./, "", $NF); sum += $NF }
+			END { printf "%d", sum }')
+		[[ "$page_size" =~ ^[0-9]+$ ]] || page_size=16384
+		[[ "$reclaimable_pages" =~ ^[1-9][0-9]*$ ]] && free_mb=$((reclaimable_pages * page_size / 1024 / 1024))
+	else
+		free_mb=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo 2>/dev/null) || free_mb=""
+	fi
+	[[ "$free_mb" =~ ^[0-9]+$ ]] || free_mb=8192
+	printf '%s\n' "$free_mb"
+	return 0
+}
+
+#######################################
+# RAM that running workers have not claimed yet. A worker's process tree grows
+# to its full footprint over minutes, so reclaimable RAM over-states headroom
+# right after launches. Reserve max(0, RAM_PER_WORKER_MB - tree RSS) for each
+# worker from one process-table snapshot; if the snapshot fails, reserve every
+# worker in full.
+# Arguments: $1 newline-separated worker root PIDs.
+# Stdout: "<growth_mb> <worker_count>".
+#######################################
+_pulse_ram_worker_growth_mb() {
+	local roots="$1" per_worker_mb="${RAM_PER_WORKER_MB:-1536}" result="" count=0 root_list="" pid=""
+	[[ "$per_worker_mb" =~ ^[1-9][0-9]*$ ]] || per_worker_mb=1536
+	# Space-separated list: BSD awk rejects newlines inside -v values.
+	while read -r pid _; do
+		[[ "$pid" =~ ^[0-9]+$ ]] || continue
+		root_list+="${root_list:+ }${pid}"
+		count=$((count + 1))
+	done <<<"$roots"
+	if ((count == 0)); then
+		printf '0 0\n'
+		return 0
+	fi
+	result=$(LC_ALL=C ps -Ao 'pid=,ppid=,rss=' 2>/dev/null | LC_ALL=C awk -v roots="$root_list" -v per_kb="$((per_worker_mb * 1024))" '
+		BEGIN { n = split(roots, list, " "); for (i = 1; i <= n; i++) root[list[i] + 0] = 1 }
+		split($0, f, " ") >= 3 { parent[f[1] + 0] = f[2] + 0; rss[f[1] + 0] = f[3] + 0; rows++ }
+		END {
+			if (rows == 0) exit 1
+			for (pid in parent) {
+				cur = pid + 0
+				for (depth = 0; depth < 32 && cur > 1; depth++) {
+					if (cur in root) { used[cur] += rss[pid]; break }
+					cur = parent[cur] + 0
+				}
+			}
+			for (r in root) { gap = per_kb - used[r]; if (gap > 0) growth += gap }
+			printf "%d\n", growth / 1024
+		}') || result=""
+	[[ "$result" =~ ^[0-9]+$ ]] || result=$((count * per_worker_mb))
+	printf '%s %s\n' "$result" "$count"
+	return 0
+}
+
+#######################################
+# RAM-only admission budget (GH#35537):
+#   slots = (reclaimable - RAM_RESERVE_MB - worker growth) / RAM_PER_WORKER_MB
+# A host running no workers keeps one slot while one worker's footprint still
+# fits in reclaimable RAM, so small hosts (where the reserve is most of RAM)
+# stay productive without stacking workers into the reserve.
+# Stdout: "<new_worker_slots> <available_mb> <growth_mb> <workers_seen>".
+#######################################
+_pulse_ram_admission() {
+	local reserve_mb="${RAM_RESERVE_MB:-6144}" per_worker_mb="${RAM_PER_WORKER_MB:-1536}"
+	local available_mb="" roots="" growth_mb=0 workers_seen=0 headroom=0 slots=0
+	[[ "$reserve_mb" =~ ^[0-9]+$ ]] || reserve_mb=6144
+	[[ "$per_worker_mb" =~ ^[1-9][0-9]*$ ]] || per_worker_mb=1536
+	available_mb=$(_pulse_ram_available_mb)
+	if declare -F list_active_worker_processes >/dev/null 2>&1; then
+		roots=$(list_active_worker_processes 2>/dev/null | LC_ALL=C awk '{print $1}') || roots=""
+	fi
+	read -r growth_mb workers_seen <<<"$(_pulse_ram_worker_growth_mb "$roots")"
+	[[ "$growth_mb" =~ ^[0-9]+$ ]] || growth_mb=0
+	[[ "$workers_seen" =~ ^[0-9]+$ ]] || workers_seen=0
+	headroom=$((available_mb - reserve_mb - growth_mb))
+	((headroom > 0)) && slots=$((headroom / per_worker_mb))
+	if ((slots == 0 && workers_seen == 0 && available_mb >= per_worker_mb)); then
+		slots=1
+	fi
+	printf '%s %s %s %s\n' "$slots" "$available_mb" "$growth_mb" "$workers_seen"
+	return 0
+}
+
+# Count distinct live runner UIDs, not workers. Include this Pulse's user even
+# when ps cannot see its wrapper. Numeric UIDs avoid truncated user names on BSD
+# ps; exact argument tokens avoid matching scripts merely mentioned in commands.
+# One process-table snapshot, no shared writable registry or per-worker probing.
+_pulse_colocated_runner_count() {
+	local current_uid="" count=""
+	local ps_args=(-axo 'uid=,stat=,args=')
+	if [[ -r /proc/self/stat ]]; then
+		# GNU ps can select shell/script comm names before fetching expensive
+		# command lines for thousands of unrelated host processes. Include Linux
+		# TASK_COMM_LEN-truncated shebang names as well as shell interpreters.
+		ps_args=(-C 'bash,sh,zsh,ksh,dash,pulse-wrapper.sh,pulse-wrapper.s,headless-runtime-helper.sh,headless-runtim' -o 'uid=,stat=,args=')
+	fi
+	current_uid=$(id -u) || current_uid="self"
+	count=$(LC_ALL=C ps "${ps_args[@]}" 2>/dev/null | LC_ALL=C awk -v self="$current_uid" '
+		BEGIN { users[self] = 1; uid_column = 1; stat_column = 2 }
+		$(stat_column) !~ /^Z/ {
+			script = 3
+			if ($script ~ /(^|\/)(ba|da|z|k)?sh$/) {
+				script++
+				while (script <= NF && $script ~ /^-/) script++
+			}
+			if ($script ~ /(^|\/)(pulse-wrapper|headless-runtime-helper)[.]sh$/) {
+				users[$(uid_column)] = 1
+			}
+		}
+		END { for (user in users) count++; print count }
+	') || count=1
+	[[ "$count" =~ ^[1-9][0-9]*$ ]] || count=1
+	printf '%s\n' "$count"
+	return 0
+}
+
+# Divide only the automatic core/RAM-derived ceiling. Explicit caps already
+# represent the operator's per-runner budget. A shared host always gets >=1 slot.
+# Arguments: $1 detected runner count. Stdout: per-runner ceiling, or 0 if unset.
+_pulse_shared_host_worker_cap() {
+	local runners="$1" cap="${MAX_WORKERS_CAP:-0}"
+	[[ "$runners" =~ ^[1-9][0-9]*$ ]] || runners=1
+	[[ "$cap" =~ ^[1-9][0-9]*$ ]] || cap=0
+	if [[ "${MAX_WORKERS_CAP_AUTO:-0}" == "1" ]] && ((cap > 0 && runners > 1)); then
+		cap=$((cap / runners))
+		((cap < 1)) && cap=1
+	fi
+	printf '%s\n' "$cap"
+	return 0
+}
+
+# Bind the minimum floor and stale refill target to the current shared ceiling.
+# Do not divide cached targets again or terminate already-running workers.
+# Arguments: $1 final target, $2 detected runners, $3 shared ceiling.
+_pulse_cap_shared_host_target() {
+	local final_max="$1" runners="$2" host_worker_cap="$3"
+	if [[ "${MAX_WORKERS_CAP_AUTO:-0}" == "1" ]] && ((runners > 1 && host_worker_cap > 0 && final_max > host_worker_cap)); then
+		final_max="$host_worker_cap"
+	fi
+	printf '%s\n' "$final_max"
+	return 0
+}
+
+#######################################
+# Write diagnostics separately so stdout remains the two-field admission API.
+_pulse_capacity_write_underfill_snapshot() {
+	local raw="$1" final="$2" ram_cap="$3" runners="$4"
+	local detected_target=$((ram_cap / runners)) config_clamp=false
+	if [[ "${MAX_WORKERS_CAP_AUTO:-0}" != 1 && "${MAX_WORKERS_CAP:-0}" =~ ^[1-9][0-9]*$ ]] &&
+		((MAX_WORKERS_CAP < detected_target)); then
+		config_clamp=true
+	fi
+	local capacity_cache="${HOME}/.aidevops/cache/pulse-underfill-capacity.json"
+	mkdir -p "${HOME}/.aidevops/cache" || return 0
+	jq -n --argjson timestamp "$(date +%s)" --argjson raw "$raw" --argjson final "$final" \
+		--argjson detected "$detected_target" --arg cap "${MAX_WORKERS_CAP:-0}" --argjson clamp "$config_clamp" \
+		'{timestamp:$timestamp,simultaneous_target_raw:$raw,simultaneous_target_final:$final,detected_target:$detected,max_workers_cap:$cap,config_clamp:$clamp,clamp_source:(if $clamp then "orchestration.max_workers_cap / MAX_WORKERS_CAP" else "provider/account/health/RAM or automatic ceiling" end)}' \
+		>"${capacity_cache}.tmp" && mv "${capacity_cache}.tmp" "$capacity_cache"
+	return 0
+}
+
+# Apply RAM, provider/account and terminal-health caps to the raw target.
+# CPU load is deliberately not an input (GH#35537 worker resource policy).
 # Arguments:
 #   $1 - raw max workers
 #   $2 - active workers
@@ -163,13 +514,28 @@ pulse_apply_provider_load_capacity_cap() {
 	[[ "$active_workers" =~ ^[0-9]+$ ]] || active_workers=0
 	[[ "$min_worker_floor" =~ ^[0-9]+$ ]] || min_worker_floor=6
 
+	# Re-sample RAM on refill: preflight's capacity file may be stale. Neither
+	# the floor nor any other cap may exceed RAM headroom. This limits
+	# launches, not running workers.
+	local ram_slots="" ram_available_mb="" ram_growth_mb="" _ram_workers_seen=""
+	read -r ram_slots ram_available_mb ram_growth_mb _ram_workers_seen <<<"$(_pulse_ram_admission)"
+	[[ "$ram_slots" =~ ^[0-9]+$ ]] || ram_slots=0
+	local ram_cap=$((active_workers + ram_slots))
+	local colocated_runners="" host_worker_cap=""
+	colocated_runners=$(_pulse_colocated_runner_count)
+	host_worker_cap=$(_pulse_shared_host_worker_cap "$colocated_runners")
+	if ((raw_max_workers == 0 || ram_slots == 0)); then
+		printf '[pulse-wrapper] Dispatch_capacity: admission=closed reason=ram ram_available_mb=%s ram_reserve_mb=%s ram_worker_growth_mb=%s ram_per_worker_mb=%s ram_slots=%s simultaneous_target_raw=%s active_workers=%s colocated_runners=%s\n' \
+			"${ram_available_mb:-na}" "${RAM_RESERVE_MB:-6144}" "${ram_growth_mb:-na}" "${RAM_PER_WORKER_MB:-1536}" "$ram_slots" "$raw_max_workers" "$active_workers" "$colocated_runners" >>"${LOGFILE:-/dev/null}" 2>/dev/null || true
+		printf '0 0\n'
+		return 0
+	fi
+
 	local provider="" account_total="" account_available="" account_limited="" account_auth_errors=""
-	provider=$(_pulse_capacity_selected_provider)
-	read -r account_total account_available account_limited account_auth_errors <<<"$(_pulse_capacity_provider_account_counts "$provider")"
-	[[ "$account_total" =~ ^[0-9]+$ ]] || account_total=0
-	[[ "$account_available" =~ ^-?[0-9]+$ ]] || account_available=-1
-	[[ "$account_limited" =~ ^[0-9]+$ ]] || account_limited=0
-	[[ "$account_auth_errors" =~ ^[0-9]+$ ]] || account_auth_errors=0
+	read -r provider account_total account_available account_limited account_auth_errors <<<"$(_pulse_capacity_resolve_provider_accounts)"
+	[[ "$provider" == "-" ]] && provider=""
+	local auth_error_only_cycles
+	auth_error_only_cycles=$(_pulse_capacity_auth_error_cycles "$provider" "$account_total" "$account_available" "$account_auth_errors")
 
 	local failures="" rate_limits="" service_interruptions="" provider_5xx="" progress_heartbeats=""
 	read -r failures rate_limits service_interruptions provider_5xx progress_heartbeats <<<"$(_pulse_capacity_recent_health_counts)"
@@ -179,15 +545,8 @@ pulse_apply_provider_load_capacity_cap() {
 	[[ "$provider_5xx" =~ ^[0-9]+$ ]] || provider_5xx=0
 	[[ "$progress_heartbeats" =~ ^[0-9]+$ ]] || progress_heartbeats=0
 
-	local account_multiplier="${PULSE_PROVIDER_ACCOUNT_SLOT_MULTIPLIER:-}" account_multiplier_source="env:PULSE_PROVIDER_ACCOUNT_SLOT_MULTIPLIER"
-	if [[ -z "$account_multiplier" ]] && declare -F config_get >/dev/null 2>&1; then
-		account_multiplier=$(config_get "orchestration.provider_account_slot_multiplier" "24")
-		account_multiplier_source="config:orchestration.provider_account_slot_multiplier"
-	elif [[ -z "$account_multiplier" ]]; then
-		account_multiplier_source="default:24"
-	fi
-	[[ "$account_multiplier" =~ ^[0-9]+$ ]] || account_multiplier=24
-	((account_multiplier < 1)) && account_multiplier=1
+	local account_multiplier="" account_multiplier_source=""
+	read -r account_multiplier account_multiplier_source <<<"$(_pulse_capacity_account_multiplier)"
 	local account_cap=-1
 	if ((account_available >= 0)); then
 		account_cap=$((account_available * account_multiplier))
@@ -211,6 +570,7 @@ pulse_apply_provider_load_capacity_cap() {
 	if ((account_cap >= 0 && final_max > account_cap)); then
 		final_max="$account_cap"
 	fi
+	final_max=$(_pulse_cap_shared_host_target "$final_max" "$colocated_runners" "$host_worker_cap")
 	if ((rate_limits > 0 || service_interruptions > 0 || provider_5xx > 0 || failures >= 3)); then
 		if ((final_max > 1)); then
 			final_max=$(((final_max + 1) / 2))
@@ -223,23 +583,19 @@ pulse_apply_provider_load_capacity_cap() {
 			fi
 		fi
 	fi
-	if ((final_max < 0)); then
-		final_max=0
-	fi
+	# RAM headroom is the final, non-negotiable host bound (GH#35537).
+	final_max=$((final_max > ram_cap ? ram_cap : final_max))
+	final_max=$((final_max < 0 ? 0 : final_max))
 	if ((floor_active == 1 && final_max < min_worker_floor)); then
 		floor_active=0
 	fi
 
-	if declare -F _dispatch_stats_gauge >/dev/null 2>&1; then
-		_dispatch_stats_gauge "dispatch_capacity_provider_accounts_available" "$((account_available < 0 ? 0 : account_available))"
-		_dispatch_stats_gauge "dispatch_capacity_recent_failures" "$failures"
-		_dispatch_stats_gauge "dispatch_capacity_recent_worker_terminal_failures" "$failures"
-		_dispatch_stats_gauge "dispatch_capacity_final_max_workers" "$final_max"
-	fi
+	_pulse_capacity_emit_gauges "$account_available" "$failures" "$final_max"
+	_pulse_capacity_write_underfill_snapshot "$raw_max_workers" "$final_max" "$ram_cap" "$colocated_runners"
 	local health_window_seconds="${PULSE_DISPATCH_CAPACITY_HEALTH_WINDOW_SECONDS:-900}"
 	[[ "$health_window_seconds" =~ ^[0-9]+$ ]] || health_window_seconds=900
-	printf '[pulse-wrapper] Dispatch_capacity: capacity_unit=simultaneous_workers simultaneous_target_raw=%s simultaneous_target_final=%s active_workers=%s provider=%s provider_accounts_total=%s provider_accounts_available=%s account_cap=%s provider_account_slot_multiplier=%s provider_account_slot_multiplier_source=%s override_hint="lower orchestration.provider_account_slot_multiplier or PULSE_PROVIDER_ACCOUNT_SLOT_MULTIPLIER if provider plan cannot sustain this concurrency" rate_limited_accounts=%s auth_error_accounts=%s worker_terminal_failures=%s rate_limits=%s service_interruptions=%s provider_5xx=%s worker_progress_heartbeats=%s failure_observation_window_seconds=%s task_duration_limit=none min_floor=%s floor_allowed=%s floor_active=%s\n' \
-		"$raw_max_workers" "$final_max" "$active_workers" "${provider:-unknown}" "$account_total" "$account_available" "$account_cap" "$account_multiplier" "$account_multiplier_source" "$account_limited" "$account_auth_errors" "$failures" "$rate_limits" "$service_interruptions" "$provider_5xx" "$progress_heartbeats" "$health_window_seconds" "$min_worker_floor" "$floor_allowed" "$floor_active" >>"${LOGFILE:-/dev/null}" 2>/dev/null || true
+	printf '[pulse-wrapper] Dispatch_capacity: capacity_unit=simultaneous_workers simultaneous_target_raw=%s simultaneous_target_final=%s active_workers=%s provider=%s provider_accounts_total=%s provider_accounts_available=%s account_cap=%s provider_account_slot_multiplier=%s provider_account_slot_multiplier_source=%s override_hint="lower orchestration.provider_account_slot_multiplier or PULSE_PROVIDER_ACCOUNT_SLOT_MULTIPLIER if provider plan cannot sustain this concurrency" rate_limited_accounts=%s auth_error_accounts=%s worker_terminal_failures=%s rate_limits=%s service_interruptions=%s provider_5xx=%s worker_progress_heartbeats=%s failure_observation_window_seconds=%s task_duration_limit=none min_floor=%s floor_allowed=%s floor_active=%s auth_error_only_cycles=%s colocated_runners=%s shared_host_worker_cap=%s worker_cap_auto=%s admission_policy=ram_only ram_available_mb=%s ram_worker_growth_mb=%s ram_slots=%s ram_cap=%s\n' \
+		"$raw_max_workers" "$final_max" "$active_workers" "${provider:-unknown}" "$account_total" "$account_available" "$account_cap" "$account_multiplier" "$account_multiplier_source" "$account_limited" "$account_auth_errors" "$failures" "$rate_limits" "$service_interruptions" "$provider_5xx" "$progress_heartbeats" "$health_window_seconds" "$min_worker_floor" "$floor_allowed" "$floor_active" "$auth_error_only_cycles" "$colocated_runners" "$host_worker_cap" "${MAX_WORKERS_CAP_AUTO:-0}" "${ram_available_mb:-na}" "${ram_growth_mb:-na}" "$ram_slots" "$ram_cap" >>"${LOGFILE:-/dev/null}" 2>/dev/null || true
 	printf '%s %s\n' "$final_max" "$floor_active"
 	return 0
 }

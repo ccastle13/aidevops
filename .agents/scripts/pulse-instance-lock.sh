@@ -27,6 +27,7 @@
 #   - _handle_existing_lock    (acquire helper: live vs stale owner check)
 #   - acquire_instance_lock
 #   - release_instance_lock
+#   - _pulse_exit_cleanup      (process-lifetime EXIT handler for main())
 #   - _handle_setup_sentinel
 #   - _handle_running_pulse_pid
 #   - check_dedup
@@ -52,6 +53,40 @@ _read_lock_pid() {
 	else
 		echo ""
 	fi
+	return 0
+}
+
+# Atomic refresh prevents contenders observing a truncated heartbeat and
+# falling back to the long-running owner's process age during dispatch.
+_pulse_instance_lock_heartbeat() {
+	local owner="" temporary=""
+	[[ -n "${LOCKDIR:-}" ]] || return 1
+	read -r owner 2>/dev/null <"${LOCKDIR}/pid" || return 1
+	[[ "$owner" == "$$" ]] && kill -0 "$owner" 2>/dev/null || return 1
+	temporary=$(mktemp "${LOCKDIR}/heartbeat.XXXXXX") || return 1
+	if date +%s >"$temporary" && read -r owner 2>/dev/null <"${LOCKDIR}/pid" && [[ "$owner" == "$$" ]] &&
+		mv -f "$temporary" "${LOCKDIR}/supervisor_heartbeat_epoch"; then
+		return 0
+	fi
+	rm -f "$temporary"
+	return 1
+}
+
+# Publication and dispatch lease age, bound to the current instance owner.
+# Invalid markers fall back to process age; expired leases stay old.
+_instance_lock_publication_age() {
+	local lock_pid="$1" lock_age="$2"
+	local publication_epoch="" owner_pid="" now_epoch=""
+	if read -r publication_epoch 2>/dev/null <"${LOCKDIR}/supervisor_heartbeat_epoch" \
+		&& [[ "$publication_epoch" =~ ^[1-9][0-9]*$ ]] \
+		&& read -r owner_pid 2>/dev/null <"${LOCKDIR}/pid" \
+		&& [[ "$owner_pid" == "$lock_pid" ]]; then
+		now_epoch=$(date +%s)
+		if [[ "$publication_epoch" -le "$now_epoch" ]]; then
+			lock_age=$((now_epoch - publication_epoch))
+		fi
+	fi
+	printf '%s\n' "$lock_age"
 	return 0
 }
 
@@ -121,11 +156,10 @@ _handle_existing_lock() {
 			return 0
 		fi
 
-		# Check 2: Age-based force-reclaim — if a genuine pulse-wrapper
-		# has been holding the lock for longer than PULSE_LOCK_MAX_AGE_S
-		# (default 1800s = 30min), it is hung. A healthy pulse cycle
-		# completes in <5 min; 30+ min means the process is stuck.
-		# Kill the stuck owner and reclaim.
+		# GH#37874: elapsed cycle age is not a hang. Dispatch can fill many
+		# waves; reclaim only after its owner heartbeat stops for the ceiling.
+		# Legacy/malformed leases fall back to process age (GH#33007).
+		lock_age=$(_instance_lock_publication_age "$lock_pid" "$lock_age")
 		local max_age="${PULSE_LOCK_MAX_AGE_S:-1800}"
 		if [[ "$lock_age" -gt "$max_age" ]]; then
 			echo "[pulse-wrapper] FORCE-RECLAIMED stale lock from PID ${lock_pid} (age ${lock_age}s > ceiling ${max_age}s, owner_cmd='${owner_cmd%%' '*}') — killing hung owner (GH#20025)" >>"$WRAPPER_LOGFILE"
@@ -223,8 +257,9 @@ _handle_stale_llm_lock() {
 		return 1
 	fi
 
-	# Age-based force-reclaim: if a genuine pulse-wrapper has been holding
-	# the LLM lock for longer than PULSE_LOCK_MAX_AGE_S, it is hung.
+	# A wrapper dispatching while it owns both lanes can outlive the old
+	# process-age ceiling. Only its matching instance lease grants extension.
+	lock_age=$(_instance_lock_publication_age "$lock_pid" "$lock_age")
 	local max_age="${PULSE_LOCK_MAX_AGE_S:-1800}"
 	if [[ "$lock_age" -gt "$max_age" ]]; then
 		echo "[pulse-wrapper] FORCE-RECLAIMED stale LLM lockdir (owner PID ${lock_pid}, age ${lock_age}s > ceiling ${max_age}s, owner_cmd='${owner_cmd%%' '*}') — killing hung owner (GH#20613)" >>"$WRAPPER_LOGFILE"
@@ -267,6 +302,7 @@ acquire_instance_lock() {
 	fi
 
 	# Write our PID into the lock directory for stale-lock detection
+	date +%s >"${LOCKDIR}/supervisor_heartbeat_epoch"
 	echo "$$" >"${LOCKDIR}/pid"
 
 	# GH#21433 (t3002): Post-acquisition ownership verification.
@@ -342,6 +378,53 @@ release_instance_lock() {
 	fi
 
 	rm -rf "$LOCKDIR" 2>/dev/null || true
+	return 0
+}
+
+#######################################
+# Process-lifetime EXIT handler for pulse-wrapper.sh main() (t18678, GH#34469)
+#
+# main() installs `trap '_pulse_exit_cleanup' EXIT` before acquiring the
+# instance lock. This handler must never move onto the shared function-scoped
+# cleanup stack (shared-constants.sh push_cleanup/_run_cleanups): a RETURN
+# trap set by a nested helper (e.g. _gh_wrapper_enter_cleanup_scope in the
+# gh_* write wrappers) stays installed after that helper returns and fires
+# again in its callers, and each fire runs and pops whichever scope is
+# current. While this list lived on that stack, a stage calling a gh write
+# wrapper ran it mid-cycle: the runtime bundle lease, per-cycle PR list caches
+# and benign-block ledger disappeared while the cycle was still running.
+#
+# Order matches the original direct EXIT trap, with this process's per-cycle
+# PR list caches first and the runtime bundle lease last. Every step is
+# idempotent and failure-tolerant, so one failing step cannot skip the lock or
+# lease release. Subshells reset EXIT traps, so it runs only in the main shell.
+#######################################
+_PULSE_EXIT_PR_LIST_CACHE_DIR=""
+_PULSE_EXIT_PR_LIST_PROVIDER_CACHE_DIR=""
+
+_pulse_exit_cleanup() {
+	local cache_dir=""
+	for cache_dir in "${_PULSE_EXIT_PR_LIST_CACHE_DIR:-}" "${_PULSE_EXIT_PR_LIST_PROVIDER_CACHE_DIR:-}"; do
+		[[ -n "$cache_dir" ]] || continue
+		rm -rf -- "$cache_dir" 2>/dev/null || true
+	done
+	_PULSE_EXIT_PR_LIST_CACHE_DIR=""
+	_PULSE_EXIT_PR_LIST_PROVIDER_CACHE_DIR=""
+	# GH#37914: the cycle-owned routines ticker ends with its cycle.
+	if declare -F _pulse_stop_routines_ticker >/dev/null 2>&1; then
+		_pulse_stop_routines_ticker || true
+	fi
+	_dispatch_cleanup_benign_blocks_cycle || true
+	_dispatch_cleanup_cycle_cache || true
+	_pulse_release_llm_lock || true
+	_pulse_cycle_state_finish_interrupted || true
+	_pulse_cycle_index_record_once || true
+	_pulse_efficiency_cycle_finish || true
+	release_instance_lock || true
+	if declare -F _pulse_finish_post_dispatch_housekeeping >/dev/null 2>&1; then
+		_pulse_finish_post_dispatch_housekeeping || true
+	fi
+	aidevops_runtime_bundle_lease_release || true
 	return 0
 }
 

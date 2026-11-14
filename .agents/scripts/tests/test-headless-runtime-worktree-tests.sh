@@ -122,6 +122,62 @@ test_issue_worker_env_contract_accepts_valid_precreated_worktree() {
 	return 0
 }
 
+test_standalone_prompt_skips_only_prose_issue_classification() {
+	unset WORKER_ISSUE_NUMBER WORKER_REPO_SLUG WORKER_WORKTREE_PATH 2>/dev/null || true
+	local prose="Review completion evidence for issue #34250; report only."
+	local standalone_output="" standalone_status=0
+	local default_output="" default_status=0
+	local key_output="" key_status=0
+	local title_output="" title_status=0
+	standalone_output=$(_validate_issue_worker_env_contract \
+		"worker" "deferred-dj-1" "$TEST_ROOT" "Deferred job: report" "$prose" 1 2>&1) || standalone_status=$?
+	default_output=$(_validate_issue_worker_env_contract \
+		"worker" "deferred-dj-1" "$TEST_ROOT" "Deferred job: report" "$prose" 2>&1) || default_status=$?
+	key_output=$(_validate_issue_worker_env_contract \
+		"worker" "issue-34250" "$TEST_ROOT" "Deferred job: report" "$prose" 1 2>&1) || key_status=$?
+	title_output=$(_validate_issue_worker_env_contract \
+		"worker" "deferred-dj-1" "$TEST_ROOT" "Issue #34250: report" "$prose" 1 2>&1) || title_status=$?
+
+	if [[ "$standalone_status" -eq 0 && -z "$standalone_output" &&
+		"$default_status" -ne 0 && "$default_output" == *"WORKER_ISSUE_NUMBER unset"* &&
+		"$key_status" -ne 0 && "$key_output" == *"WORKER_ISSUE_NUMBER unset"* &&
+		"$title_status" -ne 0 && "$title_output" == *"WORKER_ISSUE_NUMBER unset"* ]]; then
+		print_result "standalone prompt skips only prose issue classification" 0
+		return 0
+	fi
+	print_result "standalone prompt skips only prose issue classification" 1 \
+		"standalone=$standalone_status default=$default_status key=$key_status title=$title_status"
+	return 0
+}
+
+test_standalone_prompt_args_refuse_issue_identity() {
+	unset WORKER_ISSUE_NUMBER WORKER_REPO_SLUG WORKER_WORKTREE_PATH 2>/dev/null || true
+	local standalone_prompt=1 role="worker" session_key="deferred-dj-1" title="Deferred job: report"
+	local valid_status=0 triage_status=0 key_status=0 title_status=0 env_status=0
+	_validate_standalone_prompt_args >/dev/null 2>&1 || valid_status=$?
+	role="triage"
+	_validate_standalone_prompt_args >/dev/null 2>&1 || triage_status=$?
+	role="worker"
+	session_key="issue-34250"
+	_validate_standalone_prompt_args >/dev/null 2>&1 || key_status=$?
+	session_key="deferred-dj-1"
+	title="Review Issue #34250"
+	_validate_standalone_prompt_args >/dev/null 2>&1 || title_status=$?
+	title="Deferred job: report"
+	export WORKER_ISSUE_NUMBER="34250"
+	_validate_standalone_prompt_args >/dev/null 2>&1 || env_status=$?
+	unset WORKER_ISSUE_NUMBER 2>/dev/null || true
+
+	if [[ "$valid_status" -eq 0 && "$triage_status" -ne 0 && "$key_status" -ne 0 &&
+		"$title_status" -ne 0 && "$env_status" -ne 0 ]]; then
+		print_result "standalone prompt flag refuses issue identity and non-worker roles" 0
+		return 0
+	fi
+	print_result "standalone prompt flag refuses issue identity and non-worker roles" 1 \
+		"valid=$valid_status triage=$triage_status key=$key_status title=$title_status env=$env_status"
+	return 0
+}
+
 test_triage_env_contract_does_not_require_worker_authority() {
 	unset WORKER_ISSUE_NUMBER WORKER_REPO_SLUG WORKER_WORKTREE_PATH 2>/dev/null || true
 	local output=""
@@ -246,13 +302,61 @@ test_worker_worktree_claim_reclaims_stale_live_same_task_owner() {
 		transfer_worktree_ownership_if_expected 2>/dev/null || true
 	unset WORKER_ISSUE_NUMBER AIDEVOPS_WORKER_WORKTREE_OWNER_RECLAIM_AGE_SECONDS _WORKER_PRELAUNCH_FAILURE_REASON 2>/dev/null || true
 
-	if [[ "$status" -eq 0 && "$claim_calls" -eq 2 && "$transfer_called" -eq 1 && "$unregister_called" -eq 0 ]]; then
+	if [[ "$status" -eq 0 && "$claim_calls" -eq 1 && "$transfer_called" -eq 1 && "$unregister_called" -eq 0 ]]; then
 		print_result "worker worktree claim reclaims stale live same-task owner" 0
 		return 0
 	fi
 
 	print_result "worker worktree claim reclaims stale live same-task owner" 1 \
 		"status=$status calls=$claim_calls transfer=$transfer_called unregister=$unregister_called"
+	return 0
+}
+
+test_worker_worktree_claim_claims_after_dead_owner_vacated() {
+	local worktree_dir="${TEST_ROOT}/claim-dead-owner-vacated"
+	mkdir -p "$worktree_dir"
+	init_git_worktree "$worktree_dir"
+	export WORKER_ISSUE_NUMBER="22438"
+	local claim_calls=0 unregister_called=0 status=0
+	local owner_pid="2147483647"
+
+	claim_worktree_ownership() {
+		local claim_path="$1"
+		local claim_branch="$2"
+		shift 2
+		claim_calls=$((claim_calls + 1))
+		[[ -n "$claim_path" && -n "$claim_branch" ]] || return 1
+		[[ "$claim_calls" -gt 1 ]]
+		return $?
+	}
+	check_worktree_owner_snapshot() {
+		local check_path="$1"
+		[[ -n "$check_path" ]] || return 1
+		printf '%s|%s|%s|%s|%s|%s\n' "$owner_pid" "dead-session" "" "22438" "2000-01-01T00:00:00Z" "process-start-1"
+		return 0
+	}
+	_wt_pid_is_definitely_absent() {
+		return 0
+	}
+	_wt_unregister_owner_if_generation_matches() {
+		unregister_called=$((unregister_called + 1))
+		return 0
+	}
+
+	_hrw_claim_worker_worktree "issue-22438" "$worktree_dir" >/dev/null || status=$?
+
+	unset -f claim_worktree_ownership check_worktree_owner_snapshot \
+		_wt_pid_is_definitely_absent _wt_unregister_owner_if_generation_matches 2>/dev/null || true
+	unset WORKER_ISSUE_NUMBER _WORKER_PRELAUNCH_FAILURE_REASON 2>/dev/null || true
+
+	if [[ "$status" -eq 0 && "$claim_calls" -eq 2 && "$unregister_called" -eq 1 &&
+		"$_HRW_WORKTREE_RECLAIM_OUTCOME" == "$_HRW_WORKTREE_RECLAIM_VACATED" ]]; then
+		print_result "worker worktree claim claims once after a dead owner is vacated" 0
+		return 0
+	fi
+
+	print_result "worker worktree claim claims once after a dead owner is vacated" 1 \
+		"status=$status claims=$claim_calls unregisters=$unregister_called outcome=${_HRW_WORKTREE_RECLAIM_OUTCOME:-<empty>}"
 	return 0
 }
 
@@ -301,7 +405,7 @@ test_worker_worktree_claim_reclaims_dispatch_precreate_owner() {
 		transfer_worktree_ownership_if_expected 2>/dev/null || true
 	unset WORKER_ISSUE_NUMBER AIDEVOPS_WORKER_WORKTREE_OWNER_RECLAIM_AGE_SECONDS _WORKER_PRELAUNCH_FAILURE_REASON 2>/dev/null || true
 
-	if [[ "$status" -eq 0 && "$claim_calls" -eq 2 && "$transfer_called" -eq 1 && "$unregister_called" -eq 0 ]]; then
+	if [[ "$status" -eq 0 && "$claim_calls" -eq 1 && "$transfer_called" -eq 1 && "$unregister_called" -eq 0 ]]; then
 		print_result "worker worktree claim reclaims dispatch precreate owner" 0
 		return 0
 	fi
@@ -382,7 +486,7 @@ test_worker_worktree_claim_transfers_dispatch_precreate_task_state() {
 			state_preserved=1
 		fi
 
-		if [[ "$status" -eq 0 && "$claim_calls" -eq 2 && "$transfer_calls" -eq 1 &&
+		if [[ "$status" -eq 0 && "$claim_calls" -eq 1 && "$transfer_calls" -eq 1 &&
 			"$unregister_calls" -eq 0 && "$state_preserved" -eq 1 &&
 			"$transfer_args" == *"--expected-session dispatch-precreate-22438"* &&
 			"$transfer_args" == *"--expected-batch batch-7"* &&
@@ -689,6 +793,43 @@ test_worker_worktree_continuation_absent_owner_race_fails_closed() {
 	return 0
 }
 
+test_worker_worktree_continuation_rejects_unavailable_snapshot() {
+	local worktree_dir="${TEST_ROOT}/continuation-owner-unavailable"
+	mkdir -p "$worktree_dir"
+	init_git_worktree "$worktree_dir"
+	export WORKER_ISSUE_NUMBER="22438"
+	set_continuation_transfer_env "99999" "generation-7" "batch-7" "22438" "2026-07-18T00:00:03Z"
+	local claim_calls=0 transfer_calls=0 injected_snapshot_status=0
+	claim_worktree_ownership() {
+		claim_calls=$((claim_calls + 1))
+		return 0
+	}
+	check_worktree_owner_snapshot() {
+		return "$injected_snapshot_status"
+	}
+	transfer_worktree_ownership_if_expected() {
+		transfer_calls=$((transfer_calls + 1))
+		return 0
+	}
+
+	local status=0 reason=""
+	for injected_snapshot_status in 2 0; do
+		status=0
+		_hrw_claim_worker_worktree "issue-22438" "$worktree_dir" >/dev/null 2>&1 || status=$?
+		reason="${_WORKER_PRELAUNCH_FAILURE_REASON:-}"
+		if [[ "$status" -ne 0 && "$claim_calls" -eq 0 && "$transfer_calls" -eq 0 &&
+			"$reason" == "worker_worktree_owner_unavailable" ]]; then
+			print_result "continuation rejects unavailable/empty snapshot (status=$injected_snapshot_status) without mutations" 0
+		else
+			print_result "continuation rejects unavailable/empty snapshot (status=$injected_snapshot_status) without mutations" 1 \
+				"status=$status claim_calls=$claim_calls transfer_calls=$transfer_calls reason=$reason"
+		fi
+	done
+	unset -f claim_worktree_ownership check_worktree_owner_snapshot transfer_worktree_ownership_if_expected 2>/dev/null || true
+	clear_continuation_transfer_env
+	return 0
+}
+
 test_worker_worktree_continuation_classifies_task_mismatch() {
 	local worktree_dir="${TEST_ROOT}/continuation-task-mismatch"
 	mkdir -p "$worktree_dir"
@@ -827,6 +968,141 @@ test_worker_worktree_clean_without_upstream_blocks_local_commits() {
 	fi
 
 	print_result "worker worktree clean check blocks no-upstream local commits" 1 "status=$status"
+	return 0
+}
+
+# --- OpenCode runtime lockfile drift (GH#32903) ---
+
+_lockfile_git() {
+	local repo="$1"
+	shift
+	git -C "$repo" -c user.name="aidevops-test" -c user.email="aidevops-test@example.invalid" \
+		-c commit.gpgsign=false "$@"
+	return $?
+}
+
+_write_npm_opencode_lock() {
+	local file="$1"
+	local version="$2"
+	local zod_version="${3:-4.1.8}"
+	printf '{\n  "name": "opencode",\n  "lockfileVersion": 3,\n  "packages": {\n' >"$file"
+	printf '    "": { "dependencies": { "@opencode-ai/plugin": "%s" } },\n' "$version" >>"$file"
+	printf '    "node_modules/@opencode-ai/plugin": {\n      "version": "%s",\n' "$version" >>"$file"
+	printf '      "resolved": "https://registry.npmjs.org/@opencode-ai/plugin/-/plugin-%s.tgz",\n' "$version" >>"$file"
+	printf '      "integrity": "sha512-plugin%s==",\n' "${version//./}" >>"$file"
+	printf '      "dependencies": { "@opencode-ai/sdk": "%s", "zod": "%s" }\n    },\n' "$version" "$zod_version" >>"$file"
+	printf '    "node_modules/@opencode-ai/sdk": {\n      "version": "%s",\n' "$version" >>"$file"
+	printf '      "integrity": "sha512-sdk%s=="\n    },\n' "${version//./}" >>"$file"
+	printf '    "node_modules/zod": { "version": "%s", "integrity": "sha512-zod==" }\n  }\n}\n' "$zod_version" >>"$file"
+	return 0
+}
+
+_write_bun_opencode_lock() {
+	local file="$1"
+	local version="$2"
+	local zod_version="${3:-4.1.8}"
+	printf '{\n  "lockfileVersion": 1,\n  "workspaces": {\n    "": {\n' >"$file"
+	printf '      "dependencies": {\n        "@opencode-ai/plugin": "%s",\n      },\n    },\n  },\n' "$version" >>"$file"
+	printf '  "packages": {\n' >>"$file"
+	printf '    "@opencode-ai/plugin": ["@opencode-ai/plugin@%s", "", { "dependencies": { "@opencode-ai/sdk": "%s", "zod": "%s" } }, "sha512-plugin%s=="],\n' \
+		"$version" "$version" "$zod_version" "${version//./}" >>"$file"
+	printf '    "@opencode-ai/sdk": ["@opencode-ai/sdk@%s", "", {}, "sha512-sdk%s=="],\n' "$version" "${version//./}" >>"$file"
+	printf '    "zod": ["zod@%s", "", {}, "sha512-zod=="],\n  }\n}\n' "$zod_version" >>"$file"
+	return 0
+}
+
+# Creates a repo whose worker branch is one commit behind origin/main.
+_init_opencode_lockfile_repo() {
+	local repo="$1"
+	local lock_name="$2"
+	mkdir -p "${repo}/.opencode"
+	git -C "$repo" init -q -b main
+	if [[ "$lock_name" == "bun.lock" ]]; then
+		_write_bun_opencode_lock "${repo}/.opencode/bun.lock" "1.18.31"
+	else
+		_write_npm_opencode_lock "${repo}/.opencode/package-lock.json" "1.18.31"
+	fi
+	printf 'base\n' >"${repo}/README.md"
+	_lockfile_git "$repo" add -A
+	_lockfile_git "$repo" commit -q -m "base"
+	printf 'upstream\n' >"${repo}/UPSTREAM.md"
+	_lockfile_git "$repo" add UPSTREAM.md
+	_lockfile_git "$repo" commit -q -m "upstream"
+	git -C "$repo" update-ref refs/remotes/origin/main HEAD
+	_lockfile_git "$repo" checkout -q -b worker HEAD~1
+	printf 'worker\n' >"${repo}/WORKER.md"
+	_lockfile_git "$repo" add WORKER.md
+	_lockfile_git "$repo" commit -q -m "worker change"
+	return 0
+}
+
+test_opencode_lockfile_runtime_drift_restores_and_rebases() {
+	local lock_name="" repo="" output="" status=0 rebase_status=0 blocked_status=0
+	for lock_name in package-lock.json bun.lock; do
+		repo="${TEST_ROOT}/opencode-drift-${lock_name}"
+		_init_opencode_lockfile_repo "$repo" "$lock_name"
+		if [[ "$lock_name" == "bun.lock" ]]; then
+			_write_bun_opencode_lock "${repo}/.opencode/bun.lock" "1.18.32"
+		else
+			_write_npm_opencode_lock "${repo}/.opencode/package-lock.json" "1.18.32"
+		fi
+		blocked_status=0
+		_lockfile_git "$repo" rebase -q origin/main >/dev/null 2>&1 || blocked_status=$?
+		status=0 rebase_status=0
+		output=$(cmd_opencode_lockfile_drift --dir "$repo" --restore 2>&1) || status=$?
+		_lockfile_git "$repo" rebase -q origin/main >/dev/null 2>&1 || rebase_status=$?
+		if [[ "$blocked_status" -ne 0 && "$status" -eq 0 &&
+			"$output" == *".opencode/${lock_name}"$'\t'"restored"* &&
+			-z "$(git -C "$repo" status --short)" && "$rebase_status" -eq 0 &&
+			-f "${repo}/UPSTREAM.md" && -z "$(git -C "$repo" log --format=%H origin/main..HEAD -- .opencode)" ]]; then
+			print_result "opencode ${lock_name} runtime-only drift is restored and rebase succeeds" 0
+		else
+			print_result "opencode ${lock_name} runtime-only drift is restored and rebase succeeds" 1 \
+				"blocked=$blocked_status status=$status rebase=$rebase_status output=${output:-<empty>}"
+		fi
+	done
+	return 0
+}
+
+test_opencode_lockfile_real_changes_are_preserved() {
+	local lock_name="" repo="" output="" status=0 lock_path="" before="" after=""
+	for lock_name in package-lock.json bun.lock; do
+		repo="${TEST_ROOT}/opencode-preserve-${lock_name}"
+		lock_path="${repo}/.opencode/${lock_name}"
+		_init_opencode_lockfile_repo "$repo" "$lock_name"
+		# Version drift plus a non-OpenCode dependency change is ambiguous.
+		if [[ "$lock_name" == "bun.lock" ]]; then
+			_write_bun_opencode_lock "$lock_path" "1.18.32" "4.2.0"
+		else
+			_write_npm_opencode_lock "$lock_path" "1.18.32" "4.2.0"
+		fi
+		printf 'worker edit\n' >>"${repo}/README.md"
+		before=$(git -C "$repo" diff)
+		status=0
+		output=$(cmd_opencode_lockfile_drift --dir "$repo" --restore 2>&1) || status=$?
+		after=$(git -C "$repo" diff)
+		if [[ "$status" -eq 1 && "$output" == *"preserved:non-opencode-change"* &&
+			-n "$before" && "$before" == "$after" ]]; then
+			print_result "opencode ${lock_name} ambiguous drift and other edits are preserved" 0
+		else
+			print_result "opencode ${lock_name} ambiguous drift and other edits are preserved" 1 \
+				"status=$status output=${output:-<empty>}"
+		fi
+	done
+
+	# Runtime-only drift is restored while a genuine tracked edit elsewhere stays.
+	repo="${TEST_ROOT}/opencode-mixed"
+	_init_opencode_lockfile_repo "$repo" "package-lock.json"
+	_write_npm_opencode_lock "${repo}/.opencode/package-lock.json" "1.18.32"
+	printf 'worker edit\n' >>"${repo}/README.md"
+	status=0
+	output=$(cmd_opencode_lockfile_drift --dir "$repo" --restore 2>&1) || status=$?
+	if [[ "$status" -eq 0 && "$(git -C "$repo" status --short)" == " M README.md" ]]; then
+		print_result "opencode runtime drift restore leaves other tracked edits intact" 0
+	else
+		print_result "opencode runtime drift restore leaves other tracked edits intact" 1 \
+			"status=$status output=${output:-<empty>} git=$(git -C "$repo" status --short)"
+	fi
 	return 0
 }
 
@@ -1117,13 +1393,21 @@ EOF
 
 	local output=""
 	local status=0
+	if _hrw_verify_dispatch_ownership >/dev/null 2>&1; then
+		print_result "checkpoint runtime rejects missing admission claim context" 1
+	else
+		print_result "checkpoint runtime rejects missing admission claim context" 0
+	fi
+	export AIDEVOPS_PR_CHECKPOINT_ADMISSION_MODE=automatic
+	export AIDEVOPS_DISPATCH_LEASE_TOKEN=checkpoint-fixture-lease AIDEVOPS_PR_CHECKPOINT_SESSION=checkpoint-fixture
 	output=$(_hrw_verify_dispatch_ownership 2>&1) || status=$?
 	local calls=""
 	calls=$(<"$calls_file")
 	unset HEADLESS_RUNTIME_OWNERSHIP_HELPER LINKED_ISSUE_OWNERSHIP_CALLS \
 		WORKER_ISSUE_NUMBER WORKER_REPO_SLUG WORKER_GITHUB_LOGIN \
 		AIDEVOPS_PR_REPAIR_NUMBER AIDEVOPS_PR_REPAIR_LINKED_ISSUE AIDEVOPS_PR_REPAIR_ISSUE_ASSIGNEE AIDEVOPS_PR_REPAIR_HEAD_SHA \
-		AIDEVOPS_PR_REPAIR_HEAD_REF 2>/dev/null || true
+		AIDEVOPS_PR_REPAIR_HEAD_REF AIDEVOPS_PR_CHECKPOINT_ADMISSION_MODE \
+		AIDEVOPS_DISPATCH_LEASE_TOKEN AIDEVOPS_PR_CHECKPOINT_SESSION 2>/dev/null || true
 
 	if [[ "$status" -eq 0 ]] &&
 		grep -Fxq 'verify-pr-checkpoint-target 77 owner/repo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa feature/review 42 expected-runner' "$calls_file" &&
@@ -1508,36 +1792,60 @@ test_runtime_launch_marker_precedes_invocation() {
 }
 
 test_clean_prelaunch_exit_is_precise_nonzero_failure() {
-	local output="" status=0
-	set +e
-	output=$(
-		(
-			print_info() { printf '%s\n' "$*"; return 0; }
-			print_warning() { printf '%s\n' "$*"; return 0; }
+	local output="" status=0 original_status=0 expected_status=0
+	for original_status in 0 29 85; do
+		status=0
+		expected_status="$original_status"
+		[[ "$expected_status" -ne 0 ]] || expected_status=1
+		set +e
+		output=$(
+			local session_key="issue-28060"
+			print_info() {
+				printf '%s\n' "$*"
+				return 0
+			}
+			print_warning() {
+				printf '%s\n' "$*"
+				return 0
+			}
+			worker_attempt_observability_last_stage() { return 1; }
+			worker_attempt_observability_last_completed_stage() { return 0; }
 			_push_wip_commits_on_exit() { return 0; }
+			_hrff_write_external_outcome() { return 0; }
 			_emit_worker_runtime_event() { return 0; }
 			_hrw_record_terminal_outcome() { return 0; }
 			_cleanup_headless_runtime_temp_paths() { return 0; }
-			_release_dispatch_claim() { return 0; }
+			_release_dispatch_claim() {
+				local release_status="$3"
+				printf 'release_status=%s\n' "$release_status"
+				return 0
+			}
 			_release_session_lock() { return 0; }
 			_update_dispatch_ledger() { return 0; }
 			_WORKER_RUNTIME_LAUNCH_STARTED=0
 			_WORKER_START_EPOCH_MS=0
+			_WORKER_PRELAUNCH_FAILURE_REASON=""
+			_WORKER_EXIT_CODE_FILE=""
+			_WORKER_LAST_EXIT_CODE_FILE=""
+			_record_run_attempt_stage post_attempt_context_configure
+			_record_run_attempt_stage pre_attempt_ownership_verify
 			AIDEVOPS_DISPATCH_LEASE_TOKEN=""
 			trap "_exit_trap_handler 'issue-28060'" EXIT
-			exit 0
-		)
-	) || status=$?
-	set -e
+			exit "$original_status"
+		) || status=$?
+		set -e
 
-	if [[ "$status" -eq 1 && "$output" == *"reason=worker_runtime_not_invoked"* &&
-		"$output" != *"worker_noop_zero_output"* ]] &&
-		_worker_failure_reason_is_launch_preflight "worker_runtime_not_invoked"; then
-		print_result "clean exit before runtime invocation is a precise non-zero prelaunch failure" 0
-		return 0
-	fi
-	print_result "clean exit before runtime invocation is a precise non-zero prelaunch failure" 1 \
-		"status=$status output=$output"
+		if [[ "$status" -eq "$expected_status" && "$output" == *"reason=worker_runtime_not_invoked"* &&
+			"$output" == *"exit=$expected_status "* && "$output" == *"release_status=$expected_status"* &&
+			"$output" == *"last_stage=pre_attempt_ownership_verify last_completed_stage=post_attempt_context_configure"* &&
+			"$output" != *"worker_noop_zero_output"* ]] &&
+			_worker_failure_reason_is_launch_preflight "worker_runtime_not_invoked"; then
+			print_result "prelaunch exit $original_status retains precise status, stages and release" 0
+		else
+			print_result "prelaunch exit $original_status retains precise status, stages and release" 1 \
+				"status=$status output=$output"
+		fi
+	done
 	return 0
 }
 

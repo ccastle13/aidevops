@@ -22,8 +22,9 @@
 #      AIDEVOPS_WORKER_PREFLIGHT_SENTINEL != 1.
 #   9. _t3077_write_preflight_sentinel writes a sentinel and returns 0
 #      when AIDEVOPS_WORKER_PREFLIGHT_SENTINEL=1.
-#  10. pulse-wrapper.sh defines _pulse_run_fix_the_fixer_detector_if_stale
-#      and the sentinel-gate is hourly by default.
+#  10. pulse-wrapper.sh defines _pulse_run_fix_the_fixer_detector_if_stale,
+#      the sentinel-gate is hourly by default, and the complete detector stage
+#      uses the standard wall-clock timeout wrapper.
 #  11. All four touched scripts pass shellcheck.
 #
 # Tests are structural — no live GitHub API calls and no LLM invocations.
@@ -264,6 +265,16 @@ assert_contains "wrapper defines _pulse_run_fix_the_fixer_detector_if_stale" \
 	"_pulse_run_fix_the_fixer_detector_if_stale()" "$wrapper_cycle_gates_src"
 assert_contains "wrapper main calls the detector" \
 	"_pulse_run_fix_the_fixer_detector_if_stale" "$wrapper_src"
+# GH#33762 bounds the cold detector path by its own timeout (default 60s),
+# not the full pre-run stage budget.
+# shellcheck disable=SC2016 # The assertions intentionally match literal shell variable references.
+assert_contains "wrapper bounds the complete detector stage" \
+	'_pulse_run_optional_stage_with_timeout "fix_the_fixer_detector" "$_pulse_detector_timeout"' "$wrapper_src"
+# shellcheck disable=SC2016
+assert_contains "wrapper detector timeout defaults to 60s" \
+	'_pulse_detector_timeout="${PULSE_FIX_THE_FIXER_TIMEOUT_SECONDS:-60}"' "$wrapper_src"
+assert_not_contains "wrapper does not run the detector as an unbounded optional stage" \
+	'_pulse_run_optional_stage "fix_the_fixer_detector"' "$wrapper_src"
 assert_contains "wrapper sentinel uses canonical path token" \
 	"pulse-fix-the-fixer-last-run" "$wrapper_cycle_gates_src"
 assert_contains "wrapper default cadence is 3600s (hourly)" \

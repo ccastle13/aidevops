@@ -25,6 +25,9 @@
 _FULL_LOOP_COMMIT_LIB_LOADED=1
 _FULL_LOOP_CHECK_PENDING="pending"
 _FULL_LOOP_CHECK_INDETERMINATE="indeterminate"
+_FULL_LOOP_CHECK_DEFERRED="api-deferred"
+_FULL_LOOP_ERROR_COOLDOWN="github-api-cooldown"
+_FULL_LOOP_ERROR_READ_DEFERRED="github-api-read-deferred"
 _FULL_LOOP_TRUE="true"
 FULL_LOOP_COMPLETION_BOOKKEEPING_AUDIT=""
 FULL_LOOP_COMPLETION_BOOKKEEPING_FILES=""
@@ -45,366 +48,57 @@ source "${_FULL_LOOP_COMMIT_DIR}/planning-publisher.sh"
 # shellcheck disable=SC1091
 source "${_FULL_LOOP_COMMIT_DIR}/pulse-merge-required-checks.sh"
 
-# --- Pre-Merge Gate ---
+# Project validator execution is isolated so this commit/PR orchestrator stays
+# below the large-file gate without changing its public source contract.
+# shellcheck source=./full-loop-helper-commit-validators.sh
+# shellcheck disable=SC1091  # sub-library resolved at runtime via the helper directory
+source "${_FULL_LOOP_COMMIT_DIR}/full-loop-helper-commit-validators.sh"
 
-# Pre-merge gate (GH#17541) — deterministic enforcement of review-bot-gate
-# before any PR merge. Workers MUST call this before `gh pr merge`.
-# Models the pulse-wrapper.sh pattern (line 8243-8262) for the worker merge path.
-#
-# Usage: full-loop-helper.sh pre-merge-gate <PR_NUMBER> [REPO]
-# Exit codes: 0 = safe to merge, 1 = gate failed (do NOT merge)
-_full_loop_persist_pr_check_evidence() {
-	local status="$1"
-	local head_sha="$2"
-	local evidence="${3:-}"
-	command -v load_state >/dev/null 2>&1 || return 0
-	command -v save_state >/dev/null 2>&1 || return 0
-	[[ -f "${STATE_FILE:-}" ]] || return 0
-	command -v _full_loop_acquire_transition_lock >/dev/null 2>&1 || return 1
-	_full_loop_acquire_transition_lock || return 1
-	load_state || {
-		_full_loop_release_transition_lock
-		return 1
-	}
-	PR_CHECK_STATUS="$status"
-	PR_CHECK_HEAD="$head_sha"
-	PR_CHECK_EVIDENCE="$evidence"
-	if ! save_state "${CURRENT_PHASE:-pr-review}" "$SAVED_PROMPT" "${PR_NUMBER:-}" "$STARTED_AT"; then
-		_full_loop_release_transition_lock
-		return 1
-	fi
-	_full_loop_release_transition_lock
-	return 0
-}
+# Remote readiness and pre-merge gates retain the original public source contract.
+# Resolve the sibling independently of caller-owned SCRIPT_DIR fixture paths.
+# shellcheck source=./full-loop-helper-readiness.sh
+# shellcheck disable=SC1091  # sub-library resolved at runtime via the helper directory
+source "${_FULL_LOOP_COMMIT_DIR}/full-loop-helper-readiness.sh"
 
-_full_loop_query_required_checks() {
-	local pr_number="$1"
-	local repo="$2"
-	local pr_head_ref="$3"
-	local required_contexts=""
-	local required_contexts_rc=0
-	local required_checks=""
-	local required_rc=0
-	local required_checks_stderr=""
-	local required_checks_stderr_file=""
-	local minimum_check_count=1
-	local expected_no_required_checks="no required checks reported on the '${pr_head_ref}' branch"
+# shellcheck source=./full-loop-helper-subject.sh
+# shellcheck disable=SC1091
+source "${_FULL_LOOP_COMMIT_DIR}/full-loop-helper-subject.sh"
 
-	FULL_LOOP_REQUIRED_CHECKS_JSON=""
-	FULL_LOOP_REQUIRED_CHECKS_ERROR_EVIDENCE="unavailable"
-	FULL_LOOP_REQUIRED_CHECKS_ERROR_DETAIL="required-context resolution failed"
-	FULL_LOOP_REQUIRED_CHECKS_SUCCESS_EVIDENCE="required-checks-pass"
-	FULL_LOOP_REQUIRED_CHECKS_SUCCESS_SUMMARY="required checks are terminal-success"
-	FULL_LOOP_PRE_MERGE_BLOCKER_KIND=""
-	FULL_LOOP_PRE_MERGE_BLOCKER_DETAIL=""
+# Share runtime-owned paths with prospective PR risk classification.
+# shellcheck source=./full-loop-helper-risk.sh
+# shellcheck disable=SC1091
+source "${_FULL_LOOP_COMMIT_DIR}/full-loop-helper-risk.sh"
 
-	required_contexts=$(_required_contexts_for_default_branch "$repo") || required_contexts_rc=$?
-	if [[ "$required_contexts_rc" -eq 0 && -z "$required_contexts" ]]; then
-		FULL_LOOP_REQUIRED_CHECKS_JSON="[]"
-		FULL_LOOP_REQUIRED_CHECKS_SUCCESS_EVIDENCE="no-required-checks"
-		FULL_LOOP_REQUIRED_CHECKS_SUCCESS_SUMMARY="no required checks are configured"
+# Check the committed public diff before running expensive validators. The
+# pre-push hook remains authoritative for the actual ref being pushed.
+_commit_and_pr_privacy_scan() {
+	local remote_url="" base_branch="" entities_file="" hits="" scan_rc=0
+	remote_url=$(git remote get-url --push origin 2>/dev/null) || return 1
+	# shellcheck source=./privacy-guard-helper.sh
+	# shellcheck disable=SC1091
+	source "${_FULL_LOOP_COMMIT_DIR}/privacy-guard-helper.sh"
+	if ! privacy_is_target_public "$remote_url"; then
 		return 0
 	fi
-
-	required_checks_stderr_file=$(mktemp "${TMPDIR:-/tmp}/aidevops-full-loop-required-checks.XXXXXX") || {
-		FULL_LOOP_REQUIRED_CHECKS_ERROR_EVIDENCE="stderr-capture-unavailable"
-		FULL_LOOP_REQUIRED_CHECKS_ERROR_DETAIL="cannot capture gh stderr"
-		return 1
-	}
-	required_checks=$(gh_pr_checks_exact_json "$repo" "$pr_number" required \
-		2>"$required_checks_stderr_file") || required_rc=$?
-	required_checks_stderr=$(<"$required_checks_stderr_file")
-	rm -f "$required_checks_stderr_file"
-	FULL_LOOP_REQUIRED_CHECKS_ERROR_DETAIL="exact check read exit ${required_rc}"
-	if [[ "$required_checks_stderr" == *"error_kind=github-api-cooldown"* ]]; then
-		FULL_LOOP_PRE_MERGE_BLOCKER_KIND="github-api-cooldown"
-		FULL_LOOP_PRE_MERGE_BLOCKER_DETAIL="unknown"
-		if [[ "$required_checks_stderr" =~ expires_at=([0-9]+) ]]; then
-			FULL_LOOP_PRE_MERGE_BLOCKER_DETAIL="${BASH_REMATCH[1]}"
-		fi
-		FULL_LOOP_REQUIRED_CHECKS_ERROR_EVIDENCE="github-api-cooldown"
-		if [[ "$FULL_LOOP_PRE_MERGE_BLOCKER_DETAIL" =~ ^[0-9]+$ ]]; then
-			FULL_LOOP_REQUIRED_CHECKS_ERROR_DETAIL="GitHub API cooldown is active until epoch ${FULL_LOOP_PRE_MERGE_BLOCKER_DETAIL}"
-		else
-			FULL_LOOP_REQUIRED_CHECKS_ERROR_DETAIL="GitHub API cooldown is active"
-		fi
-	fi
-
-	if [[ "$required_rc" -eq 1 && -z "$required_checks" && -n "$pr_head_ref" && "$required_checks_stderr" == "$expected_no_required_checks" ]]; then
-		required_checks="[]"
-		minimum_check_count=0
-		FULL_LOOP_REQUIRED_CHECKS_SUCCESS_EVIDENCE="no-required-checks"
-		FULL_LOOP_REQUIRED_CHECKS_SUCCESS_SUMMARY="no required checks are configured"
-	elif [[ -n "$required_checks_stderr" || ("$required_rc" -ne 0 && "$required_rc" -ne 1 && "$required_rc" -ne 8) ]]; then
+	base_branch=$(_resolve_pr_base_branch origin) || return 1
+	entities_file=$(mktemp) || return 1
+	if ! privacy_enumerate_private_entities "$entities_file"; then
+		rm -f "$entities_file"
+		privacy_log ERROR "could not enumerate private entity inventory — failing closed"
 		return 1
 	fi
-	if [[ -z "$required_checks" ]] || ! printf '%s' "$required_checks" | jq -e --argjson minimum "$minimum_check_count" \
-		'type == "array" and length >= $minimum' >/dev/null 2>&1; then
+	print_info "[privacy-guard] Scanning public diff before validators..."
+	hits=$(privacy_scan_public_diff "refs/remotes/origin/${base_branch}" HEAD "$entities_file") || scan_rc=$?
+	rm -f "$entities_file"
+	if [[ "$scan_rc" -eq 1 && -n "$hits" ]]; then
+		printf '\n[privacy-guard][BLOCK] Push to origin contains private references in public-repo content:\n\n%s\n\n' "$hits" >&2
+		printf '  Remove the private material from the committed content and amend/rewrite the commit before pushing.\n\n' >&2
 		return 1
 	fi
-	FULL_LOOP_REQUIRED_CHECKS_JSON="$required_checks"
-	return 0
-}
-
-_full_loop_review_bot_gate_helper_path() {
-	local helper_path="${SCRIPT_DIR}/review-bot-gate-helper.sh"
-
-	if [[ ! -f "$helper_path" ]]; then
-		helper_path="${HOME}/.aidevops/agents/scripts/review-bot-gate-helper.sh"
-	fi
-	[[ -f "$helper_path" ]] || return 1
-	printf '%s\n' "$helper_path"
-	return 0
-}
-
-#######################################
-# Fetch the fixed full-loop PR readiness snapshot with response-owned cost.
-# Native `gh pr view` does not expose its GraphQL operation cost, so concurrent
-# activity can otherwise leave the benchmark attempt unattributed.
-# Args: $1=pr_number, $2=repo_slug
-# Output: gh-pr-view-compatible readiness JSON
-# Returns: 0=complete exact-cost snapshot, 1=API/validation failure
-#######################################
-_full_loop_pr_readiness_json_graphql() {
-	local pr_number="$1"
-	local repo_slug="$2"
-	local owner="${repo_slug%%/*}"
-	local name="${repo_slug#*/}"
-	local response="" pr_json=""
-	local jq_string_type="string"
-
-	[[ "$pr_number" =~ ^[0-9]+$ && -n "$owner" && -n "$name" && "$repo_slug" == */* ]] || return 1
-	# shellcheck disable=SC2016  # GraphQL variables are expanded by GitHub.
-	response=$(AIDEVOPS_GH_GRAPHQL_COST_FROM_RESPONSE=1 \
-		AIDEVOPS_GH_ROUTE_DECISION="full-loop-readiness-exact-cost" \
-		gh api graphql -F owner="$owner" -F name="$name" -F pr="$pr_number" -f query='
-		query($owner: String!, $name: String!, $pr: Int!) {
-			repository(owner: $owner, name: $name) {
-				pullRequest(number: $pr) {
-					state
-					isDraft
-					reviewDecision
-					headRefOid
-					headRefName
-				}
-			}
-			rateLimit { cost }
-		}' 2>/dev/null) || return 1
-
-	pr_json=$(printf '%s' "$response" | jq -ce --arg string_type "$jq_string_type" '
-		select(((.errors // []) | type) == "array")
-		| select(((.errors // []) | length) == 0)
-		| select((.data.rateLimit.cost | type) == "number")
-		| select(.data.rateLimit.cost > 0 and (.data.rateLimit.cost | floor) == .data.rateLimit.cost)
-		| .data.repository.pullRequest
-		| select(type == "object")
-		| select((.state | type) == $string_type)
-		| select((.isDraft | type) == "boolean")
-		| select((.headRefOid | type) == $string_type)
-		| select((.headRefName | type) == $string_type)
-		| {state, isDraft, reviewDecision, headRefOid, headRefName}
-	' 2>/dev/null) || return 1
-	printf '%s\n' "$pr_json"
-	return 0
-}
-
-_full_loop_reconcile_stale_coderabbit_review() {
-	local pr_number="$1"
-	local repo="$2"
-	local expected_head="$3"
-	local rbg_helper=""
-	local refreshed_json=""
-
-	FULL_LOOP_RECONCILED_PR_JSON=""
-	rbg_helper=$(_full_loop_review_bot_gate_helper_path) || {
-		print_error "review-bot-gate-helper.sh not found — cannot reconcile stale CodeRabbit review state"
-		return 1
-	}
-	print_info "Checking whether CodeRabbit's blocking review is superseded at exact head ${expected_head}..."
-	if ! bash "$rbg_helper" reconcile-stale-coderabbit "$pr_number" "$repo" "$expected_head"; then
-		print_error "PR #${pr_number} retains changes-requested review state; automatic reconciliation was not authorized"
+	if [[ "$scan_rc" -ne 0 ]]; then
+		privacy_log ERROR "private-entity scan failed (rc=${scan_rc}) — failing closed; no verified findings"
 		return 1
 	fi
-	refreshed_json=$(_full_loop_pr_readiness_json_graphql "$pr_number" "$repo") || {
-		print_error "Cannot refresh PR #${pr_number} after CodeRabbit reconciliation"
-		return 1
-	}
-	if [[ "$(printf '%s' "$refreshed_json" | jq -r '.headRefOid // empty')" != "$expected_head" ]]; then
-		print_error "PR #${pr_number} head changed during CodeRabbit reconciliation"
-		return 1
-	fi
-	FULL_LOOP_RECONCILED_PR_JSON="$refreshed_json"
-	return 0
-}
-
-_full_loop_verify_pr_readiness() {
-	local pr_number="$1"
-	local repo="$2"
-	local pr_json=""
-	local verified_head=""
-	local review_decision=""
-
-	pr_json=$(_full_loop_pr_readiness_json_graphql "$pr_number" "$repo") || {
-		print_error "Cannot read PR #${pr_number} readiness evidence"
-		return 1
-	}
-	verified_head=$(printf '%s' "$pr_json" | jq -r '.headRefOid // empty')
-	review_decision=$(printf '%s' "$pr_json" | jq -r '(.reviewDecision // "") | ascii_upcase')
-	if [[ "$review_decision" == "CHANGES_REQUESTED" && -n "$verified_head" ]]; then
-		_full_loop_reconcile_stale_coderabbit_review "$pr_number" "$repo" "$verified_head" || return 1
-		pr_json="$FULL_LOOP_RECONCILED_PR_JSON"
-	fi
-
-	if ! printf '%s' "$pr_json" | jq -e '
-		def up(v): (v // "" | ascii_upcase);
-		(.state == "OPEN")
-		and (.isDraft != true)
-		and (up(.reviewDecision) != "CHANGES_REQUESTED")
-		and ((.headRefOid // "") != "")
-	' >/dev/null; then
-		print_error "PR #${pr_number} is not remotely verified: require OPEN, non-draft, no changes requested, and a stable head"
-		return 1
-	fi
-	verified_head=$(printf '%s' "$pr_json" | jq -r '.headRefOid // empty')
-	local pr_head_ref=""
-	pr_head_ref=$(printf '%s' "$pr_json" | jq -r '.headRefName // empty')
-
-	local required_checks=""
-	_full_loop_query_required_checks "$pr_number" "$repo" "$pr_head_ref" || {
-		FULL_LOOP_PR_CHECK_STATUS="$_FULL_LOOP_CHECK_INDETERMINATE"
-		export FULL_LOOP_PR_CHECK_STATUS
-		_full_loop_persist_pr_check_evidence "$FULL_LOOP_PR_CHECK_STATUS" "$verified_head" "$FULL_LOOP_REQUIRED_CHECKS_ERROR_EVIDENCE" || true
-		print_error "PR #${pr_number} required-check evidence is indeterminate (${FULL_LOOP_REQUIRED_CHECKS_ERROR_DETAIL})"
-		return 1
-	}
-	required_checks="$FULL_LOOP_REQUIRED_CHECKS_JSON"
-	local post_checks_head=""
-	post_checks_head=$(AIDEVOPS_GH_PR_VIEW_CACHE_DISABLE=1 gh pr view "$pr_number" --repo "$repo" \
-		--json headRefOid --jq '.headRefOid // empty' 2>/dev/null) || true
-	if [[ -z "$post_checks_head" || "$post_checks_head" != "$verified_head" ]]; then
-		FULL_LOOP_PR_CHECK_STATUS="$_FULL_LOOP_CHECK_INDETERMINATE"
-		export FULL_LOOP_PR_CHECK_STATUS
-		_full_loop_persist_pr_check_evidence "$FULL_LOOP_PR_CHECK_STATUS" "$post_checks_head" "head-drift-during-check-query" || true
-		print_error "PR #${pr_number} head changed while required checks were queried; refresh exact-head evidence"
-		return 1
-	fi
-	local non_passing=""
-	non_passing=$(printf '%s' "$required_checks" | jq -c '[.[] | select((.bucket // "") != "pass")]')
-	if [[ "$(printf '%s' "$non_passing" | jq 'length')" -gt 0 ]]; then
-		if printf '%s' "$non_passing" | jq -e --arg pending "$_FULL_LOOP_CHECK_PENDING" 'all(.[]; (.bucket // "") == $pending)' >/dev/null 2>&1; then
-			FULL_LOOP_PR_CHECK_STATUS="$_FULL_LOOP_CHECK_PENDING"
-			export FULL_LOOP_PR_CHECK_STATUS
-			_full_loop_persist_pr_check_evidence "$FULL_LOOP_PR_CHECK_STATUS" "$verified_head" "required-checks-pending" || true
-			print_info "PR #${pr_number} required checks are pending at the current head; no repair action is eligible"
-		else
-			FULL_LOOP_PR_CHECK_STATUS="terminal-failure"
-			FULL_LOOP_PR_FAILURE_EVIDENCE=$(printf '%s' "$non_passing" | jq -c --arg pending "$_FULL_LOOP_CHECK_PENDING" '[.[] | select((.bucket // "") != $pending) | {name,state,bucket}]')
-			export FULL_LOOP_PR_CHECK_STATUS FULL_LOOP_PR_FAILURE_EVIDENCE
-			local failure_names=""
-			failure_names=$(printf '%s' "$FULL_LOOP_PR_FAILURE_EVIDENCE" | jq -r 'map(.name) | join(",")')
-			_full_loop_persist_pr_check_evidence "$FULL_LOOP_PR_CHECK_STATUS" "$verified_head" "$failure_names" || true
-			print_error "PR #${pr_number} has terminal required-check failures at the current head"
-		fi
-		return 1
-	fi
-	FULL_LOOP_PR_CHECK_STATUS="terminal-success"
-	export FULL_LOOP_PR_CHECK_STATUS
-	local local_branch=""
-	local_branch=$(git branch --show-current 2>/dev/null || true)
-	if [[ -n "$local_branch" && "$local_branch" == "$pr_head_ref" ]]; then
-		local local_head=""
-		local_head=$(git rev-parse HEAD 2>/dev/null || true)
-		if [[ -z "$local_head" || "$local_head" != "$verified_head" ]]; then
-			local repo_root=""
-			repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
-			if [[ -n "$repo_root" ]] && planning_verify_publication_receipt \
-				"$repo_root" origin "$pr_head_ref" "$verified_head"; then
-				print_info "Verified checkout-free planning publication receipt at PR head ${verified_head}; local Git state remains untouched"
-			else
-				print_error "PR #${pr_number} head drifted from the current worktree without a valid checkout-free planning publication receipt; push or refresh review evidence before merge"
-				return 1
-			fi
-		fi
-	fi
-	_full_loop_persist_pr_check_evidence "$FULL_LOOP_PR_CHECK_STATUS" "$verified_head" "$FULL_LOOP_REQUIRED_CHECKS_SUCCESS_EVIDENCE" || true
-
-	FULL_LOOP_VERIFIED_PR_HEAD_SHA="$verified_head"
-	export FULL_LOOP_VERIFIED_PR_HEAD_SHA
-	print_success "Remote PR evidence verified at head ${verified_head}; ${FULL_LOOP_REQUIRED_CHECKS_SUCCESS_SUMMARY}"
-	return 0
-}
-
-cmd_pre_merge_gate() {
-	local pr_number="${1:-}"
-	local repo="${2:-}"
-	FULL_LOOP_PRE_MERGE_BLOCKER_KIND=""
-	FULL_LOOP_PRE_MERGE_BLOCKER_DETAIL=""
-
-	if [[ -z "$pr_number" ]]; then
-		print_error "Usage: full-loop-helper.sh pre-merge-gate <PR_NUMBER> [REPO]"
-		return 1
-	fi
-
-	# Auto-detect repo from git remote if not provided
-	if [[ -z "$repo" ]]; then
-		repo=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || echo "")
-		if [[ -z "$repo" ]]; then
-			print_error "Cannot detect repo. Pass REPO as second argument."
-			return 1
-		fi
-	fi
-
-	_full_loop_verify_pr_readiness "$pr_number" "$repo" || return 1
-
-	local rbg_helper=""
-	if ! rbg_helper=$(_full_loop_review_bot_gate_helper_path); then
-		FULL_LOOP_PRE_MERGE_BLOCKER_KIND="review-bot"
-		print_error "review-bot-gate-helper.sh not found — refusing an unreviewed merge"
-		return 1
-	fi
-
-	print_info "Running review bot gate for PR #${pr_number} in ${repo}..."
-
-	# Check once. Pending review is persisted by the lifecycle caller and resumed
-	# by the next provider/check event; this avoids a fixed-duration polling loop.
-	local rbg_result=""
-	rbg_result=$(bash "$rbg_helper" check "$pr_number" "$repo" 2>&1) || true
-
-	local rbg_status=""
-	rbg_status=$(printf '%s' "$rbg_result" | grep -oE '(PASS_RATE_LIMITED|PASS_ADVISORY|PASS|SKIP|WAITING)' | tail -1)
-
-	case "$rbg_status" in
-	PASS | PASS_ADVISORY | SKIP | PASS_RATE_LIMITED)
-		print_success "Review bot gate: ${rbg_status} — safe to merge PR #${pr_number}"
-		;;
-	*)
-		FULL_LOOP_PRE_MERGE_BLOCKER_KIND="review-bot"
-		print_error "Review bot gate: ${rbg_status:-FAILED} — do NOT merge PR #${pr_number}"
-		printf '%s\n' "$rbg_result" | tail -5
-		return 1
-		;;
-	esac
-
-	#aidevops:trust-boundary GH#17671/GH#28622 -- resolve every authority target
-	# from the final live PR snapshot. This diagnostic never grants authority; the
-	# merge transport repeats the same evaluation immediately before its write.
-	if ! _merge_collect_external_authority_gaps "$pr_number" "$repo"; then
-		FULL_LOOP_PRE_MERGE_BLOCKER_KIND="external-authority"
-		FULL_LOOP_PRE_MERGE_BLOCKER_DETAIL="unable to verify external/fork authority"
-		return 1
-	fi
-	if [[ "${#FULL_LOOP_EXTERNAL_AUTHORITY_TARGETS[@]}" -gt 0 ]]; then
-		local approval_targets=""
-		approval_targets="${FULL_LOOP_EXTERNAL_AUTHORITY_TARGETS[*]}"
-		FULL_LOOP_PRE_MERGE_BLOCKER_KIND="external-authority"
-		FULL_LOOP_PRE_MERGE_BLOCKER_DETAIL="${approval_targets}"
-		print_error "External/fork PR #${pr_number} has missing cryptographic development authority"
-		print_info "After finalizing all approval-bound PR metadata, run this one command:"
-		printf 'sudo aidevops approve batch %s %s\n' "$approval_targets" "$repo"
-		return 1
-	fi
-
-	print_success "External/fork authority preflight: no approval required for PR #${pr_number}"
 	return 0
 }
 
@@ -423,8 +117,9 @@ _parse_commit_and_pr_args() {
 	local value=""
 	while [[ "$index" -lt "${#args[@]}" ]]; do
 		arg="${args[$index]}"
+		pr_metadata_overrides="${pr_metadata_overrides:-} ${arg#--}"
 		case "$arg" in
-		--issue | --message | --title | --summary | --testing | --risk-level | --testing-level | --decisions | --label | --proof-pr | --task-id)
+		--issue | --message | --title | --summary | --testing | --risk-level | --testing-level | --decisions | --label | --proof-pr | --task-id | --replace-pr | --replacement-reason | --base)
 			if [[ $((index + 1)) -ge ${#args[@]} ]]; then
 				print_error "${arg} requires a value"
 				return 1
@@ -478,6 +173,9 @@ _parse_commit_and_pr_args() {
 			bookkeeping_task_id="$value"
 			index=$((index + 2))
 			;;
+		--replace-pr) replacement_pr="$value"; index=$((index + 2)) ;;
+		--replacement-reason) replacement_reason="$value"; index=$((index + 2)) ;;
+		--base) stack_base_arg="$value"; index=$((index + 2)) ;; # stacked PR base
 		--completion-bookkeeping)
 			completion_bookkeeping=1
 			index=$((index + 1))
@@ -486,6 +184,7 @@ _parse_commit_and_pr_args() {
 			allow_parent_close=1
 			index=$((index + 1))
 			;;
+		--keep-issue-open) keep_issue_open=1; index=$((index + 1)) ;; # GH#36598
 		--skip-hooks)
 			# Pass --no-verify to git push. Use for doc-only PRs when hooks
 			# have been manually verified clean. See GH#20138.
@@ -504,6 +203,23 @@ _parse_commit_and_pr_args() {
 			;;
 		esac
 	done
+	return 0
+}
+
+# GH#36598: --keep-issue-open links a long-running issue with `For #N` so merge
+# leaves it open and skips the issue status:in-review handoff. It is
+# interactive-only (a worker PR that leaves its dispatched issue open would be
+# redispatched) and contradicts parent-close and bookkeeping closing intent.
+_validate_keep_issue_open_request() {
+	[[ "$keep_issue_open" -eq 1 ]] || return 0
+	if [[ "$allow_parent_close" -eq 1 || "$completion_bookkeeping" -eq 1 ]]; then
+		print_error "--keep-issue-open cannot be combined with --allow-parent-close or --completion-bookkeeping"
+		return 1
+	fi
+	if [[ "$(detect_session_origin)" != "interactive" ]]; then
+		print_error "--keep-issue-open is interactive-only; worker PRs must resolve their dispatched issue"
+		return 1
+	fi
 	return 0
 }
 
@@ -570,16 +286,16 @@ _validate_completion_bookkeeping_request() {
 _completion_bookkeeping_body_has_reference() {
 	local body="$1"
 	local issue_number="$2"
-	printf '%s\n' "$body" | grep -Eiq \
-		"(^|[[:space:]])(for|ref|close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]*:?[[:space:]]*#${issue_number}([^0-9]|$)"
+	grep -Eiq \
+		"(^|[[:space:]])(for|ref|close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]*:?[[:space:]]*#${issue_number}([^0-9]|$)" <<<"$body"
 	return $?
 }
 
 _completion_bookkeeping_body_has_closing_reference() {
 	local body="$1"
 	local issue_number="$2"
-	printf '%s\n' "$body" | grep -Eiq \
-		"(^|[[:space:]])(close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]*:?[[:space:]]*#${issue_number}([^0-9]|$)"
+	grep -Eiq \
+		"(^|[[:space:]])(close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]*:?[[:space:]]*#${issue_number}([^0-9]|$)" <<<"$body"
 	return $?
 }
 
@@ -623,8 +339,10 @@ _validate_completion_bookkeeping_paths() {
 	local changed_file=""
 	local changed_count=0
 	local todo_changed=0
+	local comparison_base=""
 
-	changed_files=$(git diff --name-only "${base_ref}..HEAD") || {
+	comparison_base=$(_pending_runtime_comparison_base "$base_ref") || return 1
+	changed_files=$(git diff --name-only "$comparison_base" HEAD) || {
 		print_error "Completion bookkeeping could not inspect the final diff"
 		return 1
 	}
@@ -646,7 +364,7 @@ _validate_completion_bookkeeping_paths() {
 		print_error "Completion bookkeeping requires a TODO.md completion-proof diff"
 		return 1
 	fi
-	deleted_files=$(git diff --name-only --diff-filter=D "${base_ref}..HEAD") || return 1
+	deleted_files=$(git diff --name-only --diff-filter=D "$comparison_base" HEAD) || return 1
 	if [[ -n "$deleted_files" ]]; then
 		print_error "Completion bookkeeping may not delete completion metadata files: ${deleted_files//$'\n'/, }"
 		return 1
@@ -674,7 +392,7 @@ _validate_completion_bookkeeping_todo() {
 	fi
 	task_pattern="${task_id//./\\.}"
 	issue_mapping_lines=$(grep -E \
-		"^- \[[ x]\] t[0-9]+([.][0-9]+)* .*ref:GH#${issue_number}([^0-9]|$)" \
+		"^[[:blank:]]*- \[[ x]\] t[0-9]+([.][0-9]+)* .*ref:GH#${issue_number}([^0-9]|$)" \
 		"$todo_file" 2>/dev/null || true)
 	issue_mapping_count=$(printf '%s\n' "$issue_mapping_lines" | grep -c . || true)
 	if [[ "$issue_mapping_count" -ne 1 ]]; then
@@ -682,10 +400,10 @@ _validate_completion_bookkeeping_todo() {
 		return 1
 	fi
 	completion_line="$issue_mapping_lines"
-	if ! printf '%s\n' "$completion_line" | grep -Eq \
-		"^- \[x\] ${task_pattern}([[:space:]]|$)" ||
-		! printf '%s\n' "$completion_line" | grep -Eq "pr:#${proof_pr}([^0-9]|$)" ||
-		! printf '%s\n' "$completion_line" | grep -Eq 'completed:[0-9]{4}-[0-9]{2}-[0-9]{2}([^0-9]|$)'; then
+	if ! grep -Eq \
+		"^[[:blank:]]*- \[x\] ${task_pattern}([[:space:]]|$)" <<<"$completion_line" ||
+		! grep -Eq "pr:#${proof_pr}([^0-9]|$)" <<<"$completion_line" ||
+		! grep -Eq 'completed:[0-9]{4}-[0-9]{2}-[0-9]{2}([^0-9]|$)' <<<"$completion_line"; then
 		print_error "Completion bookkeeping TODO.md proof must complete ${task_id} with merged PR #${proof_pr}"
 		return 1
 	fi
@@ -693,7 +411,9 @@ _validate_completion_bookkeeping_todo() {
 	local todo_patch=""
 	local patch_line=""
 	local patch_payload=""
-	todo_patch=$(git diff --unified=0 "${base_ref}..HEAD" -- TODO.md) || return 1
+	local comparison_base=""
+	comparison_base=$(_pending_runtime_comparison_base "$base_ref") || return 1
+	todo_patch=$(git diff --unified=0 "$comparison_base" HEAD -- TODO.md) || return 1
 	if [[ -z "$todo_patch" ]]; then
 		print_error "Completion bookkeeping found no TODO.md changes against ${base_ref}"
 		return 1
@@ -706,8 +426,8 @@ _validate_completion_bookkeeping_todo() {
 		+* | -*)
 			patch_payload="${patch_line:1}"
 			[[ "$patch_payload" =~ ^[[:space:]]*$ ]] && continue
-			if ! printf '%s\n' "$patch_payload" | grep -Eq \
-				"^- \[[ x]\] ${task_pattern}([[:space:]]|$)"; then
+			if ! grep -Eq \
+				"^[[:blank:]]*- \[[ x]\] ${task_pattern}([[:space:]]|$)" <<<"$patch_payload"; then
 				print_error "Completion bookkeeping TODO.md diff changes content outside task ${task_id}"
 				return 1
 			fi
@@ -724,8 +444,8 @@ _validate_completion_bookkeeping_pr_body() {
 		print_error "Completion bookkeeping PR body contains a closing keyword for issue #${issue_number}"
 		return 1
 	fi
-	if ! printf '%s\n' "$pr_body" | grep -Eiq \
-		"(^|[[:space:]])(for|ref)[[:space:]]*:?[[:space:]]*#${issue_number}([^0-9]|$)"; then
+	if ! grep -Eiq \
+		"(^|[[:space:]])(for|ref)[[:space:]]*:?[[:space:]]*#${issue_number}([^0-9]|$)" <<<"$pr_body"; then
 		print_error "Completion bookkeeping PR body must use For/Ref #${issue_number}"
 		return 1
 	fi
@@ -779,6 +499,48 @@ _resolve_remote_default_branch() {
 	print_error "Run: git remote set-head ${remote_name} --auto"
 	print_error "Then retry: full-loop-helper.sh commit-and-pr ..."
 	return 1
+}
+
+# Stacked-PR base override set by `--base <branch>` (empty = remote default).
+FULL_LOOP_STACK_BASE=""
+
+# Resolve the branch a PR targets: the validated --base override when set,
+# otherwise the remote default branch.
+_resolve_pr_base_branch() {
+	local remote_name="${1:-origin}"
+	if [[ -n "${FULL_LOOP_STACK_BASE:-}" ]]; then
+		printf '%s\n' "$FULL_LOOP_STACK_BASE"
+		return 0
+	fi
+	_resolve_remote_default_branch "$remote_name"
+	return $?
+}
+
+# Validate a --base override: must exist on origin and differ from the
+# current branch. Sets FULL_LOOP_STACK_BASE on success; an empty value
+# resets it so the remote default branch is used.
+# Args: $1=base branch (may be empty) $2=current branch
+_validate_stack_base() {
+	local stack_base="$1"
+	local current_branch="$2"
+	FULL_LOOP_STACK_BASE=""
+	[[ -n "$stack_base" ]] || return 0
+	if [[ "$stack_base" == "$current_branch" ]]; then
+		print_error "--base must name a branch other than the current branch (${current_branch})"
+		return 1
+	fi
+	if ! git check-ref-format --branch "$stack_base" >/dev/null 2>&1; then
+		print_error "--base '${stack_base}' is not a valid branch name"
+		return 1
+	fi
+	if ! git fetch origin "+refs/heads/${stack_base}:refs/remotes/origin/${stack_base}" --quiet 2>/dev/null ||
+		! git rev-parse --verify --quiet "refs/remotes/origin/${stack_base}" >/dev/null; then
+		print_error "--base branch '${stack_base}' does not exist on origin; push the parent branch first"
+		return 1
+	fi
+	FULL_LOOP_STACK_BASE="$stack_base"
+	print_info "Stacked PR: base is origin/${stack_base} (--base)"
+	return 0
 }
 
 # Ensure no rebase/merge state is active before recovery-mode push.
@@ -859,21 +621,41 @@ _validate_commit_and_pr_inputs() {
 
 # --- Staging & Commit ---
 
-# Stage all changes and commit with the given message.
+# Stage product changes without relying on repository-specific ignore rules.
+# Refuse pre-staged runtime changes rather than silently altering the index.
+_stage_product_changes() {
+	local path=""
+	local -a protected_paths=() stage_paths=(":/")
+	# shellcheck disable=SC2154 # initialized by full-loop-helper-risk.sh
+	for path in "${_full_loop_runtime_paths[@]}"; do
+		protected_paths+=(":(top,literal)${path}")
+		# A singleton glob matches the exact dot while preventing Git from
+		# rejecting an ignored literal exclusion as an explicitly added path.
+		stage_paths+=(":(top,exclude)[.]${path#.}" ":(top,exclude)[.]${path#.}/**")
+	done
+	if ! git diff --cached --quiet -- "${protected_paths[@]}"; then
+		print_error "Runtime state is staged, or its index check failed; unstage runtime paths before retrying."
+		return 1
+	fi
+	if ! git add -A -- "${stage_paths[@]}"; then
+		print_error "git add failed while excluding runtime state"
+		return 1
+	fi
+	return 0
+}
+
+# Stage product changes and commit with the given message.
 # Skips commit if nothing staged but commits exist ahead of the remote default branch.
 # Returns 1 on failure.
 _stage_and_commit() {
 	local commit_message="$1"
 
 	print_info "Staging and committing changes..."
-	if ! git add -A; then
-		print_error "git add failed"
-		return 1
-	fi
+	_stage_product_changes || return 1
 
 	if git diff --cached --quiet 2>/dev/null; then
 		local base_branch="" base_ref="" ahead=""
-		base_branch=$(_resolve_remote_default_branch origin) || return 1
+		base_branch=$(_resolve_pr_base_branch origin) || return 1
 		base_ref="origin/${base_branch}"
 		ahead=$(git rev-list --count "${base_ref}..HEAD" 2>/dev/null || echo "0")
 		if [[ "$ahead" == "0" ]]; then
@@ -903,7 +685,7 @@ _finalize_wip_history() {
 
 	local base_branch="" branch_range="" branch_subjects=""
 	local base_ref="" base_oid=""
-	base_branch=$(_resolve_remote_default_branch origin) || return 1
+	base_branch=$(_resolve_pr_base_branch origin) || return 1
 	printf -v base_ref 'origin/%s' "$base_branch"
 	if ! git fetch origin "$base_branch" --quiet 2>/dev/null; then
 		print_error "Cannot refresh ${base_ref} before WIP history finalization."
@@ -982,6 +764,49 @@ _finalize_wip_history() {
 	return 0
 }
 
+# GH#33253: _finalize_wip_history (above) and _rebase_for_push both rewrite
+# branch history, which defeats issue_open_pr_guard_check's require_ancestry
+# proof if that check runs afterward on the rewritten HEAD. Validate an
+# explicit --replace-pr's ancestry now, against the pre-finalization,
+# pre-rebase HEAD, while the replaced PR's head commit is still reachable.
+# Sets REPLACEMENT_PR_ANCESTRY_VALIDATED=1 when this call proved ancestry, so
+# the final guard call downstream can skip its now-defeated ancestry check.
+# Args: $1=issue_number $2=repo $3=branch $4=replacement_pr $5=replacement_reason
+REPLACEMENT_PR_ANCESTRY_VALIDATED=0
+_validate_replacement_pr_ancestry() {
+	local issue_number="$1"
+	local repo="$2"
+	local branch="$3"
+	local replacement_pr="$4"
+	local replacement_reason="$5"
+
+	REPLACEMENT_PR_ANCESTRY_VALIDATED=0
+	[[ -n "$replacement_pr" ]] || return 0
+
+	local guard_rc=0
+	issue_open_pr_guard_check "$issue_number" "$repo" "$branch" \
+		"$replacement_pr" "$replacement_reason" 1 || guard_rc=$?
+	case "$guard_rc" in
+	0)
+		REPLACEMENT_PR_ANCESTRY_VALIDATED=1
+		return 0
+		;;
+	3)
+		# Continuing the same branch/author as the open PR; no separate
+		# replacement-ancestry proof is required.
+		return 0
+		;;
+	1)
+		print_error "Aborting duplicate PR creation: open PR #${replacement_pr}'s head is not contained in this branch"
+		return 1
+		;;
+	*)
+		print_error "Aborting PR creation: replacement-PR ancestry evidence is unavailable or ambiguous"
+		return 1
+		;;
+	esac
+}
+
 # --- Project Validators (t2842) ---
 # Closes the worker-CI-failure gap where workers ship code that fails
 # project CI checks (Format/Lint/Typecheck) because no pre-push
@@ -990,8 +815,8 @@ _finalize_wip_history() {
 #   _run_project_validators       — orchestrator
 #   _validators_should_run        — bypass-path check
 #   _detect_node_project          — node-project detection (returns pm)
-#   _run_node_auto_fix            — format/lint auto-fix + amend
-#   _run_node_typecheck           — typecheck check-only
+#   _validator_scopes             — affected-workspace/root scope selection
+#   _run_scoped_node_checks       — bounded, mutation-guarded check-only scripts
 
 # Print every file changed between the remote default branch and HEAD.
 # The merge-base range keeps classification aligned with the complete PR diff
@@ -999,7 +824,7 @@ _finalize_wip_history() {
 _validator_changed_files() {
 	local base_branch=""
 	local base_ref=""
-	base_branch=$(_resolve_remote_default_branch origin) || return 1
+	base_branch=$(_resolve_pr_base_branch origin) || return 1
 	printf -v base_ref 'origin/%s' "$base_branch"
 	if ! git diff --name-only "${base_ref}...HEAD" 2>/dev/null; then
 		print_error "[validators] cannot inspect changed files relative to ${base_ref}"
@@ -1049,7 +874,7 @@ _commit_touches_node_files() {
 	local changed_file
 	while IFS= read -r changed_file; do
 		case "$changed_file" in
-		package.json | package-lock.json | npm-shrinkwrap.json | pnpm-lock.yaml | yarn.lock | bun.lock | bun.lockb)
+		package.json | package-lock.json | npm-shrinkwrap.json | pnpm-lock.yaml | pnpm-workspace.yaml | yarn.lock | bun.lock | bun.lockb)
 			return 0
 			;;
 		*.js | *.jsx | *.mjs | *.cjs | *.ts | *.tsx | *.mts | *.cts)
@@ -1079,19 +904,20 @@ _detect_node_project() {
 		return 1
 	fi
 	local has_relevant_scripts
-	# Only include scripts that are actually executed by the runner.
-	# "format" and "lint" (without :fix suffix) are omitted because the runner
-	# only attempts format:fix/format:write/prettier:fix and lint:fix — detecting
-	# on bare format/lint causes false positives where validators report "passed"
-	# without actually running anything (Augment review, PR #20898).
+	# Check-only scripts and workspaces are executable validation surfaces. Legacy
+	# mutating-only scripts are also detected so the orchestrator can fail with
+	# actionable configuration guidance instead of silently reporting success.
 	has_relevant_scripts=$(jq -r '
-		.scripts // {} |
-		[has("format:fix"),has("format:write"),has("prettier:fix"),
-		 has("lint:fix"),
-		 has("typecheck"),has("check:types"),has("tsc")] |
-		any
+		(.scripts // {} |
+		 [has("format:check"),has("check:format"),has("prettier:check"),
+		  has("lint:check"),has("lint"),
+		  has("typecheck"),has("check:types"),has("tsc"),has("test"),
+		  has("format:fix"),has("format:write"),has("prettier:fix"),has("lint:fix")] |
+		 any) or
+		((.workspaces // []) |
+		 if arrays then length > 0 else ((.packages? // []) | length > 0) end)
 	' package.json 2>/dev/null || echo "false")
-	if [[ "$has_relevant_scripts" != "true" ]]; then
+	if [[ "$has_relevant_scripts" != "true" && ! -f pnpm-workspace.yaml ]]; then
 		return 1
 	fi
 	pm="npm"
@@ -1099,166 +925,6 @@ _detect_node_project() {
 		pm="pnpm"
 	elif [[ -f yarn.lock ]]; then
 		pm="yarn"
-	fi
-	if ! command -v "$pm" >/dev/null 2>&1; then
-		print_warning "[validators] $pm not available on PATH — skipping (set AIDEVOPS_SKIP_PROJECT_VALIDATORS=1 to silence)"
-		return 1
-	fi
-	return 0
-}
-
-# Run auto-fix passes (format then lint). Continue past failures —
-# fix scripts may legitimately exit non-zero on un-auto-fixable issues.
-# If auto-fix produced changes, amend the HEAD commit.
-# Sets caller-scope `fix_changes` to 1 if amend happened, 0 otherwise.
-# Args: $1=pm (npm|pnpm|yarn) $2=timeout_secs $3=timeout_available (0|1)
-# Returns 0 on success, 1 if amend failed.
-_restore_validator_repo_root() {
-	local repo_root="$1"
-	local phase="$2"
-
-	if [[ -z "$repo_root" || ! -d "$repo_root" ]]; then
-		print_error "[validators] repository root disappeared during ${phase}: ${repo_root:-<unknown>}"
-		print_error "[validators] refusing to run git amend from a missing working directory"
-		return 1
-	fi
-	if ! cd "$repo_root" 2>/dev/null; then
-		print_error "[validators] failed to restore repository root after ${phase}: $repo_root"
-		return 1
-	fi
-	return 0
-}
-
-_run_node_auto_fix() {
-	local pm="$1"
-	local t="$2"
-	local timeout_available="${3:-0}"
-	local repo_root=""
-	repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P 2>/dev/null || echo "")
-	if [[ -z "$repo_root" ]]; then
-		print_error "[validators] cannot determine repository root before auto-fix"
-		return 1
-	fi
-	_restore_validator_repo_root "$repo_root" "startup" || return 1
-	# Build a timeout prefix array; empty when timeout(1) is not available.
-	local -a timeout_prefix=()
-	[[ "$timeout_available" == "1" ]] && timeout_prefix=("timeout" "$t")
-	fix_changes=0
-	local script_name
-	for script_name in format:fix format:write prettier:fix; do
-		if jq -e --arg s "$script_name" '.scripts[$s] // empty' package.json >/dev/null 2>&1; then
-			print_info "[validators] $pm run $script_name (auto-fix)"
-			"${timeout_prefix[@]}" "$pm" run "$script_name" >/dev/null 2>&1 || true
-			_restore_validator_repo_root "$repo_root" "$script_name" || return 1
-			break
-		fi
-	done
-	# Lint auto-fix loop pattern matches format for parallel extension.
-	# shellcheck disable=SC2043
-	for script_name in lint:fix; do
-		if jq -e --arg s "$script_name" '.scripts[$s] // empty' package.json >/dev/null 2>&1; then
-			print_info "[validators] $pm run $script_name (auto-fix)"
-			"${timeout_prefix[@]}" "$pm" run "$script_name" >/dev/null 2>&1 || true
-			_restore_validator_repo_root "$repo_root" "$script_name" || return 1
-			break
-		fi
-	done
-	_restore_validator_repo_root "$repo_root" "auto-fix" || return 1
-	if git diff --quiet 2>/dev/null; then
-		return 0
-	fi
-	print_info "[validators] auto-fix produced changes, amending commit"
-	# Use git add -u (tracked files only) to avoid staging untracked artifacts
-	# that format/lint runners may create (e.g. caches, generated files).
-	git add -u
-	# --no-verify on amend: avoid recursing into pre-commit territory.
-	if ! git commit --amend --no-edit --no-verify >/dev/null 2>&1; then
-		print_error "[validators] failed to amend commit with auto-fix changes"
-		git status -s 2>&1 | head -10 >&2
-		return 1
-	fi
-	fix_changes=1
-	return 0
-}
-
-# Run check-only typecheck. Picks first existing script in preference order.
-# Captures output for failure diagnosis. Mentor error on failure.
-# Args: $1=pm $2=timeout_secs $3=timeout_available (0|1)
-# Returns 0 on pass/no-script, 1 on failure.
-_run_node_typecheck() {
-	local pm="$1"
-	local t="$2"
-	local timeout_available="${3:-0}"
-	# Build a timeout prefix array; empty when timeout(1) is not available.
-	local -a timeout_prefix=()
-	[[ "$timeout_available" == "1" ]] && timeout_prefix=("timeout" "$t")
-	local typecheck_script
-	typecheck_script=""
-	local script_name
-	for script_name in typecheck check:types tsc; do
-		if jq -e --arg s "$script_name" '.scripts[$s] // empty' package.json >/dev/null 2>&1; then
-			typecheck_script="$script_name"
-			break
-		fi
-	done
-	if [[ -z "$typecheck_script" ]]; then
-		return 0
-	fi
-	print_info "[validators] $pm run $typecheck_script (check-only)"
-	# Separate declaration from mktemp assignment: local masks the exit code of
-	# command substitutions, so declare first then assign (Gemini review PR #20898).
-	# mktemp without -t: more portable (GNU and BSD mktemp differ on -t semantics).
-	local tc_log
-	tc_log="$(mktemp)"
-	local tc_rc=0
-	"${timeout_prefix[@]}" "$pm" run "$typecheck_script" >"$tc_log" 2>&1 || tc_rc=$?
-	if [[ "$tc_rc" -eq 0 ]]; then
-		rm -f "$tc_log"
-		return 0
-	fi
-	print_error "[validators] $typecheck_script FAILED — code has type errors"
-	print_error "  last 20 lines:"
-	tail -20 "$tc_log" >&2
-	rm -f "$tc_log"
-	print_error ""
-	print_error "  diagnose:    $pm run $typecheck_script"
-	print_error "  fix errors, commit, then re-run: full-loop-helper.sh commit-and-pr ..."
-	print_error "  bypass:      full-loop-helper.sh commit-and-pr ... --skip-hooks"
-	print_error "               (or AIDEVOPS_SKIP_PROJECT_VALIDATORS=1 env)"
-	return 1
-}
-
-# Orchestrator. Args: $1=skip_hooks (0|1). Returns 0 on pass/skip, 1 on fail.
-_run_project_validators() {
-	local skip_hooks="${1:-0}"
-	# _validators_should_run returns 0 when validators should run, 1 otherwise.
-	if ! _validators_should_run "$skip_hooks"; then
-		return 0
-	fi
-	if ! _commit_touches_node_files; then
-		print_info "[validators] no Node/TypeScript files changed, skipping node project validators"
-		return 0
-	fi
-	local pm=""
-	if ! _detect_node_project; then
-		# Silent skip when no project detected (non-node project = most aidevops paths).
-		return 0
-	fi
-	print_info "[validators] running node project validators ($pm)..."
-	local validator_timeout
-	validator_timeout="${AIDEVOPS_VALIDATOR_TIMEOUT:-300}"
-	# Detect timeout(1) availability once here; sub-functions receive a flag so
-	# they don't each re-check (portability: macOS may lack timeout without
-	# GNU coreutils; pattern mirrors _rebase_and_push:L941).
-	local timeout_available=0
-	command -v timeout >/dev/null 2>&1 && timeout_available=1
-	local fix_changes=0
-	_run_node_auto_fix "$pm" "$validator_timeout" "$timeout_available" || return 1
-	_run_node_typecheck "$pm" "$validator_timeout" "$timeout_available" || return 1
-	if [[ "$fix_changes" == "1" ]]; then
-		print_info "[validators] passed (auto-fix amended into commit)"
-	else
-		print_info "[validators] passed"
 	fi
 	return 0
 }
@@ -1313,7 +979,7 @@ _rebase_for_push() {
 	local branch="$1"
 	local skip_rebase="${2:-0}"
 	local base_branch="" base_ref=""
-	base_branch=$(_resolve_remote_default_branch origin) || return 1
+	base_branch=$(_resolve_pr_base_branch origin) || return 1
 	base_ref="origin/${base_branch}"
 
 	if [[ "$skip_rebase" == "1" ]]; then
@@ -1363,11 +1029,153 @@ _rebase_for_push() {
 	return 0
 }
 
+# GH#33381: the exact branch name the last successful _push_branch published.
+# PR creation and its partial-failure recovery use this instead of inferring
+# the head from ambient git/gh state, which can differ after a replacement
+# branch or in a linked worktree backed by a bare common directory.
+FULL_LOOP_PUSHED_BRANCH=""
+
+# GH#33381: classify the remote ref for a branch before pushing.
+# Args: $1=branch
+# Output: "<state> <remote_sha>" where state is one of
+#   absent       — no remote ref (remote_sha empty)
+#   same         — remote already equals HEAD
+#   fast-forward — remote is an ancestor of HEAD
+#   own-rewrite  — remote is a previous tip of this local branch (its reflog),
+#                  i.e. our own history rewritten by rebase/WIP finalization
+#   foreign      — remote diverged and is not our history (e.g. a dead
+#                  worker's push under the same deterministic branch name)
+#   unknown      — remote could not be queried
+_classify_remote_branch() {
+	local branch="$1"
+	local ls_output="" remote_sha="" head_sha=""
+	if ! ls_output=$(git ls-remote --heads origin "refs/heads/${branch}" 2>/dev/null); then
+		printf 'unknown \n'
+		return 0
+	fi
+	remote_sha=$(printf '%s\n' "$ls_output" | awk -v ref="refs/heads/${branch}" '!found && $2 == ref { print $1; found=1 }')
+	if [[ -z "$remote_sha" ]]; then
+		printf 'absent \n'
+		return 0
+	fi
+	head_sha=$(git rev-parse HEAD 2>/dev/null || true)
+	if [[ "$remote_sha" == "$head_sha" ]]; then
+		printf 'same %s\n' "$remote_sha"
+		return 0
+	fi
+	if ! git cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+		git fetch --quiet origin "refs/heads/${branch}" 2>/dev/null || true
+	fi
+	if git cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+		if git merge-base --is-ancestor "$remote_sha" HEAD 2>/dev/null; then
+			printf 'fast-forward %s\n' "$remote_sha"
+			return 0
+		fi
+		# Capture first: `grep -q` exiting early would SIGPIPE git under pipefail.
+		local own_tips=""
+		own_tips=$(git reflog show --format=%H "refs/heads/${branch}" 2>/dev/null || true)
+		if [[ $'\n'"${own_tips}"$'\n' == *$'\n'"${remote_sha}"$'\n'* ]]; then
+			printf 'own-rewrite %s\n' "$remote_sha"
+			return 0
+		fi
+	fi
+	printf 'foreign %s\n' "$remote_sha"
+	return 0
+}
+
+# GH#33381: pick the first "<branch>-rN" name that exists neither locally nor
+# on origin. Args: $1=branch. Output: replacement name. Returns 1 if none free.
+_replacement_branch_name() {
+	local branch="$1"
+	local n=2 candidate="" remote_hit=""
+	while [[ "$n" -le 9 ]]; do
+		candidate="${branch}-r${n}"
+		if ! git show-ref --verify --quiet "refs/heads/${candidate}"; then
+			remote_hit=$(git ls-remote --heads origin "refs/heads/${candidate}" 2>/dev/null || printf 'error')
+			if [[ -z "$remote_hit" ]]; then
+				printf '%s\n' "$candidate"
+				return 0
+			fi
+		fi
+		n=$((n + 1))
+	done
+	return 1
+}
+
+# GH#33381: resolve the --head value for PR creation. Same-repository pushes
+# use the plain branch name; a fork origin needs "<fork-owner>:<branch>".
+# Args: $1=target repo slug $2=branch
+_pr_head_ref_for_repo() {
+	local repo="$1"
+	local branch="$2"
+	local origin_url="" origin_slug=""
+	origin_url=$(git remote get-url origin 2>/dev/null || true)
+	origin_slug=$(printf '%s\n' "$origin_url" | sed -E 's#\.git$##; s#^.*[:/]([^/:]+/[^/]+)$#\1#')
+	if [[ "$origin_slug" == */* && -n "$repo" ]] &&
+		[[ "$(printf '%s' "$origin_slug" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$repo" | tr '[:upper:]' '[:lower:]')" ]]; then
+		printf '%s:%s\n' "${origin_slug%%/*}" "$branch"
+		return 0
+	fi
+	printf '%s\n' "$branch"
+	return 0
+}
+
 # Push a branch after all final-diff metadata validation has passed.
-# Args: $1=branch $2=skip_hooks (0|1, optional, default 0)
+# Args: $1=branch $2=skip_hooks (0|1, optional, default 0) $3=repo slug (optional)
+#       $4=explicitly authorized --replace-pr number (optional)
+# Sets FULL_LOOP_PUSHED_BRANCH to the branch actually published.
+#
+# GH#33381: never overwrite history that is not ours. The remote ref is
+# classified first; our own (fast-forward or reflog-proven rewrite) history is
+# replaced only with an explicit lease on the observed SHA. A diverged foreign
+# remote branch is preserved untouched and this work is published under a
+# collision-free "<branch>-rN" name instead — unless that remote branch backs
+# an open PR, which must be continued or replaced explicitly.
 _push_branch() {
 	local branch="$1"
 	local skip_hooks="${2:-0}"
+	local repo="${3:-}"
+	local replacement_pr="${4:-}"
+	FULL_LOOP_PUSHED_BRANCH=""
+
+	local classification="" remote_state="" remote_sha=""
+	classification=$(_classify_remote_branch "$branch")
+	remote_state="${classification%% *}"
+	remote_sha="${classification#* }"
+
+	local lease_arg=""
+	case "$remote_state" in
+	absent) lease_arg="--force-with-lease=${branch}:" ;;
+	same | fast-forward | own-rewrite) lease_arg="--force-with-lease=${branch}:${remote_sha}" ;;
+	foreign)
+		local open_pr=""
+		if [[ -n "$repo" ]]; then
+			open_pr=$(gh pr list --repo "$repo" --head "$branch" --state open \
+				--json number --jq '.[0].number // empty' 2>/dev/null || printf 'unknown')
+		else
+			open_pr="unknown"
+		fi
+		if [[ -n "$open_pr" && ( -z "$replacement_pr" || "$open_pr" != "$replacement_pr" ) ]]; then
+			print_error "Remote branch '${branch}' has diverged (${remote_sha:0:12}) and backs open PR #${open_pr} (or PR state is unavailable)."
+			print_error "Continue that PR's history, or replace it explicitly with --replace-pr N --replacement-reason TEXT; nothing was pushed."
+			return 1
+		fi
+		local replacement=""
+		replacement=$(_replacement_branch_name "$branch") || {
+			print_error "Remote branch '${branch}' has diverged and no free '${branch}-rN' replacement name was found; nothing was pushed."
+			return 1
+		}
+		print_warning "Remote branch '${branch}' has diverged with history that is not this branch's (${remote_sha:0:12}); preserving it untouched."
+		git branch -m "$branch" "$replacement" || {
+			print_error "Could not rename local branch '${branch}' to '${replacement}'; nothing was pushed."
+			return 1
+		}
+		print_info "Publishing this work as replacement branch '${replacement}'"
+		branch="$replacement"
+		lease_arg="--force-with-lease=${branch}:"
+		;;
+	*) lease_arg="" ;;
+	esac
 
 	print_info "Pushing to origin/${branch}..."
 
@@ -1378,7 +1186,8 @@ _push_branch() {
 	# Fast-path: both hooks now exit early on doc-only diffs (<1s), so the
 	# 60s timeout is a safety net for edge cases, not a normal code path.
 	local push_timeout=60
-	local _push_args=(-u origin "$branch" --force-with-lease)
+	local _push_args=(-u origin "$branch")
+	[[ -n "$lease_arg" ]] && _push_args+=("$lease_arg")
 	[[ "$skip_hooks" == "1" ]] && _push_args+=(--no-verify)
 
 	local push_rc
@@ -1401,16 +1210,19 @@ _push_branch() {
 		print_error "Push failed (exit ${push_rc}). Check remote state and retry."
 		return 1
 	fi
+	FULL_LOOP_PUSHED_BRANCH="$branch"
 	return 0
 }
 
 # Compatibility wrapper for callers that do not need a pre-push validation gap.
+# Args: $1=branch $2=skip_hooks $3=skip_rebase $4=repo slug (optional)
 _rebase_and_push() {
 	local branch="$1"
 	local skip_hooks="${2:-0}"
 	local skip_rebase="${3:-0}"
+	local repo="${4:-}"
 	_rebase_for_push "$branch" "$skip_rebase" || return 1
-	_push_branch "$branch" "$skip_hooks" || return 1
+	_push_branch "$branch" "$skip_hooks" "$repo" || return 1
 	return 0
 }
 
@@ -1436,7 +1248,7 @@ _issue_has_parent_task_label() {
 
 	local hit=""
 	hit=$(printf '%s' "$labels_json" |
-		jq -r '(.labels // [])[].name | select(. == "parent-task" or . == "meta")' | head -n 1 || true)
+		jq -r '(.labels // [])[].name | select(. == "parent-task" or . == "meta")' | sed -n '1p' || true)
 
 	if [[ -n "$hit" ]]; then
 		return 0
@@ -1444,10 +1256,27 @@ _issue_has_parent_task_label() {
 	return 1
 }
 
+# Return the safe keyword for redispatched review repairs. The issue-body
+# receipt survives worker/session changes; it can only remove closure authority.
+# A verified final delivery uses the existing explicit --allow-parent-close.
+_review_repair_closing_keyword() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local issue_body=""
+	issue_body=$(_gh_with_timeout read gh issue view "$issue_number" --repo "$repo_slug" \
+		--json body --jq '.body // ""') || return 1
+	if [[ "$issue_body" == *"<!-- aidevops:review-repair:non-closing:${issue_number} -->"* ]]; then
+		printf '%s' For
+	else
+		printf '%s' Resolves
+	fi
+	return 0
+}
+
 # Build the PR body string and print it to stdout.
 # Arguments: issue_number, summary_what, summary_testing, files_changed,
 #            sig_footer, closing_keyword (default: Resolves), requested_risk,
-#            requested_testing_level, base_ref
+#            requested_testing_level, base_ref (resolved merge base)
 _build_pr_body() {
 	local issue_number="$1" summary_what="$2" summary_testing="$3"
 	local files_changed="$4" sig_footer="$5"
@@ -1455,8 +1284,31 @@ _build_pr_body() {
 	local requested_risk="${7:-}"
 	local requested_testing_level="${8:-}"
 	local base_ref="${9:-}"
+	local replacement_note="${10:-}"
+	local decisions="${11:-}"
 	local runtime_risk=""
 	local testing_level=""
+	local related="" related_numbers=" "
+	local field="" text="" reference="" reference_number="" prefix=""
+	local reference_pattern='(^|[^[:alnum:]_])([Ff][Oo][Rr]|[Rr][Ee][Ff])[:[:space:]]+#([0-9]+)'
+
+	# GH#36864: prose must not introduce a second explicit work identity.
+	# Keep the dispatched declaration below authoritative, even when summaries
+	# contain same-line, multiline or prose-prefixed child/umbrella references.
+	for field in summary_what summary_testing replacement_note decisions; do
+		text="${!field}"
+		while [[ "$text" =~ $reference_pattern ]]; do
+			reference="${BASH_REMATCH[0]}"
+			prefix="${BASH_REMATCH[1]}"
+			reference_number="${BASH_REMATCH[3]}"
+			text="${text/"$reference"/"${prefix}issue #${reference_number}"}"
+			if [[ "$reference_number" != "$issue_number" && "$related_numbers" != *" ${reference_number} "* ]]; then
+				related_numbers+="${reference_number} "
+				related+="Ref #${reference_number}"$'\n'
+			fi
+		done
+		printf -v "$field" '%s' "$text"
+	done
 
 	runtime_risk=$(_derive_runtime_risk "$requested_risk" "$files_changed" "$summary_what" "$base_ref") || return 1
 	testing_level=$(_resolve_runtime_testing_level "$runtime_risk" "$requested_testing_level" "$summary_testing") || return 1
@@ -1465,17 +1317,30 @@ _build_pr_body() {
 
 ${summary_what:-Implementation for issue #${issue_number}.}
 
+${replacement_note:+## Replacement Audit
+
+${replacement_note}
+}
+
 ## Files Changed
 
 ${files_changed:-See diff}
 
-## Runtime Testing
+${decisions:+## Decisions
+
+${decisions}
+
+}## Runtime Testing
 
 - **Risk level:** ${runtime_risk}
 - **Verification:** ${testing_level} — ${summary_testing:-no additional evidence supplied}
 
 ${closing_keyword} #${issue_number}
 
+${related:+## Related
+
+${related}
+}
 ${sig_footer}"
 	return 0
 }
@@ -1602,7 +1467,7 @@ _derive_pr_title_prefix() {
 	# boundary after the number so ref:GH#123 doesn't match ref:GH#12345.
 	local task_id=""
 	task_id=$(grep -E "^- \[[ x]\] t[0-9]+ .*ref:GH#${issue_number}([^0-9]|\$)" "$todo_file" 2>/dev/null |
-		head -1 |
+		sed -n '1p' |
 		grep -oE '^- \[[ x]\] t[0-9]+' |
 		grep -oE 't[0-9]+$' ||
 		true)
@@ -1741,10 +1606,41 @@ _reconcile_pr_origin_label() {
 # GH#26045: After extracting the PR number, verify/re-apply the current session
 # origin label via set_origin_label so recovered partial-success PRs cannot remain
 # unlabeled and unroutable by pulse CI/review repair workers.
+_create_or_continue_pr() {
+	local continuation_pr="$1"
+	local repo="$2"
+	local pr_title="$3"
+	local pr_body="$4"
+	local origin_label="$5"
+	shift 5
+	if [[ -n "$continuation_pr" ]]; then
+		print_info "Continuing existing issue-linked PR #${continuation_pr} at the final creation boundary"
+		_reconcile_pr_origin_label "$continuation_pr" "$repo" "${origin_label#origin:}" || return 1
+		_reconcile_recovered_pr_metadata "$continuation_pr" "$repo" "$pr_title" "$pr_body" || return 1
+		if [[ -n "${FULL_LOOP_STACK_BASE:-}" ]]; then
+			local current_base=""
+			current_base=$(_gh_with_timeout read gh api "repos/${repo}/pulls/${continuation_pr}" --jq '.base.ref') || return 1
+			if [[ "$current_base" != "$FULL_LOOP_STACK_BASE" ]]; then
+				print_info "Retargeting PR #${continuation_pr} base: ${current_base} -> ${FULL_LOOP_STACK_BASE}"
+				gh api "repos/${repo}/pulls/${continuation_pr}" --method PATCH \
+					--raw-field "base=${FULL_LOOP_STACK_BASE}" >/dev/null || {
+					print_error "Failed to retarget PR #${continuation_pr} to base ${FULL_LOOP_STACK_BASE}"
+					return 1
+				}
+			fi
+		fi
+		printf '%s\n' "$continuation_pr"
+		return 0
+	fi
+	_create_pr "$repo" "$pr_title" "$pr_body" "$origin_label" "$@"
+	return $?
+}
+
 _create_pr() {
 	local repo="$1" pr_title="$2" pr_body="$3" origin_label="$4"
 	shift 4
 	local -a extra_labels=("$@")
+	local recovered=0
 
 	print_info "Creating PR..."
 	local pr_url="" pr_error="" rc=0
@@ -1757,7 +1653,14 @@ _create_pr() {
 	# Canonical failure: PR #21825. Origin label is now injected at creation by
 	# gh_create_pr, via session_origin_label(), then reconciled below after the
 	# PR number is known to cover partial-success recovery gaps (GH#26045).
+	# GH#33381: pass the exact pushed head instead of letting gh infer it from
+	# ambient checkout state (wrong after a replacement branch, or in linked
+	# worktrees backed by a bare common directory).
+	local head_branch="${FULL_LOOP_PUSHED_BRANCH:-}"
+	[[ -n "$head_branch" ]] || head_branch=$(git branch --show-current 2>/dev/null || echo "")
 	local -a pr_cmd=(gh_create_pr --repo "$repo" --title "$pr_title" --body "$pr_body")
+	[[ -n "$head_branch" ]] && pr_cmd+=(--head "$(_pr_head_ref_for_repo "$repo" "$head_branch")")
+	[[ -n "${FULL_LOOP_STACK_BASE:-}" ]] && pr_cmd+=(--base "$FULL_LOOP_STACK_BASE")
 	for lbl in "${extra_labels[@]+"${extra_labels[@]}"}"; do
 		pr_cmd+=(--label "$lbl")
 	done
@@ -1772,12 +1675,12 @@ _create_pr() {
 		# label application) succeeds on GitHub's backend but the subsequent API response
 		# fails with a transient error (e.g. "Something went wrong while executing your query").
 		# Before treating this as a hard failure, check whether the PR now exists.
-		local current_branch="" recovered_url=""
-		current_branch=$(git branch --show-current 2>/dev/null || echo "")
-		recovered_url=$(_gh_recover_pr_if_exists "$current_branch" "$repo" 2>/dev/null || echo "")
+		local recovered_url=""
+		recovered_url=$(_gh_recover_pr_if_exists "$head_branch" "$repo" 2>/dev/null || echo "")
 		if [[ -n "$recovered_url" ]]; then
 			print_info "PR creation command returned non-zero but PR exists — recovering (t2767): ${recovered_url}"
 			pr_url="$recovered_url"
+			recovered=1
 		else
 			print_error "PR creation failed: $(<"$pr_error")"
 			rm -f "$pr_error"
@@ -1808,9 +1711,178 @@ _create_pr() {
 		;;
 	esac
 	_reconcile_pr_origin_label "$pr_number" "$repo" "$origin_name" || return 1
+	if [[ "$recovered" -eq 1 ]]; then
+		_reconcile_recovered_pr_metadata "$pr_number" "$repo" "$pr_title" "$pr_body" || return 1
+	fi
 
 	print_success "PR #${pr_number} created: ${pr_url}"
 	printf '%s\n' "$pr_number"
+	return 0
+}
+
+# Inherit omitted evidence before prospective risk validation, not after push.
+# Explicit values remain authoritative; final-diff risk checks still run normally.
+_inherit_pr_runtime_metadata() {
+	local pr_number="$1"
+	local repo="$2"
+	local body="" metadata=""
+	local override_flags=" ${pr_metadata_overrides:-} "
+	local endpoint="repos/${repo}/pulls"
+	endpoint+="/${pr_number}"
+	body=$(_gh_with_timeout read gh api "$endpoint" --jq '.body // empty') || return 1
+	metadata=$(python3 - "$body" <<'PY'
+import json, re, sys
+body = sys.argv[1]
+section = re.search(r'^## Runtime Testing\s*\n(.*?)(?=^## |\Z)', body, re.M | re.S)
+text = section[1] if section else ''
+text = re.split(r'^(?:Resolves|Fixes|Closes|For|Ref) #\d+\b|^<!-- aidevops:', text, maxsplit=1, flags=re.M)[0]
+risk = re.search(r'^- \*\*Risk level:\*\* (.+)$', text, re.M)
+verification = re.search(r'^- \*\*Verification:\*\*[ \t]+([\w-]+) —[ \t]*(.*?)(?=^- \*\*|\Z)', text, re.M | re.S)
+print(json.dumps({'risk': risk[1] if risk else '',
+                  'level': verification[1] if verification else '',
+                  'evidence': verification[2].strip() if verification else ''}))
+PY
+	) || return 1
+	[[ "$override_flags" == *" risk-level "* ]] || runtime_risk=$(printf '%s' "$metadata" | jq -r '.risk')
+	[[ "$override_flags" == *" testing-level "* ]] || testing_level=$(printf '%s' "$metadata" | jq -r '.level')
+	[[ "$override_flags" == *" testing "* ]] || summary_testing=$(printf '%s' "$metadata" | jq -r '.evidence')
+	return 0
+}
+
+# Keep curated sections verbatim, refreshing only derived data and explicit
+# overrides. Use the live body as the base so arbitrary prose and footer survive.
+_merge_existing_pr_body() {
+	local current_body="$1"
+	local generated_body="$2"
+	local overrides="${3:-}"
+	python3 - "$current_body" "$generated_body" "$overrides" <<'PY'
+import re, sys
+current, generated, overrides = sys.argv[1], sys.argv[2], set(sys.argv[3].split())
+if not current.strip() or not re.search(r'^## ', generated, re.M):
+    print(generated)
+    sys.exit(0)
+
+def section(body, name):
+    boundary = r'(?=^## |^(?:Resolves|Fixes|Closes|For|Ref) #\d+\b|^<!-- aidevops:|\Z)'
+    return re.search(r'^## ' + re.escape(name) + r'\n.*?' + boundary, body, re.M | re.S)
+
+def insert_section(body, text):
+    footer = re.search(r'^(?:Resolves|Fixes|Closes|For|Ref) #\d+\b|^<!-- aidevops:', body, re.M)
+    position = footer.start() if footer else len(body)
+    return body[:position].rstrip('\n') + '\n\n' + text.rstrip('\n') + '\n\n' + body[position:]
+
+for name, flag in [('Files Changed', None), ('Summary', 'summary'), ('Decisions', 'decisions')]:
+    old, new = section(current, name), section(generated, name)
+    if old and not new and flag in overrides:
+        current = current[:old.start()] + current[old.end():]
+    if new and (not old or flag is None or flag in overrides):
+        if old:
+            current = current[:old.start()] + new[0] + current[old.end():]
+        else:
+            current = insert_section(current, new[0])
+
+old, new = section(current, 'Runtime Testing'), section(generated, 'Runtime Testing')
+if old and new:
+    # The runtime section can also contain the closing reference and signature:
+    # replace only the requested metadata lines, never that trailing content.
+    text = old[0]
+    for label, flags in [('Risk level', {'risk-level'}), ('Verification', {'testing', 'testing-level'})]:
+        pattern = r'^- \*\*' + label + r':\*\* .*?(?=^- \*\*|\Z)'
+        replacement = re.search(pattern, new[0], re.M | re.S)
+        if overrides & flags and replacement:
+            text = re.sub(pattern, lambda _: replacement[0], text, flags=re.M | re.S)
+    current = current[:old.start()] + text + current[old.end():]
+elif new:
+    current = insert_section(current, new[0])
+
+# Sections deliberately exclude the closing reference and signature. Recover
+# each independently so a partial footer is completed without duplicating it.
+reference = r'^(?:Resolves|Fixes|Closes|For|Ref) #\d+\b[^\n]*'
+if not re.search(reference, current, re.M):
+    closing = re.search(reference, generated, re.M)
+    if closing:
+        signature_start = re.search(r'^<!-- aidevops:', current, re.M)
+        position = signature_start.start() if signature_start else len(current)
+        current = current[:position].rstrip('\n') + '\n\n' + closing[0] + '\n\n' + current[position:]
+if not re.search(r'^<!-- aidevops:sig -->', current, re.M):
+    signature = re.search(r'^(?:<!-- aidevops:origin:[^\n]*\n)?<!-- aidevops:sig -->.*', generated, re.M | re.S)
+    if signature:
+        current = current.rstrip('\n') + '\n\n' + signature[0]
+print(current.rstrip('\n'))
+PY
+	return $?
+}
+
+# Read one authoritative metadata snapshot, distinguishing a null body from a
+# successful transport with no usable output. Do not retry outside transport policy.
+_read_pr_metadata_json() {
+	local repo="$1"
+	local pr_number="$2"
+	local metadata=""
+	metadata=$(_gh_with_timeout read gh api "repos/${repo}/pulls/${pr_number}") || return 1
+	# Slurping also rejects empty output and multiple JSON documents.
+	printf '%s' "$metadata" | jq -es '
+		length == 1 and (.[0] | type == "object" and
+			has("title") and has("body") and (.title | type) == "string" and
+			((.body | type) == "string" or .body == null))
+	' >/dev/null 2>&1 || return 1
+	printf '%s\n' "$metadata"
+	return 0
+}
+
+# Restore generated metadata after partial PR creation recovered an existing PR.
+# A retry may compute title/body details from a newer review-repair head.
+# Arguments: PR number, repository slug, generated title, generated body.
+_reconcile_recovered_pr_metadata() {
+	local pr_number="$1"
+	local repo="$2"
+	local generated_title="$3"
+	local generated_body="$4"
+	local current_title=""
+	local current_body=""
+	local metadata=""
+
+	metadata=$(_read_pr_metadata_json "$repo" "$pr_number" 2>/dev/null) || {
+		print_error "Could not read recovered PR #${pr_number} title/body for metadata reconciliation"
+		return 1
+	}
+	current_title=$(jq -r '.title' <<<"$metadata") || return 1
+	current_body=$(jq -r '.body // ""' <<<"$metadata") || return 1
+	generated_body=$(_merge_existing_pr_body "$current_body" "$generated_body" "${pr_metadata_overrides:-}") || return 1
+	if [[ "$current_title" == "$generated_title" && "$current_body" == "$generated_body" ]]; then
+		print_info "Recovered PR #${pr_number} metadata already matches the generated head"
+		return 0
+	fi
+
+	local temp_root="${AIDEVOPS_TEMP_DIR:-${HOME}/.aidevops/.agent-workspace/tmp}"
+	local body_file=""
+	if ! mkdir -p "$temp_root" || ! body_file=$(mktemp "${temp_root}/aidevops-recovered-pr-body.XXXXXX"); then
+		print_error "Could not create recovered PR metadata body file"
+		return 1
+	fi
+	if ! printf '%s\n' "$generated_body" >"$body_file"; then
+		rm -f "$body_file"
+		print_error "Could not write recovered PR metadata body"
+		return 1
+	fi
+	if ! gh_pr_edit_safe "$pr_number" --repo "$repo" --title "$generated_title" --body-file "$body_file" >/dev/null; then
+		rm -f "$body_file"
+		print_error "Failed to update stale metadata on recovered PR #${pr_number}"
+		return 1
+	fi
+	rm -f "$body_file"
+
+	metadata=$(_read_pr_metadata_json "$repo" "$pr_number" 2>/dev/null) || {
+		print_error "Could not verify recovered PR #${pr_number} title/body reconciliation"
+		return 1
+	}
+	current_title=$(jq -r '.title' <<<"$metadata") || return 1
+	current_body=$(jq -r '.body // ""' <<<"$metadata") || return 1
+	if [[ "$current_title" != "$generated_title" || "$current_body" != "$generated_body" ]]; then
+		print_error "Recovered PR #${pr_number} metadata reconciliation did not reach the generated title/body postcondition"
+		return 1
+	fi
+	print_success "Reconciled and verified recovered PR #${pr_number} metadata"
 	return 0
 }
 
@@ -1825,37 +1897,55 @@ _ensure_worker_pr_linkage() {
 	local issue_number="$3"
 	local generated_body="$4"
 	local current_body=""
+	local metadata=""
+	local reference_keyword="Resolves"
 
 	if [[ ! "$pr_number" =~ ^[1-9][0-9]*$ || "$repo" != */* || ! "$issue_number" =~ ^[1-9][0-9]*$ || -z "$generated_body" ]]; then
 		print_error "Cannot validate worker PR linkage: invalid PR, repository, issue, or generated body"
 		return 1
 	fi
 
-	current_body=$(_gh_with_timeout read gh api "repos/${repo}/pulls/${pr_number}" --jq '.body // empty' 2>/dev/null) || {
+	metadata=$(_read_pr_metadata_json "$repo" "$pr_number" 2>/dev/null) || {
 		print_error "Cannot validate worker PR #${pr_number} linkage before review transition"
 		return 1
 	}
+	current_body=$(jq -r '.body // ""' <<<"$metadata") || return 1
+	if printf '%s' "$generated_body" | jq -Rse --arg issue "$issue_number" \
+		'test("(^|\\n)(For|Ref) #" + $issue + "\\b")' >/dev/null 2>&1; then
+		reference_keyword="For"
+	fi
 
 	local closing_issues=""
 	closing_issues=$(printf '%s' "$current_body" |
 		grep -ioE '(close[ds]?|fix(es|ed)?|resolve[ds]?)[[:space:]]+#[0-9]+' |
 		grep -oE '[0-9]+' | sort -u) || closing_issues=""
 	if [[ "$closing_issues" == "$issue_number" ]]; then
+		if [[ "$reference_keyword" == "For" ]]; then
+			print_error "Worker PR #${pr_number} has a closing reference despite non-closing repair intent"
+			return 1
+		fi
 		return 0
 	fi
 
 	# A qualified close reference targets another repository. Do not add a local
 	# reference to an ambiguous body: pulse must remain fail-closed for cross-repo
 	# or multi-issue relationships.
-	if [[ -n "$closing_issues" ]] || printf '%s' "$current_body" | grep -Eiq \
-		'(close[ds]?|fix(es|ed)?|resolve[ds]?)[[:space:]]+[^[:space:]]+#[0-9]+'; then
+	if [[ -n "$closing_issues" ]] || grep -Eiq \
+		'(close[ds]?|fix(es|ed)?|resolve[ds]?)[[:space:]]+[^[:space:]]+#[0-9]+' <<<"$current_body"; then
 		print_error "Worker PR #${pr_number} has ambiguous or cross-repository closing references; refusing linkage repair"
 		return 1
+	fi
+	# GH#33374: explicit checkpoint intent is not a missing closing reference.
+	# Never turn a deliberate For/Ref body into a GitHub auto-closing link.
+	if printf '%s' "$current_body" | jq -Rse --arg issue "$issue_number" \
+		'test("\\b(for|ref)[[:space:]]+#" + $issue + "\\b"; "i")' >/dev/null 2>&1; then
+		print_info "Preserving non-closing checkpoint reference on worker PR #${pr_number}"
+		return 0
 	fi
 
 	local repaired_body="$generated_body"
 	if [[ -n "$current_body" ]]; then
-		repaired_body="${current_body}"$'\n\n'"Resolves #${issue_number}"
+		repaired_body="${current_body}"$'\n\n'"${reference_keyword} #${issue_number}"
 	fi
 	local temp_root="${AIDEVOPS_TEMP_DIR:-${HOME}/.aidevops/.agent-workspace/tmp}"
 	local repair_body_file=""
@@ -1875,10 +1965,17 @@ _ensure_worker_pr_linkage() {
 	fi
 	rm -f "$repair_body_file"
 
-	current_body=$(_gh_with_timeout read gh api "repos/${repo}/pulls/${pr_number}" --jq '.body // empty' 2>/dev/null) || {
+	metadata=$(_read_pr_metadata_json "$repo" "$pr_number" 2>/dev/null) || {
 		print_error "Could not verify repaired linked issue reference on worker PR #${pr_number}"
 		return 1
 	}
+	current_body=$(jq -r '.body // ""' <<<"$metadata") || return 1
+	if [[ "$reference_keyword" == "For" ]]; then
+		printf '%s' "$current_body" | jq -Rse --arg issue "$issue_number" \
+			'test("(^|\\n)(For|Ref) #" + $issue + "\\b") and
+			(test("\\b(close[ds]?|fix(es|ed)?|resolve[ds]?)[[:space:]]+#" + $issue + "\\b"; "i") | not)' >/dev/null 2>&1 || return 1
+		return 0
+	fi
 	closing_issues=$(printf '%s' "$current_body" |
 		grep -ioE '(close[ds]?|fix(es|ed)?|resolve[ds]?)[[:space:]]+#[0-9]+' |
 		grep -oE '[0-9]+' | sort -u) || closing_issues=""
@@ -1892,23 +1989,90 @@ _ensure_worker_pr_linkage() {
 
 # --- Merge Summary ---
 
+# Reconcile the single canonical merge summary comment without creating a
+# duplicate. The gh API shim signs the PATCH body before it reaches GitHub.
+# Arguments: PR number, repo, comments endpoint, marker, generated body.
+_reconcile_existing_merge_summary() {
+	local pr_number="$1"
+	local repo="$2"
+	local comments_endpoint="$3"
+	local merge_summary_marker="$4"
+	local merge_summary_body="$5"
+	local existing_summary=""
+	local summary_id=""
+	local existing_body=""
+	local summary_id_jq="[.[] | select(.body | test(\$marker))] | first | .id"
+	local summary_body_jq="[.[] | select(.body | test(\$marker))] | first | .body"
+
+	existing_summary=$(_gh_with_timeout read gh api "$comments_endpoint" \
+		2>/dev/null) || {
+		print_error "Could not read the canonical merge summary comment on PR #${pr_number}"
+		return 1
+	}
+	if ! summary_id=$(printf '%s' "$existing_summary" |
+		jq -er --arg marker "$merge_summary_marker" "$summary_id_jq"); then
+		print_error "Could not identify the canonical merge summary comment on PR #${pr_number}"
+		return 1
+	fi
+	if ! existing_body=$(printf '%s' "$existing_summary" |
+		jq -er --arg marker "$merge_summary_marker" "$summary_body_jq"); then
+		print_error "Could not read the canonical merge summary comment body on PR #${pr_number}"
+		return 1
+	fi
+	if [[ "$existing_body" == "$merge_summary_body"* ]]; then
+		print_info "Merge summary comment already matches PR #${pr_number} — skipping duplicate (t2767)"
+		return 0
+	fi
+	if ! gh api "repos/${repo}/issues/comments/${summary_id}" \
+		--method PATCH --raw-field "body=${merge_summary_body}" >/dev/null; then
+		print_error "Failed to update stale canonical merge summary comment on PR #${pr_number}"
+		return 1
+	fi
+	existing_summary=$(_gh_with_timeout read gh api "$comments_endpoint" \
+		2>/dev/null) || {
+		print_error "Could not verify the updated canonical merge summary comment on PR #${pr_number}"
+		return 1
+	}
+	if ! existing_body=$(printf '%s' "$existing_summary" |
+		jq -er --arg marker "$merge_summary_marker" "$summary_body_jq"); then
+		print_error "Could not read the updated canonical merge summary comment body on PR #${pr_number}"
+		return 1
+	fi
+	if [[ "$existing_body" != "$merge_summary_body"* ]]; then
+		print_error "Canonical merge summary comment on PR #${pr_number} did not reach the generated metadata postcondition"
+		return 1
+	fi
+	print_success "Updated and verified stale canonical merge summary comment on PR #${pr_number}"
+	return 0
+}
+
 # Post the MERGE_SUMMARY comment on the PR (full-loop step 4.2.1).
 # Arguments: pr_number, repo, issue_number, summary_what, files_changed,
 #            summary_testing, summary_decisions
-# t2767: Idempotent — skips posting if the canonical MERGE_SUMMARY comment already exists.
-# This handles the partial-success recovery case where commit-and-pr was
-# interrupted after posting the comment but before returning the PR number.
+# t2767: Idempotent — preserves a matching canonical MERGE_SUMMARY comment,
+# while updating the one canonical comment if a retry generated newer metadata.
 _post_merge_summary() {
 	local pr_number="$1" repo="$2" issue_number="$3" summary_what="$4"
 	local files_changed="$5" summary_testing="$6" summary_decisions="$7"
+	local merge_summary_marker="<!-- MERGE_SUMMARY -->"
+	local comments_endpoint="repos/${repo}/issues/${pr_number}/comments"
+	local summary_count_jq="[.[] | select(.body | test(\"${merge_summary_marker}\"))] | length"
+	local merge_summary_body="${merge_summary_marker}
+## Completion Summary
+
+- **What**: ${summary_what:-Implementation for issue #${issue_number}}
+- **Issue**: #${issue_number}
+- **Files changed**: ${files_changed:-see diff}
+- **Testing**: ${summary_testing:-shellcheck clean, self-assessed}
+- **Key decisions**: ${summary_decisions:-none}"
 
 	# t2767/GH#26608: Check if the canonical MERGE_SUMMARY comment already exists before posting.
 	# Uses PR timeline comments endpoint (issues endpoint covers PR comments).
 	# Counter safety: validate result is a number before comparing (t2763).
 	local _existing_count=0
 	local _tmp_count=""
-	if ! _tmp_count=$(gh api "repos/${repo}/issues/${pr_number}/comments" \
-		--jq '[.[] | select(.body | test("<!-- MERGE_SUMMARY -->"))] | length'); then
+	if ! _tmp_count=$(gh api "$comments_endpoint" \
+		--jq "$summary_count_jq"); then
 		print_error "Could not verify existing merge summary comments on PR #${pr_number}; refusing a potentially duplicate post"
 		return 1
 	fi
@@ -1918,8 +2082,9 @@ _post_merge_summary() {
 	fi
 	_existing_count="$_tmp_count"
 	if [[ "$_existing_count" -eq 1 ]]; then
-		print_info "Merge summary comment already exists on PR #${pr_number} — skipping duplicate (t2767)"
-		return 0
+		_reconcile_existing_merge_summary "$pr_number" "$repo" "$comments_endpoint" \
+			"$merge_summary_marker" "$merge_summary_body"
+		return $?
 	fi
 	if [[ "$_existing_count" -gt 1 ]]; then
 		print_error "PR #${pr_number} has ${_existing_count} canonical merge summary comments; expected exactly one"
@@ -1936,14 +2101,7 @@ _post_merge_summary() {
 		print_error "Could not create merge summary body file in ${temp_root}"
 		return 1
 	fi
-	if ! printf '%s\n' "<!-- MERGE_SUMMARY -->
-## Completion Summary
-
-- **What**: ${summary_what:-Implementation for issue #${issue_number}}
-- **Issue**: #${issue_number}
-- **Files changed**: ${files_changed:-see diff}
-- **Testing**: ${summary_testing:-shellcheck clean, self-assessed}
-- **Key decisions**: ${summary_decisions:-none}" >"$merge_summary_file"; then
+	if ! printf '%s\n' "$merge_summary_body" >"$merge_summary_file"; then
 		print_error "Could not write merge summary body file for PR #${pr_number}"
 		rm -f "$merge_summary_file"
 		return 1
@@ -1958,8 +2116,8 @@ _post_merge_summary() {
 	fi
 	rm -f "$merge_summary_file"
 
-	_tmp_count=$(gh api "repos/${repo}/issues/${pr_number}/comments" \
-		--jq '[.[] | select(.body | test("<!-- MERGE_SUMMARY -->"))] | length') || {
+	_tmp_count=$(gh api "$comments_endpoint" \
+		--jq "$summary_count_jq") || {
 		print_error "Merge summary posted on PR #${pr_number}, but verification failed"
 		return 1
 	}

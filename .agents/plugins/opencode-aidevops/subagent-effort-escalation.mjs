@@ -7,80 +7,27 @@ import {
   routingModelIdentity,
   selectConnectedRoutingCandidate,
 } from "./model-routing.mjs";
+import { ON_DEMAND_TOOL } from "./on-demand-tools.mjs";
+import { failoverTask as entitlementFailover } from "./subagent-entitlement-failover.mjs";
 import { SubagentLifecycleTracker } from "./subagent-lifecycle-tracker.mjs";
+import {
+  ESCALATION_PROMPT,
+  SIDE_EFFECT_SKIP,
+  capabilityEscalationEvidence,
+  responseError,
+  responseText,
+  terminalToolFailure,
+  toolFailed,
+} from "./subagent-escalation-text.mjs";
 import { classifySideEffect, safeToolName } from "./subagent-side-effect-classifier.mjs";
 
-const TASK_TOOLS = new Set(["task", "mcp_task"]);
-const TERMINAL_TOOL_FAILURES = new Set([
-  "aborted", "cancelled", "canceled", "error", "failed",
-]);
-const FORBIDDEN_ESCALATION_EVIDENCE = /\b(?:auth(?:entication|orization)?|billing|credential|locality|permission|policy|provider|rate[ -]?limit|secret|trust[ -]?boundary)\b/i;
-const MAX_TRACKED_SESSIONS = 64;
-const SIDE_EFFECT_SKIP = "[AIDEvOps automatic capability escalation skipped: the child attempted side effects, so parent review is required before retry.]";
+export { appendCapabilityEscalationContract, capabilityEscalationEvidence } from "./subagent-escalation-text.mjs";
 
-const ESCALATION_PROMPT = [
-  "[AIDEvOps capability escalation]",
-  "Continue the exact task in this session using the prior attempt and evidence.",
-  "Do not repeat completed discovery. Produce the requested result and verification evidence.",
-  "If model capability alone still blocks safe completion after bounded attempts, end with `BLOCKED: capability limit - <evidence>`.",
-  "Never use that marker for permission, authentication, provider, rate-limit, secret, policy, trust-boundary, locality, billing, or side-effect uncertainty.",
-].join("\n");
+const TASK_TOOLS = new Set(["task", "mcp_task"]);
+const MAX_TRACKED_SESSIONS = 64;
 
 function capMap(map) {
   while (map.size > MAX_TRACKED_SESSIONS) map.delete(map.keys().next().value);
-}
-
-function responsePayload(response) {
-  return response?.data ?? response ?? {};
-}
-
-function responseError(response) {
-  return response?.error || response?.data?.error || null;
-}
-
-function responseText(response) {
-  const payload = responsePayload(response);
-  return (payload.parts || [])
-    .filter((part) => part?.type === "text")
-    .map((part) => part.text || "")
-    .join("\n")
-    .trim();
-}
-
-function toolFailed(output) {
-  const status = String(output?.metadata?.status || output?.status || "").toLowerCase();
-  return TERMINAL_TOOL_FAILURES.has(status);
-}
-
-/** Return safe capability-only evidence from the exact escalation marker. */
-export function capabilityEscalationEvidence(value) {
-  const match = String(value || "").match(/^BLOCKED: capability limit - ([^\r\n]+)$/im);
-  const evidence = String(match?.[1] || "").trim();
-  if (!evidence || FORBIDDEN_ESCALATION_EVIDENCE.test(evidence)) return "";
-  return evidence;
-}
-
-/** Add the bounded failure contract once to an eligible child prompt. */
-export function appendCapabilityEscalationContract(output) {
-  const marker = "[AIDEvOps capability escalation contract]";
-  const parts = Array.isArray(output?.parts) ? output.parts : [];
-  if (parts.some((part) => part?.type === "text" && String(part.text || "").includes(marker))) return;
-  const targetIndex = parts.findIndex((part) => part?.type === "text"
-    && typeof part.id === "string"
-    && typeof part.sessionID === "string"
-    && typeof part.messageID === "string");
-  if (targetIndex < 0) return;
-
-  const contract = [
-    marker,
-    "After bounded attempts, emit `BLOCKED: capability limit - <evidence>` only when model capability is the sole blocker.",
-    "Do not use it for permission, authentication, provider, rate-limit, secret, policy, trust-boundary, locality, billing, or side-effect uncertainty.",
-  ].join("\n");
-  const target = parts[targetIndex];
-  const originalText = String(target.text || "");
-  output.parts = parts.map((part, index) => index === targetIndex
-    ? { ...target, text: originalText ? `${originalText}\n\n${contract}` : contract }
-    : part);
 }
 
 class InteractiveSubagentEscalator {
@@ -153,7 +100,7 @@ class InteractiveSubagentEscalator {
     const terminalEvidence = identity.childID
       ? this.lifecycle.terminalEvidence(identity.childID)
       : "";
-    const failed = toolFailed(output) || TERMINAL_TOOL_FAILURES.has(terminalEvidence);
+    const failed = toolFailed(output) || terminalToolFailure(terminalEvidence);
     const status = String(output?.metadata?.status || output?.status || terminalEvidence || "completed")
       .toLowerCase();
     this.recordOutcome({
@@ -172,21 +119,30 @@ class InteractiveSubagentEscalator {
     });
   }
 
+  appendObjectiveReceiptReminder(output, input, identity, objective) {
+    if (!identity.childID || this.context.policies.get(identity.childID)?.pinned) return;
+    const receipt = [
+      "[AIDEvOps parent receipt]",
+      `${ON_DEMAND_TOOL} tool=aidevops_objective_receipt args: parent_session_id=${String(input?.sessionID || "")} objective_id=${objective.objectiveID} run_id=${objective.runID} contribution_id=opencode-child:${identity.childID}; record an explicit outcome after review.`,
+    ].join("\n");
+    output.output = [String(output.output || "").trim(), receipt].filter(Boolean).join("\n\n");
+  }
+
   prepareRoute(policy, tier, model) {
     policy.effort = tier;
     policy.attempt = Math.max(1, Number(policy.attempt) || 1) + 1;
     policy.reason = "capability_escalation";
     policy.escalated = true;
     policy.routedModel = model;
-    policy.candidateIndex = routingCandidateIndex(this.context.modelRouting, tier, model);
+    policy.candidateIndex = routingCandidateIndex(policy.armRouting || this.context.modelRouting, tier, model);
     policy.awaitingEscalationPrompt = true;
     policy.createdAt = Date.now();
   }
 
-  async promptNextTier(childID, childSession, model) {
+  async promptNextTier(childID, childSession, model, prompt = ESCALATION_PROMPT) {
     const body = {
       model: routingModelIdentity(model),
-      parts: [{ type: "text", text: ESCALATION_PROMPT, synthetic: true }],
+      parts: [{ type: "text", text: prompt, synthetic: true }],
     };
     if (childSession?.agent) body.agent = childSession.agent;
     return this.context.client.session.prompt({ path: { id: childID }, body });
@@ -226,14 +182,17 @@ class InteractiveSubagentEscalator {
   }
 
   async nextEscalationCandidate(policy) {
-    const tier = nextRoutingTier(this.context.modelRouting, policy.effort);
+    const routing = policy.armRouting || this.context.modelRouting;
+    const tier = nextRoutingTier(routing, policy.effort);
     if (!tier) return null;
     const providerState = await this.context.resolveProviderState();
     if (!providerState) return null;
     const model = selectConnectedRoutingCandidate(
-      this.context.modelRouting,
+      routing,
       tier,
       providerState,
+      undefined,
+      this.availability(),
     );
     return model ? { model, tier } : null;
   }
@@ -297,9 +256,31 @@ class InteractiveSubagentEscalator {
     return this.completeEscalation(output, state);
   }
 
+  availability() {
+    return this.context.resolveAvailability?.() || {};
+  }
+
+  /** GH#36698: same-tier entitlement failover; see subagent-entitlement-failover.mjs. */
+  failoverTask(output, childID) {
+    return entitlementFailover(this, output, childID);
+  }
+
   async afterTool(input, output) {
     if (!TASK_TOOLS.has(safeToolName(input?.tool)) || !this.trackingEnabled()) return null;
     const identity = this.lifecycle.takeChildIdentity(input, output);
+    const objective = this.context.onSubagentOutcome?.objectiveContext?.(input?.sessionID);
+    if (objective && identity.childID) {
+      output.metadata = {
+        ...output.metadata,
+        aidevopsObjective: {
+          childSessionID: identity.childID,
+          contributionID: `opencode-child:${identity.childID}`,
+          objectiveID: objective.objectiveID,
+          runID: objective.runID,
+        },
+      };
+      this.appendObjectiveReceiptReminder(output, input, identity, objective);
+    }
     if (this.enabled() && !identity.childID) {
       output.metadata = {
         ...output.metadata,
@@ -307,7 +288,9 @@ class InteractiveSubagentEscalator {
       };
     }
     try {
-      return this.enabled() ? await this.escalateTask(output, identity.childID) : null;
+      if (!this.enabled()) return null;
+      const failover = await this.failoverTask(output, identity.childID);
+      return failover || await this.escalateTask(output, identity.childID);
     } finally {
       this.recordHostOutcome(input, output, identity);
       if (identity.childID) this.sideEffects.delete(identity.childID);

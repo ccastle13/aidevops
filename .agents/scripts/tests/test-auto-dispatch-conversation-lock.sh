@@ -43,6 +43,8 @@ reset_gh_calls() {
 GH_LOCKED=true
 GH_LOCK_RC=0
 GH_API_RC=0
+GH_BATCH_RC=0
+GH_BATCH_JSON='{"data":{"repository":{}}}'
 gh() {
 	local command="${1:-}"
 	local subcommand="${2:-}"
@@ -51,11 +53,17 @@ gh() {
 		return "$GH_LOCK_RC"
 	fi
 	if [[ "$command" == "api" ]]; then
+		if [[ "${2:-}" == "graphql" ]]; then
+			[[ "$GH_BATCH_RC" -eq 0 ]] || return "$GH_BATCH_RC"
+			printf '%s\n' "$GH_BATCH_JSON"
+			return 0
+		fi
 		local api_count
 		api_count=$(<"$GH_API_COUNT_FILE")
 		api_count=$((api_count + 1))
 		printf '%s\n' "$api_count" >"$GH_API_COUNT_FILE"
 		if [[ "$GH_API_RC" -ne 0 ]]; then
+			[[ -z "${GH_API_STDERR:-}" ]] || printf '%s\n' "$GH_API_STDERR" >&2
 			return "$GH_API_RC"
 		fi
 		if [[ "$GH_LOCKED" == *,* ]]; then
@@ -80,9 +88,10 @@ export -f gh gh_pr_list
 source "${SCRIPTS_DIR}/pulse-dispatch-core.sh"
 
 reset_gh_calls
+GH_LOCKED=false,true
 if lock_issue_for_worker 41 owner/repo &&
 	grep -q -- 'issue lock 41 --repo owner/repo --reason resolved' "$GH_CALLS" &&
-	grep -q -- 'api repos/owner/repo/issues/41 --jq .locked == true' "$GH_CALLS" &&
+	[[ "$(grep -c -- 'api repos/owner/repo/issues/41 --jq .locked' "$GH_CALLS")" -eq 2 ]] &&
 	[[ -f "${AIDEVOPS_AUTO_DISPATCH_LOCK_DIR}/owner--repo-41" ]]; then
 	pass "strict lock succeeds only after independent verification"
 else
@@ -90,9 +99,9 @@ else
 fi
 
 reset_gh_calls
-GH_LOCKED=false,false,false
+GH_LOCKED=false
 if ! lock_issue_for_worker 42 owner/repo &&
-	[[ "$(grep -c -- '^api ' "$GH_CALLS")" -eq 3 ]] &&
+	[[ "$(grep -c -- '^api ' "$GH_CALLS")" -eq 4 ]] &&
 	grep -q -- 'dispatch remains blocked' "$LOGFILE"; then
 	pass "unverified issue lock fails closed"
 else
@@ -100,9 +109,9 @@ else
 fi
 
 reset_gh_calls
-GH_LOCKED=false,true
+GH_LOCKED=false,false,true
 if lock_issue_for_worker 43 owner/repo &&
-	[[ "$(grep -c -- '^api ' "$GH_CALLS")" -eq 2 ]] &&
+	[[ "$(grep -c -- '^api ' "$GH_CALLS")" -eq 3 ]] &&
 	[[ -f "${AIDEVOPS_AUTO_DISPATCH_LOCK_DIR}/owner--repo-43" ]]; then
 	pass "stale lock read retries and then succeeds"
 else
@@ -113,8 +122,8 @@ reset_gh_calls
 GH_LOCK_RC=1
 GH_LOCKED=true
 if lock_issue_for_worker 46 owner/repo &&
-	grep -q -- 'issue lock 46 --repo owner/repo --reason resolved' "$GH_CALLS" &&
-	grep -q -- 'api repos/owner/repo/issues/46 --jq .locked == true' "$GH_CALLS" &&
+	! grep -q -- '^issue lock ' "$GH_CALLS" &&
+	[[ "$(grep -c -- '^api ' "$GH_CALLS")" -eq 1 ]] &&
 	grep -q -- 'Reused existing verified conversation lock' "$LOGFILE" &&
 	[[ -f "${AIDEVOPS_AUTO_DISPATCH_LOCK_DIR}/owner--repo-46" ]]; then
 	pass "already locked issue is accepted after independent verification"
@@ -127,25 +136,97 @@ reset_gh_calls
 GH_LOCKED=false
 GH_API_RC=1
 if ! lock_issue_for_worker 44 owner/repo &&
-	[[ "$(grep -c -- '^api ' "$GH_CALLS")" -eq 3 ]] &&
+	[[ "$(grep -c -- '^api ' "$GH_CALLS")" -eq 1 ]] &&
+	! grep -q -- '^issue lock ' "$GH_CALLS" &&
 	[[ ! -f "${AIDEVOPS_AUTO_DISPATCH_LOCK_DIR}/owner--repo-44" ]]; then
-	pass "lock verification API errors exhaust retries and fail closed"
+	pass "unknown lock state stops without mutation or transport retries"
 else
-	fail "lock verification API errors exhaust retries and fail closed"
+	fail "unknown lock state stops without mutation or transport retries"
 fi
 
 reset_gh_calls
-GH_LOCKED=false,false,false
+GH_API_RC=0
+GH_LOCKED=false
 AIDEVOPS_CONVERSATION_LOCK_VERIFY_ATTEMPTS=999
 AIDEVOPS_CONVERSATION_LOCK_VERIFY_DELAY=999
 if ! lock_issue_for_worker 45 owner/repo &&
-	[[ "$(grep -c -- '^api ' "$GH_CALLS")" -eq 3 ]]; then
+	[[ "$(grep -c -- '^api ' "$GH_CALLS")" -eq 4 ]]; then
 	pass "oversized verification controls remain capped"
 else
 	fail "oversized verification controls remain capped"
 fi
 unset AIDEVOPS_CONVERSATION_LOCK_VERIFY_ATTEMPTS
 AIDEVOPS_CONVERSATION_LOCK_VERIFY_DELAY=0
+
+# GH#34057: fail-closed outcomes carry an allowlisted cause, never raw output.
+LOCK_SECRET_FIXTURE="synthetic-lock-read-secret-fixture"
+assert_lock_cause() {
+	local issue="$1"
+	local expected="$2"
+	local message="$3"
+	local rc=0 summary=""
+	: >"$LOGFILE"
+	lock_issue_for_worker "$issue" owner/repo || rc=$?
+	summary=$(conversation_lock_failure_summary)
+	if [[ "$rc" -eq 1 && "$summary" == "$expected" ]] &&
+		! grep -qF "$LOCK_SECRET_FIXTURE" "$LOGFILE" &&
+		[[ ! -f "${AIDEVOPS_AUTO_DISPATCH_LOCK_DIR}/owner--repo-${issue}" ]]; then
+		pass "$message"
+	else
+		fail "$message (rc=${rc} summary='${summary}')"
+	fi
+	return 0
+}
+
+reset_gh_calls
+GH_LOCKED=false
+GH_API_RC=1
+GH_API_STDERR="gh: Not Found (HTTP 404) ${LOCK_SECRET_FIXTURE}"
+assert_lock_cause 71 "cause=read_unavailable detail=not_found mutation=not_attempted" \
+	"unavailable lock read is attributed without raw stderr"
+GH_API_STDERR="HTTP 403: API rate limit exceeded ${LOCK_SECRET_FIXTURE}"
+assert_lock_cause 72 "cause=read_unavailable detail=rate_limited mutation=not_attempted" \
+	"rate-limited lock read is distinguished from a generic forbidden read"
+GH_API_RC=0
+GH_API_STDERR=""
+
+reset_gh_calls
+GH_LOCKED=null
+assert_lock_cause 73 "cause=state_malformed detail=none mutation=not_attempted" \
+	"malformed lock state is attributed before any mutation"
+if ! grep -q -- '^issue lock ' "$GH_CALLS"; then
+	pass "malformed lock state does not mutate the conversation"
+else
+	fail "malformed lock state does not mutate the conversation"
+fi
+
+reset_gh_calls
+GH_LOCKED=false
+assert_lock_cause 74 "cause=verify_not_propagated detail=none mutation=accepted" \
+	"accepted but unverified lock is attributed to propagation"
+if grep -q 'dispatch remains blocked (GH#30180) cause=verify_not_propagated detail=none mutation=accepted$' "$LOGFILE"; then
+	pass "unverified lock log line carries the sanitized cause"
+else
+	fail "unverified lock log line carries the sanitized cause"
+fi
+
+reset_gh_calls
+GH_LOCK_RC=1
+GH_LOCKED=false
+assert_lock_cause 75 "cause=verify_not_propagated detail=none mutation=rejected" \
+	"rejected lock mutation is distinguished from an accepted one"
+if [[ "$(grep -c -- '^issue lock ' "$GH_CALLS")" -eq 1 ]]; then
+	pass "rejected lock mutation is not retried"
+else
+	fail "rejected lock mutation is not retried"
+fi
+GH_LOCK_RC=0
+
+reset_gh_calls
+GH_LOCKED=false,
+assert_lock_cause 76 "cause=verify_read_malformed detail=none mutation=accepted" \
+	"malformed verification read is distinguished from propagation lag"
+GH_LOCKED=true
 
 reset_gh_calls
 GH_API_RC=0
@@ -156,18 +237,123 @@ snapshot='[
   {"number":53,"labels":[]},
   {"number":55,"labels":[{"name":"no-auto-dispatch"}]}
 ]'
+GH_BATCH_JSON='{"data":{"repository":{"issue_51":{"number":51,"locked":true},"issue_52":{"number":52,"locked":true}}}}'
 mkdir -p "$AIDEVOPS_AUTO_DISPATCH_LOCK_DIR"
 : >"${AIDEVOPS_AUTO_DISPATCH_LOCK_DIR}/owner--repo-53"
 : >"${AIDEVOPS_AUTO_DISPATCH_LOCK_DIR}/owner--repo-55"
 if reconcile_auto_dispatch_issue_locks owner/repo "$snapshot" &&
-	grep -q -- 'issue lock 51 --repo owner/repo' "$GH_CALLS" &&
-	grep -q -- 'issue lock 52 --repo owner/repo' "$GH_CALLS" &&
+	! grep -q -- '^issue lock ' "$GH_CALLS" &&
+	[[ "$(grep -c -- '^api graphql ' "$GH_CALLS")" -eq 1 ]] &&
 	grep -q -- 'issue unlock 53 --repo owner/repo' "$GH_CALLS" &&
 	[[ ! -f "${AIDEVOPS_AUTO_DISPATCH_LOCK_DIR}/owner--repo-53" ]] &&
 	! grep -q -- 'issue unlock 55 --repo owner/repo' "$GH_CALLS"; then
 	pass "reconciliation covers blocked and queued issues without undoing lockdowns"
 else
 	fail "reconciliation covers blocked and queued issues without undoing lockdowns"
+fi
+
+reset_gh_calls
+snapshot='[{"number":61,"labels":[{"name":"auto-dispatch"}]}]'
+GH_BATCH_JSON='{"data":{"repository":{"issue_61":{"number":61,"locked":true}}}}'
+if reconcile_auto_dispatch_issue_locks same/same "$snapshot" &&
+	[[ "$(grep -c -- '^api graphql ' "$GH_CALLS")" -eq 1 ]] &&
+	grep -q -- '-F owner=same -F name=same' "$GH_CALLS" &&
+	! grep -q -- '^issue lock ' "$GH_CALLS" &&
+	[[ -f "${AIDEVOPS_AUTO_DISPATCH_LOCK_DIR}/same--same-61" ]]; then
+	pass "equal owner and repository names use authoritative batch evidence"
+else
+	fail "equal owner and repository names use authoritative batch evidence"
+fi
+
+reset_gh_calls
+if [[ "$(_read_issue_conversation_locks_batch same/same '[]')" == '[]' ]] &&
+	[[ ! -s "$GH_CALLS" ]]; then
+	pass "equal owner and repository names allow an empty snapshot without an API call"
+else
+	fail "equal owner and repository names allow an empty snapshot without an API call"
+fi
+
+for invalid_slug in '' owner /repo owner/ / owner/repo/extra owner//repo; do
+	reset_gh_calls
+	if ! _read_issue_conversation_locks_batch "$invalid_slug" "$snapshot" >/dev/null &&
+		[[ ! -s "$GH_CALLS" ]]; then
+		pass "malformed slug '$invalid_slug' fails before an API call"
+	else
+		fail "malformed slug '$invalid_slug' fails before an API call"
+	fi
+done
+
+reset_gh_calls
+snapshot='[{"number":62,"labels":[{"name":"auto-dispatch"}]}]'
+GH_BATCH_JSON='{"data":{"repository":{}}}'
+if ! reconcile_auto_dispatch_issue_locks same/same "$snapshot" &&
+	[[ "$(grep -c -- '^api graphql ' "$GH_CALLS")" -eq 1 ]] &&
+	! grep -q -- '^issue lock ' "$GH_CALLS" &&
+	[[ ! -f "${AIDEVOPS_AUTO_DISPATCH_LOCK_DIR}/same--same-62" ]]; then
+	pass "equal-name repository still fails closed on missing batch evidence"
+else
+	fail "equal-name repository still fails closed on missing batch evidence"
+fi
+
+reset_gh_calls
+snapshot=$(jq -nc '[range(1; 81) | {number: ., labels: [{name: "auto-dispatch"}]}]')
+GH_BATCH_JSON=$(jq -nc '{data: {repository: ([range(1; 81) | {key: ("issue_" + tostring), value: {number: ., locked: true}}] | from_entries)}}')
+if reconcile_auto_dispatch_issue_locks owner/repo "$snapshot" &&
+	[[ "$(grep -c -- '^api graphql ' "$GH_CALLS")" -eq 1 ]] &&
+	! grep -q -- '^api repos/' "$GH_CALLS" &&
+	! grep -q -- '^issue lock ' "$GH_CALLS" &&
+	[[ -f "${AIDEVOPS_AUTO_DISPATCH_LOCK_DIR}/owner--repo-1" ]] &&
+	[[ -f "${AIDEVOPS_AUTO_DISPATCH_LOCK_DIR}/owner--repo-80" ]]; then
+	pass "large reconciliation uses one authoritative batch lock read"
+else
+	fail "large reconciliation uses one authoritative batch lock read"
+fi
+
+reset_gh_calls
+snapshot='[
+  {"number":156,"labels":[{"name":"auto-dispatch"}]},
+  {"number":157,"labels":[{"name":"auto-dispatch"}]}
+]'
+GH_BATCH_JSON='{"data":{"repository":{"issue_156":{"number":156,"locked":true}}}}'
+if ! reconcile_auto_dispatch_issue_locks owner/repo "$snapshot" &&
+	[[ "$(grep -c -- '^api graphql ' "$GH_CALLS")" -eq 1 ]] &&
+	! grep -q -- '^issue lock ' "$GH_CALLS" &&
+	[[ ! -f "${AIDEVOPS_AUTO_DISPATCH_LOCK_DIR}/owner--repo-156" ]] &&
+	[[ ! -f "${AIDEVOPS_AUTO_DISPATCH_LOCK_DIR}/owner--repo-157" ]]; then
+	pass "partial batch lock evidence leaves the repository fail-closed"
+else
+	fail "partial batch lock evidence leaves the repository fail-closed"
+fi
+
+reset_gh_calls
+snapshot='[
+  {"number":158,"labels":[{"name":"auto-dispatch"}]},
+  {"number":159,"labels":[{"name":"auto-dispatch"}]}
+]'
+GH_BATCH_JSON='{"data":{"repository":{"issue_158":{"number":159,"locked":false},"issue_159":{"number":158,"locked":true}}}}'
+GH_LOCKED=true
+if reconcile_auto_dispatch_issue_locks owner/repo "$snapshot" &&
+	! grep -q -- '^issue lock 158 ' "$GH_CALLS" &&
+	grep -q -- '^issue lock 159 --repo owner/repo --reason resolved' "$GH_CALLS" &&
+	[[ -f "${AIDEVOPS_AUTO_DISPATCH_LOCK_DIR}/owner--repo-158" ]] &&
+	[[ -f "${AIDEVOPS_AUTO_DISPATCH_LOCK_DIR}/owner--repo-159" ]]; then
+	pass "batch lock state remains bound to the validated returned issue number"
+else
+	fail "batch lock state remains bound to the validated returned issue number"
+fi
+
+reset_gh_calls
+GH_BATCH_JSON='{"data":{"repository":{"issue_58":{"number":58,"locked":false}}}}'
+GH_LOCKED=true
+snapshot='[{"number":58,"labels":[{"name":"auto-dispatch"}]}]'
+if reconcile_auto_dispatch_issue_locks owner/repo "$snapshot" &&
+	[[ "$(grep -c -- '^api graphql ' "$GH_CALLS")" -eq 1 ]] &&
+	[[ "$(grep -c -- '^api repos/owner/repo/issues/58 --jq .locked' "$GH_CALLS")" -eq 1 ]] &&
+	grep -q -- '^issue lock 58 --repo owner/repo --reason resolved' "$GH_CALLS" &&
+	[[ -f "${AIDEVOPS_AUTO_DISPATCH_LOCK_DIR}/owner--repo-58" ]]; then
+	pass "unlocked batch evidence mutates once and verifies the target freshly"
+else
+	fail "unlocked batch evidence mutates once and verifies the target freshly"
 fi
 
 reset_gh_calls

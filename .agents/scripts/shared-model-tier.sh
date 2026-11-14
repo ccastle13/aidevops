@@ -17,7 +17,7 @@
 #   - model_tier_variant <tier> <model> — model-specific/provider variant.
 #   - model_tier_escalation_order       — normalized configured tiers, one/line.
 #   - model_tier_next <tier>          — next capability tier, when configured.
-#   - model_tier_for_model <model>     — configured tier containing a model.
+#   - model_tier_for_model <model> [preferred_tier] — configured tier containing a model.
 #   - resolve_model_tier <tier>       — tier name → full provider/model string.
 #                                       Tries fallback-chain-helper.sh first
 #                                       (availability-aware), falls back to a
@@ -145,6 +145,41 @@ model_routing_custom_table_validation_findings() {
 }
 
 #######################################
+# Print custom-table entries using providers unavailable to headless workers.
+# Google is excluded because it is also a native API-key provider.
+#######################################
+model_routing_custom_table_interactive_only_findings() {
+	local custom_table="$1"
+	local framework_table="$2"
+	[[ -n "$custom_table" && "$custom_table" != "$framework_table" ]] || return 0
+	command -v jq >/dev/null 2>&1 || return 0
+	jq -r '
+		(.tiers // {}) | to_entries[]
+		| select((.value | type) == "object" and (.value.models | type) == "array")
+		| .key as $tier
+		| .value.models[] | strings
+		| select(test("^(claudecli|cursor)/"))
+		| "\($tier): \(.)"
+	' "$custom_table" 2>/dev/null || true
+	return 0
+}
+
+#######################################
+# Warn once about interactive-only providers in custom routing tables.
+#######################################
+model_routing_warn_interactive_only_providers() {
+	local custom_table="$1"
+	local framework_table="$2"
+	local findings=""
+	[[ "${_MODEL_ROUTING_INTERACTIVE_ONLY_WARNING_EMITTED:-0}" != "1" ]] || return 0
+	findings=$(model_routing_custom_table_interactive_only_findings "$custom_table" "$framework_table") || return 0
+	[[ -n "$findings" ]] || return 0
+	_MODEL_ROUTING_INTERACTIVE_ONLY_WARNING_EMITTED=1
+	printf 'WARNING: custom model routing table lists interactive-only providers; headless workers cannot use them and fall through to the next candidate (use anthropic/* via the OAuth pool for Claude subscriptions): %s\n' "${findings//$'\n'/; }" >&2
+	return 0
+}
+
+#######################################
 # Warn once when a custom routing-table tier cannot supply candidates.
 #######################################
 model_routing_warn_invalid_custom_table() {
@@ -180,6 +215,7 @@ model_tier_candidates() {
 	framework_table=$(model_routing_framework_table_path 2>/dev/null) || framework_table=""
 	if command -v jq >/dev/null 2>&1; then
 		model_routing_warn_invalid_custom_table "$routing_table" "$framework_table"
+		model_routing_warn_interactive_only_providers "$routing_table" "$framework_table"
 		local table=""
 		local previous_table=""
 		for table in "$routing_table" "$framework_table"; do
@@ -202,12 +238,33 @@ model_tier_candidates() {
 	fi
 
 	case "$tier" in
-	simple) printf '%s\n' "openai/gpt-5.6-luna" "anthropic/claude-haiku-4-5" ;;
-	standard) printf '%s\n' "openai/gpt-5.6-terra" "zai-coding-plan/glm-5.2" "anthropic/claude-sonnet-4-6" ;;
-	thinking) printf '%s\n' "openai/gpt-5.6-sol" "anthropic/claude-opus-4-6" ;;
+	simple) printf '%s\n' "openai/gpt-6-luna" "anthropic/claude-haiku-5-5" ;;
+	standard) printf '%s\n' "anthropic/claude-sonnet-5-5" "openai/gpt-6.1-sol" "openai/gpt-6.1-terra" "opencode-go/deepseek-v4.1-flash" ;;
+	thinking) printf '%s\n' "anthropic/claude-opus-5-5" "openai/gpt-6.1-sol" ;;
 	*) return 1 ;;
 	esac
 	return 0
+}
+
+#######################################
+# Return success only when this tier opts in to provider-level round-robin.
+# A custom tier without this setting inherits the framework default (false).
+#######################################
+model_tier_round_robin_enabled() {
+	local tier="${1:-standard}"
+	local table=""
+	local framework_table=""
+	local value=""
+	command -v jq >/dev/null 2>&1 || return 1
+	table=$(model_routing_table_path 2>/dev/null) || return 1
+	framework_table=$(model_routing_framework_table_path 2>/dev/null) || return 1
+	if [[ "$table" != "$framework_table" ]]; then
+		value=$(jq -r --arg tier "$tier" '.tiers[$tier].round_robin as $value | if ($value | type) == "boolean" then ($value | tostring) else empty end' "$table" 2>/dev/null) || return 1
+	fi
+	if [[ -z "$value" ]]; then
+		value=$(jq -r --arg tier "$tier" '.tiers[$tier].round_robin as $value | if ($value | type) == "boolean" then ($value | tostring) else "false" end' "$framework_table" 2>/dev/null) || return 1
+	fi
+	[[ "$value" == "true" ]]
 }
 
 #######################################
@@ -266,6 +323,12 @@ model_tier_variant() {
 	local variant_result=""
 	local table=""
 	local previous_table=""
+	local minimum='medium'
+	local floor="$minimum"
+	if [[ -n "$routing_table" && -r "$routing_table" ]]; then
+		floor=$(jq -r --arg minimum "$minimum" '.settings.minimum_reasoning // $minimum' "$routing_table" 2>/dev/null) || floor="$minimum"
+	fi
+	case "$floor" in high | xhigh | max) ;; *) floor="$minimum" ;; esac
 	for table in "$routing_table" "$framework_table"; do
 		[[ -n "$table" && -r "$table" && "$table" != "$previous_table" ]] || continue
 		previous_table="$table"
@@ -285,7 +348,44 @@ model_tier_variant() {
 		' "$table" 2>/dev/null) || variant_result=""
 		if [[ "$variant_result" == "found"$'\t'* ]]; then
 			variant="${variant_result#*$'\t'}"
+			case "$variant" in
+			low | minimal | none) variant="$floor" ;;
+			medium) [[ "$floor" == "$minimum" ]] || variant="$floor" ;;
+			esac
 			[[ -z "$variant" ]] || printf '%s\n' "$variant"
+			return 0
+		fi
+	done
+	return 1
+}
+
+#######################################
+# Print the next explicitly configured reasoning level for this exact model.
+# Invalid, duplicate, descending, exhausted or unknown ladders fail closed.
+#######################################
+model_tier_next_variant() {
+	local requested_tier="$1"
+	local model="$2"
+	local current="$3"
+	local tier="" table="" routing_table="" framework_table="" previous_table=""
+	tier=$(normalize_model_tier_name "$requested_tier")
+	routing_table=$(model_routing_table_path 2>/dev/null) || routing_table=""
+	framework_table=$(model_routing_framework_table_path 2>/dev/null) || framework_table=""
+	command -v jq >/dev/null 2>&1 || return 1
+	for table in "$routing_table" "$framework_table"; do
+		[[ -n "$table" && -r "$table" && "$table" != "$previous_table" ]] || continue
+		previous_table="$table"
+		if jq -e --arg tier "$tier" --arg model "$model" \
+			'.tiers[$tier].reasoning_escalation | type == "object" and has($model)' "$table" >/dev/null 2>&1; then
+			jq -er --arg tier "$tier" --arg model "$model" --arg current "$current" '
+				["medium", "high", "xhigh", "max"] as $levels
+				| .tiers[$tier].reasoning_escalation[$model] as $ladder
+				| select(($ladder | type) == "array")
+				| [$ladder[] | . as $level | $levels | index($level)] as $ranks
+				| select(($ranks | all(. != null)) and ($ranks == ($ranks | sort | unique)))
+				| ($ladder | index($current)) as $index
+				| select($index != null) | $ladder[$index + 1] // empty
+			' "$table" 2>/dev/null || return 1
 			return 0
 		fi
 	done
@@ -353,11 +453,20 @@ model_tier_next() {
 }
 
 #######################################
-# Print the first configured tier containing a concrete model.
+# Print the configured tier containing a concrete model.
+# A model may serve several tiers at different reasoning levels (e.g. Sol:
+# standard low, thinking medium). When preferred_tier lists the model it wins;
+# otherwise the first tier in escalation order is returned.
+# Arguments: model [preferred_tier]
 #######################################
 model_tier_for_model() {
 	local model="$1"
+	local preferred_tier="${2:-}"
 	local tier="" candidate=""
+	if [[ -n "$preferred_tier" ]] && model_tier_candidate_index "$preferred_tier" "$model" >/dev/null 2>&1; then
+		printf '%s\n' "$preferred_tier"
+		return 0
+	fi
 	while IFS= read -r tier; do
 		while IFS= read -r candidate; do
 			if [[ "$candidate" == "$model" ]]; then
@@ -530,7 +639,7 @@ get_model_pricing() {
 			.models | to_entries[] |
 			select(.key as $k | $ms | contains($k)) |
 			"\(.value.input)|\(.value.output)|\(.value.cache_read)|\(.value.cache_write)"
-		' 2>/dev/null | head -1)
+		' 2>/dev/null | sed -n '1p')
 		if [[ -n "$result" ]]; then
 			echo "$result"
 			return 0
@@ -550,20 +659,29 @@ get_model_pricing() {
 	ms="${ms%%-202*}"
 	case "$ms" in
 	*gpt-5.6-sol-pro*) echo "$fallback_default_pricing" ;;
-	*gpt-5.6-sol*) echo "5.0|30.0|0.50|6.25" ;;
+	*gpt-6-astra*) echo "10.0|50.0|1.0|12.50" ;;
+	*gpt-6.1-sol*) echo "2.0|10.0|0.10|2.50" ;;
+	*gpt-6.1-terra*) echo "1.0|5.0|0.05|1.25" ;;
+	*gpt-6-sol*) echo "2.0|10.0|0.20|2.50" ;;
+	*gpt-6-luna*) echo "0.10|0.50|0.01|0.125" ;;
+	*gpt-5.6-sol*) echo "4.0|20.0|0.40|5.0" ;;
 	*gpt-5.6-terra*) echo "2.0|12.0|0.20|2.50" ;;
 	*gpt-5.6-luna*) echo "0.20|1.20|0.02|0.25" ;;
 	*opus-4* | *claude-opus*) echo "15.0|75.0|1.50|18.75" ;;
 	*sonnet-4* | *claude-sonnet*) echo "$fallback_default_pricing" ;;
+	*haiku-5-5*) echo "0.10|0.50|0.01|0.125" ;;
 	*haiku-4* | *haiku-3* | *claude-haiku*) echo "0.80|4.0|0.08|1.0" ;;
 	*gpt-4.1-mini*) echo "0.40|1.60|0.10|0.40" ;;
 	*gpt-4.1*) echo "2.0|8.0|0.50|2.0" ;;
-	*o3*) echo "10.0|40.0|2.50|10.0" ;;
+	*o3-pro*) echo "20.0|80.0|0|0" ;;
+	*o3-mini*) echo "1.10|4.40|0.55|1.10" ;;
+	*o3*) echo "2.0|8.0|0.50|2.0" ;;
 	*o4-mini*) echo "1.10|4.40|0.275|1.10" ;;
 	*gemini-2.5-pro*) echo "1.25|10.0|0.3125|2.50" ;;
 	*gemini-2.5-flash*) echo "0.15|0.60|0.0375|0.15" ;;
 	*gemini-3-pro*) echo "1.25|10.0|0.3125|2.50" ;;
 	*gemini-3-flash*) echo "0.10|0.40|0.025|0.10" ;;
+	*deepseek-v4.1-flash*) echo "0.15|0.60|0.003|0" ;;
 	*deepseek-r1*) echo "0.55|2.19|0.14|0.55" ;;
 	*deepseek-v3*) echo "0.27|1.10|0.07|0.27" ;;
 	*) echo "$fallback_default_pricing" ;;
@@ -578,6 +696,7 @@ get_provider_from_model() {
 	gpt-* | openai/*) echo "openai" ;;
 	gemini-* | google/*) echo "google" ;;
 	deepseek-* | deepseek/*) echo "deepseek" ;;
+	opencode-go/*) echo "opencode-go" ;;
 	grok-* | xai/*) echo "xai" ;;
 	*) echo "unknown" ;;
 	esac

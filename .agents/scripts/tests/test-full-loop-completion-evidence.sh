@@ -16,7 +16,69 @@ cat >"${ROOT}/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 merge_sha="${COMPLETION_PR_MERGE_SHA:-1111111111111111111111111111111111111111}"
 release_mode="${COMPLETION_RELEASE_MODE:-valid}"
-if [[ "$*" == *"repos/marcusquinn/aidevops/git/ref/tags/v3.0.0"* ]]; then
+if [[ "$*" == *"repos/testorg/app"* ]]; then
+	mode="${COMPLETION_DEPLOYMENT_MODE:-valid}"
+	run_id="${COMPLETION_DEPLOYMENT_RUN_ID:-900}"
+	run_attempt="${COMPLETION_DEPLOYMENT_ATTEMPT:-1}"
+	[[ "$mode" != "api-failure" ]] || exit 70
+	case "$*" in
+	"api repos/testorg/app")
+		jq -cn --arg mode "$mode" '{full_name:"testorg/app",archived:false,permissions:{push:($mode != "external")}}' ;;
+	*"/pulls/"*)
+		jq -cn --arg mode "$mode" '{merged:($mode != "unmerged"),state:"closed",merged_at:"2026-07-11T00:00:00Z",
+			merge_commit_sha:"1111111111111111111111111111111111111111",base:{ref:"develop",repo:{full_name:"testorg/app"}}}' ;;
+	*"/collaborators/"*)
+		jq -cn --arg mode "$mode" --arg call "$*" '{permission:
+			(if $mode == "untrusted" or ($mode == "untrusted-rerun" and ($call | contains("rerunner"))) then "read" else "write" end)}' ;;
+	*"/actions/workflows/deploy.yml/runs"*)
+		jq -cn --arg mode "$mode" --argjson id "$run_id" --argjson attempt "$run_attempt" \
+			'{workflow_runs:[{id:(if $mode == "stale" then 901 else $id end),
+			status:"completed",conclusion:"success",run_attempt:$attempt,head_sha:"3333333333333333333333333333333333333333"}]}' ;;
+	*"/actions/workflows/deploy.yml")
+		printf '%s\n' '{"id":12,"path":".github/workflows/deploy.yml"}' ;;
+	*"/actions/runs/900"|*"/actions/runs/901")
+		jq -cn --arg mode "$mode" --argjson id "$run_id" --argjson attempt "$run_attempt" \
+			'{id:$id,workflow_id:(if $mode == "wrong-workflow" then 13 else 12 end),
+			path:".github/workflows/deploy.yml",repository:{full_name:"testorg/app"},
+			head_repository:{full_name:(if $mode == "fork" then "outside/app" else "testorg/app" end)},
+			event:(if $mode == "pr-event" then "pull_request" else "push" end),
+			head_branch:(if $mode == "wrong-branch" then "other" else "develop" end),
+			head_sha:(if $mode == "wrong-sha" then "4444444444444444444444444444444444444444" else "3333333333333333333333333333333333333333" end),
+			status:(if $mode == "pending" then "in_progress" else "completed" end),
+			conclusion:(if $mode == "failed" then "failure" else "success" end),
+			run_attempt:(if $mode == "rerun" then 2 else $attempt end),
+			run_started_at:(if $mode == "pre-merge" then "2026-07-10T00:00:00Z" else "2026-07-11T00:01:00Z" end),
+			actor:{login:"deployer"},triggering_actor:{login:"rerunner"}}' ;;
+	*"/compare/"*)
+		jq -cn --arg mode "$mode" '{status:(if $mode == "unrelated" then "diverged" else "ahead" end),
+			base_commit:{sha:"1111111111111111111111111111111111111111"},
+			merge_base_commit:{sha:(if $mode == "wrong-ancestor" then "2222222222222222222222222222222222222222" else "1111111111111111111111111111111111111111" end)}}' ;;
+	*) exit 71 ;;
+	esac
+	exit 0
+fi
+if [[ "$*" == *"pr view 71 "* ]]; then
+	merge_sha="2222222222222222222222222222222222222222"
+fi
+if [[ "$*" == "api repos/testorg/manual" ]]; then
+	printf '%s\n' '{"archived":false,"permissions":{"admin":true}}'
+	exit 0
+fi
+if [[ "$*" == "api repos/testorg/manual/actions/permissions" ]]; then
+	jq -cn --arg enabled "${COMPLETION_ACTIONS_ENABLED:-true}" '{enabled:($enabled == "true")}'
+	exit 0
+fi
+if [[ "$*" == "api repos/testorg/manual/releases/123" ]]; then
+	jq -cn --arg mode "$release_mode" '{tag_name:"v3.0.0",draft:($mode == "draft-release"),assets:
+		(if $mode == "no-assets" then [] else [{name:"plugin.zip",state:(if $mode == "unfinished-asset" then "new" else "uploaded" end),size:(if $mode == "empty-asset" then 0 else 123 end)}] end)}'
+	exit 0
+fi
+if [[ "$*" == *"repos/testorg/manual/compare/"* ]]; then
+	jq -cn --arg status "${COMPLETION_COMPARE_STATUS:-ahead}" \
+		'{status:$status,base_commit:{sha:"2222222222222222222222222222222222222222"},merge_base_commit:{sha:"2222222222222222222222222222222222222222"}}'
+	exit 0
+fi
+if [[ "$*" == *"/git/ref/tags/v3.0.0"* ]]; then
 	if [[ "$release_mode" == "wrong-tag-commit" ]]; then
 		printf '%s\n' '{"ref":"refs/tags/v3.0.0","object":{"type":"commit","sha":"2222222222222222222222222222222222222222"}}'
 	else
@@ -24,7 +86,7 @@ if [[ "$*" == *"repos/marcusquinn/aidevops/git/ref/tags/v3.0.0"* ]]; then
 	fi
 	exit 0
 fi
-if [[ "$*" == *"repos/marcusquinn/aidevops/releases/tags/v3.0.0"* ]]; then
+if [[ "$*" == *"/releases/tags/v3.0.0"* ]]; then
 	if [[ "$release_mode" == "draft-release" ]]; then
 		printf '%s\n' '{"tag_name":"v3.0.0","draft":true}'
 	else
@@ -32,7 +94,7 @@ if [[ "$*" == *"repos/marcusquinn/aidevops/releases/tags/v3.0.0"* ]]; then
 	fi
 	exit 0
 fi
-if [[ "$*" == *"repos/marcusquinn/aidevops/actions/runs?event=release"* ]]; then
+if [[ "$*" == *"/actions/runs?event=release"* || "$*" == *"/actions/workflows/release-verify.yml/runs?event=release"* ]]; then
 	case "$release_mode" in
 	failed-workflow)
 		jq -cn --arg sha "$merge_sha" '{workflow_runs:[{event:"release",status:"completed",conclusion:"failure",head_branch:"v3.0.0",head_sha:$sha}]}'
@@ -44,6 +106,20 @@ if [[ "$*" == *"repos/marcusquinn/aidevops/actions/runs?event=release"* ]]; then
 		jq -cn --arg sha "$merge_sha" '{workflow_runs:[{event:"release",status:"completed",conclusion:"success",head_branch:"v3.0.0",head_sha:$sha}]}'
 		;;
 	esac
+	exit 0
+fi
+if [[ "$*" == *"/actions/workflows/release.yml/runs?event=release&"* ]]; then
+	printf '%s\n' '{"workflow_runs":[]}'
+	exit 0
+fi
+if [[ "$*" == *"/actions/workflows/release.yml/runs?head_sha="* ]]; then
+	case "$release_mode" in
+	diagnostic-unavailable) exit 70 ;;
+	diagnostic-wrong-sha) merge_sha="2222222222222222222222222222222222222222" ;;
+	esac
+	jq -cn --arg sha "$merge_sha" --arg mode "$release_mode" '{workflow_runs:[{event:"push",status:"completed",
+		conclusion:(if $mode == "diagnostic-failed" then "failure" else "success" end),
+		head_branch:(if $mode == "diagnostic-main" then "main" else "v3.0.0" end),head_sha:$sha}]}'
 	exit 0
 fi
 if [[ "$*" == *"repos/marcusquinn/aidevops/actions/workflows/release.yml/runs?event=push&status=success&per_page=100"* ]]; then
@@ -79,6 +155,11 @@ if [[ "$*" == *"headRefName,headRefOid,headRepository,isCrossRepository"* ]]; th
 		--arg head_oid "${COMPLETION_PR_HEAD_OID:-}" \
 		--arg head_repo "${COMPLETION_PR_HEAD_REPO:-}" \
 		'{headRefName:$head_ref,headRefOid:$head_oid,headRepository:{nameWithOwner:$head_repo},isCrossRepository:false}'
+	exit 0
+fi
+if [[ "$*" == *"--json headRefName --jq .headRefName"* ]]; then
+	[[ "${COMPLETION_HEAD_LOOKUP_FAIL:-false}" != true ]] || exit 70
+	printf '%s\n' "${COMPLETION_PR_HEAD_REF:-}"
 	exit 0
 fi
 call_count=1
@@ -182,7 +263,7 @@ DEFAULT_MAX_PR_ITERATIONS=20
 HEADLESS=false
 source '${SCRIPTS_DIR}/shared-constants.sh'
 source '${SCRIPTS_DIR}/full-loop-helper-state.sh'
-cmd_record_published_release "\$@"
+\${COMPLETION_RECORD_COMMAND:-cmd_record_published_release} "\$@"
 RUNNER
 chmod +x "$published_record_runner"
 
@@ -242,6 +323,24 @@ AIDEVOPS_FULL_LOOP_RECEIPT_DIR="$receipt_dir" AIDEVOPS_FULL_LOOP_CLEANUP_DIR="$c
 cmp -s "$published_cleanup_receipt" "${ROOT}/published-release-receipt-before.json"
 printf 'PASS verified manual release records published evidence and reconciles cleanup idempotently\n'
 
+for diagnostic_mode in valid diagnostic-wrong-sha diagnostic-failed diagnostic-main diagnostic-unavailable; do
+	if diagnostic_output=$(COMPLETION_RELEASE_MODE="$diagnostic_mode" AIDEVOPS_FULL_LOOP_RECEIPT_DIR="$receipt_dir" \
+		PATH="${ROOT}/bin:/opt/homebrew/bin:/usr/bin:/bin" \
+		bash "$published_record_runner" 60 v3.0.0 marcusquinn/aidevops --workflow release.yml 2>&1); then
+		printf 'FAIL diagnostic query recorded publication evidence\n'
+		exit 1
+	fi
+	[[ ! -e "${receipt_dir}/marcusquinn_aidevops-60.status" ]]
+	[[ "$diagnostic_output" == *"No successful release run of workflow release.yml"* ]]
+	if [[ "$diagnostic_mode" == "valid" ]]; then
+		[[ "$diagnostic_output" == *"Successful events of workflow release.yml"*": push"* ]]
+		[[ "$diagnostic_output" == *"--event push"* ]]
+	else
+		[[ "$diagnostic_output" != *"--event push"* ]]
+	fi
+done
+printf 'PASS missing release event suggests matching tag-push evidence without accepting mismatched or unavailable diagnostics\n'
+
 push_published_worktree="${ROOT}/push-published-release-worktree"
 mkdir -p "$push_published_worktree"
 push_published_receipt=$(full_loop_write_cleanup_deferred marcusquinn/aidevops 61 "$push_published_worktree" \
@@ -253,6 +352,23 @@ AIDEVOPS_FULL_LOOP_RECEIPT_DIR="$receipt_dir" AIDEVOPS_FULL_LOOP_CLEANUP_DIR="$c
 grep -qx 'published' "${receipt_dir}/marcusquinn_aidevops-61.status"
 jq -e '.release_status == "published"' "$push_published_receipt" >/dev/null
 printf 'PASS exact repository-owned push workflow records published evidence\n'
+
+# The opt-in does not change the exact-commit path or existing receipt bytes.
+cp "$push_published_receipt" "${ROOT}/generated-opt-in-before.json"
+AIDEVOPS_FULL_LOOP_RECEIPT_DIR="$receipt_dir" AIDEVOPS_FULL_LOOP_CLEANUP_DIR="$cleanup_receipt_dir" \
+	PATH="${ROOT}/bin:/opt/homebrew/bin:/usr/bin:/bin" \
+	bash "$published_record_runner" 61 v3.0.0 marcusquinn/aidevops \
+		--workflow release.yml --event push --generated-cloudron-catalog >/dev/null
+cmp -s "$push_published_receipt" "${ROOT}/generated-opt-in-before.json"
+if COMPLETION_RELEASE_MODE=wrong-tag-commit AIDEVOPS_FULL_LOOP_RECEIPT_DIR="$receipt_dir" \
+	AIDEVOPS_FULL_LOOP_CLEANUP_DIR="$cleanup_receipt_dir" PATH="${ROOT}/bin:/opt/homebrew/bin:/usr/bin:/bin" \
+	bash "$published_record_runner" 61 v3.0.0 marcusquinn/aidevops \
+		--workflow release.yml --event push --generated-cloudron-catalog >/dev/null 2>&1; then
+	printf 'FAIL generated catalog opt-in accepted an unproven descendant\n'
+	exit 1
+fi
+cmp -s "$push_published_receipt" "${ROOT}/generated-opt-in-before.json"
+printf 'PASS generated catalog opt-in preserves exact-commit replay and rejects missing proof without mutation\n'
 
 for invalid_push_mode in push-failed-workflow push-wrong-event push-wrong-sha; do
 	invalid_push_worktree="${ROOT}/invalid-${invalid_push_mode}"
@@ -314,6 +430,268 @@ if AIDEVOPS_FULL_LOOP_RECEIPT_DIR="$receipt_dir" AIDEVOPS_FULL_LOOP_CLEANUP_DIR=
 fi
 grep -qx 'not-requested' "${receipt_dir}/marcusquinn_aidevops-60.status"
 printf 'PASS conflicting terminal receipts cannot be replaced by manual publication evidence\n'
+
+# Manual inclusion uses an independently published version-bump PR, never the
+# feature PR's ancestry as a replacement for exact source-tag evidence.
+export AIDEVOPS_FULL_LOOP_RECEIPT_DIR="$receipt_dir"
+export PATH="${ROOT}/bin:/opt/homebrew/bin:/usr/bin:/bin"
+included_status="${receipt_dir}/testorg_manual-71.status"
+included_evidence="${receipt_dir}/testorg_manual-71.aggregate.json"
+if COMPLETION_RECORD_COMMAND=cmd_record_included_release bash "$published_record_runner" \
+	71 70 v3.0.0 testorg/manual --workflow release-verify.yml >/dev/null 2>&1; then
+	printf 'FAIL inclusion accepted a missing source published receipt\n'
+	exit 1
+fi
+[[ ! -e "$included_status" && ! -e "$included_evidence" ]]
+bash "$published_record_runner" 70 v3.0.0 testorg/manual --workflow release-verify.yml >/dev/null
+grep -qx published "${receipt_dir}/testorg_manual-70.status"
+for invalid_inclusion_mode in wrong-tag-commit draft-release failed-workflow wrong-workflow-tag; do
+	if COMPLETION_RELEASE_MODE="$invalid_inclusion_mode" COMPLETION_RECORD_COMMAND=cmd_record_included_release \
+		bash "$published_record_runner" 71 70 v3.0.0 testorg/manual --workflow release-verify.yml >/dev/null 2>&1; then
+		printf 'FAIL inclusion accepted %s\n' "$invalid_inclusion_mode"
+		exit 1
+	fi
+	[[ ! -e "$included_status" && ! -e "$included_evidence" ]]
+done
+for invalid_compare in behind diverged identical; do
+	if COMPLETION_COMPARE_STATUS="$invalid_compare" COMPLETION_RECORD_COMMAND=cmd_record_included_release \
+		bash "$published_record_runner" 71 70 v3.0.0 testorg/manual --workflow release-verify.yml >/dev/null 2>&1; then
+		printf 'FAIL inclusion accepted %s ancestry\n' "$invalid_compare"
+		exit 1
+	fi
+	[[ ! -e "$included_status" && ! -e "$included_evidence" ]]
+done
+printf '%s\n' not-requested >"$included_status"
+COMPLETION_RECORD_COMMAND=cmd_record_included_release bash "$published_record_runner" \
+	71 70 v3.0.0 testorg/manual --workflow release-verify.yml >/dev/null
+grep -qx superseded "$included_status"
+jq -e '.aggregate_pr == 70 and .source_merge == "2222222222222222222222222222222222222222"
+	and .aggregate_merge == .release_commit and .release_tag == "v3.0.0"' "$included_evidence" >/dev/null
+cp "$included_evidence" "${ROOT}/included-before.json"
+COMPLETION_RECORD_COMMAND=cmd_record_included_release bash "$published_record_runner" \
+	71 70 v3.0.0 testorg/manual --workflow release-verify.yml >/dev/null
+cmp -s "$included_evidence" "${ROOT}/included-before.json"
+# Catalog opt-in must still fail closed on an unproven descendant tag commit.
+if COMPLETION_RELEASE_MODE=wrong-tag-commit COMPLETION_RECORD_COMMAND=cmd_record_included_release \
+	bash "$published_record_runner" 71 70 v3.0.0 testorg/manual \
+	--workflow release-verify.yml --event release --generated-cloudron-catalog >/dev/null 2>&1; then
+	printf 'FAIL generated catalog inclusion accepted an unproven descendant tag\n'
+	exit 1
+fi
+cmp -s "$included_evidence" "${ROOT}/included-before.json"
+if COMPLETION_RECORD_COMMAND=cmd_record_included_release bash "$published_record_runner" \
+	71 58 v3.0.0 marcusquinn/aidevops >/dev/null 2>&1; then
+	printf 'FAIL manual inclusion replaced canonical signed aggregation\n'
+	exit 1
+fi
+unset AIDEVOPS_FULL_LOOP_RECEIPT_DIR
+printf 'PASS manual release inclusion verifies source evidence and ancestry, fails closed, and replays without mutation\n'
+
+# Tagless app deployments reuse the existing receipt/cleanup runner, not an app
+# environment or a second test harness. Every remote mutation is unexpected.
+export AIDEVOPS_FULL_LOOP_RECEIPT_DIR="$receipt_dir"
+deployment_sha="3333333333333333333333333333333333333333"
+deployment_receipt="${receipt_dir}/testorg_app-80.status"
+deployment_worktree="${ROOT}/deployment-worktree"
+mkdir -p "$deployment_worktree"
+deployment_cleanup=$(full_loop_write_cleanup_deferred testorg/app 80 "$deployment_worktree" \
+	feature/deployment "$$" deployment-session pending FINALIZATION_PENDING)
+cp "$deployment_cleanup" "${ROOT}/deployment-cleanup-before.json"
+for invalid_deployment in api-failure external unmerged untrusted untrusted-rerun stale \
+	wrong-workflow fork pr-event wrong-branch wrong-sha pending failed pre-merge unrelated wrong-ancestor rerun; do
+	if COMPLETION_DEPLOYMENT_MODE="$invalid_deployment" COMPLETION_RECORD_COMMAND=cmd_record_deployment \
+		bash "$published_record_runner" 80 900 deploy.yml "$deployment_sha" testorg/app >/dev/null 2>&1; then
+		printf 'FAIL tagless deployment accepted %s\n' "$invalid_deployment"
+		exit 1
+	fi
+	[[ ! -e "$deployment_receipt" ]]
+	cmp -s "$deployment_cleanup" "${ROOT}/deployment-cleanup-before.json"
+done
+COMPLETION_RECORD_COMMAND=cmd_record_deployment bash "$published_record_runner" \
+	80 900 deploy.yml "$deployment_sha" testorg/app >/dev/null
+cp "$deployment_receipt" "${ROOT}/deployment-evidence-before"
+COMPLETION_RECORD_COMMAND=cmd_record_deployment bash "$published_record_runner" \
+	80 900 deploy.yml "$deployment_sha" testorg/app >/dev/null
+cmp -s "$deployment_receipt" "${ROOT}/deployment-evidence-before"
+jq -e '.release_status == "published" and .executor_completion_state == "FINALIZATION_PENDING"' "$deployment_cleanup" >/dev/null
+# Repeated shared status persistence must not erase typed evidence.
+COMPLETION_RECORD_COMMAND=_full_loop_write_release_receipt bash "$published_record_runner" \
+	testorg/app 80 published
+cmp -s "$deployment_receipt" "${ROOT}/deployment-evidence-before"
+if bash "$migration_runner" 80 testorg/app testorg/renamed-app >/dev/null 2>&1; then
+	printf 'FAIL legacy migration discarded typed deployment proof\n'
+	exit 1
+fi
+cmp -s "$deployment_receipt" "${ROOT}/deployment-evidence-before"
+[[ ! -e "${receipt_dir}/testorg_renamed-app-80.status" ]]
+deployment_payload=$(jq -Rrs 'split("\n")[1]' "$deployment_receipt")
+cp "$deployment_cleanup" "${ROOT}/deployment-recorded-cleanup"
+for corrupt_framing in wrong-header trailing-data empty-payload missing-newline; do
+	case "$corrupt_framing" in
+	wrong-header) printf 'failed\n%s\n' "$deployment_payload" >"$deployment_receipt" ;;
+	trailing-data) printf 'published\n%s\nunexpected trailing data\n' "$deployment_payload" >"$deployment_receipt" ;;
+	empty-payload) printf 'published\n\n' >"$deployment_receipt" ;;
+	missing-newline) printf 'published\n%s' "$deployment_payload" >"$deployment_receipt" ;;
+	esac
+	if COMPLETION_RECORD_COMMAND=cmd_record_deployment bash "$published_record_runner" \
+		80 900 deploy.yml "$deployment_sha" testorg/app >/dev/null 2>&1; then
+		printf 'FAIL recording accepted corrupted deployment framing\n'
+		exit 1
+	fi
+	if bash "$finalize_runner" 80 testorg/app >/dev/null 2>&1; then
+		printf 'FAIL finalization accepted corrupted deployment framing\n'
+		exit 1
+	fi
+	cp "$deployment_receipt" "${ROOT}/corrupted-deployment-before"
+	if COMPLETION_RECORD_COMMAND=_full_loop_write_release_receipt bash "$published_record_runner" \
+		testorg/app 80 published >/dev/null 2>&1; then
+		printf 'FAIL shared status writer erased corrupted deployment proof\n'
+		exit 1
+	fi
+	if bash "$migration_runner" 80 testorg/app testorg/renamed-app >/dev/null 2>&1; then
+		printf 'FAIL migration erased corrupted deployment proof\n'
+		exit 1
+	fi
+	cmp -s "$deployment_receipt" "${ROOT}/corrupted-deployment-before"
+	cmp -s "$deployment_cleanup" "${ROOT}/deployment-recorded-cleanup"
+done
+cp "${ROOT}/deployment-evidence-before" "$deployment_receipt"
+for invalid_deployment in failed stale untrusted rerun; do
+	if COMPLETION_DEPLOYMENT_MODE="$invalid_deployment" bash "$finalize_runner" 80 testorg/app >/dev/null 2>&1; then
+		printf 'FAIL finalization accepted invalidated deployment %s\n' "$invalid_deployment"
+		exit 1
+	fi
+done
+# A fresh attestation repairs stale evidence without permitting failed repairs,
+# workflow changes, or rollback to an older run/attempt.
+export COMPLETION_DEPLOYMENT_RUN_ID=901
+if bash "$finalize_runner" 80 testorg/app >/dev/null 2>&1; then
+	printf 'FAIL stale receipt finalized before re-attestation\n'
+	exit 1
+fi
+COMPLETION_RECORD_COMMAND=cmd_record_deployment bash "$published_record_runner" \
+	80 901 deploy.yml "$deployment_sha" testorg/app >/dev/null
+jq -Rse 'split("\n")[1] | fromjson | .run_id == 901 and .run_attempt == 1' "$deployment_receipt" >/dev/null
+cp "$deployment_receipt" "${ROOT}/deployment-recovered"
+export COMPLETION_DEPLOYMENT_ATTEMPT=2
+if COMPLETION_DEPLOYMENT_MODE=failed COMPLETION_RECORD_COMMAND=cmd_record_deployment \
+	bash "$published_record_runner" 80 901 deploy.yml "$deployment_sha" testorg/app >/dev/null 2>&1; then
+	printf 'FAIL failed rerun repaired receipt\n'
+	exit 1
+fi
+cmp -s "$deployment_receipt" "${ROOT}/deployment-recovered"
+COMPLETION_RECORD_COMMAND=cmd_record_deployment bash "$published_record_runner" \
+	80 901 deploy.yml "$deployment_sha" testorg/app >/dev/null
+jq -Rse 'split("\n")[1] | fromjson | .run_id == 901 and .run_attempt == 2' "$deployment_receipt" >/dev/null
+cp "$deployment_receipt" "${ROOT}/deployment-recovered"
+if COMPLETION_DEPLOYMENT_ATTEMPT=1 COMPLETION_RECORD_COMMAND=cmd_record_deployment \
+	bash "$published_record_runner" 80 901 deploy.yml "$deployment_sha" testorg/app >/dev/null 2>&1; then
+	printf 'FAIL receipt rolled back to an older attempt\n'
+	exit 1
+fi
+if COMPLETION_DEPLOYMENT_RUN_ID=900 COMPLETION_RECORD_COMMAND=cmd_record_deployment \
+	bash "$published_record_runner" 80 900 deploy.yml "$deployment_sha" testorg/app >/dev/null 2>&1; then
+	printf 'FAIL receipt rolled back to an older run\n'
+	exit 1
+fi
+cmp -s "$deployment_receipt" "${ROOT}/deployment-recovered"
+bash "$finalize_runner" 80 testorg/app >/dev/null
+unset COMPLETION_DEPLOYMENT_RUN_ID COMPLETION_DEPLOYMENT_ATTEMPT
+jq -e '.release_status == "published" and .executor_completion_state == "COMPLETE"
+	and .resource_cleanup_state == "CLEANUP_DEFERRED" and .owner.pid > 0' "$deployment_cleanup" >/dev/null
+[[ -d "$deployment_worktree" ]]
+full_loop_cleanup_owner_alive "$deployment_cleanup"
+if bash "$record_runner" 80 testorg/app >/dev/null 2>&1; then
+	printf 'FAIL deployment overwritten by not-requested\n'
+	exit 1
+fi
+for bad_workflow in ../deploy.yml arbitrary.json; do
+	if COMPLETION_RECORD_COMMAND=cmd_record_deployment bash "$published_record_runner" \
+		81 900 "$bad_workflow" "$deployment_sha" testorg/app >/dev/null 2>&1; then
+		printf 'FAIL deployment accepted unsafe workflow\n'
+		exit 1
+	fi
+done
+if COMPLETION_RECORD_COMMAND=cmd_record_deployment bash "$published_record_runner" \
+	81 900 deploy.yml "$deployment_sha" marcusquinn/aidevops >/dev/null 2>&1; then
+	printf 'FAIL deployment bypassed canonical versioned release\n'
+	exit 1
+fi
+printf 'published\n{"schema_version":1,"evidence_type":"tagless-deployment","repository":"testorg/app","pr_number":81}\n' \
+	>"${receipt_dir}/testorg_app-81.status"
+if bash "$finalize_runner" 81 testorg/app >/dev/null 2>&1; then
+	printf 'FAIL forged local JSON finalized deployment\n'
+	exit 1
+fi
+unset AIDEVOPS_FULL_LOOP_RECEIPT_DIR
+printf 'PASS tagless deployment validates remote evidence, rejects unsafe/stale proof, replays and finalizes without live-owner cleanup\n'
+
+# Execute the workflow's actual verification shell, without publishing anything.
+# Needs PyYAML: CI installs it and must never skip; locally skip only this section.
+if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+	if [[ "${CI:-}" == "true" ]]; then
+		printf 'FAIL actual workflow shell verification: PyYAML unavailable under CI=true\n'
+		exit 1
+	fi
+	printf 'SKIP actual workflow shell verification: PyYAML unavailable (CI installs PyYAML==6.0.3)\n'
+else
+python3 - "$SCRIPTS_DIR" "$ROOT" <<'PY'
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import yaml
+
+scripts = Path(sys.argv[1]).resolve()
+root = Path(sys.argv[2])
+repo = scripts.parent.parent
+workflow = yaml.safe_load((repo / '.github/workflows/release-verify-reusable.yml').read_text())
+step = next(s for s in workflow['jobs']['verify']['steps'] if s.get('name', '').startswith('Verify release,'))
+sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+env = dict(os.environ, GH_REPO='testorg/manual', TAG='v3.0.0', RELEASE_ID='123',
+           GITHUB_SHA=sha, COMPLETION_PR_MERGE_SHA=sha)
+for mode, expected, success in [('valid', 'plugin.zip', True), ('valid', '', True),
+                               ('valid', 'missing.zip', False), ('draft-release', '', False),
+                               ('no-assets', '', False), ('empty-asset', '', False),
+                               ('unfinished-asset', '', False), ('wrong-tag-commit', '', False)]:
+    result = subprocess.run(['bash', '-c', step['run']], env=dict(env, COMPLETION_RELEASE_MODE=mode,
+                            EXPECTED_ASSETS=expected), capture_output=True, text=True)
+    assert (result.returncode == 0) == success, (mode, expected, result.stderr)
+print('PASS actual workflow shell verifies exact tag and uploaded assets, rejects invalid publication')
+
+home = root / 'workflow-home'
+target = home / 'repo'
+templates = home / '.aidevops/agents/templates/workflows'
+templates.mkdir(parents=True)
+(home / '.config/aidevops').mkdir(parents=True)
+(target / '.github/workflows').mkdir(parents=True)
+subprocess.run(['git', 'init', '-q', str(target)], check=True)
+subprocess.run(['git', '-C', str(target), 'remote', 'add', 'origin', 'git@github.com:testorg/manual.git'], check=True)
+template = scripts.parent / 'templates/workflows/release-verify-caller.yml'
+shutil.copy(template, templates / template.name)
+(home / '.config/aidevops/repos.json').write_text(json.dumps({'initialized_repos': [
+    {'slug': 'testorg/manual', 'path': str(target), 'local_only': False}]}))
+sync_env = dict(os.environ, HOME=str(home))
+command = ['bash', str(scripts / 'sync-workflows-helper.sh'), '--repo', 'testorg/manual',
+           '--workflow', 'release-verify', '--install-missing', '--json']
+result = subprocess.run(command, env=sync_env, check=True, capture_output=True, text=True)
+assert 'PLANNED' in result.stdout, result.stdout
+result = subprocess.run(command, env=dict(sync_env, COMPLETION_ACTIONS_ENABLED='false'),
+                        check=True, capture_output=True, text=True)
+assert 'actions-disabled' in result.stdout and 'PLANNED' not in result.stdout, result.stdout
+subprocess.run(['git', '-C', str(target), 'remote', 'remove', 'origin'], check=True)
+result = subprocess.run(command, env=sync_env, check=True, capture_output=True, text=True)
+assert 'unsupported-forge' in result.stdout and 'PLANNED' not in result.stdout, result.stdout
+shutil.copy(template, target / '.github/workflows/release-verify.yml')
+result = subprocess.run(['bash', str(scripts / 'check-workflows-helper.sh'), '--repo', 'testorg/manual',
+                         '--workflow', 'release-verify', '--json'], env=sync_env,
+                        check=True, capture_output=True, text=True)
+assert 'CURRENT/CALLER' in result.stdout, result.stdout
+print('PASS managed release caller is offered only with Actions enabled and classifies current')
+PY
+fi
 
 direct_worktree="${ROOT}/direct-merge-worktree"
 mkdir -p "$direct_worktree"
@@ -807,10 +1185,42 @@ if bash "$complete_runner" >/dev/null 2>&1; then
 fi
 printf 'PASS release:failed blocks cleanup before worktree removal\n'
 
+# CI checks out a detached HEAD; the handoff needs worktree and branch evidence.
+handoff_repo="${ROOT}/handoff-repo"
+mkdir -p "$handoff_repo"
+git -C "$handoff_repo" init -q -b handoff-test
+merge_state_runner="${ROOT}/merge-state-runner.sh"
+cat >"$merge_state_runner" <<RUNNER
+#!/usr/bin/env bash
+set -euo pipefail
+cd '${handoff_repo}'
+SCRIPT_DIR='${SCRIPTS_DIR}'
+STATE_DIR='${ROOT}/merge-state'
+STATE_FILE="\${STATE_DIR}/full-loop.state"
+DEFAULT_MAX_TASK_ITERATIONS=50
+DEFAULT_MAX_PREFLIGHT_ITERATIONS=5
+DEFAULT_MAX_PR_ITERATIONS=20
+HEADLESS=false
+source '${SCRIPTS_DIR}/shared-constants.sh'
+source '${SCRIPTS_DIR}/full-loop-helper-state.sh'
+mkdir -p "\$STATE_DIR"
+STARTED_AT=2026-07-11T00:00:00Z
+save_state task test "\${TEST_INITIAL_PR:-}" "\$STARTED_AT"
+_full_loop_record_merged_pr 99 testorg/repo
+load_state
+printf '%s\n' "\$PR_NUMBER"
+RUNNER
+chmod +x "$merge_state_runner"
+[[ "$(PATH="${ROOT}/bin:$PATH" TEST_INITIAL_PR=42 COMPLETION_PR_HEAD_REF=chore/release-v3.0.0-provenance bash "$merge_state_runner")" == 42 ]]
+[[ "$(PATH="${ROOT}/bin:$PATH" TEST_INITIAL_PR=42 COMPLETION_HEAD_LOOKUP_FAIL=true bash "$merge_state_runner")" == 42 ]]
+[[ "$(PATH="${ROOT}/bin:$PATH" TEST_INITIAL_PR=42 COMPLETION_PR_HEAD_REF=handoff-test bash "$merge_state_runner")" == 99 ]]
+[[ "$(PATH="${ROOT}/bin:$PATH" COMPLETION_PR_HEAD_REF=foreign bash "$merge_state_runner")" == 99 ]]
+printf 'PASS merged PR bookkeeping preserves foreign loop identity and permits matching or unbound state\n'
 handoff_runner="${ROOT}/handoff-runner.sh"
 cat >"$handoff_runner" <<RUNNER
 #!/usr/bin/env bash
 set -euo pipefail
+cd '${handoff_repo}'
 SCRIPT_DIR='${SCRIPTS_DIR}'
 STATE_DIR='${ROOT}/handoff-state'
 STATE_FILE='${ROOT}/handoff-state/full-loop.state'
@@ -834,10 +1244,102 @@ handoff_output=$(AIDEVOPS_FULL_LOOP_REPO=testorg/repo AIDEVOPS_FULL_LOOP_CLEANUP
 printf '%s\n' "$handoff_output" | grep -q '<promise>FULL_LOOP_CLEANUP_DEFERRED</promise>'
 handoff_json="${handoff_output##*$'\n'}"
 printf '%s' "$handoff_json" | jq -e \
-	'.executor_completion_state == "COMPLETE" and .resource_cleanup_state == "CLEANUP_DEFERRED"' >/dev/null
+	'.executor_completion_state == "COMPLETE"
+	and .executor_status == "complete"
+	and .resource_cleanup_state == "CLEANUP_DEFERRED"
+	and .next_action == "await-resource-cleanup"
+	and .phase_is_historical == true' >/dev/null
 jq -e '.executor_completion_state == "COMPLETE" and .release_status == "not-requested"' \
 	"${cleanup_receipt_dir}/testorg_repo-43.json" >/dev/null
 printf 'PASS interactive completion emits durable executor handoff and machine-readable cleanup state\n'
+
+status_runner="${ROOT}/status-runner.sh"
+cat >"$status_runner" <<RUNNER
+#!/usr/bin/env bash
+set -euo pipefail
+cd '${handoff_repo}'
+SCRIPT_DIR='${SCRIPTS_DIR}'
+STATE_DIR='${ROOT}/handoff-state'
+STATE_FILE='${ROOT}/handoff-state/full-loop.state'
+DEFAULT_MAX_TASK_ITERATIONS=50
+DEFAULT_MAX_PREFLIGHT_ITERATIONS=5
+DEFAULT_MAX_PR_ITERATIONS=20
+HEADLESS=false
+source '${SCRIPTS_DIR}/shared-constants.sh'
+source '${SCRIPTS_DIR}/full-loop-helper-state.sh'
+cmd_status --json
+RUNNER
+chmod +x "$status_runner"
+handoff_receipt="${cleanup_receipt_dir}/testorg_repo-43.json"
+cp "$handoff_receipt" "${ROOT}/handoff-receipt-valid.json"
+cp "${ROOT}/handoff-state/full-loop.state" "${ROOT}/handoff-state-valid"
+status_repeat_one=$(AIDEVOPS_FULL_LOOP_REPO=testorg/repo AIDEVOPS_FULL_LOOP_CLEANUP_DIR="$cleanup_receipt_dir" bash "$status_runner")
+status_repeat_two=$(AIDEVOPS_FULL_LOOP_REPO=testorg/repo AIDEVOPS_FULL_LOOP_CLEANUP_DIR="$cleanup_receipt_dir" bash "$status_runner")
+printf '%s' "$status_repeat_one" | jq -e '.next_action == "await-resource-cleanup" and .phase_is_historical == true' >/dev/null
+[[ "$status_repeat_one" == "$status_repeat_two" ]]
+cmp -s "$handoff_receipt" "${ROOT}/handoff-receipt-valid.json"
+cmp -s "${ROOT}/handoff-state/full-loop.state" "${ROOT}/handoff-state-valid"
+printf 'PASS repeated terminal status reads are stable and side-effect free\n'
+
+jq '.executor_completion_state = "FINALIZATION_PENDING"' "$handoff_receipt" >"${handoff_receipt}.tmp"
+mv "${handoff_receipt}.tmp" "$handoff_receipt"
+cp "$handoff_receipt" "${ROOT}/handoff-receipt-pending.json"
+pending_status=$(AIDEVOPS_FULL_LOOP_REPO=testorg/repo AIDEVOPS_FULL_LOOP_CLEANUP_DIR="$cleanup_receipt_dir" bash "$status_runner")
+printf '%s' "$pending_status" | jq -e \
+	'.executor_completion_state == "FINALIZATION_PENDING"
+	and .executor_status != "complete"
+	and .resource_cleanup_state == "CLEANUP_DEFERRED"
+	and .next_action == "complete"
+	and .phase_is_historical == false' >/dev/null
+cmp -s "$handoff_receipt" "${ROOT}/handoff-receipt-pending.json"
+cmp -s "${ROOT}/handoff-state/full-loop.state" "${ROOT}/handoff-state-valid"
+cp "${ROOT}/handoff-receipt-valid.json" "$handoff_receipt"
+printf 'PASS pending finalization status directs to complete without mutating receipt or lifecycle state\n'
+
+mkdir -p "${ROOT}/failing-gh"
+cat >"${ROOT}/failing-gh/gh" <<'GH'
+#!/usr/bin/env bash
+exit 75
+GH
+chmod +x "${ROOT}/failing-gh/gh"
+offline_status=$(PATH="${ROOT}/failing-gh:${PATH}" AIDEVOPS_FULL_LOOP_CLEANUP_DIR="$cleanup_receipt_dir" bash "$status_runner")
+printf '%s' "$offline_status" | jq -e \
+	'.executor_completion_state == "COMPLETE"
+	and .resource_cleanup_state == "CLEANUP_DEFERRED"
+	and .next_action == "await-resource-cleanup"
+	and .phase_is_historical == true' >/dev/null
+printf 'PASS terminal status projects its exact receipt when live repository discovery fails\n'
+
+mkdir -p "${ROOT}/wrong-repo-gh"
+cat >"${ROOT}/wrong-repo-gh/gh" <<'GH'
+#!/usr/bin/env bash
+printf '%s\n' wrong/repo
+GH
+chmod +x "${ROOT}/wrong-repo-gh/gh"
+wrong_live_repo_status=$(PATH="${ROOT}/wrong-repo-gh:${PATH}" AIDEVOPS_FULL_LOOP_CLEANUP_DIR="$cleanup_receipt_dir" bash "$status_runner")
+printf '%s' "$wrong_live_repo_status" | jq -e \
+	'.executor_completion_state == "COMPLETE"
+	and .resource_cleanup_state == "CLEANUP_DEFERRED"
+	and .next_action == "await-resource-cleanup"
+	and .phase_is_historical == true' >/dev/null
+printf 'PASS persisted repository identity outranks unrelated live repository discovery\n'
+
+printf '{invalid\n' >"$handoff_receipt"
+malformed_status=$(AIDEVOPS_FULL_LOOP_REPO=testorg/repo AIDEVOPS_FULL_LOOP_CLEANUP_DIR="$cleanup_receipt_dir" bash "$status_runner")
+printf '%s' "$malformed_status" | jq -e \
+	'.executor_completion_state == "in-progress" and .resource_cleanup_state == "none"
+	and .next_action != "await-resource-cleanup" and .next_action != "none"
+	and .phase_is_historical == false' >/dev/null
+cp "${ROOT}/handoff-receipt-valid.json" "$handoff_receipt"
+jq '.repository = "wrong/repo"' "$handoff_receipt" >"${handoff_receipt}.tmp"
+mv "${handoff_receipt}.tmp" "$handoff_receipt"
+mismatched_status=$(AIDEVOPS_FULL_LOOP_REPO=testorg/repo AIDEVOPS_FULL_LOOP_CLEANUP_DIR="$cleanup_receipt_dir" bash "$status_runner")
+printf '%s' "$mismatched_status" | jq -e \
+	'.executor_completion_state == "in-progress" and .resource_cleanup_state == "none"
+	and .next_action != "await-resource-cleanup" and .next_action != "none"
+	and .phase_is_historical == false' >/dev/null
+cp "${ROOT}/handoff-receipt-valid.json" "$handoff_receipt"
+printf 'PASS malformed and identity-mismatched receipts cannot establish completion\n'
 
 printf '%s\n' published >"${receipt_dir}/marcusquinn_aidevops-44.status"
 published_handoff_output=$(AIDEVOPS_FULL_LOOP_REPO=marcusquinn/aidevops \

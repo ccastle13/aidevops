@@ -80,6 +80,37 @@ restore_scheduler_helper_mocks() {
 	return 0
 }
 
+test_platform_success_calendar_boundary() {
+	if (
+		export HOME="$TEST_DIR/platform-state"
+		# shellcheck source=../routine-log-helper.sh
+		source "$ROUTINE_LOG_HELPER_SH"
+		# shellcheck source=../pulse-routines.sh
+		source "$PULSE_ROUTINES_SH"
+		ROUTINE_STATE_FILE="$HOME/pulse-state.json"
+		_compute_next_run() {
+			printf '%s' never
+			return 0
+		}
+		_update_state_after_run r908 '{"last_status":"success","last_run":"2020-01-01T00:00:00Z"}' failure 1 0 'cron(0 * * * *)' >/dev/null
+		_read_state r908 | jq -e '.last_success == "2020-01-01T00:00:00Z"' >/dev/null || exit 1
+		_update_state_after_run r908 '{}' success 1 0 'cron(0 * * * *)' >/dev/null
+		local state boundary
+		state=$(_read_state r908)
+		boundary=$(_routine_last_run_epoch r908)
+		[[ "$boundary" -gt 0 ]] || exit 1
+		_update_state_after_run r908 "$state" failure 1 0 'cron(0 * * * *)' >/dev/null
+		[[ "$(_routine_last_run_epoch r908)" == "$boundary" ]] || exit 1
+		printf '%s\n' '{"r908":{"last_run":"2099-01-01T00:00:00Z"}}' >"$ROUTINE_STATE_FILE"
+		[[ "$(_routine_last_run_epoch r908)" -gt "$boundary" ]] || exit 1
+	); then
+		print_result 'platform success advances calendar boundary; failure preserves it; newer Pulse wins' 0
+	else
+		print_result 'platform success calendar boundary' 1
+	fi
+	return 0
+}
+
 test_core_routine_logged_command_shape() {
 	local command_text
 	command_text=$(_core_routine_logged_command "r908" "'$TEST_DIR/profile-readme-helper.sh' update")
@@ -204,14 +235,241 @@ HELPER
 	_routine_execute "r777" "sample" "scripts/sample.sh" "" "$TEST_DIR"
 
 	local args=""
-	if [[ -f "$ROUTINE_LOG_CAPTURE" ]]; then
-		args=$(<"$ROUTINE_LOG_CAPTURE")
-	fi
+	local attempts=0
+	while [[ "$attempts" -lt 100 ]]; do
+		[[ ! -f "$ROUTINE_LOG_CAPTURE" ]] || args=$(<"$ROUTINE_LOG_CAPTURE")
+		[[ "$args" == *"--status success"* ]] && break
+		sleep 0.05
+		attempts=$((attempts + 1))
+	done
 	if [[ "$args" == update\ r777\ --status\ success\ --duration\ * ]]; then
 		print_result "pulse routine update passes flags and duration" 0
 	else
 		print_result "pulse routine update passes flags and duration" 1 "$args"
 	fi
+	return 0
+}
+
+test_pulse_script_routine_marks_running_before_terminal_completion() {
+	local fake_home="$TEST_DIR/async-home"
+	local agents_dir="$fake_home/.aidevops/agents"
+	local marker="$TEST_DIR/script-routine.done"
+	local release="$TEST_DIR/script-routine.release"
+	local attempts=0
+	mkdir -p "$agents_dir/scripts" "$TEST_DIR/bin"
+	cat >"$agents_dir/scripts/slow-sample.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+while [[ ! -f "$ROUTINE_SCRIPT_RELEASE" ]]; do
+  sleep 0.05
+done
+: >"$ROUTINE_SCRIPT_DONE"
+SCRIPT
+	printf '#!/usr/bin/env bash\nexit 0\n' >"$TEST_DIR/bin/routine-log-helper.sh"
+	chmod +x "$agents_dir/scripts/slow-sample.sh" "$TEST_DIR/bin/routine-log-helper.sh"
+	HOME="$fake_home"
+	ROUTINE_STATE_FILE="$TEST_DIR/async-state.json"
+	LOGFILE="$TEST_DIR/async-pulse.log"
+	ROUTINE_LOG_HELPER="$TEST_DIR/bin/routine-log-helper.sh"
+	ROUTINE_SCRIPT_DONE="$marker"
+	ROUTINE_SCRIPT_RELEASE="$release"
+	export ROUTINE_SCRIPT_DONE ROUTINE_SCRIPT_RELEASE
+	_routine_execute "r779" "slow sample" "scripts/slow-sample.sh" "" "$TEST_DIR"
+	while [[ "$attempts" -lt 100 ]]; do
+		[[ ! -f "$ROUTINE_STATE_FILE" ]] ||
+			[[ "$(jq -r '.r779.last_status' "$ROUTINE_STATE_FILE")" != "running" ]] || break
+		sleep 0.05
+		attempts=$((attempts + 1))
+	done
+	if [[ "$(jq -r '.r779.last_status' "$ROUTINE_STATE_FILE")" != "running" ]] || ! _routine_retry_blocked r779; then
+		print_result "script routine records running before detached completion" 1
+		return 0
+	fi
+	: >"$release"
+	attempts=0
+	while [[ "$attempts" -lt 100 ]]; do
+		[[ "$(jq -r '.r779.last_status' "$ROUTINE_STATE_FILE")" != "success" ||
+		-d "${ROUTINE_STATE_FILE}.r779.runner" ]] || break
+		sleep 0.05
+		attempts=$((attempts + 1))
+	done
+	if [[ -f "$marker" && "$(jq -r '.r779.last_status' "$ROUTINE_STATE_FILE")" == "success" ]]; then
+		print_result "script routine records running before detached completion" 0
+	else
+		print_result "script routine records running before detached completion" 1
+	fi
+	return 0
+}
+
+test_pulse_runner_lock_release_and_reclaim() {
+	local script="$TEST_DIR/runner-exit.sh"
+	local lock_dir=""
+	local status=""
+	local exit_code=0
+	local dead_pid=0
+	local before=""
+	# shellcheck disable=SC2016 # Expand the fixture's argument when it runs.
+	printf '#!/usr/bin/env bash\nexit "${1:-0}"\n' >"$script"
+	chmod +x "$script"
+	# Exercise fresh shells so EXIT runs after the function locals are gone.
+	# shellcheck disable=SC2089 # Literal quotes in filenames exercise trap escaping.
+	ROUTINE_STATE_FILE="$TEST_DIR/runner state 'quoted'.json"
+	LOGFILE="$TEST_DIR/runner-pulse.log"
+	ROUTINE_LOG_HELPER="$TEST_DIR/bin/routine-log-helper.sh"
+	# shellcheck disable=SC2090 # Export a literal filename, not a shell command.
+	export ROUTINE_STATE_FILE LOGFILE ROUTINE_LOG_HELPER
+	for exit_code in 0 1 75; do
+		case "$exit_code" in
+		0) status=success ;;
+		1) status=failure ;;
+		75) status=deferred ;;
+		esac
+		bash -c 'source "$1"; _routine_run_detached_script r-lock "$2" "$3" "$(date +%s)" "$4"' \
+			_ "$PULSE_ROUTINES_SH" "$script" "$TEST_DIR" "$exit_code"
+		if [[ -d "${ROUTINE_STATE_FILE}.r-lock.runner" ||
+			"$(jq -r '."r-lock".last_status' "$ROUTINE_STATE_FILE")" != "$status" ]]; then
+			print_result "runner releases lock and records $status" 1
+			return 0
+		fi
+		print_result "runner releases lock and records $status" 0
+	done
+	# A reaped process supplies a demonstrably dead PID, not a guessed PID.
+	bash -c 'exit 0' &
+	dead_pid=$!
+	wait "$dead_pid"
+	lock_dir="${ROUTINE_STATE_FILE}.r-lock.runner"
+	for status in pidless dead; do
+		mkdir "$lock_dir"
+		[[ "$status" != dead ]] || printf '%s\n' "$dead_pid" >"$lock_dir/pid-$dead_pid"
+		touch -t 200001010000 "$lock_dir"
+		bash -c 'source "$1"; _routine_run_detached_script r-lock "$2" "$3" "$(date +%s)"' \
+			_ "$PULSE_ROUTINES_SH" "$script" "$TEST_DIR"
+		if [[ -d "$lock_dir" || "$(jq -r '."r-lock".last_status' "$ROUTINE_STATE_FILE")" != success ]]; then
+			print_result "runner reclaims $status stale lock" 1
+			return 0
+		fi
+		print_result "runner reclaims $status stale lock" 0
+	done
+	before=$(<"$ROUTINE_STATE_FILE")
+	for status in fresh live; do
+		mkdir "$lock_dir"
+		if [[ "$status" == live ]]; then
+			printf '%s\n' "$$" >"$lock_dir/pid-$$"
+			touch -t 200001010000 "$lock_dir"
+		fi
+		bash -c 'source "$1"; _routine_run_detached_script r-lock "$2" "$3" "$(date +%s)"' \
+			_ "$PULSE_ROUTINES_SH" "$script" "$TEST_DIR"
+		if [[ ! -d "$lock_dir" || "$(<"$ROUTINE_STATE_FILE")" != "$before" ]]; then
+			print_result "runner preserves $status lock and skipped dispatch state" 1
+			return 0
+		fi
+		print_result "runner preserves $status lock and skipped dispatch state" 0
+		rm -f -- "$lock_dir/pid-$$"
+		rmdir "$lock_dir"
+	done
+	_test_pulse_runner_lock_concurrency_and_exit "$script" "$lock_dir"
+	return 0
+}
+
+_test_pulse_runner_lock_concurrency_and_exit() {
+	local script="$1"
+	local lock_dir="$2"
+	local first_pid=0
+	local second_pid=0
+	local status=""
+	# Both contenders see an empty legacy directory; only one can replace it
+	# with a populated lock, even before the winning caller resumes.
+	mkdir "$lock_dir"
+	bash -c 'source "$1"; if _routine_acquire_runner_lock "$2"; then printf won; else printf lost; fi' \
+		_ "$PULSE_ROUTINES_SH" "$lock_dir" >"$TEST_DIR/claim-one" &
+	first_pid=$!
+	bash -c 'source "$1"; if _routine_acquire_runner_lock "$2"; then printf won; else printf lost; fi' \
+		_ "$PULSE_ROUTINES_SH" "$lock_dir" >"$TEST_DIR/claim-two" &
+	second_pid=$!
+	wait "$first_pid" "$second_pid"
+	status="$(<"$TEST_DIR/claim-one")$(<"$TEST_DIR/claim-two")"
+	if [[ "$status" == wonlost || "$status" == lostwon ]]; then
+		print_result "concurrent reclaim publication admits exactly one owner" 0
+	else
+		print_result "concurrent reclaim publication admits exactly one owner" 1 "$status"
+	fi
+	# The winning helper has exited without cleanup; cover real dead-owner recovery.
+	touch -t 200001010000 "$lock_dir"
+	bash -c 'source "$1"; _routine_run_detached_script r-lock "$2" "$3" "$(date +%s)"' \
+		_ "$PULSE_ROUTINES_SH" "$script" "$TEST_DIR"
+	if [[ ! -d "$lock_dir" ]]; then
+		print_result "runner recovers abandoned atomic owner lock" 0
+	else
+		print_result "runner recovers abandoned atomic owner lock" 1
+	fi
+	# Force an exit before normal finalization to exercise the fallback trap.
+	if bash -c 'source "$1"; _routine_finalize_terminal() { exit 23; }; _routine_run_detached_script r-lock "$2" "$3" "$(date +%s)"' \
+		_ "$PULSE_ROUTINES_SH" "$script" "$TEST_DIR"; then
+		print_result "EXIT fallback releases owner lock" 1
+	elif [[ "$?" -eq 23 && ! -d "$lock_dir" ]]; then
+		print_result "EXIT fallback releases owner lock" 0
+	else
+		print_result "EXIT fallback releases owner lock" 1
+	fi
+	return 0
+}
+
+test_pulse_routine_scripts_use_registered_repository() {
+	local fake_home="$TEST_DIR/context-home"
+	local agents_dir="$fake_home/.aidevops/agents"
+	local repo_dir="$TEST_DIR/registered-repo"
+	local launcher_dir="$TEST_DIR/launcher"
+	local configured_capture="$TEST_DIR/configured-cwd"
+	local custom_capture="$TEST_DIR/custom-cwd"
+	local original_cwd=""
+	local caller_cwd=""
+	local missing_failed=0
+	local attempts=0
+	mkdir -p "$agents_dir/scripts" "$agents_dir/custom/scripts" "$repo_dir" "$launcher_dir" "$TEST_DIR/bin"
+	cat >"$agents_dir/scripts/record-cwd.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+printf '%s|%s\n' "$PWD" "$*" >"$ROUTINE_CWD_CAPTURE"
+SCRIPT
+	cat >"$agents_dir/custom/scripts/r-cwd.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+printf '%s\n' "$PWD" >"$ROUTINE_CUSTOM_CWD_CAPTURE"
+SCRIPT
+	cat >"$TEST_DIR/bin/routine-log-helper.sh" <<'HELPER'
+#!/usr/bin/env bash
+exit 0
+HELPER
+	chmod +x "$agents_dir/scripts/record-cwd.sh" "$agents_dir/custom/scripts/r-cwd.sh" "$TEST_DIR/bin/routine-log-helper.sh"
+
+	HOME="$fake_home"
+	ROUTINE_STATE_FILE="$TEST_DIR/context-state.json"
+	LOGFILE="$TEST_DIR/context-pulse.log"
+	ROUTINE_LOG_HELPER="$TEST_DIR/bin/routine-log-helper.sh"
+	ROUTINE_CWD_CAPTURE="$configured_capture"
+	ROUTINE_CUSTOM_CWD_CAPTURE="$custom_capture"
+	export ROUTINE_CWD_CAPTURE ROUTINE_CUSTOM_CWD_CAPTURE
+	original_cwd=$(pwd)
+	cd "$launcher_dir" || return 1
+	caller_cwd=$(pwd)
+	_routine_execute "r-cwd-configured" "configured cwd" "scripts/record-cwd.sh with-argument" "" "$repo_dir"
+	_routine_execute "r-cwd" "custom cwd" "" "" "$repo_dir"
+	while [[ "$attempts" -lt 100 && ! -f "$configured_capture" ]]; do
+		sleep 0.05
+		attempts=$((attempts + 1))
+	done
+	if _routine_execute "r-cwd-missing" "missing cwd" "scripts/record-cwd.sh" "" "$TEST_DIR/missing-repo"; then
+		missing_failed=0
+	else
+		missing_failed=1
+	fi
+	if [[ "$(<"$configured_capture")" == "${repo_dir}|with-argument" ]] &&
+		[[ "$(<"$custom_capture")" == "$repo_dir" ]] &&
+		[[ "$(pwd)" == "$caller_cwd" ]] &&
+		[[ "$missing_failed" -eq 1 ]] &&
+		[[ "$(<"$LOGFILE")" == *"repository directory not found or not a directory"* ]]; then
+		print_result "pulse routine scripts use registered repository cwd" 0
+	else
+		print_result "pulse routine scripts use registered repository cwd" 1 "configured=$(<"$configured_capture") custom=$(<"$custom_capture") cwd=$(pwd)"
+	fi
+	cd "$original_cwd" || return 1
 	return 0
 }
 
@@ -322,8 +580,8 @@ test_opencode_archive_scheduler_is_daily_and_low_priority() {
 		print_result "opencode archive scheduler uses dedicated service" 1 "$captured_service"
 		return 0
 	fi
-	if [[ "$captured_cron" != "0 5 * * *" || "$captured_interval" != "86400" || "$captured_calendar" != "*-*-* 5:0:00" ]]; then
-		print_result "opencode archive scheduler runs daily" 1 "cron=${captured_cron} interval=${captured_interval} calendar=${captured_calendar}"
+	if [[ "$captured_cron" != "0 0-7 * * *" || "$captured_interval" != "3600" || "$captured_calendar" != "*-*-* 00..07:00:00" ]]; then
+		print_result "opencode archive scheduler runs hourly overnight (GH#35517)" 1 "cron=${captured_cron} interval=${captured_interval} calendar=${captured_calendar}"
 		return 0
 	fi
 	if [[ "$captured_command" != "\"${archive_script}\"" || "$captured_log" != "$fake_home/.aidevops/logs/opencode-db-archive.log" ]]; then
@@ -394,8 +652,17 @@ test_opencode_archive_launchd_uses_safe_path_expansion() {
 		printf '%s\n' "$value"
 		return $?
 	}
+	local real_mkdir
+	real_mkdir=$(command -v mkdir)
+	local real_cat
+	real_cat=$(command -v cat)
 	mkdir() {
-		/bin/mkdir "$@"
+		"$real_mkdir" "$@"
+		return $?
+	}
+	cat() {
+		# The plist heredoc uses stdin only; keep cat available with the restricted PATH.
+		"$real_cat"
 		return $?
 	}
 	uname() {
@@ -410,17 +677,30 @@ test_opencode_archive_launchd_uses_safe_path_expansion() {
 	setup_opencode_db_archive
 	HOME="$orig_home"
 	PATH="$orig_path"
-	unset -f uname mkdir
+	unset -f uname mkdir cat
 	restore_scheduler_helper_mocks
 
 	local body
 	body=$(<"$SCHEDULERS_PLATFORM_SH")
-	# shellcheck disable=SC2016 # Match the literal safe expansion used in generated launchd PATH construction.
-	if [[ "$captured_plist" != *"/bin:/usr/bin:/usr/local/bin:/opt/homebrew/bin:/bin:/usr/bin"* ]] || [[ "$body" != *'${PATH:+:${PATH}}'* ]]; then
+	# The shared daemon-PATH helper now owns normalization; assert delegation
+	# and its returned value, not the obsolete inline fallback expression.
+	# shellcheck disable=SC2016 # Match the literal helper call in generated launchd PATH construction.
+	if [[ "$captured_plist" != *'<string>/bin:/usr/bin</string>'* ]] || [[ "$body" != *'aidevops_launchd_sanitized_path "${PATH}"'* ]]; then
 		print_result "opencode archive launchd uses safe PATH expansion" 1 "$captured_plist"
 		return 0
 	fi
 	print_result "opencode archive launchd uses safe PATH expansion" 0
+	local calendar_entries
+	calendar_entries=$(printf '%s\n' "$captured_plist" | grep -c '<key>Hour</key>' || true)
+	local plist_valid=0
+	if command -v plutil >/dev/null 2>&1; then
+		printf '%s\n' "$captured_plist" | plutil -lint - >/dev/null 2>&1 || plist_valid=1
+	fi
+	if [[ "$captured_plist" != *'<key>StartCalendarInterval</key>'*'<array>'* || "$calendar_entries" != 8 || "$plist_valid" != 0 ]]; then
+		print_result "opencode archive launchd fires hourly 00-07 (GH#35517)" 1 "entries=${calendar_entries}"
+		return 0
+	fi
+	print_result "opencode archive launchd fires hourly 00-07 (GH#35517)" 0
 	return 0
 }
 
@@ -463,6 +743,15 @@ test_routine_issue_creation_includes_tracking_label() {
 	# shellcheck source=/dev/null
 	source "$ROUTINE_LOG_HELPER_SH" help >/dev/null
 
+	# Existing labels need no writes; never contact GitHub from this fixture.
+	gh() {
+		local command="$1" endpoint="${2:-}"
+		if [[ "$command" == api && "$endpoint" == repos/marcusquinn/aidevops/labels/* ]]; then
+			return 0
+		fi
+		return 1
+	}
+
 	gh_create_issue() {
 		printf '%q ' "$@" >"$create_log"
 		printf '%s\n' "https://github.com/marcusquinn/aidevops/issues/4242"
@@ -474,7 +763,9 @@ test_routine_issue_creation_includes_tracking_label() {
 	create_args=$(<"$create_log")
 	if [[ "$issue_number" != "4242" ]] ||
 		[[ "$create_args" != *"--label routines"* ]] ||
-		[[ "$create_args" != *"--label routine-tracking"* ]]; then
+		[[ "$create_args" != *"--label routine-tracking"* ]] ||
+		[[ "$create_args" != *"--label persistent"* ]] ||
+		[[ "$create_args" != *"--label no-auto-dispatch"* ]]; then
 		print_result "routine issue creation includes tracking labels" 1 \
 			"issue=${issue_number}; args=${create_args}"
 		return 0
@@ -487,9 +778,13 @@ main() {
 	setup
 	load_scheduler_helpers
 	test_core_routine_logged_command_shape
+	test_platform_success_calendar_boundary
 	test_core_routine_shell_quote_escapes_single_quotes
 	test_linux_core_scheduler_commands_are_logged
 	test_pulse_routine_update_uses_flags_and_duration
+	test_pulse_script_routine_marks_running_before_terminal_completion
+	test_pulse_runner_lock_release_and_reclaim
+	test_pulse_routine_scripts_use_registered_repository
 	test_agent_routine_waits_for_terminal_result
 	test_opencode_archive_scheduler_is_daily_and_low_priority
 	test_opencode_archive_scheduler_tolerates_unset_home

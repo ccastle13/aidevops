@@ -57,6 +57,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 1
 
+# shellcheck source=./shared-gh-budget-policy.sh
+source "${SCRIPT_DIR}/shared-gh-budget-policy.sh"
+
+# shellcheck source=./pulse-rest-observation.sh
+source "${SCRIPT_DIR}/pulse-rest-observation.sh"
+
 # shellcheck source=./shared-gh-request-state.sh
 if [[ -f "${SCRIPT_DIR}/shared-gh-request-state.sh" ]]; then
 	# shellcheck disable=SC1091
@@ -205,10 +211,10 @@ _cb_rest_core_header() {
 #######################################
 _cb_rest_core_bounds() {
 	local soft_cap="${AIDEVOPS_PULSE_REST_CORE_RESERVE:-${AIDEVOPS_PULSE_REST_DISPATCH_MIN_CORE_REMAINING:-500}}"
-	local hard_floor="${AIDEVOPS_PULSE_REST_CORE_HARD_FLOOR:-100}"
+	local hard_floor="${AIDEVOPS_PULSE_REST_CORE_HARD_FLOOR:-0}"
 	local window_seconds="${AIDEVOPS_PULSE_REST_CORE_ADAPTIVE_WINDOW_SECONDS:-3600}"
 	[[ "$soft_cap" =~ ^[0-9]+$ ]] || soft_cap=500
-	[[ "$hard_floor" =~ ^[0-9]+$ ]] || hard_floor=100
+	[[ "$hard_floor" =~ ^[0-9]+$ ]] || hard_floor=0
 	[[ "$window_seconds" =~ ^[1-9][0-9]*$ ]] || window_seconds=3600
 	if [[ "$soft_cap" -eq 0 ]]; then
 		hard_floor=0
@@ -223,8 +229,8 @@ _cb_rest_core_bounds() {
 # Return normalized headroom reserved for already-admitted REST work.
 #######################################
 _cb_rest_core_in_flight_allowance() {
-	local allowance="${AIDEVOPS_PULSE_REST_CORE_IN_FLIGHT_ALLOWANCE:-250}"
-	[[ "$allowance" =~ ^[0-9]+$ ]] || allowance=250
+	local allowance="${AIDEVOPS_PULSE_REST_CORE_IN_FLIGHT_ALLOWANCE:-0}"
+	[[ "$allowance" =~ ^[0-9]+$ ]] || allowance=0
 	printf '%s\n' "$allowance"
 	return 0
 }
@@ -288,7 +294,9 @@ _cb_rest_core_thresholds() {
 	[[ "$seconds_until_reset" -le "$window_seconds" ]] || seconds_until_reset="$window_seconds"
 
 	local reserve_span=$((soft_cap - hard_floor))
-	local adaptive_threshold=$((hard_floor + (reserve_span * seconds_until_reset + window_seconds - 1) / window_seconds))
+	local adaptive_threshold
+	adaptive_threshold=$(gh_budget_window_threshold "$reserve_span" "$reset_epoch" "$now_epoch" "$window_seconds") || return 1
+	adaptive_threshold=$((hard_floor + adaptive_threshold))
 	[[ "$adaptive_threshold" -ge "$hard_floor" ]] || adaptive_threshold="$hard_floor"
 	[[ "$adaptive_threshold" -le "$soft_cap" ]] || adaptive_threshold="$soft_cap"
 	printf '%s %s %s\n' "$adaptive_threshold" "$soft_cap" "$hard_floor"
@@ -308,6 +316,12 @@ _cb_rest_core_observation() {
 	[[ "$ttl" =~ ^[0-9]+$ ]] || ttl=20
 	now=$(date +%s 2>/dev/null) || now=0
 	[[ "$now" =~ ^[0-9]+$ ]] || now=0
+
+	# Avoid spending a paced REST request just to rediscover recent headers.
+	# Request admission remains atomic in the transport; this is observation only.
+	if _cb_rest_core_local_observation "$ttl" "$now"; then
+		return 0
+	fi
 
 	if [[ -f "$_CB_REST_CORE_CACHE_FILE" ]]; then
 		read -r observed remaining limit reset resource < <(jq -r --arg unknown "$_CB_REST_CORE_UNKNOWN" '[.observed // 0, .remaining // $unknown, .limit // $unknown, .reset // 0, .resource // $unknown] | @tsv' "$_CB_REST_CORE_CACHE_FILE" 2>/dev/null) || true
@@ -450,7 +464,7 @@ _cb_rest_core_unknown_progress_allows() {
 # Apply a REST priority class to one already-observed budget snapshot.
 #
 # Args:
-#   $1 - critical, progress, or deferrable.
+#   $1 - critical, scheduled, progress, or deferrable.
 #   $2 - output from pulse_rest_core_priority_snapshot.
 # Returns: 0 allowed; 1 deferred by threshold; 2 unknown/invalid evidence.
 #######################################
@@ -461,7 +475,7 @@ _cb_rest_core_priority_decision_allows() {
 	critical)
 		return 0
 		;;
-	progress | deferrable) ;;
+	scheduled | progress | deferrable) ;;
 	*) return 2 ;;
 	esac
 
@@ -494,6 +508,13 @@ _cb_rest_core_priority_decision_allows() {
 		return 2
 	fi
 
+	# Scheduled slots can use the headroom background/progress work preserves,
+	# but must leave the hard floor plus a small per-launch allowance intact.
+	if [[ "$priority" == "scheduled" ]]; then
+		[[ "$remaining" -gt $((hard_floor + 25)) ]] && return 0
+		return 1
+	fi
+
 	local progress_start_floor
 	progress_start_floor=$(_cb_rest_core_progress_start_floor "$hard_floor" "$soft_cap") || return 2
 	if [[ "$priority" == "progress" ]]; then
@@ -512,7 +533,7 @@ _cb_rest_core_priority_decision_allows() {
 #######################################
 # Return whether a REST priority class may start new API-heavy work.
 #
-# Args: $1 - critical, progress, or deferrable.
+# Args: $1 - critical, scheduled, progress, or deferrable.
 # Returns: 0 allowed; 1 deferred by threshold; 2 unknown/invalid evidence.
 #######################################
 pulse_rest_core_priority_allows() {
@@ -521,7 +542,7 @@ pulse_rest_core_priority_allows() {
 	critical)
 		return 0
 		;;
-	progress | deferrable) ;;
+	scheduled | progress | deferrable) ;;
 	*) return 2 ;;
 	esac
 
@@ -544,7 +565,7 @@ pulse_rest_core_priority_allows_next() {
 	critical)
 		return 0
 		;;
-	progress | deferrable) ;;
+	scheduled | progress | deferrable) ;;
 	*) return 2 ;;
 	esac
 
@@ -744,6 +765,9 @@ is_graphql_budget_sufficient() {
 	# Compute threshold as integer: threshold_count = ceil(threshold * limit).
 	local threshold_count
 	threshold_count=$(_compute_threshold_count "$threshold" "$limit") || threshold_count=0
+	local reset_epoch=""
+	reset_epoch=$(printf '%s' "$rate_json" | jq -r '.resources.graphql.reset // ""') || reset_epoch=""
+	threshold_count=$(gh_budget_window_threshold "$threshold_count" "$reset_epoch") || return 1
 
 	if [[ "$remaining" -le "$threshold_count" ]]; then
 		if _cb_allow_dispatch_with_rest_fallback "$rate_json" "$remaining" "$limit" "$threshold_count" "$threshold"; then
@@ -751,7 +775,7 @@ is_graphql_budget_sufficient() {
 		fi
 
 		# Breaker trips.
-		echo "${_CB_RL_LOG_PREFIX} GraphQL budget EXHAUSTED: remaining=${remaining}/${limit} (threshold=${threshold_count}, configured=${threshold}) — deferring dispatch until next cycle" >>"$LOGFILE"
+		echo "${_CB_RL_LOG_PREFIX} Local GraphQL scheduling deferred: remaining=${remaining}/${limit} (adaptive_threshold=${threshold_count}, configured_cap=${threshold}, reset=${reset_epoch}) — no usable REST fallback; not a server secondary-limit rejection" >>"$LOGFILE"
 
 		# Record state for status reporting.
 		printf '%s %s %s %s\n' "$(date +%s)" "$remaining" "$limit" "$threshold" >"$_CIRCUIT_BREAKER_STATE_FILE" 2>/dev/null || true
@@ -791,7 +815,7 @@ _compute_threshold_count() {
 	local limit="$2"
 
 	# Validate threshold is a reasonable decimal (0-1 range).
-	if ! printf '%s' "$threshold" | grep -qE '^[0-9]*\.?[0-9]+$'; then
+	if ! printf '%s' "$threshold" | grep -E '^[0-9]*\.?[0-9]+$' >/dev/null; then
 		echo "0"
 		return 0
 	fi
@@ -860,6 +884,7 @@ _circuit_breaker_status() {
 	local threshold_count="$_CB_RL_UNKNOWN"
 	if [[ "$limit" =~ ^[0-9]+$ ]] && [[ "$limit" -gt 0 ]]; then
 		threshold_count=$(_compute_threshold_count "$threshold" "$limit") || threshold_count="$_CB_RL_UNKNOWN"
+		threshold_count=$(gh_budget_window_threshold "$threshold_count" "$reset_epoch") || threshold_count="$_CB_RL_UNKNOWN"
 	fi
 
 	# Report 24h trip count if stats helper is available.
@@ -907,14 +932,41 @@ _circuit_breaker_status() {
 #   AIDEVOPS_SKIP_ACTIONS_QUEUE_SATURATION=1 — return saturated=0 unconditionally
 #   QUEUED_MIN=0                              — disable check via threshold
 #######################################
+_cb_actions_queued_endpoint() {
+	local repo_slug="$1"
+	local queue_window_hours="$2"
+	local endpoint="repos/${repo_slug}/actions/runs?status=queued&per_page=1"
+	local now_epoch="" window_start_epoch="" window_start=""
+
+	[[ "$queue_window_hours" -gt 0 ]] || {
+		printf '%s' "$endpoint"
+		return 0
+	}
+	now_epoch=$(date -u '+%s' 2>/dev/null) || now_epoch=""
+	if [[ "$now_epoch" =~ ^[0-9]+$ ]]; then
+		window_start_epoch=$((now_epoch - queue_window_hours * 3600))
+		window_start=$(date -u -r "$window_start_epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)
+		[[ -n "$window_start" ]] || window_start=$(date -u -d "@${window_start_epoch}" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)
+	fi
+	if [[ -n "$window_start" ]]; then
+		printf '%s&created=>=%s' "$endpoint" "$window_start"
+	else
+		echo "${_CB_RL_LOG_PREFIX} WARNING: could not calculate Actions queue window — querying all queued runs" >>"$LOGFILE"
+		printf '%s' "$endpoint"
+	fi
+	return 0
+}
+
 _check_actions_queue_saturation() {
 	local repo_slug="$1"
 	local queued_min="${AIDEVOPS_ACTIONS_QUEUE_SATURATION_QUEUED_MIN:-50}"
 	local ratio_min="${AIDEVOPS_ACTIONS_QUEUE_SATURATION_RATIO_MIN:-10}"
+	local queue_window_hours="${AIDEVOPS_ACTIONS_QUEUE_SATURATION_WINDOW_HOURS:-6}"
 
 	# Validate inputs — invalid env values default to safe disabled state.
 	[[ "$queued_min" =~ ^[0-9]+$ ]] || queued_min=50
 	[[ "$ratio_min" =~ ^[0-9]+$ ]] || ratio_min=10
+	[[ "$queue_window_hours" =~ ^[0-9]+$ ]] || queue_window_hours=6
 
 	# Empty repo_slug → cannot query → fail-open with zeros.
 	if [[ -z "$repo_slug" ]]; then
@@ -949,11 +1001,18 @@ _check_actions_queue_saturation() {
 		fi
 	fi
 
+	# Query only queued runs created within the configured window. GitHub can
+	# retain uncancellable zombie runs in queued state indefinitely; counting
+	# those as current runner demand causes false saturation. The in-progress
+	# query intentionally remains unfiltered.
+	local queued_endpoint=""
+	queued_endpoint=$(_cb_actions_queued_endpoint "$repo_slug" "$queue_window_hours")
+
 	# Query Actions runs for queued + in_progress states. per_page=1 is
 	# enough — the .total_count field carries the population size without
 	# pulling the run bodies (cheap REST call).
 	local queued_json="" in_progress_json=""
-	queued_json=$(gh api "repos/${repo_slug}/actions/runs?status=queued&per_page=1" 2>/dev/null) || queued_json=""
+	queued_json=$(gh api "$queued_endpoint" 2>/dev/null) || queued_json=""
 	in_progress_json=$(gh api "repos/${repo_slug}/actions/runs?status=in_progress&per_page=1" 2>/dev/null) || in_progress_json=""
 
 	# Fail-open on any API error — instrumentation must never break the pulse.
@@ -1004,6 +1063,18 @@ _main() {
 		is_graphql_budget_sufficient
 		return $?
 		;;
+	rest-core-allows)
+		# Args: $1=priority, $2=static log context. Lets child helpers that run
+		# long deferrable loops share the Pulse REST-core priority budget.
+		local priority="${1:-}"
+		local context="${2:-cli}"
+		if [[ -z "$priority" ]]; then
+			echo "Usage: pulse-rate-limit-circuit-breaker.sh rest-core-allows <critical|scheduled|progress|deferrable> [context]" >&2
+			return 2
+		fi
+		pulse_rest_core_priority_allows_next "$priority" "$context"
+		return $?
+		;;
 	check-actions-queue)
 		# Args: $1=repo_slug. Prints KEY=VALUE lines.
 		local repo_slug="${1:-}"
@@ -1027,6 +1098,7 @@ _main() {
 		echo ""
 		echo "Usage:"
 		echo "  pulse-rate-limit-circuit-breaker.sh check                          # exit 0=OK, 1=blocked, 2=GraphQL unavailable after REST allows"
+		echo "  pulse-rate-limit-circuit-breaker.sh rest-core-allows PRIORITY [CTX] # exit 0=start, 1=threshold defer, 2=unknown evidence"
 		echo "  pulse-rate-limit-circuit-breaker.sh check-actions-queue OWNER/REPO # KEY=VALUE: queued/in_progress/ratio/saturated"
 		echo "  pulse-rate-limit-circuit-breaker.sh status [--cached]              # human-readable status line"
 		echo ""
@@ -1041,6 +1113,7 @@ _main() {
 		echo "Environment (Actions queue, t3211):"
 		echo "  AIDEVOPS_ACTIONS_QUEUE_SATURATION_QUEUED_MIN  min queued runs (default 50; 0 disables)"
 		echo "  AIDEVOPS_ACTIONS_QUEUE_SATURATION_RATIO_MIN   min queued/in_progress ratio (default 10)"
+		echo "  AIDEVOPS_ACTIONS_QUEUE_SATURATION_WINDOW_HOURS recent queued-run window (default 6; 0 counts all)"
 		echo "  AIDEVOPS_SKIP_ACTIONS_QUEUE_SATURATION=1      emergency bypass"
 		echo "  AIDEVOPS_SKIP_GITHUB_ACTIONS_STATUS=1         bypass public Actions incident signal"
 		return 0

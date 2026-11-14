@@ -11,6 +11,8 @@
 # Public and internal entry points remain available after this file is sourced:
 #   - pulse-merge-timing.sh               — low-overhead timing aggregation
 #   - pulse-merge-pass.sh                 — checkpoints, cursors, pass orchestration
+#   - pulse-merge-backlog.sh              — backlog buckets/ordering, PR-list reads,
+#                                           cursor enrichment (GH#27171)
 #   - merge_ready_prs_all_repos           — top-level merge pass entry point
 #   - _merge_ready_prs_for_repo           — per-repo PR iteration
 #   - _pmp_consolidate_duplicate_pr_groups — safe superseded sibling PR cleanup
@@ -23,7 +25,9 @@
 #   - _attempt_pr_ci_rebase_retry         — CI-drift rebase (t2805)
 #   - _route_pr_to_fix_worker             — unified fix-worker dispatch (t2203)
 #   - _retarget_stacked_children          — stacked PR retargeting (t2412)
-#   - _attempt_worker_briefed_auto_merge  — worker-briefed trust chain (t2449)
+#   - pulse-merge-process-worker-briefed.sh — worker-briefed trust chain
+#                                           (_attempt_worker_briefed_auto_merge,
+#                                           t2449; split out GH#27171)
 #   - _attempt_green_behind_update_branch — green+BEHIND branch refresh (GH#26659)
 #   - _check_required_checks_passing      — branch-protection context check (t2922)
 #
@@ -62,6 +66,7 @@ _PULSE_MERGE_PROCESS_LOADED=1
 _PMP_ORIGIN_INTERACTIVE_PATTERN=",origin:interactive,"
 _PMP_ORIGIN_WORKER_PATTERN=",origin:worker,"
 _PMP_ORIGIN_TAKEOVER_PATTERN=",origin:worker-takeover,"
+_PMP_CHECK_FAILURE="FAILURE"
 
 #######################################
 # Return the persistent state path for one interactive PR's semantic
@@ -101,7 +106,7 @@ _pmp_update_branch_conflict_cooldown_active() {
 	IFS=$'\t' read -r recorded_head_sha expires_at <"$state_file" || return 1
 	[[ "$recorded_head_sha" == "$expected_head_sha" ]] || return 1
 	[[ "$expires_at" =~ ^[0-9]+$ ]] || return 1
-	now=$(date +%s)
+	_pmp_now_epoch_into now
 	[[ "$now" =~ ^[0-9]+$ ]] || return 1
 	[[ "$now" -lt "$expires_at" ]] || return 1
 	return 0
@@ -127,7 +132,7 @@ _pmp_record_update_branch_conflict_cooldown() {
 
 	[[ -n "$expected_head_sha" ]] || return 1
 	[[ "$AIDEVOPS_UPDATE_BRANCH_CONFLICT_COOLDOWN_SECONDS" =~ ^[0-9]+$ ]] || return 1
-	now=$(date +%s)
+	_pmp_now_epoch_into now
 	[[ "$now" =~ ^[0-9]+$ ]] || return 1
 	expires_at=$((now + AIDEVOPS_UPDATE_BRANCH_CONFLICT_COOLDOWN_SECONDS))
 	state_file=$(_pmp_update_branch_conflict_cooldown_file "$pr_number" "$repo_slug") || return 1
@@ -150,8 +155,140 @@ _pmp_is_protected_release_pr() {
 	local head_ref="$1"
 	local labels_csv="$2"
 
-	[[ ",${labels_csv}," == *",release,"* ]] || return 1
-	[[ "$head_ref" =~ ^chore/release-v[0-9]+\.[0-9]+\.[0-9]+-provenance$ ]] || return 1
+	protected_release_pr "$head_ref" "$labels_csv" || return 1
+	return 0
+}
+
+# Bind a protected release PR head to its remote release evidence without
+# requiring this runner to trust the release signer (GH#38012). Collaborator
+# runners usually lack the releaser's allowed-signers principal, so a local
+# `git verify-tag` failure cannot distinguish "untrusted here" from drift.
+# Instead bind the PR-pinned provenance marker, the remote staging envelope,
+# the raw tag bytes it carries, and the live head exactly.
+# Args: $1=repo_path $2=head_ref $3=live head OID $4=PR body
+# Returns: 0=bound, 1=proven mismatch or invalid evidence, 2=evidence unavailable
+_pmp_protected_release_head_binding() {
+	local repo_path="$1"
+	local head_ref="$2"
+	local head_oid="$3"
+	local pr_body="$4"
+	local tag_name="${head_ref#chore/release-}" marker_regex="" pinned_object="" pinned_commit=""
+	local remote_ref="" ls_rc=0 staged_oid="" tag_object="" tag_header="" tag_commit="" envelope_parents=""
+	tag_name="${tag_name%-provenance}"
+	marker_regex='<!-- aidevops:release-provenance tag=(v[0-9]+\.[0-9]+\.[0-9]+) tag-object=([0-9a-f]{40}) release-commit=([0-9a-f]{40}) merge-method=merge -->'
+	[[ "$head_oid" =~ ^[0-9a-f]{40}$ ]] || return 1
+	# aidevops:trust-boundary — the release lane pins the exact release commit
+	# in the PR body; any other live head is proven drift without git access.
+	[[ "$pr_body" =~ $marker_regex && "${BASH_REMATCH[1]}" == "$tag_name" ]] || return 1
+	pinned_object="${BASH_REMATCH[2]}"
+	pinned_commit="${BASH_REMATCH[3]}"
+	[[ "$pinned_commit" == "$head_oid" ]] || return 1
+	if [[ -z "$repo_path" ]] || ! git -C "$repo_path" rev-parse --git-dir >/dev/null 2>&1; then
+		return 2
+	fi
+	# Read remote evidence, never a stale local ref. A missing staging ref is
+	# not "unavailable": the release lane stages it before queueing the merge.
+	remote_ref=$(GIT_TERMINAL_PROMPT=0 timeout_sec 30 git -C "$repo_path" ls-remote --exit-code origin \
+		"refs/aidevops/release-tags/${tag_name}" 2>/dev/null) || ls_rc=$?
+	[[ "$ls_rc" -ne 2 ]] || return 1
+	[[ "$ls_rc" -eq 0 ]] || return 2
+	staged_oid="${remote_ref%%[[:space:]]*}"
+	[[ "$staged_oid" =~ ^[0-9a-f]{40}$ ]] || return 1
+	GIT_TERMINAL_PROMPT=0 timeout_sec 30 git -C "$repo_path" fetch --quiet --no-tags --no-write-fetch-head \
+		origin "refs/aidevops/release-tags/${tag_name}" 2>/dev/null || return 2
+	tag_object=$(git -C "$repo_path" cat-file blob "${staged_oid}:tag" 2>/dev/null |
+		git -C "$repo_path" hash-object -t tag -w --stdin 2>/dev/null) || return 1
+	[[ "$tag_object" == "$pinned_object" ]] || return 1
+	tag_header=$(git -C "$repo_path" cat-file tag "$tag_object" 2>/dev/null |
+		awk '/^$/ {exit} /^tag / {print substr($0, 5)}') || return 1
+	[[ "$tag_header" == "$tag_name" ]] || return 1
+	tag_commit=$(git -C "$repo_path" rev-parse --verify "${tag_object}^{commit}" 2>/dev/null) || return 1
+	envelope_parents=$(git -C "$repo_path" show -s --format=%P "$staged_oid" 2>/dev/null) || return 1
+	[[ "$envelope_parents" == "$head_oid" && "$tag_commit" == "$head_oid" ]] || return 1
+	return 0
+}
+
+# Protected release PRs always belong to exact-merge reconciliation. Even an
+# exact signed head must never be armed for the generic native squash path.
+# The release lane's own `--merge --match-head-commit` request is retained
+# while the live head stays bound to the pinned release commit (GH#38012).
+# Decide whether an armed protected release auto-merge may stay queued.
+# Args: $1=PR REST JSON $2=repo_slug $3=head_ref $4=gated head OID
+# Prints the log reason. Returns: 0=retain the exact queue, 1=disarm.
+_pmp_protected_release_queue_decision() {
+	local pr_json="$1"
+	local repo_slug="$2"
+	local head_ref="$3"
+	local head_oid="$4"
+	local auto_method="" live_head="" head_repo="" base_repo="" author_association=""
+	local pr_body="" repo_path="" binding_rc=0 normalized_repo=""
+	auto_method=$(printf '%s' "$pr_json" | jq -r '.auto_merge.merge_method // ""' 2>/dev/null) || auto_method=""
+	live_head=$(printf '%s' "$pr_json" | jq -r '.head.sha // ""' 2>/dev/null) || live_head=""
+	head_repo=$(printf '%s' "$pr_json" | jq -r '(.head.repo.full_name // "") | ascii_downcase' 2>/dev/null) || head_repo=""
+	base_repo=$(printf '%s' "$pr_json" | jq -r '(.base.repo.full_name // "") | ascii_downcase' 2>/dev/null) || base_repo=""
+	normalized_repo=$(printf '%s' "$repo_slug" | jq -Rr 'ascii_downcase') || return 1
+	author_association=$(printf '%s' "$pr_json" | jq -r '.author_association // ""' 2>/dev/null) || author_association=""
+	pr_body=$(printf '%s' "$pr_json" | jq -r '.body // ""' 2>/dev/null) || pr_body=""
+	# aidevops:trust-boundary — only the release lane's ancestry-preserving
+	# exact merge on the gated, same-repository, collaborator-authored head may stay.
+	if [[ "$auto_method" != "merge" ]]; then
+		printf "protected release PR native auto-merge uses '%s', not the ancestry-preserving exact merge" "${auto_method:-unknown}"
+		return 1
+	fi
+	if [[ -z "$head_oid" || "$live_head" != "$head_oid" || "$head_repo" != "$normalized_repo" ||
+		"$base_repo" != "$normalized_repo" ]]; then
+		printf '%s' "protected release PR live head or repository no longer matches the gated head"
+		return 1
+	fi
+	if [[ ! "$author_association" =~ ^(OWNER|MEMBER|COLLABORATOR)$ ]]; then
+		printf '%s' "protected release PR author is not a trusted repository collaborator"
+		return 1
+	fi
+	repo_path=$(_pulse_merge_repo_path_for_slug "$repo_slug" 2>/dev/null) || repo_path=""
+	_pmp_protected_release_head_binding "$repo_path" "$head_ref" "$live_head" "$pr_body" || binding_rc=$?
+	case "$binding_rc" in
+	0)
+		printf 'retaining exact-merge native auto-merge; head %s is bound to the remote signed release evidence (GH#38012)' "${live_head:0:12}"
+		return 0
+		;;
+	2)
+		# The live head equals the release lane's pinned commit; only this
+		# runner's copy of the remote envelope is unavailable. The release
+		# lane and `aidevops release reconcile` own any further recovery.
+		printf 'retaining exact-merge native auto-merge; head %s matches pinned release provenance and remote staging evidence is unavailable on this runner (GH#38012)' "${live_head:0:12}"
+		return 0
+		;;
+	esac
+	printf '%s' "protected release PR head differs from its pinned signed release commit or remote staging evidence"
+	return 1
+}
+
+_pmp_hold_protected_release_pr() {
+	local pr_number="$1"
+	local repo_slug="$2"
+	local head_ref="$3"
+	local head_oid="$4"
+	local pr_api_path="" pr_json="" disarm=1 stop_rc=0
+	local hold_reason="protected release PR requires exact-merge reconciliation"
+	printf -v pr_api_path 'repos/%s/pulls/%s' "$repo_slug" "$pr_number"
+	if [[ "${DRY_RUN:-0}" == "1" ]]; then
+		disarm=0
+	elif ! pr_json=$(gh api "$pr_api_path" 2>/dev/null) || [[ -z "$pr_json" ]]; then
+		# An unavailable read takes the fail-closed disarm path below.
+		hold_reason="protected release PR state is unreadable"
+	elif printf '%s' "$pr_json" | jq -e '.auto_merge == null' >/dev/null 2>&1; then
+		# Do not turn an already-safe release into a draft on every merge pass.
+		disarm=0
+	elif hold_reason=$(_pmp_protected_release_queue_decision "$pr_json" "$repo_slug" "$head_ref" "$head_oid"); then
+		disarm=0
+	fi
+	[[ -n "$hold_reason" ]] || hold_reason="protected release PR exact-merge evidence is unavailable"
+	echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: ${hold_reason}" >>"$LOGFILE"
+	[[ "$disarm" -eq 1 ]] || return 0
+	# aidevops:trust-boundary — revoke native auto-merge before deferring so a
+	# previously armed request cannot merge a drifted release between passes.
+	_stop_external_native_auto_merge "$pr_number" "$repo_slug" "$hold_reason" || stop_rc=$?
+	[[ "$stop_rc" -eq 0 || "$stop_rc" -eq 2 ]] || return 1
 	return 0
 }
 
@@ -159,6 +296,8 @@ _pmp_is_protected_release_pr() {
 # direct routine sourcing. pulse-wrapper.sh also sources this before the merge
 # modules, so the include guard in pulse-pr-list-cache.sh keeps this idempotent.
 _PULSE_MERGE_PROCESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./protected-release-helper.sh
+source "${_PULSE_MERGE_PROCESS_DIR}/protected-release-helper.sh"
 if [[ -f "${_PULSE_MERGE_PROCESS_DIR}/pulse-pr-list-cache.sh" ]]; then
 	# shellcheck source=./pulse-pr-list-cache.sh
 	# shellcheck disable=SC1091
@@ -179,25 +318,12 @@ source "${_PULSE_MERGE_PROCESS_DIR}/pulse-merge-rest-state.sh"
 # shellcheck source=./pulse-merge-required-checks.sh
 # shellcheck disable=SC1091  # sub-library resolved via _PULSE_MERGE_PROCESS_DIR
 source "${_PULSE_MERGE_PROCESS_DIR}/pulse-merge-required-checks.sh"
-
-_pmp_cache_key() {
-	local raw_key="$1"
-	local safe_key=""
-	safe_key=$(printf '%s' "$raw_key" | tr -c '[:alnum:]._-' '_')
-	[[ -n "$safe_key" ]] || safe_key="empty"
-	printf '%s' "$safe_key"
-	return 0
-}
-
-# PR backlog categories exposed in logs. These are scheduling/observability
-# buckets only; _process_single_ready_pr still enforces every merge safety gate
-# before approving, merging, closing, or dispatching a fix worker.
-readonly _PMP_BACKLOG_MERGE_READY="merge-ready"
-readonly _PMP_BACKLOG_CHECKS_IN_PROGRESS="checks-in-progress"
-readonly _PMP_BACKLOG_SMALL_FIX_NEEDED="small-fix-needed"
-readonly _PMP_BACKLOG_DIRTY_CONFLICTED="dirty-conflicted"
-readonly _PMP_BACKLOG_HUMAN_APPROVAL_NEEDED="human-approval-needed"
-readonly _PMP_BACKLOG_OTHER="other"
+# shellcheck source=./pulse-merge-unchanged-skip.sh
+# shellcheck disable=SC1091  # sub-library resolved via _PULSE_MERGE_PROCESS_DIR
+source "${_PULSE_MERGE_PROCESS_DIR}/pulse-merge-unchanged-skip.sh"
+# shellcheck source=./pulse-merge-backlog.sh
+# shellcheck disable=SC1091  # sub-library resolved via _PULSE_MERGE_PROCESS_DIR
+source "${_PULSE_MERGE_PROCESS_DIR}/pulse-merge-backlog.sh"
 
 # --- Functions ---
 
@@ -226,294 +352,16 @@ _pmp_normalize_pr_lifecycle_state_into() {
 	return 0
 }
 
-#######################################
-# Classify one PR object into a scheduling/observability backlog bucket.
-# This is intentionally advisory: it never decides merge eligibility. The
-# existing per-PR gate stack remains authoritative.
-#
-# Args:
-#   $1 - compact PR JSON object from gh_pr_list
-# Output: one of the _PMP_BACKLOG_* values
-#######################################
-_pmp_classify_pr_backlog_state() {
-	local pr_obj="$1"
-	local repo_slug="${2:-}"
-	local _RS=$'\x1e'
-	local number="" mergeable="" review_decision="" is_draft="" labels="" failed_count="" pending_count=""
-	IFS="$_RS" read -r number mergeable review_decision is_draft labels failed_count pending_count < <(
-		printf '%s' "$pr_obj" | jq -r '
-			def up(v): (v // "" | ascii_upcase);
-			def failed: [.statusCheckRollup[]? | select(up(.conclusion) == "FAILURE" or up(.state) == "FAILURE")] | length;
-			def pending: [.statusCheckRollup[]? | select(up(.status) == "QUEUED" or up(.status) == "IN_PROGRESS" or up(.state) == "PENDING" or up(.state) == "EXPECTED" or ((up(.conclusion) == "") and (up(.state) != "SUCCESS") and (up(.status) != "COMPLETED")))] | length;
-			"\(.number // "")\u001e\(.mergeable // "UNKNOWN")\u001e\(if ((has("reviewDecision") | not) or .reviewDecision == null or (.reviewDecision | tostring | length) == 0) then "UNKNOWN" else .reviewDecision end)\u001e\(.isDraft // false)\u001e\([.labels[].name] | join(","))\u001e\(failed)\u001e\(pending)"' 2>/dev/null
-	)
-	_pmp_normalize_mergeable_state_into mergeable "$mergeable"
-	_pmp_normalize_review_decision_into review_decision "$review_decision"
-
-	[[ "$failed_count" =~ ^[0-9]+$ ]] || failed_count=0
-	[[ "$pending_count" =~ ^[0-9]+$ ]] || pending_count=0
-
-	if [[ "$is_draft" == "true" || ",${labels}," == *",hold-for-review,"* || "$review_decision" == "CHANGES_REQUESTED" ]] ||
-		_pmp_review_decision_is_unknown "$review_decision"; then
-		printf '%s' "$_PMP_BACKLOG_HUMAN_APPROVAL_NEEDED"
-		return 0
-	fi
-	if [[ "$mergeable" == "CONFLICTING" ]]; then
-		printf '%s' "$_PMP_BACKLOG_DIRTY_CONFLICTED"
-		return 0
-	fi
-	if [[ "$failed_count" -gt 0 ]]; then
-		if _pmp_review_decision_is_unknown "$review_decision"; then
-			printf '%s' "$_PMP_BACKLOG_HUMAN_APPROVAL_NEEDED"
-			return 0
-		fi
-		printf '%s' "$_PMP_BACKLOG_SMALL_FIX_NEEDED"
-		return 0
-	fi
-	if [[ "$pending_count" -gt 0 || "$mergeable" == "UNKNOWN" ]]; then
-		printf '%s' "$_PMP_BACKLOG_CHECKS_IN_PROGRESS"
-		return 0
-	fi
-	if [[ "$mergeable" == "MERGEABLE" ]]; then
-		printf '%s' "$_PMP_BACKLOG_MERGE_READY"
-		return 0
-	fi
-	printf '%s' "$_PMP_BACKLOG_OTHER"
-	return 0
-}
-
-_pmp_enrich_prs_with_rest_check_status() {
-	local repo_slug="$1"
-	local pr_json="$2"
-	local status_json=""
-	status_json=$(gh_pr_check_status_rest_batch "$repo_slug" "$pr_json" 2>/dev/null) || status_json="[]"
-	[[ -n "$status_json" && "$status_json" != "null" ]] || status_json="[]"
-	jq -n --argjson prs "$pr_json" --argjson statuses "$status_json" '
-		def rollup($s):
-			if $s == "PASS" then [{status:"COMPLETED", conclusion:"SUCCESS", state:"SUCCESS"}]
-			elif $s == "FAIL" then [{status:"COMPLETED", conclusion:"FAILURE", state:"FAILURE"}]
-			elif $s == "PENDING" then [{status:"IN_PROGRESS", conclusion:null, state:"PENDING"}]
-			else [] end;
-		$prs | map(. as $pr | ($statuses | map(select(.number == $pr.number)) | last | .status // "none") as $s | $pr + {statusCheckRollup: rollup($s)})' \
-		2>/dev/null || printf '%s' "$pr_json"
-	return 0
-}
-
-#######################################
-# Convert a backlog bucket to a numeric scheduling priority.
-# Lower number runs first. Merge-ready and fix-needed PRs are processed before
-# unrelated dispatch stages get any budget because this sort happens inside the
-# deterministic merge pass, which runs before dispatch_max.
-#
-# Args:
-#   $1 - backlog category string
-# Output: integer priority
-#######################################
-_pmp_backlog_priority() {
-	local category="$1"
-	case "$category" in
-	"$_PMP_BACKLOG_MERGE_READY") printf '10' ;;
-	"$_PMP_BACKLOG_SMALL_FIX_NEEDED") printf '20' ;;
-	"$_PMP_BACKLOG_CHECKS_IN_PROGRESS") printf '30' ;;
-	"$_PMP_BACKLOG_DIRTY_CONFLICTED") printf '40' ;;
-	"$_PMP_BACKLOG_HUMAN_APPROVAL_NEEDED") printf '50' ;;
-	*) printf '90' ;;
-	esac
-	return 0
-}
-
-#######################################
-# Sort a PR JSON array by backlog attention priority, preserving original
-# order inside each category. Emits a JSON array.
-#
-# Args:
-#   $1 - JSON array of PR objects
-# Output: JSON array sorted by backlog priority
-#######################################
-_pmp_sort_prs_by_backlog_priority() {
-	local pr_json="$1"
-	local repo_slug="${2:-}"
-	local pr_count=""
-	pr_count=$(printf '%s' "$pr_json" | jq 'length' 2>/dev/null) || pr_count=0
-	[[ "$pr_count" =~ ^[0-9]+$ ]] || pr_count=0
-	if [[ "$pr_count" -eq 0 ]]; then
-		printf '[]'
-		return 0
-	fi
-
-	local _tmp_lines=""
-	_tmp_lines=$(mktemp)
-	local i=0
-	while [[ "$i" -lt "$pr_count" ]]; do
-		local pr_obj="" category="" priority=""
-		pr_obj=$(printf '%s' "$pr_json" | jq -c ".[$i]" 2>/dev/null)
-		category=$(_pmp_classify_pr_backlog_state "$pr_obj" "$repo_slug")
-		priority=$(_pmp_backlog_priority "$category")
-		printf '%03d\t%06d\t%s\n' "$priority" "$i" "$pr_obj" >>"$_tmp_lines"
-		i=$((i + 1))
-	done
-
-	LC_ALL=C sort "$_tmp_lines" | cut -f3- | jq -s '.'
-	rm -f "$_tmp_lines"
-	return 0
-}
-
-#######################################
-# Log PR backlog category counts for current-state diagnostics.
-#
-# Args:
-#   $1 - repo slug
-#   $2 - JSON array of PR objects
-#######################################
-_pmp_log_pr_backlog_counts() {
-	local repo_slug="$1"
-	local pr_json="$2"
-	local merge_ready=0 checks_in_progress=0 small_fix_needed=0 dirty_conflicted=0 human_approval_needed=0 other=0
-	local pr_count=""
-	pr_count=$(printf '%s' "$pr_json" | jq 'length' 2>/dev/null) || pr_count=0
-	[[ "$pr_count" =~ ^[0-9]+$ ]] || pr_count=0
-
-	local i=0
-	while [[ "$i" -lt "$pr_count" ]]; do
-		local pr_obj="" category=""
-		pr_obj=$(printf '%s' "$pr_json" | jq -c ".[$i]" 2>/dev/null)
-		category=$(_pmp_classify_pr_backlog_state "$pr_obj" "$repo_slug")
-		case "$category" in
-		"$_PMP_BACKLOG_MERGE_READY") merge_ready=$((merge_ready + 1)) ;;
-		"$_PMP_BACKLOG_CHECKS_IN_PROGRESS") checks_in_progress=$((checks_in_progress + 1)) ;;
-		"$_PMP_BACKLOG_SMALL_FIX_NEEDED") small_fix_needed=$((small_fix_needed + 1)) ;;
-		"$_PMP_BACKLOG_DIRTY_CONFLICTED") dirty_conflicted=$((dirty_conflicted + 1)) ;;
-		"$_PMP_BACKLOG_HUMAN_APPROVAL_NEEDED") human_approval_needed=$((human_approval_needed + 1)) ;;
-		*) other=$((other + 1)) ;;
-		esac
-		i=$((i + 1))
-	done
-
-	echo "[pulse-wrapper] PR backlog ${repo_slug}: total=${pr_count}, merge-ready=${merge_ready}, checks-in-progress=${checks_in_progress}, small-fix-needed=${small_fix_needed}, dirty-conflicted=${dirty_conflicted}, human-approval-needed=${human_approval_needed}, other=${other}" >>"$LOGFILE"
-	return 0
-}
-
 # Safe duplicate worker PR consolidation helpers (m-20260508-0e27c3 task 2.4).
 _PULSE_MERGE_PROCESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./pulse-merge-duplicate-consolidation.sh
 # shellcheck disable=SC1091  # sub-library resolved at runtime via _PULSE_MERGE_PROCESS_DIR
 source "${_PULSE_MERGE_PROCESS_DIR}/pulse-merge-duplicate-consolidation.sh"
-
-#######################################
-# Enrich one PR inside the durable PR-cursor boundary. A time-budget edge returns
-# 5 and a REST-core launch-floor edge returns 6 after any potentially blocking
-# phase so the caller persists the current PR before another network phase.
-# Args: $1=repo slug, $2=PR object
-# Stdout: enriched PR object
-#######################################
-_pmp_enrich_single_pr_for_processing() {
-	local repo_slug="$1"
-	local pr_obj="$2"
-	local enriched_json=""
-
-	[[ -n "$repo_slug" && -n "$pr_obj" ]] || return 1
-	enriched_json=$(jq -cn --argjson pr "$pr_obj" '[$pr]' 2>/dev/null) || return 1
-	enriched_json=$(_pmp_enrich_prs_with_mergeability "$repo_slug" "$enriched_json") || return 1
-	_pmp_merge_pass_budget_exhausted && return 5
-	_pmp_rest_core_priority_allows_next progress "merge_enrichment_mergeability:${repo_slug}" || return 6
-	enriched_json=$(_pmp_enrich_prs_with_rest_check_status "$repo_slug" "$enriched_json") || return 1
-	_pmp_merge_pass_budget_exhausted && return 5
-	_pmp_rest_core_priority_allows_next progress "merge_enrichment_checks:${repo_slug}" || return 6
-	enriched_json=$(_pmp_enrich_prs_with_review_decisions "$repo_slug" "$enriched_json") || return 1
-	_pmp_merge_pass_budget_exhausted && return 5
-	_pmp_rest_core_priority_allows_next progress "merge_enrichment_reviews:${repo_slug}" || return 6
-
-	printf '%s' "$enriched_json" | jq -c '.[0] // empty' 2>/dev/null || return 1
-	return 0
-}
-
-#######################################
-# Prepare one cursor item for eligibility processing. Stop, budget, and
-# cooldown pauses persist the current item before returning status 5.
-# Args: $1=repo, $2=PR array, $3=index, $4=output var,
-#       $5-$7=counter var names, $8-$10=counter values, $11-$12=cache dirs
-#######################################
-_pmp_prepare_pr_at_cursor() {
-	local repo_slug="$1"
-	local pr_json="$2"
-	local cursor_index="$3"
-	local output_var="$4"
-	local merged_var="$5"
-	local closed_var="$6"
-	local failed_var="$7"
-	local merged_count="$8"
-	local closed_count="$9"
-	local failed_count="${10}"
-	local required_contexts_cache_dir="${11}"
-	local author_permission_cache_dir="${12}"
-	local prepared_pr_obj="" enriched_pr_obj="" enrichment_rc=0
-
-	[[ "$output_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
-	if [[ -f "$STOP_FLAG" ]]; then
-		_pmp_pause_merge_pr_cursor "$repo_slug" "$pr_json" "$cursor_index" stop "$merged_var" "$closed_var" "$failed_var" "$merged_count" "$closed_count" "$failed_count" "$required_contexts_cache_dir" "$author_permission_cache_dir"
-		return $?
-	fi
-	if _pmp_merge_pass_budget_exhausted; then
-		_pmp_pause_merge_pr_cursor "$repo_slug" "$pr_json" "$cursor_index" budget "$merged_var" "$closed_var" "$failed_var" "$merged_count" "$closed_count" "$failed_count" "$required_contexts_cache_dir" "$author_permission_cache_dir"
-		return $?
-	fi
-	if declare -F _gh_secondary_cooldown_preflight >/dev/null 2>&1 && ! _gh_secondary_cooldown_preflight write >/dev/null 2>&1; then
-		_pmp_pause_merge_pr_cursor "$repo_slug" "$pr_json" "$cursor_index" cooldown "$merged_var" "$closed_var" "$failed_var" "$merged_count" "$closed_count" "$failed_count" "$required_contexts_cache_dir" "$author_permission_cache_dir"
-		return $?
-	fi
-	if ! _pmp_rest_core_priority_allows_next progress "merge_pr:${repo_slug}"; then
-		_pmp_pause_merge_pr_cursor "$repo_slug" "$pr_json" "$cursor_index" rest-core "$merged_var" "$closed_var" "$failed_var" "$merged_count" "$closed_count" "$failed_count" "$required_contexts_cache_dir" "$author_permission_cache_dir"
-		return $?
-	fi
-
-	prepared_pr_obj=$(_pmp_pr_object_at_index "$pr_json" "$cursor_index")
-	if [[ -n "$prepared_pr_obj" ]]; then
-		# Backlog cache values are advisory and may become stale without a head
-		# change. Remove them so authoritative processing always refreshes all
-		# eligibility state from bounded REST endpoints.
-		prepared_pr_obj=$(printf '%s' "$prepared_pr_obj" | jq -c 'del(.mergeable, .reviewDecision, .statusCheckRollup)') || return 1
-		enriched_pr_obj=$(_pmp_enrich_single_pr_for_processing "$repo_slug" "$prepared_pr_obj") || enrichment_rc=$?
-		if [[ "$enrichment_rc" -eq 5 || "$enrichment_rc" -eq 6 ]]; then
-			local pause_reason="budget"
-			[[ "$enrichment_rc" -eq 6 ]] && pause_reason="rest-core"
-			_pmp_pause_merge_pr_cursor "$repo_slug" "$pr_json" "$cursor_index" "$pause_reason" "$merged_var" "$closed_var" "$failed_var" "$merged_count" "$closed_count" "$failed_count" "$required_contexts_cache_dir" "$author_permission_cache_dir"
-			return $?
-		fi
-		if [[ "$enrichment_rc" -ne 0 || -z "$enriched_pr_obj" ]]; then
-			echo "[pulse-wrapper] Merge pass: PR enrichment failed closed for ${repo_slug} at cursor index=${cursor_index}" >>"$LOGFILE"
-			prepared_pr_obj=$(printf '%s' "$prepared_pr_obj" | jq -c '. + {mergeable:"UNKNOWN", reviewDecision:"UNKNOWN", statusCheckRollup:[]}' 2>/dev/null) || prepared_pr_obj=""
-		else
-			prepared_pr_obj="$enriched_pr_obj"
-		fi
-	fi
-	printf -v "$output_var" '%s' "$prepared_pr_obj"
-	return 0
-}
-
-#######################################
-# Apply one processed PR result to pass counters and durable same-pass evidence.
-# Args: $1=repo, $2=PR number, $3=head SHA, $4=result code,
-#       $5=merged var, $6=closed var, $7=failed var
-#######################################
-_pmp_record_processed_pr_result() {
-	local repo_slug="$1"
-	local pr_number="$2"
-	local head_sha="$3"
-	local result_code="$4"
-	local merged_var="$5"
-	local closed_var="$6"
-	local failed_var="$7"
-	local outcome="blocked"
-
-	case "$result_code" in
-	0) _pmp_add_counter_var "$merged_var" 1 || return 1; outcome="merged" ;;
-	2) _pmp_add_counter_var "$closed_var" 1 || return 1; outcome="progress" ;;
-	3) _pmp_add_counter_var "$failed_var" 1 || return 1; outcome="eligible-unmerged" ;;
-	4) outcome="deferred" ;;
-	esac
-	_pmp_record_same_pass_pr_outcome "$repo_slug" "$pr_number" "$head_sha" "$outcome" || return 1
-	return 0
-}
+# Worker-briefed auto-merge trust chain (t2449/t3052/t3062/GH#35752), extracted
+# to keep this orchestrator below the file-size threshold (GH#27171).
+# shellcheck source=./pulse-merge-process-worker-briefed.sh
+# shellcheck disable=SC1091  # sub-library resolved at runtime via _PULSE_MERGE_PROCESS_DIR
+source "${_PULSE_MERGE_PROCESS_DIR}/pulse-merge-process-worker-briefed.sh"
 
 #######################################
 # Merge ready PRs for a single repo.
@@ -521,6 +369,9 @@ _pmp_record_processed_pr_result() {
 # Fetches the PR list for the repo, iterates, and delegates each PR
 # to _process_single_ready_pr. Uses eval to return counts to caller
 # (Bash 3.2 compat: no nameref).
+# GH#33569: opted-in callers skip an unchanged PR set that recently evaluated
+# to a no-op (_pmu_skip_unchanged_repo); complete from-start evaluations record
+# fresh evidence (_pmu_record_repo_evaluation). Skipped outcomes stay incomplete.
 #
 # Args:
 #   $1 - repo slug
@@ -538,93 +389,93 @@ _merge_ready_prs_for_repo() {
 	local _timing_prefix="${6:-}"
 
 	local merged=0 closed=0 failed=0
-	local pr_json="" pr_merge_err="" _list_start="" pr_count=""
+	# Propagate the graceful deadline into every nested bounded GitHub read
+	# and write, including the multi-call per-PR safety/eligibility evaluator.
+	local AIDEVOPS_GH_DEADLINE_EPOCH="${AIDEVOPS_GH_DEADLINE_EPOCH:-}"
+	_pmp_apply_merge_api_deadline
+	local pr_json="" pr_merge_err="" _list_start="" pr_count="" pr_list_timeout="" pr_list_rc=0
 	local pr_list_complete=1 outcomes_complete=1
-	_list_start=$(_pmp_now_epoch)
-	pr_merge_err=$(mktemp)
-	if declare -F pulse_pr_list_get >/dev/null 2>&1; then
-		pr_json=$(pulse_pr_list_get --repo "$repo_slug" --state open \
-			--json "$(_pulse_merge_ready_pr_json_fields)" \
-			--limit "$PULSE_MERGE_BATCH_LIMIT" 2>"$pr_merge_err") || pr_json=""
-	else
-		pr_json=$(gh_pr_list --repo "$repo_slug" --state open \
-			--json "$(_pulse_merge_ready_pr_json_fields)" \
-			--limit "$PULSE_MERGE_BATCH_LIMIT" 2>"$pr_merge_err") || pr_json=""
+	_pmp_now_epoch_into _list_start
+	if ! pr_list_timeout=$(_pmp_merge_pr_list_timeout_seconds); then
+		_pmp_record_pr_list_timing "$_timing_prefix" "$_list_start" 0
+		if [[ -n "$_pr_count_var" ]]; then
+			[[ "$_pr_count_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+			printf -v "$_pr_count_var" '%s' '0'
+		fi
+		eval "${_merged_var}=0; ${_closed_var}=0; ${_failed_var}=0"
+		return 5
 	fi
-	if [[ -z "$pr_json" || "$pr_json" == "null" ]]; then
+	pr_merge_err=$(mktemp)
+	pr_json=$(_pmp_fetch_ready_pr_list "$repo_slug" "$pr_list_timeout" "$pr_merge_err") || pr_list_rc=$?
+	if [[ "$pr_list_rc" -ne 0 || -z "$pr_json" || "$pr_json" == "null" ]]; then
 		local _pr_merge_err_msg
 		_pr_merge_err_msg=$(cat "$pr_merge_err" 2>/dev/null || echo "unknown error")
-		echo "[pulse-wrapper] _process_merge_batch: pulse_pr_list_get FAILED for ${repo_slug}: ${_pr_merge_err_msg}" >>"$LOGFILE"
+		echo "[pulse-wrapper] _process_merge_batch: pulse_pr_list_get FAILED for ${repo_slug}: list_state=incomplete rc=${pr_list_rc} timeout_s=${pr_list_timeout}: ${_pr_merge_err_msg}" >>"$LOGFILE"
 		pr_json="[]"
 		pr_list_complete=0
 	fi
-	rm -f "$pr_merge_err"
-	[[ -n "$_timing_prefix" ]] && _pmp_add_elapsed_seconds "${_timing_prefix}list_s" "$_list_start"
-
+	pr_json=$(_pmp_include_queued_pr_targets_or_fallback "$repo_slug" "$pr_json" "$pr_merge_err") || pr_list_complete=0
 	pr_count=$(printf '%s' "$pr_json" | jq 'length' 2>/dev/null) || { pr_count=0; pr_list_complete=0; }
-	[[ "$pr_count" =~ ^[0-9]+$ ]] || pr_count=0
+	[[ "$pr_count" =~ ^[0-9]+$ ]] || { pr_count=0; pr_list_complete=0; }
+	_pmp_record_pr_list_timing "$_timing_prefix" "$_list_start" "$pr_list_complete"
 	if [[ -n "$_pr_count_var" ]]; then
 		[[ "$_pr_count_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
 		printf -v "$_pr_count_var" '%s' "$pr_count"
 	fi
 
-	if [[ "$pr_count" -eq 0 ]]; then
+	if [[ "$pr_count" -eq 0 ]] || _pmu_skip_unchanged_repo "$repo_slug" "$pr_json" "$pr_list_complete"; then
 		eval "${_merged_var}=0; ${_closed_var}=0; ${_failed_var}=0"
-		if [[ "$pr_list_complete" -eq 1 ]]; then
+		if [[ "$pr_count" -eq 0 && "$pr_list_complete" -eq 1 ]]; then
 			_pmp_clear_merge_enrichment_state; _pmp_mark_same_pass_repo_complete "$repo_slug" 2>/dev/null || true
 		fi
 		return 0
 	fi
 
 	local AIDEVOPS_PULSE_REQUIRED_CONTEXTS_CACHE_DIR="" AIDEVOPS_PULSE_AUTHOR_PERMISSION_CACHE_DIR=""
-	AIDEVOPS_PULSE_REQUIRED_CONTEXTS_CACHE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/aidevops-pulse-required-contexts.XXXXXX" 2>/dev/null) || AIDEVOPS_PULSE_REQUIRED_CONTEXTS_CACHE_DIR=""
-	AIDEVOPS_PULSE_AUTHOR_PERMISSION_CACHE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/aidevops-pulse-author-perms.XXXXXX" 2>/dev/null) || AIDEVOPS_PULSE_AUTHOR_PERMISSION_CACHE_DIR=""
-	if [[ -z "$AIDEVOPS_PULSE_REQUIRED_CONTEXTS_CACHE_DIR" || -z "$AIDEVOPS_PULSE_AUTHOR_PERMISSION_CACHE_DIR" ]]; then
-		echo "[pulse-wrapper] Merge pass: per-repo cache setup incomplete for ${repo_slug}; continuing without one or more caches (GH#25696)" >>"$LOGFILE"
-	fi
+	_pmp_setup_merge_repo_caches "$repo_slug"
 
-	local prepared_pr_json="" preparation_rc=0
-	_pmp_prepare_enriched_pr_backlog "$repo_slug" "$pr_json" prepared_pr_json || preparation_rc=$?
+	local preparation_rc=0
+	_pmp_prepare_repo_processing_backlog "$repo_slug" "$_timing_prefix" || preparation_rc=$?
 	if [[ "$preparation_rc" -ne 0 ]]; then
-		[[ -n "$AIDEVOPS_PULSE_REQUIRED_CONTEXTS_CACHE_DIR" ]] && rm -rf -- "$AIDEVOPS_PULSE_REQUIRED_CONTEXTS_CACHE_DIR"
-		[[ -n "$AIDEVOPS_PULSE_AUTHOR_PERMISSION_CACHE_DIR" ]] && rm -rf -- "$AIDEVOPS_PULSE_AUTHOR_PERMISSION_CACHE_DIR"
+		_pmp_cleanup_merge_repo_caches
 		eval "${_merged_var}=0; ${_closed_var}=0; ${_failed_var}=0"
 		return "$preparation_rc"
 	fi
-	pr_json="$prepared_pr_json"
-	_pmp_log_pr_backlog_counts "$repo_slug" "$pr_json"
-	pr_json=$(_pmp_sort_prs_by_backlog_priority "$pr_json" "$repo_slug")
-	_pmp_consolidate_duplicate_pr_groups "$repo_slug" "$pr_json" || true
-	pr_count=$(printf '%s' "$pr_json" | jq 'length' 2>/dev/null) || { pr_count=0; outcomes_complete=0; }
-	[[ "$pr_count" =~ ^[0-9]+$ ]] || pr_count=0
 
 	local i=0
 	_pmp_prepare_merge_pr_cursor_resume "$repo_slug" "$pr_json" "$pr_count" "$PULSE_MERGE_PR_CURSOR_FILE" "$LOGFILE" i || i=0
+	local _evaluated_from_start=$((i == 0))
 	while [[ "$i" -lt "$pr_count" ]]; do
-		local pr_obj=""
+		local pr_obj="" _pr_start=""
+		_pr_start=$(_pmp_now_epoch) # GH#33307: time the whole per-PR unit
 		_pmp_prepare_pr_at_cursor "$repo_slug" "$pr_json" "$i" pr_obj "$_merged_var" "$_closed_var" "$_failed_var" "$merged" "$closed" "$failed" "$AIDEVOPS_PULSE_REQUIRED_CONTEXTS_CACHE_DIR" "$AIDEVOPS_PULSE_AUTHOR_PERMISSION_CACHE_DIR" || return $?
 		[[ -n "$pr_obj" ]] || {
+			[[ -n "$_timing_prefix" ]] && _pmp_record_pr_processing_timing "$_timing_prefix" "$_pr_start" ""
 			i=$((i + 1))
 			continue
 		}
 		local _cursor_last_pr="" _cursor_next_pr="" _pr_head_sha=""
 		_cursor_last_pr=$(printf '%s' "$pr_obj" | jq -r '.number // empty' 2>/dev/null) || _cursor_last_pr=""
 		_pr_head_sha=$(printf '%s' "$pr_obj" | jq -r '.headRefOid // empty' 2>/dev/null) || _pr_head_sha=""
+
+		local _pr_rc=0
+		_pmp_evaluate_pr_with_deadline "$repo_slug" "$pr_obj" "$_timing_prefix" || _pr_rc=$?
+		if [[ "$_pr_rc" -eq 124 ]]; then
+			_pmp_pause_merge_pr_cursor "$repo_slug" "$pr_json" "$i" budget "$_merged_var" "$_closed_var" "$_failed_var" "$merged" "$closed" "$failed" "$AIDEVOPS_PULSE_REQUIRED_CONTEXTS_CACHE_DIR" "$AIDEVOPS_PULSE_AUTHOR_PERMISSION_CACHE_DIR"
+			return $?
+		fi
 		i=$((i + 1))
 		_cursor_next_pr=$(_pmp_pr_number_at_index "$pr_json" "$i") || _cursor_next_pr=""
-		[[ -n "$pr_obj" ]] || continue
-
-		_process_single_ready_pr "$repo_slug" "$pr_obj" "$_timing_prefix"
-		local _pr_rc=$?
+		[[ -n "$_timing_prefix" ]] && _pmp_record_pr_processing_timing "$_timing_prefix" "$_pr_start" "$_cursor_last_pr"
 		_pmp_record_processed_pr_result "$repo_slug" "$_cursor_last_pr" "$_pr_head_sha" "$_pr_rc" merged closed failed || outcomes_complete=0
 		_pmp_write_merge_pr_cursor "$PULSE_MERGE_PR_CURSOR_FILE" "$repo_slug" "$i" "$_cursor_last_pr" "$_cursor_next_pr"
 	done
 	_pmp_clear_merge_pr_cursor "$PULSE_MERGE_PR_CURSOR_FILE"
 	_pmp_clear_merge_enrichment_state
 
-	[[ -n "$AIDEVOPS_PULSE_REQUIRED_CONTEXTS_CACHE_DIR" ]] && rm -rf -- "$AIDEVOPS_PULSE_REQUIRED_CONTEXTS_CACHE_DIR"
-	[[ -n "$AIDEVOPS_PULSE_AUTHOR_PERMISSION_CACHE_DIR" ]] && rm -rf -- "$AIDEVOPS_PULSE_AUTHOR_PERMISSION_CACHE_DIR"
+	_pmp_cleanup_merge_repo_caches
 	if [[ "$pr_list_complete" -eq 1 && "$outcomes_complete" -eq 1 ]]; then _pmp_mark_same_pass_repo_complete "$repo_slug" 2>/dev/null || true; fi
+	_pmu_record_repo_evaluation "$repo_slug" "$merged" "$closed" "$failed" "$((pr_list_complete * _evaluated_from_start))"
 
 	eval "${_merged_var}=${merged}; ${_closed_var}=${closed}; ${_failed_var}=${failed}"
 	return 0
@@ -643,9 +494,9 @@ _merge_ready_prs_for_repo() {
 # fall through to the close path).
 #
 # Rate-limit considerations: one REST update-branch call per CONFLICTING
-# PR per merge cycle. A confirmed interactive semantic conflict is persisted
-# for a bounded cooldown so later cycles do not retry an impossible write
-# until the head changes or the cooldown expires (GH#30396).
+# PR per merge cycle. A confirmed semantic conflict (any PR origin) is
+# persisted for a bounded cooldown so later cycles do not retry an impossible
+# write until the head changes or the cooldown expires (GH#30396, GH#34560).
 #
 # Args: $1=pr_number, $2=repo_slug, $3=expected current head SHA
 #######################################
@@ -678,12 +529,8 @@ _attempt_pr_update_branch() {
 		_PMP_UPDATE_BRANCH_SEMANTIC_CONFLICT_PR="$pr_number"
 		_PMP_UPDATE_BRANCH_SEMANTIC_CONFLICT_REPO="$repo_slug"
 		_PMP_UPDATE_BRANCH_SEMANTIC_CONFLICT_HEAD="$expected_head_sha"
-		local _ub_labels=""
-		_ub_labels=$(gh_pr_view "$pr_number" --repo "$repo_slug" --json labels \
-			--jq '[.labels[]?.name] | join(",")' 2>/dev/null) || _ub_labels=""
-		if [[ ",${_ub_labels}," == *"$_PMP_ORIGIN_INTERACTIVE_PATTERN"* ]]; then
-			_pmp_record_update_branch_conflict_cooldown "$pr_number" "$repo_slug" "$expected_head_sha" || true
-		fi
+		# The head-bound cooldown is recorded for every PR origin inside
+		# _pmp_update_branch_rest so all callers share it (GH#34560).
 	fi
 	echo "[pulse-wrapper] Merge pass: PR #${pr_number} in ${repo_slug} — update-branch failed, falling through to close (t2116): ${_ub_output}" >>"$LOGFILE"
 	return 1
@@ -886,7 +733,7 @@ _attempt_pr_ci_rebase_retry() {
 		# keeps PR-level needs-maintainer-review authoritative even though the
 		# repair-only gate intentionally stops before merge-only final checks.
 		if ! declare -F _pulse_merge_admin_safety_check >/dev/null 2>&1 \
-			|| ! _pulse_merge_admin_safety_check "$pr_number" "$repo_slug" "$_head_oid"; then
+			|| ! _pulse_merge_admin_safety_check "$pr_number" "$repo_slug" "$_head_oid" "$_review_repair_policy"; then
 			echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: live PR authority failed before strict review-repair rebase; preserving CHANGES_REQUESTED" >>"$LOGFILE"
 			return 1
 		fi
@@ -1131,17 +978,120 @@ _route_pr_has_linked_issue() {
 	return 1
 }
 
+# Recover a tracking issue only for an aged, trusted interactive PR. The issue
+# stays non-dispatchable until its closing link is persisted and the normal
+# handover/claim gates have passed. A deterministic title + marker recovers a
+# successful create followed by a failed PR edit without creating another issue.
+_recover_interactive_pr_work_issue() {
+	local pr_number="$1"
+	local repo_slug="$2"
+	local meta="" author="" title="Track interactive PR #${pr_number}" matches="" issue="" issue_meta=""
+	local marker="<!-- pulse-interactive-tracking:${pr_number} -->"
+	local body_file="" files="" created="" existing="" live_meta=""
+	[[ "${DRY_RUN:-0}" != "1" ]] || return 1
+	[[ "${AIDEVOPS_INTERACTIVE_PR_HANDOVER_MODE:-enforce}" == "enforce" ]] || return 1
+	meta=$(gh pr view "$pr_number" --repo "$repo_slug" --json state,author,labels,body,url,headRefOid) || return 1
+	printf '%s' "$meta" | jq -e '.state == "OPEN" and
+		([.labels[].name] | index("origin:interactive") != null and
+		any(. == "no-takeover" or . == "needs-maintainer-review" or
+		. == "external-contributor" or . == "hold-for-review") == false)' >/dev/null || return 1
+	#aidevops:trust-boundary — labels alone cannot authorize creation or takeover.
+	author=$(printf '%s' "$meta" | jq -r '.author.login // empty')
+	[[ -n "$author" ]] && _is_collaborator_author "$author" "$repo_slug" || return 1
+	_interactive_pr_is_stale "$pr_number" "$repo_slug" "" "" "" 1 || return 1
+	# Never replace a non-closing For/Ref work link with a new tracking issue.
+	existing=$(_extract_pr_work_issue "$pr_number" "$repo_slug") || return 1
+	if [[ -n "$existing" ]]; then
+		printf '%s' "$existing"
+		return 0
+	fi
+	matches=$(gh api -X GET search/issues -f q="repo:${repo_slug} is:issue in:title \"${title}\"") || return 1
+	printf '%s' "$matches" | jq -e 'select(.incomplete_results == false) | .items | arrays' >/dev/null || return 1
+	issue=$(printf '%s' "$matches" | jq -r --arg title "$title" '.items[] | select(.title == $title) | .number') || return 1
+	# Ambiguous search results must never choose somebody else's issue.
+	[[ "$issue" != *$'\n'* ]] || return 1
+	if [[ -n "$issue" ]]; then
+		issue_meta=$(gh api "repos/${repo_slug}/issues/${issue}") || return 1
+		printf '%s' "$issue_meta" | jq -e --arg marker "$marker" '.state == "open" and (.body | contains($marker))' >/dev/null || return 1
+		author=$(printf '%s' "$issue_meta" | jq -r '.user.login // empty')
+		_is_collaborator_author "$author" "$repo_slug" || return 1
+	else
+		files=$(gh api --paginate "repos/${repo_slug}/pulls/${pr_number}/files" --jq '.[].filename') || return 1
+		[[ -n "$files" ]] || return 1
+		body_file=$(mktemp) || return 1
+		{
+			printf '%s\n\n## Outcome\n\nComplete existing interactive PR %s through its existing CI, review and merge gates. Preserve its commits; repair only evidenced failures.\n\n### Files Scope\n' "$marker" "$(printf '%s' "$meta" | jq -r '.url')"
+			# shellcheck disable=SC2016 # Markdown code spans, not shell substitution
+			while IFS= read -r existing; do printf -- '- `%s`\n' "$existing"; done <<<"$files"
+			printf '\n### Verification\n\nUse the existing checks and verification documented on the source PR; inspect its exact-head CI and review feedback before repair. Do not bypass approval or security gates.\n'
+			printf '\n### Recovery state\n\nInitially blocked pending verified PR linkage. Pulse owns linkage recovery; after verification, existing feedback routing transitions this issue to available when repair is needed. No independent dispatch before that transition.\n'
+		} >"$body_file"
+		local create_rc=0
+		created=$(gh_create_issue --repo "$repo_slug" --title "$title" --label origin:interactive --label status:blocked --body-file "$body_file") || create_rc=$?
+		rm -f "$body_file"
+		[[ "$create_rc" -eq 0 ]] || return 1
+		issue="${created##*/}"
+	fi
+	[[ "$issue" =~ ^[0-9]+$ ]] || return 1
+	# Do not overwrite concurrent body edits, new commits or newly applied holds.
+	live_meta=$(gh pr view "$pr_number" --repo "$repo_slug" --json state,author,labels,body,url,headRefOid) || return 1
+	[[ "$(printf '%s' "$meta" | jq -Sc .)" == "$(printf '%s' "$live_meta" | jq -Sc .)" ]] || return 1
+	body_file=$(mktemp) || return 1
+	printf '%s\n\nResolves #%s\n' "$(printf '%s' "$meta" | jq -r '.body // ""')" "$issue" >"$body_file"
+	local edit_rc=0
+	gh_pr_edit_safe "$pr_number" --repo "$repo_slug" --body-file "$body_file" >/dev/null || edit_rc=$?
+	rm -f "$body_file"
+	[[ "$edit_rc" -eq 0 ]] || return 1
+	existing=$(_extract_linked_issue "$pr_number" "$repo_slug") || return 1
+	[[ "$existing" == "$issue" ]] || return 1
+	printf '%s' "$issue"
+	return 0
+}
+
+# Conflict checkpoints intentionally use For/Ref, not closing keywords.
+# Resolve independently of the caller's closing-only target, retaining the
+# existing linked-issue validation and all later routing guards (GH#33763).
+# Partial worker deliveries also declare their work issue with a standalone
+# For/Ref line. The merge gates already associate that explicit identity, so
+# CI/review repair must use it too or the PR is stranded with failing checks
+# and no route (GH#36260). It is a repair target only, never closure authority.
+_route_pr_resolve_work_issue() {
+	local pr_number="$1"
+	local repo_slug="$2"
+	local linked_issue="$3"
+	local kind="$4"
+	if [[ "$kind" == "conflict" ]]; then
+		linked_issue=$(_extract_pr_work_issue "$pr_number" "$repo_slug") || return 1
+	elif [[ -z "$linked_issue" ]]; then
+		linked_issue=$(_extract_pr_work_issue "$pr_number" "$repo_slug" explicit) || linked_issue=""
+	fi
+	if [[ -z "$linked_issue" ]]; then
+		# Fall through so an unroutable PR always logs why, every cycle.
+		linked_issue=$(_recover_interactive_pr_work_issue "$pr_number" "$repo_slug") || linked_issue=""
+	fi
+	_route_pr_has_linked_issue "$pr_number" "$repo_slug" "$linked_issue" "$kind" || return 1
+	printf '%s' "$linked_issue"
+	return 0
+}
+
 _route_pr_issue_labels_for_dispatch() {
 	local pr_number="$1"
 	local repo_slug="$2"
 	local linked_issue="$3"
+	local issue_meta=""
 	local issue_labels=""
 
-	if ! issue_labels=$(gh api "repos/${repo_slug}/issues/${linked_issue}" \
-		--jq '[.labels[].name] | join(",")' 2>/dev/null); then
+	if ! issue_meta=$(gh api "repos/${repo_slug}/issues/${linked_issue}" 2>/dev/null); then
 		echo "[pulse-wrapper] _route_pr_to_fix_worker: linked issue #${linked_issue} metadata unavailable for PR #${pr_number} in ${repo_slug} — refusing destructive routing" >>"$LOGFILE"
 		return "${PULSE_FEEDBACK_ROUTE_DEFERRED_RC:-75}"
 	fi
+	# The issues endpoint also returns pull requests. Never dispatch feedback to
+	# another PR merely because a For/Ref declaration names its number.
+	if ! printf '%s' "$issue_meta" | jq -e 'type == ({} | type) and (has("pull_request") | not)' >/dev/null 2>&1; then
+		echo "[pulse-wrapper] _route_pr_to_fix_worker: target #${linked_issue} for PR #${pr_number} in ${repo_slug} is not a verified issue — refusing destructive routing" >>"$LOGFILE"
+		return 1
+	fi
+	issue_labels=$(printf '%s' "$issue_meta" | jq -er '[.labels[].name] | join(",")') || return "${PULSE_FEEDBACK_ROUTE_DEFERRED_RC:-75}"
 	[[ ",${issue_labels}," != *",needs-maintainer-review,"* ]] || return 1
 	printf '%s\n' "$issue_labels"
 	return 0
@@ -1166,6 +1116,69 @@ _route_pr_feedback_terminal_guard() {
 		return "${PULSE_FEEDBACK_ROUTE_DEFERRED_RC:-75}"
 	fi
 	_feedback_route_guard_existing_terminal_label "$pr_number" "$repo_slug" "$linked_issue" "$kind"
+	return $?
+}
+
+_route_pr_preserve_deferred_retry() {
+	local route_rc="$1"
+	local pr_number="$2"
+	local repo_slug="$3"
+	local linked_issue="$4"
+	local kind="$5"
+	local queue_action="unavailable"
+
+	[[ "$route_rc" -eq "${PULSE_FEEDBACK_ROUTE_DEFERRED_RC:-75}" ]] || return "$route_rc"
+	if declare -F _pulse_merge_queue_defer >/dev/null 2>&1; then
+		queue_action=$(_pulse_merge_queue_defer "$repo_slug" "$pr_number" 2>>"$LOGFILE") || queue_action="unavailable"
+	elif declare -F _pulse_merge_queue_enqueue >/dev/null 2>&1; then
+		queue_action=$(_pulse_merge_queue_enqueue "$repo_slug" "$pr_number" 2>>"$LOGFILE") || queue_action="unavailable"
+	fi
+	echo "[pulse-wrapper] _route_pr_to_fix_worker: preserved deferred ${kind} route for PR #${pr_number} and issue #${linked_issue} in ${repo_slug} (retry_hint=${queue_action})" >>"$LOGFILE"
+	return "${PULSE_FEEDBACK_ROUTE_DEFERRED_RC:-75}"
+}
+
+_route_pr_issue_labels_with_retry() {
+	local pr_number="$1"
+	local repo_slug="$2"
+	local linked_issue="$3"
+	local kind="$4"
+	local issue_labels=""
+	local route_rc=0
+
+	issue_labels=$(_route_pr_issue_labels_for_dispatch "$pr_number" "$repo_slug" "$linked_issue") || route_rc=$?
+	if [[ "$route_rc" -ne 0 ]]; then
+		_route_pr_preserve_deferred_retry "$route_rc" "$pr_number" "$repo_slug" "$linked_issue" "$kind"
+		return $?
+	fi
+	printf '%s' "$issue_labels"
+	return 0
+}
+
+_route_pr_guard_and_dispatch_with_retry() {
+	local has_routed_label="$1"
+	local pr_number="$2"
+	local repo_slug="$3"
+	local linked_issue="$4"
+	local kind="$5"
+	local routed_label="$6"
+	local pr_title="$7"
+	local checks_json="$8"
+	local route_rc=0
+
+	# Classify closed issues before recovering old terminal markers or dispatching.
+	_feedback_route_guard_closed_issue "$pr_number" "$repo_slug" "$linked_issue" "$kind" || route_rc=$?
+	if [[ "$route_rc" -eq 0 ]]; then
+		_route_pr_feedback_terminal_guard "$has_routed_label" "$pr_number" "$repo_slug" \
+			"$linked_issue" "$kind" "$routed_label" || route_rc=$?
+	fi
+	if [[ "$route_rc" -eq 0 ]]; then
+		_dispatch_pr_repair_by_kind "$kind" "$pr_number" "$repo_slug" "$linked_issue" "$pr_title" "$checks_json" || route_rc=$?
+	fi
+	if [[ "$route_rc" -eq 0 || "$route_rc" -eq "${PULSE_FEEDBACK_ROUTE_MAINTAINER_RC:-76}" ]] \
+		&& declare -F _pulse_merge_queue_finish >/dev/null 2>&1; then
+		_pulse_merge_queue_finish 2
+	fi
+	_route_pr_preserve_deferred_retry "$route_rc" "$pr_number" "$repo_slug" "$linked_issue" "$kind"
 	return $?
 }
 
@@ -1210,9 +1223,8 @@ _route_pr_to_fix_worker() {
 	local label_list=""
 	local takeover_pattern="$_PMP_ORIGIN_TAKEOVER_PATTERN"
 	local has_routed_label=0
-	local issue_labels_rc=0
 
-	_route_pr_has_linked_issue "$pr_number" "$repo_slug" "$linked_issue" "$kind" || return 1
+	linked_issue=$(_route_pr_resolve_work_issue "$pr_number" "$repo_slug" "$linked_issue" "$kind") || return 1
 
 	# Fetch labels if not provided by caller
 	if [[ -z "$pr_labels" ]]; then
@@ -1248,8 +1260,7 @@ _route_pr_to_fix_worker() {
 	fi
 
 	# A linked issue on explicit maintainer hold is never rewritten or reopened.
-	issue_labels=$(_route_pr_issue_labels_for_dispatch "$pr_number" "$repo_slug" "$linked_issue") || issue_labels_rc=$?
-	[[ "$issue_labels_rc" -eq 0 ]] || return "$issue_labels_rc"
+	issue_labels=$(_route_pr_issue_labels_with_retry "$pr_number" "$repo_slug" "$linked_issue" "$kind") || return $?
 
 	if _route_pr_issue_supplies_worker_origin "$label_list" "$issue_labels"; then
 		issue_has_worker_origin=1
@@ -1263,11 +1274,13 @@ _route_pr_to_fix_worker() {
 			local origin_reconcile_rc=0
 			_route_issue_origin_is_trusted "$pr_number" "$repo_slug" "$linked_issue" \
 				|| origin_reconcile_rc=$?
-			[[ "$origin_reconcile_rc" -eq 0 ]] || return "$origin_reconcile_rc"
+			if [[ "$origin_reconcile_rc" -ne 0 ]]; then
+				_route_pr_preserve_deferred_retry "$origin_reconcile_rc" "$pr_number" "$repo_slug" "$linked_issue" "$kind"
+				return $?
+			fi
 		fi
-		_route_pr_feedback_terminal_guard "$has_routed_label" "$pr_number" "$repo_slug" \
-			"$linked_issue" "$kind" "$routed_label" || return $?
-		_dispatch_pr_repair_by_kind "$kind" "$pr_number" "$repo_slug" "$linked_issue" "$pr_title" "$checks_json"
+		_route_pr_guard_and_dispatch_with_retry "$has_routed_label" "$pr_number" "$repo_slug" \
+			"$linked_issue" "$kind" "$routed_label" "$pr_title" "$checks_json"
 		return $?
 	fi
 
@@ -1284,9 +1297,8 @@ _route_pr_to_fix_worker() {
 			echo "[pulse-wrapper] _route_pr_to_fix_worker: origin:worker-takeover not confirmed for PR #${pr_number} in ${repo_slug} — refusing destructive routing" >>"$LOGFILE"
 			return 1
 		fi
-		_route_pr_feedback_terminal_guard "$has_routed_label" "$pr_number" "$repo_slug" \
-			"$linked_issue" "$kind" "$routed_label" || return $?
-		_dispatch_pr_repair_by_kind "$kind" "$pr_number" "$repo_slug" "$linked_issue" "$pr_title" "$checks_json"
+		_route_pr_guard_and_dispatch_with_retry "$has_routed_label" "$pr_number" "$repo_slug" \
+			"$linked_issue" "$kind" "$routed_label" "$pr_title" "$checks_json"
 		return $?
 	fi
 
@@ -1336,206 +1348,6 @@ _retarget_stacked_children() {
 }
 
 #######################################
-# Check if a GitHub login appears in the trusted-issue-author allowlist (t3062).
-#
-# Peer runners with COLLABORATOR association can be added to the allowlist to
-# bypass the OWNER/MEMBER author_association gate without requiring per-issue
-# cryptographic approval (sudo aidevops approve issue N).
-#
-# Config: AIDEVOPS_TRUSTED_AUTHORS_CONF env var (override) or
-#         <_PULSE_MERGE_DIR>/../configs/trusted-issue-authors.conf (default).
-# Empty/missing config = no trusted authors = returns 1 (not trusted).
-#
-# Args: $1=github_login
-# Returns: 0=login is trusted, 1=not trusted
-#######################################
-_is_trusted_issue_author() {
-	local login="$1"
-	[[ -z "$login" ]] && return 1
-	local _trusted_conf="${AIDEVOPS_TRUSTED_AUTHORS_CONF:-${_PULSE_MERGE_DIR:+${_PULSE_MERGE_DIR}/../configs/trusted-issue-authors.conf}}"
-	[[ -z "$_trusted_conf" || ! -f "$_trusted_conf" ]] && return 1
-	local _tentry
-	while IFS= read -r _tentry || [[ -n "$_tentry" ]]; do
-		[[ -z "$_tentry" || "$_tentry" == "#"* ]] && continue
-		[[ "$_tentry" == "$login" ]] && return 0
-	done < "$_trusted_conf"
-	return 1
-}
-
-#######################################
-# Check whether an issue author has maintainer-equivalent repository access.
-#
-# GitHub can expose maintainer-operated issues/PRs as COLLABORATOR rather than
-# OWNER/MEMBER. For worker-briefed auto-merge, verify that ambiguous metadata
-# through the authenticated collaborator permission endpoint instead of forcing
-# per-issue cryptographic approvals for every maintainer-run aidevops worker.
-#
-# Args: $1=repo_slug, $2=github_login, $3=precomputed_permission(optional)
-# Returns: 0=trusted maintainer-equivalent access, 1=not trusted or API error
-#######################################
-_issue_author_has_maintainer_authority() {
-	local repo_slug="$1"
-	local login="$2"
-	local permission="${3:-}"
-
-	[[ -n "$repo_slug" && -n "$login" ]] || return 1
-
-	if [[ -z "$permission" ]]; then
-		#aidevops:trust-boundary GH#24958: ambiguous GitHub issue
-		# author_association values are not sufficient to auto-merge worker PRs.
-		# Confirm maintainer-equivalent access with authenticated metadata and fail
-		# closed on API errors or permissions below write.
-		permission=$(gh api "repos/${repo_slug}/collaborators/${login}/permission" \
-			--jq '.permission // ""' 2>/dev/null) || return 1
-	fi
-
-	case "$permission" in
-		admin | maintain | write)
-			return 0
-			;;
-	esac
-	return 1
-}
-
-#######################################
-# Verify that a linked issue has a maintainer cryptographic approval (t3052).
-#
-# Marker-string presence is not a trust signal: any user able to comment could
-# paste the marker. This helper delegates to approval-helper.sh, which verifies
-# the SSH signature against the maintainer approval public key.
-#
-# Args: $1=issue_number, $2=repo_slug
-# Returns: 0=verified approval, 1=no verified approval
-#######################################
-_issue_has_verified_crypto_approval() {
-	local issue_number="$1"
-	local repo_slug="$2"
-	[[ -z "$issue_number" || -z "$repo_slug" ]] && return 1
-
-	local approval_helper="${AGENTS_DIR:-$HOME/.aidevops/agents}/scripts/approval-helper.sh"
-	[[ ! -f "$approval_helper" ]] && return 1
-
-	local verify_result=""
-	verify_result=$(bash "$approval_helper" verify "$issue_number" "$repo_slug" 2>/dev/null) || verify_result=""
-	[[ "$verify_result" == "VERIFIED" ]]
-	return $?
-}
-
-#######################################
-# Check origin:worker worker-briefed auto-merge gates (t2449).
-#
-# Sibling to _check_interactive_pr_gates — validates that an origin:worker
-# PR is eligible for auto-merge based on the maintainer-briefed trust chain.
-# Called from _check_pr_merge_gates when the PR carries origin:worker.
-#
-# The trust-chain equivalence argument: if the underlying issue was filed by
-# the repo OWNER/MEMBER, the worker faithfully implemented, CI confirms
-# correctness, and no human reviewer objected, the trust chain is equivalent
-# to (or stronger than) an origin:interactive auto-merge.
-#
-# Nine criteria (see GH#20204):
-#   1. PR carries origin:worker label (caller pre-checks)
-#   2. Linked issue authored by OWNER or MEMBER
-#   3. Linked issue has live maintainer-author authority or cryptographic approval
-#   4. All required status checks PASS/SKIPPED (checked by general gates)
-#   5. No CHANGES_REQUESTED from human reviewers (checked by general gates)
-#   6. PR is not a draft
-#   7. No hold-for-review label
-#   8. Passes review-bot-gate (checked by general gates)
-#   9. No origin:worker-takeover label (caller pre-checks)
-#
-# Feature flag: AIDEVOPS_WORKER_BRIEFED_AUTO_MERGE (default: 1=on, 0=off)
-# When OFF, all origin:worker PRs fall back to manual merge only.
-#
-# Args: $1=pr_number, $2=repo_slug, $3=labels_str (comma-separated),
-#       $4=is_draft, $5=linked_issue,
-#       $6=precomputed_pr_author_permission(optional),
-#       $7=precomputed_pr_author_login(optional)
-# Returns: 0=all gates pass (eligible for auto-merge), 1=blocked
-#######################################
-_attempt_worker_briefed_auto_merge() {
-	local pr_number="$1"
-	local repo_slug="$2"
-	local labels_str="$3"
-	local is_draft="$4"
-	local linked_issue="$5"
-	local precomputed_pr_author_permission="${6:-}"
-	local precomputed_pr_author_login="${7:-}"
-
-	# Feature flag — when OFF, all origin:worker PRs fall back to manual merge
-	if [[ "${AIDEVOPS_WORKER_BRIEFED_AUTO_MERGE:-1}" == "0" ]]; then
-		echo "[pulse-merge] worker-briefed auto-merge: disabled by AIDEVOPS_WORKER_BRIEFED_AUTO_MERGE=0 for PR #${pr_number} in ${repo_slug} (t2449)" >>"$LOGFILE"
-		return 1
-	fi
-
-	# Gate: not a draft
-	if [[ "$is_draft" == "true" ]]; then
-		echo "[pulse-merge] worker-briefed auto-merge: skipping PR #${pr_number} in ${repo_slug} — draft PR not eligible (t2449)" >>"$LOGFILE"
-		return 1
-	fi
-
-	# Gate: no hold-for-review opt-out label
-	if [[ ",${labels_str}," == *",hold-for-review,"* ]]; then
-		echo "[pulse-merge] worker-briefed auto-merge: skipping PR #${pr_number} in ${repo_slug} — hold-for-review label (t2449)" >>"$LOGFILE"
-		return 1
-	fi
-
-	# Gate: must have a linked issue (the "brief" in "maintainer-briefed")
-	if [[ -z "$linked_issue" ]]; then
-		echo "[pulse-merge] worker-briefed auto-merge: skipping PR #${pr_number} in ${repo_slug} — no linked issue (t2449)" >>"$LOGFILE"
-		return 1
-	fi
-
-	# Reuse the issue API base path for author-association and NMR checks.
-	local _issue_api
-	_issue_api=$(_pm_issue_api "$repo_slug" "$linked_issue")
-	# Fetch author_association and user.login in one API call (t3062 needs login).
-	local _issue_meta
-	_issue_meta=$(gh api "${_issue_api}" \
-		--jq '[.author_association // "", .user.login // ""] | @tsv' 2>/dev/null) || _issue_meta="	"
-	local issue_author_assoc=""
-	local issue_author_login=""
-	read -r issue_author_assoc issue_author_login <<< "$_issue_meta"
-	local issue_author_permission=""
-	#aidevops:trust-boundary — reuse PR-author permission only for the same non-empty issue-author login.
-	if [[ -n "$precomputed_pr_author_permission" && -n "$precomputed_pr_author_login" && "$precomputed_pr_author_login" == "$issue_author_login" ]]; then
-		issue_author_permission="$precomputed_pr_author_permission"
-	fi
-
-	local _not_true_status="not-verified"
-	local _has_crypto="$_not_true_status"
-	if _issue_has_verified_crypto_approval "$linked_issue" "$repo_slug"; then
-		_has_crypto="true"
-	fi
-
-	# Gate: linked issue authored by OWNER/MEMBER, OR login has authenticated
-	# maintainer-equivalent repo permission (GH#24958), OR login is in the
-	# trusted-issue-author allowlist (t3062), OR cryptographically approved
-	# by maintainer (t3052). The trust chain "maintainer SSH-signed
-	# an approval on the issue" is at least as strong as the OWNER/MEMBER
-	# author check — the maintainer personally vouched with their private key.
-	if [[ "$issue_author_assoc" != "OWNER" && "$issue_author_assoc" != "MEMBER" ]]; then
-		if _issue_author_has_maintainer_authority "$repo_slug" "$issue_author_login" "$issue_author_permission"; then
-			echo "[pulse-merge] worker-briefed auto-merge: PR #${pr_number} in ${repo_slug} — linked issue #${linked_issue} author ${issue_author_login} passes via authenticated maintainer permission fallback (GH#24958)" >>"$LOGFILE"
-		elif _is_trusted_issue_author "$issue_author_login"; then
-			echo "[pulse-merge] worker-briefed auto-merge: PR #${pr_number} in ${repo_slug} — linked issue #${linked_issue} author ${issue_author_login} passes via trusted-issue-author allowlist (t3062)" >>"$LOGFILE"
-		elif [[ "$_has_crypto" != "true" ]]; then
-			echo "[pulse-merge] worker-briefed auto-merge: skipping PR #${pr_number} in ${repo_slug} — linked issue #${linked_issue} author_association=${issue_author_assoc} (not OWNER/MEMBER) and no cryptographic approval signature found (t2449/t3052)" >>"$LOGFILE"
-			return 1
-		else
-			echo "[pulse-merge] worker-briefed auto-merge: PR #${pr_number} in ${repo_slug} — linked issue #${linked_issue} author_association=${issue_author_assoc} but cryptographic approval signature present, proceeding (t3052)" >>"$LOGFILE"
-		fi
-	fi
-
-	# Historical NMR/normalization comments are not current authority signals.
-	# Live issue-author authority above is sufficient; external authors still
-	# require verified cryptographic approval and live NMR remains blocked by the
-	# general merge gates.
-	echo "[pulse-merge] worker-briefed auto-merge: PR #${pr_number} in ${repo_slug} passed all gates (issue #${linked_issue}, author_assoc=${issue_author_assoc}, crypto_approved=${_has_crypto}) (t2449/t3052)" >>"$LOGFILE"
-	return 0
-}
-
-#######################################
 # Verify all branch-protection-required check contexts have passed on a PR.
 #
 # Uses the branch protection API as the authoritative source for required
@@ -1561,6 +1373,12 @@ _check_required_checks_passing() {
 	local repo_slug="$1"
 	local pr_number="$2"
 	local pr_sha="${3:-}"
+
+	# GH#32951: expose why contexts are not passing so native auto-merge can
+	# tell never-reported contexts from in-flight ones. Empty = unknown.
+	_PULSE_REQUIRED_CHECKS_NONPASS_COUNT=""
+	_PULSE_REQUIRED_CHECKS_MISSING_COUNT=""
+	_PULSE_CHECKS_IN_FLIGHT_COUNT=""
 
 	# Resolve required contexts (delegates default-branch lookup + branch
 	# protection API + 404 distinction to the helper). Empty stdout + exit 0
@@ -1616,11 +1434,13 @@ _check_required_checks_passing() {
 	# Count required contexts that are not in a passing state. check-runs
 	# objects expose `.name`, `.conclusion`, and `.status`. Status
 	# `completed` + conclusion in {success, neutral, skipped} → PASS.
-	local failing_count _fc_exit
-	failing_count=$(jq -n \
+	# Also count required contexts absent from the exact-head rollup and any
+	# check still in flight (GH#32951).
+	local counts="" failing_count="" missing_count="" in_flight_count="" _fc_exit=0
+	counts=$(jq -nr \
 		--argjson req "$req_json" \
 		--argjson checks "$rollup_json" \
-		'$req | map(
+		'($req | map(
 			. as $ctx |
 			($checks | map(select((.name // "") == $ctx)) | last) as $c |
 			if $c == null then "NOT_FOUND"
@@ -1628,16 +1448,21 @@ _check_required_checks_passing() {
 				| . == "SUCCESS" or . == "NEUTRAL" or . == "SKIPPED") then "PASS"
 			else "FAIL"
 			end
-		) | map(select(. != "PASS")) | length' 2>/dev/null)
-	_fc_exit=$?
+		)) as $states |
+		($checks | map(select(((.status // "completed") | ascii_downcase) != "completed")) | length) as $in_flight |
+		"\($states | map(select(. != "PASS")) | length) \($states | map(select(. == "NOT_FOUND")) | length) \($in_flight)"' 2>/dev/null) || _fc_exit=$?
+	read -r failing_count missing_count in_flight_count <<<"$counts"
 
-	if [[ $_fc_exit -ne 0 || -z "$failing_count" ]]; then
+	if [[ $_fc_exit -ne 0 || ! "$failing_count" =~ ^[0-9]+$ || ! "$missing_count" =~ ^[0-9]+$ || ! "$in_flight_count" =~ ^[0-9]+$ ]]; then
 		echo "[pulse-merge] _check_required_checks_passing: jq evaluation failed for PR #${pr_number} in ${repo_slug} — failing closed (t2922)" >>"$LOGFILE"
 		return 1
 	fi
+	_PULSE_REQUIRED_CHECKS_NONPASS_COUNT="$failing_count"
+	_PULSE_REQUIRED_CHECKS_MISSING_COUNT="$missing_count"
+	_PULSE_CHECKS_IN_FLIGHT_COUNT="$in_flight_count"
 
 	if [[ "$failing_count" -gt 0 ]]; then
-		echo "[pulse-merge] _check_required_checks_passing: ${failing_count} required context(s) not passing for PR #${pr_number} in ${repo_slug} (t2922)" >>"$LOGFILE"
+		echo "[pulse-merge] _check_required_checks_passing: ${failing_count} required context(s) not passing for PR #${pr_number} in ${repo_slug} (${missing_count} never reported, ${in_flight_count} check(s) in flight) (t2922)" >>"$LOGFILE"
 		return 1
 	fi
 
@@ -1798,6 +1623,9 @@ _enable_native_auto_merge_for_head() {
 		echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: native auto-merge not set because the gated head SHA is unavailable" >>"$LOGFILE"
 		return 1
 	fi
+	# #aidevops:trust-boundary — enabling auto-merge can merge immediately.
+	_pulse_merge_final_trust_gate "$pr_number" "$repo_slug" "$expected_head_sha" || return 1
+	[[ "${_PULSE_FINAL_REQUIRES_SYNCHRONOUS_MERGE:-0}" != "1" ]] || return 1
 	auto_output=$(gh pr merge "$pr_number" --repo "$repo_slug" --auto --squash \
 		--match-head-commit "$expected_head_sha" 2>&1)
 	auto_exit=$?
@@ -1807,6 +1635,130 @@ _enable_native_auto_merge_for_head() {
 	fi
 	echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: gh pr merge --auto failed (exit ${auto_exit}): ${auto_output} — falling through to immediate merge (t3070)" >>"$LOGFILE"
 	return 1
+}
+
+_pmp_issue_sync_run_api() {
+	local operation="$1"
+	shift
+	if declare -F _gh_with_timeout >/dev/null 2>&1; then
+		_gh_with_timeout "$operation" "$@"
+	else
+		"$@"
+	fi
+}
+
+_pmp_audit_issue_sync_run_approval() {
+	local repo_slug="$1"
+	local pr_number="$2"
+	local expected_head_sha="$3"
+	local run_id="$4"
+	local outcome="$5"
+	local audit_helper="${_PULSE_MERGE_PROCESS_DIR}/audit-log-helper.sh"
+
+	[[ -x "$audit_helper" ]] || return 0
+	"$audit_helper" log operation.verify \
+		"pulse approved trusted Issue Sync workflow run ${run_id} for PR #${pr_number} in ${repo_slug} — ${outcome}" \
+		--detail "op=pulse.issue-sync-run-approval" \
+		--detail "repo=${repo_slug}" \
+		--detail "pr=${pr_number}" \
+		--detail "head=${expected_head_sha}" \
+		--detail "run=${run_id}" \
+		--detail "outcome=${outcome}" >/dev/null 2>&1 || true
+	return 0
+}
+
+#######################################
+# Approve pull_request workflow runs that GitHub held for a repository-generated
+# Issue Sync PR. The shared immutable trust predicate remains the authority;
+# every candidate and the live PR head are checked again before each mutation.
+#
+# Args: $1=pr_number, $2=repo_slug, $3=expected_head_sha
+# Returns: 0=no candidates or all candidates approved/idempotently cleared;
+#          1=API, schema, identity, association, or freshness failure
+# Sets: _PULSE_ISSUE_SYNC_RUNS_APPROVED to the number of approved/cleared runs
+#######################################
+_pmp_approve_issue_sync_action_required_runs() {
+	local pr_number="$1"
+	local repo_slug="$2"
+	local expected_head_sha="$3"
+	local runs_json="" candidates_json="" run_ids="" run_id=""
+	local live_identity="" live_head_sha="" live_head_repo=""
+	local approve_output="" run_conclusion="" approved_count=0
+	_PULSE_ISSUE_SYNC_RUNS_APPROVED=0
+
+	[[ "$pr_number" =~ ^[0-9]+$ && -n "$repo_slug" && -n "$expected_head_sha" ]] || return 1
+	#aidevops:trust-boundary -- workflow approval is available only to the shared
+	# immutable exact-head Issue Sync authority predicate.
+	_pulse_is_trusted_issue_sync_pr "$pr_number" "$repo_slug" "$expected_head_sha" || return 0
+
+	runs_json=$(_pmp_issue_sync_run_api read gh api \
+		"repos/${repo_slug}/actions/runs?event=pull_request&head_sha=${expected_head_sha}&per_page=100") || {
+		echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: trusted Issue Sync action-required run listing failed; refusing workflow approval" >>"$LOGFILE"
+		return 1
+	}
+	if ! printf '%s' "$runs_json" | jq -e '
+		type == "object"
+		and (.total_count | type == "number" and . >= 0 and . <= 100)
+		and (.workflow_runs | type == "array")
+		and (.total_count == (.workflow_runs | length))
+	' >/dev/null 2>&1; then
+		echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: trusted Issue Sync workflow-run response was malformed or exceeded the 100-run bound; refusing workflow approval" >>"$LOGFILE"
+		return 1
+	fi
+	candidates_json=$(printf '%s' "$runs_json" | jq -c '[.workflow_runs[] | select((.conclusion // "") == "action_required")]') || return 1
+	[[ "$candidates_json" != "[]" ]] || return 0
+	if ! printf '%s' "$candidates_json" | jq -e --arg repo "$repo_slug" --arg head "$expected_head_sha" --argjson pr "$pr_number" '
+		all(.[ ];
+			(.id | type == "number")
+			and .event == "pull_request"
+			and .conclusion == "action_required"
+			and .head_sha == $head
+			and .head_repository.full_name == $repo
+			and (.pull_requests | type == "array" and length == 1)
+			and .pull_requests[0].number == $pr)
+	' >/dev/null 2>&1; then
+		echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: action-required run identity, repository, head, or PR association did not match; refusing workflow approval" >>"$LOGFILE"
+		return 1
+	fi
+	run_ids=$(printf '%s' "$candidates_json" | jq -r '.[].id') || return 1
+
+	while IFS= read -r run_id; do
+		[[ "$run_id" =~ ^[0-9]+$ ]] || return 1
+		live_identity=$(_pmp_issue_sync_run_api read gh api "repos/${repo_slug}/pulls/${pr_number}" \
+			--jq '[.head.sha // "", .head.repo.full_name // ""] | @tsv') || return 1
+		IFS=$'\t' read -r live_head_sha live_head_repo <<<"$live_identity"
+		#aidevops:trust-boundary -- revalidate both current ownership and the shared
+		# immutable Issue Sync predicate immediately before every run approval.
+		if [[ "$live_head_sha" != "$expected_head_sha" || "$live_head_repo" != "$repo_slug" ]] \
+			|| ! _pulse_is_trusted_issue_sync_pr "$pr_number" "$repo_slug" "$expected_head_sha"; then
+			echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: head or Issue Sync trust changed before workflow run ${run_id} approval; refusing remaining approvals" >>"$LOGFILE"
+			return 1
+		fi
+		if approve_output=$(_pmp_issue_sync_run_api write gh api -X POST \
+			"repos/${repo_slug}/actions/runs/${run_id}/approve" 2>&1); then
+			approved_count=$((approved_count + 1))
+			_pmp_audit_issue_sync_run_approval "$repo_slug" "$pr_number" "$expected_head_sha" "$run_id" approved
+			continue
+		fi
+		run_conclusion=$(_pmp_issue_sync_run_api read gh api \
+			"repos/${repo_slug}/actions/runs/${run_id}" --jq '.conclusion // ""' 2>/dev/null) || return 1
+		if [[ "$run_conclusion" != "action_required" && -n "$run_conclusion" ]]; then
+			approved_count=$((approved_count + 1))
+			_pmp_audit_issue_sync_run_approval "$repo_slug" "$pr_number" "$expected_head_sha" "$run_id" already-cleared
+			continue
+		fi
+		echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: approval failed for trusted Issue Sync workflow run ${run_id}; refusing remaining approvals: ${approve_output}" >>"$LOGFILE"
+		return 1
+	done <<<"$run_ids"
+
+	_PULSE_ISSUE_SYNC_RUNS_APPROVED="$approved_count"
+	if declare -F gh_pr_check_status_cache_invalidate >/dev/null 2>&1 \
+		&& ! gh_pr_check_status_cache_invalidate "$repo_slug" "$expected_head_sha"; then
+		echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: approved Issue Sync runs but required-check cache invalidation failed; deferring for a fresh pass" >>"$LOGFILE"
+		return 1
+	fi
+	echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: approved or confirmed cleared ${approved_count} exact-head action-required Issue Sync workflow run(s); refreshing required checks on the next pass" >>"$LOGFILE"
+	return 0
 }
 
 _handle_existing_native_auto_merge() {
@@ -1849,6 +1801,12 @@ _handle_existing_native_auto_merge() {
 	if ! _check_required_checks_passing "$repo_slug" "$pr_number" >/dev/null 2>&1; then
 		pending_count=1
 	fi
+	if [[ "$pending_count" -gt 0 ]] \
+		&& _pmp_remediate_missing_required_checks "$pr_number" "$repo_slug" "$expected_head_sha"; then
+		# GH#32951: required contexts never reported; CI retrigger requested
+		# or bounded. Keep the existing request instead of churning it.
+		return 0
+	fi
 	if [[ "$pending_count" -gt 0 ]]; then
 		local enabled_at="" enabled_epoch="0" now_epoch="0" age_seconds="0"
 		enabled_at=$(printf '%s' "$pr_state" | jq -r '.autoMergeRequest.enabledAt // ""' 2>/dev/null) || enabled_at=""
@@ -1888,6 +1846,8 @@ _handle_existing_native_auto_merge() {
 #   * Repo allow_auto_merge=false      → return 1 (caller --admin path)
 #   * No required check pending        → return 1 (caller --admin path —
 #                                                  immediate merge fastest)
+#   * Required contexts never reported → return 2 (bounded update-branch
+#     on an aged head, nothing in flight   retriggers CI; GH#32951)
 #   * gh pr merge --auto succeeds      → return 0 (caller skips merge)
 #   * gh pr merge --auto fails         → return 1 (caller --admin fallback)
 #
@@ -1912,6 +1872,20 @@ _set_native_auto_merge_or_skip() {
 	local require_synchronous_final_gate="${3:-0}"
 	local current_review="${4:-UNKNOWN}"
 	local expected_head_sha="${5:-}"
+	local release_metadata="" release_head="" release_labels=""
+
+	# aidevops:trust-boundary — inspect fresh identity before retaining or enabling
+	# native auto-merge. A failed identity read cannot authorize a generic merge.
+	release_metadata=$(gh api "repos/${repo_slug}/pulls/${pr_number}" 2>/dev/null) || return 2
+	printf '%s' "$release_metadata" | jq -e '
+		type == "object" and (.head.ref | type == "string" and length > 0)
+		and (.labels | arrays | true)' >/dev/null || return 2
+	release_head=$(printf '%s' "$release_metadata" | jq -r '.head.ref // ""') || return 2
+	release_labels=$(printf '%s' "$release_metadata" | jq -r '[.labels[]?.name] | join(",")') || return 2
+	if _pmp_is_protected_release_pr "$release_head" "$release_labels"; then
+		_pmp_hold_protected_release_pr "$pr_number" "$repo_slug" "$release_head" "$expected_head_sha" || return 3
+		return 2
+	fi
 
 	# Fetch auto_merge metadata + merge state through exact-attribution routes.
 	# Carry forward the review state that passed this cycle's gate; unknown or
@@ -1950,6 +1924,11 @@ _set_native_auto_merge_or_skip() {
 	fi
 	if [[ "$require_synchronous_final_gate" == "1" ]]; then
 		echo "[pulse-merge] PR #${pr_number} in ${repo_slug}: CI pending; external approval state requires synchronous final revalidation, so native auto-merge remains disabled" >>"$LOGFILE"
+		return 2
+	fi
+	# GH#32951: never-reported required contexts cannot turn green; retrigger
+	# CI (bounded) instead of arming a native auto-merge that cannot finish.
+	if _pmp_remediate_missing_required_checks "$pr_number" "$repo_slug" "$expected_head_sha"; then
 		return 2
 	fi
 

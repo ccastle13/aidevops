@@ -17,7 +17,9 @@ _SHARED_GH_SECONDARY_COOLDOWN_LOADED=1
 : "${AIDEVOPS_GH_SECONDARY_COOLDOWN_EVENTS_MAX_LINES:=100}"
 : "${AIDEVOPS_GH_SECONDARY_COOLDOWN_EVENTS_MAX_BYTES:=262144}"
 : "${AIDEVOPS_GH_READ_RAMP_ENABLED:=1}"
-: "${AIDEVOPS_GH_READ_RAMP_BOOT_SECS:=180}"
+# Healthy boots do not imply GitHub pressure. Recovery after real throttling
+# retains its bounded ramp; callers may explicitly request a boot ramp.
+: "${AIDEVOPS_GH_READ_RAMP_BOOT_SECS:=0}"
 : "${AIDEVOPS_GH_READ_RAMP_RECOVERY_SECS:=300}"
 : "${AIDEVOPS_GH_READ_RAMP_BUDGET:=60}"
 : "${AIDEVOPS_GH_READ_RAMP_STATE_FILE:=${AIDEVOPS_GH_SECONDARY_COOLDOWN_HOME}/.aidevops/cache/gh-read-ramp-state.tsv}"
@@ -28,6 +30,19 @@ _GH_SECONDARY_READ_OP="read"
 _GH_SECONDARY_COOLDOWN_ACTION_CREATED="created"
 _GH_SECONDARY_COOLDOWN_UNKNOWN="unknown"
 _GH_SECONDARY_COOLDOWN_GRAPHQL="graphql"
+
+# The wrappers already resolved their own directory; standalone sourcing must
+# resolve this file under both bash and zsh (where BASH_SOURCE is empty).
+_gh_secondary_lib_dir="${_SHARED_GH_WRAPPERS_DIR:-}"
+if [[ -z "$_gh_secondary_lib_dir" && -n "${BASH_SOURCE[0]:-}" ]]; then
+	_gh_secondary_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 1
+elif [[ -z "$_gh_secondary_lib_dir" && -n "${ZSH_VERSION:-}" ]]; then
+	_gh_secondary_lib_self="$0"
+	[[ -f "$_gh_secondary_lib_self" ]] || return 1
+	_gh_secondary_lib_dir="$(cd "$(dirname "$_gh_secondary_lib_self")" && pwd)" || return 1
+fi
+# shellcheck source=./shared-gh-primary-cooldown.sh
+source "${_gh_secondary_lib_dir}/shared-gh-primary-cooldown.sh"
 
 _gh_secondary_cooldown_now() {
 	date +%s
@@ -46,7 +61,7 @@ _gh_secondary_cooldown_event_file() {
 
 _gh_secondary_cooldown_detect() {
 	local text="$1"
-	printf '%s' "$text" | grep -Eqi 'secondary rate limit|abuse detection mechanism|You have exceeded a secondary rate limit' || return 1
+	grep -Eqi 'secondary rate limit|abuse detection mechanism|You have exceeded a secondary rate limit' <<<"$text" || return 1
 	return 0
 }
 
@@ -256,23 +271,23 @@ _gh_secondary_cooldown_body_classification() {
 	local response_text="$1"
 	local status="${2:-}"
 	local remaining="${3:-}"
-	if printf '%s' "$response_text" | grep -Eqi 'abuse detection mechanism'; then
+	if grep -Eqi 'abuse detection mechanism' <<<"$response_text"; then
 		printf 'abuse-detection'
 		return 0
 	fi
-	if printf '%s' "$response_text" | grep -Eqi 'secondary rate limit|You have exceeded a secondary rate limit'; then
+	if grep -Eqi 'secondary rate limit|You have exceeded a secondary rate limit' <<<"$response_text"; then
 		printf 'secondary-rate-limit'
 		return 0
 	fi
-	if printf '%s' "$response_text" | grep -Eqi 'GraphQL: API rate limit already exceeded|API rate limit exceeded'; then
+	if grep -Eqi 'GraphQL: API rate limit already exceeded|API rate limit exceeded' <<<"$response_text"; then
 		printf 'primary-rate-limit'
 		return 0
 	fi
-	if printf '%s' "$response_text" | grep -Eqi 'Resource not accessible by integration'; then
+	if grep -Eqi 'Resource not accessible by integration' <<<"$response_text"; then
 		printf 'resource-not-accessible'
 		return 0
 	fi
-	if printf '%s' "$response_text" | grep -Eqi 'requires?.*(permission|scope)|permission.*required|must have.*(admin|write|read)|insufficient.*permission'; then
+	if grep -Eqi 'requires?.*(permission|scope)|permission.*required|must have.*(admin|write|read)|insufficient.*permission' <<<"$response_text"; then
 		printf 'requires-permission'
 		return 0
 	fi
@@ -653,7 +668,7 @@ _gh_secondary_cooldown_parse_response_metadata() {
 		case "$meta_key" in
 		[Rr][Ee][Tt][Rr][Yy]-[Aa][Ff][Tt][Ee][Rr]) retry_after="$meta_value" ;;
 		[Xx]-[Rr][Aa][Tt][Ee][Ll][Ii][Mm][Ii][Tt]-[Ll][Ii][Mm][Ii][Tt]) ratelimit_limit="$meta_value" ;;
-		[Xx]-[Rr][Aa][Tt][Ee][Ll][Ii][Mm][Ii][Tt]-[Rr][Ee][Mm][Aa][Ii][Nn][Ii][Ng]) ratelimit_remaining="$meta_value" ;;
+		[Xx]-[Rr][Aa][Tt][Ee][Ll][Ii][Mm][Ii][Tt]-[Rr][Ee][Mm][Aa][Ii][Nn][Ii][Nn][Gg]) ratelimit_remaining="$meta_value" ;;
 		[Xx]-[Rr][Aa][Tt][Ee][Ll][Ii][Mm][Ii][Tt]-[Rr][Ee][Ss][Ee][Tt]) ratelimit_reset="$meta_value" ;;
 		[Xx]-[Rr][Aa][Tt][Ee][Ll][Ii][Mm][Ii][Tt]-[Uu][Ss][Ee][Dd]) ratelimit_used="$meta_value" ;;
 		[Xx]-[Rr][Aa][Tt][Ee][Ll][Ii][Mm][Ii][Tt]-[Rr][Ee][Ss][Oo][Uu][Rr][Cc][Ee]) ratelimit_resource="$meta_value" ;;
@@ -751,7 +766,9 @@ _gh_secondary_cooldown_write_until() {
 		_gh_secondary_cooldown_write_state_fallback "$file" || return 1
 	fi
 	mv "${file}.tmp" "$file" || return 1
-	printf '[gh-cooldown] secondary-rate-limit active=true expires_at=%s reason=%s\n' "$expires" "$reason" >&2
+	local limit_kind="secondary-rate-limit"
+	[[ "$decision_branch" != primary-* ]] || limit_kind="$decision_branch"
+	printf '[gh-cooldown] %s active=true expires_at=%s reason=%s\n' "$limit_kind" "$expires" "$reason" >&2
 	return 0
 }
 
@@ -765,24 +782,25 @@ _gh_secondary_cooldown_write() {
 _gh_secondary_cooldown_header_value() {
 	local response_text="$1"
 	local header_name="$2"
-	printf '%s\n' "$response_text" | awk -v name="$header_name" '
+	awk -v name="$header_name" '
 		BEGIN { target = tolower(name) ":" }
 		{ line = $0; sub(/\r$/, "", line); if (line == "") { exit } lower = tolower(line); if (index(lower, target) == 1) { sub(/^[^:]*:[[:space:]]*/, "", line); sub(/[[:space:]]+$/, "", line); print line; exit } }
-	' 2>/dev/null
+	' <<<"$response_text" 2>/dev/null
 	return 0
 }
 
 _gh_secondary_cooldown_status() {
 	local response_text="$1"
-	printf '%s\n' "$response_text" | awk '
+	awk '
 		{ line = $0; sub(/\r$/, "", line); if (line == "") { exit } }
 		line ~ /^HTTP\// { split(line, parts, /[[:space:]]+/); print parts[2]; exit }
-	' 2>/dev/null || printf ''
+	' <<<"$response_text" 2>/dev/null || printf ''
 	return 0
 }
 
 _gh_secondary_cooldown_header_expires_at() {
 	local response_text="$1"
+	local body_classification="${2:-}"
 	local now=""
 	local retry_after=""
 	local reset_at=""
@@ -793,17 +811,25 @@ _gh_secondary_cooldown_header_expires_at() {
 		printf '%s' $((now + retry_after))
 		return 0
 	fi
-	reset_at="$(_gh_secondary_cooldown_header_value "$response_text" "x-ratelimit-reset")"
-	if [[ "$reset_at" =~ ^[0-9]+$ && "$reset_at" -gt "$now" ]]; then
-		printf '%s' "$reset_at"
-		return 0
-	fi
+	case "$body_classification" in
+	secondary-rate-limit | abuse-detection) ;;
+	*)
+		reset_at="$(_gh_secondary_cooldown_header_value "$response_text" "x-ratelimit-reset")"
+		if [[ "$reset_at" =~ ^[0-9]+$ && "$reset_at" -gt "$now" ]]; then
+			printf '%s' "$reset_at"
+			return 0
+		fi
+		;;
+	esac
 	printf '%s' $((now + AIDEVOPS_GH_SECONDARY_COOLDOWN_SECS))
 	return 0
 }
 
 _gh_secondary_cooldown_rest_reset_at() {
 	local endpoint_arg="${1:-}"
+	# The native transport boundary already owns response headers. Do not
+	# recursively query a projection while recording a stopped transport.
+	[[ "${AIDEVOPS_GH_COOLDOWN_NO_PROBE:-0}" != 1 ]] || return 1
 	local endpoint_family=""
 	local resource_key="core"
 	local reset_at=""
@@ -824,6 +850,17 @@ _gh_secondary_cooldown_rest_reset_at() {
 	return 1
 }
 
+_gh_search_cooldown_preflight() {
+	# Compatibility entrypoint used by native and REST-wrapper boundaries.
+	_gh_primary_cooldown_preflight "$@"
+	return $?
+}
+
+_gh_search_primary_response() {
+	_gh_primary_cooldown_response "$@"
+	return $?
+}
+
 _gh_secondary_cooldown_record_response_if_needed() {
 	local rc="$1"
 	local response_text="${2:-}"
@@ -839,6 +876,9 @@ _gh_secondary_cooldown_record_response_if_needed() {
 	local body_classification=""
 	local expires_at=""
 
+	if _gh_search_primary_response "$response_text" "$method_arg" "$endpoint_arg" "$query_shape_arg" "$operation_arg" "$wrapper_arg" "$pulse_stage_arg"; then
+		return 0
+	fi
 	status="$(_gh_secondary_cooldown_status "$response_text")"
 	remaining="$(_gh_secondary_cooldown_header_value "$response_text" "x-ratelimit-remaining")"
 	retry_after="$(_gh_secondary_cooldown_header_value "$response_text" "retry-after")"
@@ -849,7 +889,7 @@ _gh_secondary_cooldown_record_response_if_needed() {
 			_gh_secondary_cooldown_record_event "diagnostic-only" "github-api-forbidden-status-403" "status-403-diagnostic-only" "$response_text" "$method_arg" "$endpoint_arg" "$query_shape_arg" "$operation_arg" "$wrapper_arg" "$pulse_stage_arg"
 			return 0
 		fi
-		expires_at="$(_gh_secondary_cooldown_header_expires_at "$response_text")"
+		expires_at="$(_gh_secondary_cooldown_header_expires_at "$response_text" "$body_classification")"
 		if [[ -z "$retry_after" ]] && ! [[ "$(_gh_secondary_cooldown_header_value "$response_text" "x-ratelimit-reset")" =~ ^[0-9]+$ ]]; then
 			expires_at="$(_gh_secondary_cooldown_rest_reset_at "$endpoint_arg" || printf '%s' "$expires_at")"
 		fi
@@ -857,7 +897,7 @@ _gh_secondary_cooldown_record_response_if_needed() {
 		return 0
 		;;
 	429)
-		expires_at="$(_gh_secondary_cooldown_header_expires_at "$response_text")"
+		expires_at="$(_gh_secondary_cooldown_header_expires_at "$response_text" "$body_classification")"
 		if [[ -z "$retry_after" ]] && ! [[ "$(_gh_secondary_cooldown_header_value "$response_text" "x-ratelimit-reset")" =~ ^[0-9]+$ ]]; then
 			expires_at="$(_gh_secondary_cooldown_rest_reset_at "$endpoint_arg" || printf '%s' "$expires_at")"
 		fi

@@ -4,6 +4,14 @@
 
 set -euo pipefail
 
+# Resolve native Git once from the system default PATH (portable to non-FHS
+# hosts such as NixOS); fixtures must bypass the aidevops git wrapper.
+TEST_NATIVE_GIT=$(command -p -v git) || {
+	printf '%s\n' 'Native Git is unavailable on the system PATH' >&2
+	exit 1
+}
+export TEST_NATIVE_GIT
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)" || exit
 GITHUB_HELPER="$REPO_ROOT/.agents/scripts/github-cli-helper.sh"
@@ -44,6 +52,10 @@ set -euo pipefail
 printf 'AIDEVOPS_AGENTS_DIR=%s\n' "${AIDEVOPS_AGENTS_DIR-unset}" >>"${SYNC_ENV_LOG_PATH:?SYNC_ENV_LOG_PATH must be set}"
 printf 'AGENTS_DIR=%s\n' "${AGENTS_DIR-unset}" >>"$SYNC_ENV_LOG_PATH"
 printf '%s\n' "$*" >>"${SYNC_LOG_PATH:?SYNC_LOG_PATH must be set}"
+if [[ "${MOCK_REQUIRE_OUTER_LOCK:-0}" == "1" &&
+	! -d "$HOME/.aidevops/locks/runtime-transition.lock.d" ]]; then
+	exit 91
+fi
 if [[ "${MOCK_DEPLOY_EXIT_CODE:-0}" -ne 0 ]]; then
 	exit "$MOCK_DEPLOY_EXIT_CODE"
 fi
@@ -193,7 +205,7 @@ fi
 if [[ "${MOCK_GIT_STATUS_FAIL:-0}" == "1" && "$repo_root" == "${SYNC_FIXTURE_REPO:-}" && "$*" == *" status "* ]]; then
 	exit 128
 fi
-exec /usr/bin/git "$@"
+exec "$TEST_NATIVE_GIT" "$@"
 EOF
 	chmod +x "$git_path"
 	return 0
@@ -244,6 +256,8 @@ invoke_github_sync() {
 invoke_release_sync() {
 	local repo_root="$1"
 	local deployment_scope="${2:-incremental}"
+	local mock_lane_source_pr="${MOCK_RELEASE_LANE_SOURCE_PR:-${AIDEVOPS_RELEASE_LANE_SOURCE_PR:-}}"
+	local mock_lane_tag="${MOCK_RELEASE_LANE_TAG:-${AIDEVOPS_RELEASE_LANE_TAG:-}}"
 	AIDEVOPS_SYNC_REPO_ROOT="$repo_root" \
 		AIDEVOPS_RELEASE_DEPLOY_SCOPE="$deployment_scope" \
 		AIDEVOPS_SYNC_DEPLOY_SCRIPT="$TEST_DIR/repo/.agents/scripts/deploy-agents-on-merge.sh" \
@@ -252,8 +266,140 @@ invoke_release_sync() {
 		SYNC_ENV_LOG_PATH="$TEST_DIR/sync-env.log" \
 		MOCK_DEPLOY_EXIT_CODE="${MOCK_DEPLOY_EXIT_CODE:-0}" \
 		MOCK_DEPLOY_MODE="${MOCK_DEPLOY_MODE:-current}" \
-		bash -c 'source "$1" && run_post_release_agent_sync' _ "$VERSION_HELPER"
+		AIDEVOPS_RELEASE_SQUASH_RECOVERY="${AIDEVOPS_RELEASE_SQUASH_RECOVERY:-0}" \
+		AIDEVOPS_RELEASE_LANE_SOURCE_PR="${AIDEVOPS_RELEASE_LANE_SOURCE_PR:-}" \
+		AIDEVOPS_RELEASE_LANE_TAG="${AIDEVOPS_RELEASE_LANE_TAG:-}" \
+		MOCK_RELEASE_LANE_SOURCE_PR="$mock_lane_source_pr" \
+		MOCK_RELEASE_LANE_TAG="$mock_lane_tag" \
+		bash -c '
+			source "$1"
+			release_lane_setup_guard() {
+				local repo_slug="$1"
+				[[ -n "$repo_slug" ]] || return 1
+				_AIDEVOPS_RELEASE_LANE_JSON=$(jq -cn \
+					--argjson source_pr "${MOCK_RELEASE_LANE_SOURCE_PR:-0}" \
+					--arg tag "${MOCK_RELEASE_LANE_TAG:-}" \
+					"{active:true,source_pr:\$source_pr,tag:\$tag,phase:\"exact-tag-deployment\",terminal_receipt:null}") || return 1
+				return 0
+			}
+			if [[ "${RELEASE_SYNC_ENTRYPOINT:-sync}" == "gates" ]]; then
+				run_post_publication_gates 9.9.10 0
+			else
+				run_post_release_agent_sync
+			fi
+		' _ "$VERSION_HELPER"
 	return $?
+}
+
+prepare_squash_integrated_release() {
+	local repo_path="$1"
+	local mode="${2:-complete}"
+	local base_sha=""
+	local active_sha=""
+	local release_sha=""
+	local special_path=$'active\nspecial.txt'
+
+	base_sha=$(PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" rev-parse HEAD) || return 1
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" checkout -qb active-branch
+	printf 'active one\n' >"$repo_path/active-one.txt"
+	printf 'active two\n' >"$repo_path/active-two.txt"
+	if [[ "$mode" == "newline-changed" ]]; then
+		printf 'active special\n' >"$repo_path/$special_path"
+	fi
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" add -A
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" commit -qm "active branch changes"
+	active_sha=$(PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" rev-parse HEAD) || return 1
+	invoke_release_sync "$repo_path" >/dev/null 2>&1 || return 1
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" checkout -q --detach "$base_sha"
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" checkout active-branch -- active-one.txt active-two.txt
+	if [[ "$mode" == "newline-changed" ]]; then
+		PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" checkout active-branch -- "$special_path"
+	fi
+	case "$mode" in
+	omitted) rm -f "$repo_path/active-two.txt" ;;
+	changed) printf 'different release value\n' >"$repo_path/active-two.txt" ;;
+	newline-changed) printf 'different special value\n' >"$repo_path/$special_path" ;;
+	complete) ;;
+	*) return 1 ;;
+	esac
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" add -A
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" commit -qm "squash active branch"
+	printf '9.9.10\n' >"$repo_path/VERSION"
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" add VERSION
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" commit -qm "publish descendant release"
+	release_sha=$(PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" rev-parse HEAD) || return 1
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" -c tag.gpgSign=false tag v9.9.10 "$release_sha"
+	printf '%s|%s\n' "$active_sha" "$release_sha"
+	return 0
+}
+
+prepare_protected_integration_release() {
+	local repo_path="$1"
+	local mode="${2:-complete}"
+	local base_sha=""
+	local active_sha=""
+	local release_sha=""
+	local integration_sha=""
+	local protected_main=""
+	local remote_path=""
+
+	base_sha=$(PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" rev-parse HEAD) || return 1
+	remote_path=$(configure_local_aidevops_remote "$repo_path") || return 1
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" checkout -qb active-branch
+	printf 'unique active content\n' >"$repo_path/active-only.txt"
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" add active-only.txt
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" commit -qm "ordinary post-source merge"
+	active_sha=$(PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" rev-parse HEAD) || return 1
+	invoke_release_sync "$repo_path" >/dev/null 2>&1 || return 1
+
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" checkout -qb release-branch "$base_sha"
+	printf '9.9.10\n' >"$repo_path/VERSION"
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" add VERSION
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" commit -qm "publish snapshot release"
+	release_sha=$(PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" rev-parse HEAD) || return 1
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" -c tag.gpgSign=false tag v9.9.10 "$release_sha"
+
+	if [[ "$mode" == "later-merge" || "$mode" == "missing-active" ]]; then
+		# The integration mainline lacks the active runtime; it reaches main only afterwards.
+		PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" checkout -qb mainline-branch "$base_sha"
+	elif [[ "$mode" == "double-merge" ]]; then
+		# The direct release integration lands on a side branch, while protected
+		# main independently advances past the active runtime before merging it.
+		PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" checkout -qb mainline-branch "$base_sha"
+	else
+		PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" checkout -q active-branch
+	fi
+	if [[ "$mode" == "intervening" ]]; then
+		# GH#32510: ordinary mainline merges land after the deployed runtime.
+		printf 'intervening content\n' >"$repo_path/intervening.txt"
+		PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" add intervening.txt
+		PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" commit -qm "advance active before integration"
+	fi
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" merge -q --no-ff release-branch -m "preserve signed release"
+	integration_sha=$(PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" rev-parse HEAD) || return 1
+	if [[ "$mode" == "later-merge" ]]; then
+		PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" merge -q --no-ff active-branch -m "merge active after integration"
+	elif [[ "$mode" == "double-merge" ]]; then
+		PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" checkout -q active-branch
+		printf 'main advanced before release integration\n' >"$repo_path/main-before-integration.txt"
+		PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" add main-before-integration.txt
+		PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" commit -qm "advance active main"
+		PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" merge -q --no-ff mainline-branch -m "merge protected release integration"
+	fi
+	printf 'protected main successor\n' >"$repo_path/protected-successor.txt"
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" add protected-successor.txt
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" commit -qm "advance protected main"
+	protected_main=$(PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" rev-parse HEAD) || return 1
+	if [[ "$mode" == "unreachable" ]]; then
+		PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" push -q "$remote_path" "$active_sha:refs/heads/main"
+	elif [[ "$mode" == "missing-active" ]]; then
+		PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" push -q "$remote_path" "$protected_main:refs/heads/main"
+	else
+		PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" push -q "$remote_path" "$protected_main:refs/heads/main"
+	fi
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" checkout -q --detach "$release_sha"
+	printf '%s|%s|%s|%s\n' "$active_sha" "$release_sha" "$integration_sha" "$protected_main"
+	return 0
 }
 
 create_fake_repo() {
@@ -279,6 +425,18 @@ create_fake_repo() {
 	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" add .
 	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" commit -qm fixture
 	printf '%s\n' "$repo_path"
+	return 0
+}
+
+configure_local_aidevops_remote() {
+	local repo_path="$1"
+	local repo_name="${repo_path##*/}"
+	local remote_path="$TEST_DIR/remotes/$repo_name/marcusquinn/aidevops.git"
+
+	mkdir -p "${remote_path%/*}"
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git init --bare -q "$remote_path"
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" remote set-url origin "$remote_path"
+	printf '%s\n' "$remote_path"
 	return 0
 }
 
@@ -458,11 +616,11 @@ test_merge_sync_skips_dirty_canonical_mirror() {
 	local output=""
 	active_before=$(cd "$TEST_HOME/.aidevops/agents" && pwd -P)
 	printf '%s\n' '# unexpected canonical edit' >>"$TEST_DIR/repo/.agents/scripts/deploy-agents-on-merge.sh"
-	dirty_blob_before=$(/usr/bin/git hash-object "$TEST_DIR/repo/.agents/scripts/deploy-agents-on-merge.sh")
+	dirty_blob_before=$("$TEST_NATIVE_GIT" hash-object "$TEST_DIR/repo/.agents/scripts/deploy-agents-on-merge.sh")
 	output=$(invoke_github_sync "marcusquinn/aidevops" 2>&1)
 	active_after=$(cd "$TEST_HOME/.aidevops/agents" && pwd -P)
-	dirty_blob_after=$(/usr/bin/git hash-object "$TEST_DIR/repo/.agents/scripts/deploy-agents-on-merge.sh")
-	/usr/bin/git -C "$TEST_DIR/repo" checkout -- .agents/scripts/deploy-agents-on-merge.sh
+	dirty_blob_after=$("$TEST_NATIVE_GIT" hash-object "$TEST_DIR/repo/.agents/scripts/deploy-agents-on-merge.sh")
+	"$TEST_NATIVE_GIT" -C "$TEST_DIR/repo" checkout -- .agents/scripts/deploy-agents-on-merge.sh
 
 	if [[ ! -s "$TEST_DIR/sync.log" && ! -s "$TEST_DIR/recovery.log" &&
 		"$active_before" == "$active_after" && "$dirty_blob_before" == "$dirty_blob_after" &&
@@ -693,19 +851,61 @@ test_release_sync_accepts_validated_same_tree_descendant() {
 	return 0
 }
 
-test_release_sync_rejects_changed_tree_descendant() {
+test_release_sync_accepts_changed_tree_protected_main_descendant() {
 	local repo_path
+	local remote_path=""
+	local active_sha=""
 	local output=""
-	repo_path=$(create_fake_repo "release-changed-tree-descendant" "https://github.com/marcusquinn/aidevops.git")
-	prepare_active_release_preservation "$repo_path" changed-tree >/dev/null
+	repo_path=$(create_fake_repo "release-changed-tree-protected-main" "https://github.com/marcusquinn/aidevops.git")
+	remote_path=$(configure_local_aidevops_remote "$repo_path") || {
+		print_result "release sync accepts a changed-tree protected-main descendant" 1 "Could not prepare local protected remote"
+		return 0
+	}
+	active_sha=$(prepare_active_release_preservation "$repo_path" changed-tree)
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" push -q "$remote_path" "$active_sha:refs/heads/main"
 	: >"$TEST_DIR/sync.log"
 
-	if output=$(invoke_release_sync "$repo_path" 2>&1); then
-		print_result "release sync rejects a changed-tree preservation descendant" 1 "Changed-tree descendant was reported as converged"
-	elif [[ "$output" == *"tree differs from release"* && ! -s "$TEST_DIR/sync.log" ]]; then
-		print_result "release sync rejects a changed-tree preservation descendant" 0
+	if output=$(invoke_release_sync "$repo_path" 2>&1) &&
+		[[ ! -s "$TEST_DIR/sync.log" ]] &&
+		[[ "$output" == *"preservation merge ${active_sha:0:12}"* ]] &&
+		[[ "$output" == *"verified no-op"* ]]; then
+		print_result "release sync accepts an exact-verified changed-tree protected-main descendant" 0
 	else
-		print_result "release sync rejects a changed-tree preservation descendant" 1 "Missing fail-closed changed-tree evidence: $output"
+		print_result "release sync accepts an exact-verified changed-tree protected-main descendant" 1 "$output"
+	fi
+	return 0
+}
+
+test_release_sync_accepts_changed_tree_non_tip_descendant() {
+	local repo_path
+	local remote_path=""
+	local release_sha=""
+	local active_sha=""
+	local protected_main=""
+	local output=""
+	repo_path=$(create_fake_repo "release-changed-tree-non-tip" "https://github.com/marcusquinn/aidevops.git")
+	remote_path=$(configure_local_aidevops_remote "$repo_path") || {
+		print_result "release sync rejects a changed-tree non-tip descendant" 1 "Could not prepare local protected remote"
+		return 0
+	}
+	release_sha=$(PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" rev-parse HEAD)
+	active_sha=$(prepare_active_release_preservation "$repo_path" changed-tree)
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" checkout -q --detach "$active_sha"
+	printf 'new protected-main change\n' >"$repo_path/new-protected-change.txt"
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" add new-protected-change.txt
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" commit -qm "advance protected main"
+	protected_main=$(PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" rev-parse HEAD)
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" push -q "$remote_path" "$protected_main:refs/heads/main"
+	PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git -C "$repo_path" checkout -q --detach "$release_sha"
+	: >"$TEST_DIR/sync.log"
+
+	if output=$(invoke_release_sync "$repo_path" 2>&1) &&
+		[[ ! -s "$TEST_DIR/sync.log" ]] &&
+		[[ "$output" == *"preservation merge ${active_sha:0:12}"* ]] &&
+		[[ "$output" != *"[ERROR]"* ]]; then
+		print_result "release sync accepts a verified non-tip descendant despite moving main" 0
+	else
+		print_result "release sync accepts a verified non-tip descendant despite moving main" 1 "$output"
 	fi
 	return 0
 }
@@ -719,10 +919,163 @@ test_release_sync_rejects_unrelated_active_commit() {
 
 	if output=$(invoke_release_sync "$repo_path" 2>&1); then
 		print_result "release sync rejects an unrelated active commit" 1 "Unrelated active commit was reported as converged"
-	elif [[ "$output" == *"is not a descendant of release"* && ! -s "$TEST_DIR/sync.log" ]]; then
+	elif [[ "$output" == *"neither ancestry-related nor a lane-authorized squash-integrated source"* && ! -s "$TEST_DIR/sync.log" ]]; then
 		print_result "release sync rejects an unrelated active commit" 0
 	else
 		print_result "release sync rejects an unrelated active commit" 1 "Missing fail-closed ancestry evidence: $output"
+	fi
+	return 0
+}
+
+test_release_sync_defers_verified_protected_integration() {
+	local mode=""
+	local repo_path=""
+	local evidence=""
+	local active_sha=""
+	local integration_sha=""
+	local output=""
+	local actual_rc=0
+	local label=""
+	for mode in complete intervening later-merge double-merge; do
+		label="release sync defers a verified $mode protected integration for main convergence"
+		actual_rc=0
+		repo_path=$(create_fake_repo "release-protected-integration-$mode" "https://github.com/marcusquinn/aidevops.git")
+		evidence=$(prepare_protected_integration_release "$repo_path" "$mode") || {
+			print_result "$label" 1 "Could not prepare protected integration topology"
+			continue
+		}
+		active_sha="${evidence%%|*}"
+		integration_sha="${evidence#*|*|}"
+		integration_sha="${integration_sha%%|*}"
+		: >"$TEST_DIR/sync.log"
+		output=$(RELEASE_SYNC_ENTRYPOINT=gates AIDEVOPS_RELEASE_SQUASH_RECOVERY=1 AIDEVOPS_RELEASE_LANE_SOURCE_PR=90 \
+			AIDEVOPS_RELEASE_LANE_TAG=v9.9.10 invoke_release_sync "$repo_path" 2>&1) || actual_rc=$?
+		if [[ "$actual_rc" -eq 76 && ! -s "$TEST_DIR/sync.log" ]] &&
+			[[ "$output" == *"protected integration ${integration_sha:0:12} is verified"* ]] &&
+			[[ "$output" == *"active runtime ${active_sha:0:12} does not include the release tag"* ]] &&
+			[[ "$output" != *"[ERROR]"* ]]; then
+			print_result "$label" 0
+		else
+			print_result "$label" 1 "Expected verified stale-runtime deferral: $output"
+		fi
+	done
+	return 0
+}
+
+test_release_sync_rejects_unverified_protected_integration() {
+	local mode=""
+	local repo_path=""
+	local output=""
+	for mode in unreachable missing-active; do
+		repo_path=$(create_fake_repo "release-protected-integration-$mode" "https://github.com/marcusquinn/aidevops.git")
+		prepare_protected_integration_release "$repo_path" "$mode" >/dev/null || {
+			print_result "release sync rejects $mode protected integration" 1 "Could not prepare topology"
+			continue
+		}
+		: >"$TEST_DIR/sync.log"
+		if output=$(AIDEVOPS_RELEASE_SQUASH_RECOVERY=1 AIDEVOPS_RELEASE_LANE_SOURCE_PR=90 \
+			AIDEVOPS_RELEASE_LANE_TAG=v9.9.10 invoke_release_sync "$repo_path" 2>&1); then
+			print_result "release sync rejects $mode protected integration" 1 "Unverified topology was accepted"
+		elif [[ "$output" == *"neither ancestry-related nor a lane-authorized squash-integrated source"* && ! -s "$TEST_DIR/sync.log" ]]; then
+			print_result "release sync rejects $mode protected integration" 0
+		else
+			print_result "release sync rejects $mode protected integration" 1 "$output"
+		fi
+	done
+	return 0
+}
+
+test_release_sync_recovers_verified_squash_integration() {
+	local repo_path
+	local release_sha=""
+	local deployed_sha=""
+	local evidence=""
+	local output=""
+	repo_path=$(create_fake_repo "release-squash-complete" "https://github.com/marcusquinn/aidevops.git")
+	evidence=$(prepare_squash_integrated_release "$repo_path" complete) || {
+		print_result "release sync recovers a verified squash-integrated active bundle" 1 "Could not prepare squash topology"
+		return 0
+	}
+	release_sha="${evidence#*|}"
+	: >"$TEST_DIR/sync.log"
+	if output=$(AIDEVOPS_RELEASE_SQUASH_RECOVERY=1 AIDEVOPS_RELEASE_LANE_SOURCE_PR=90 \
+		MOCK_REQUIRE_OUTER_LOCK=1 \
+		AIDEVOPS_RELEASE_LANE_TAG=v9.9.10 invoke_release_sync "$repo_path" 2>&1); then
+		IFS= read -r deployed_sha <"$TEST_HOME/.aidevops/.deployed-sha" || deployed_sha=""
+	fi
+	if [[ "$deployed_sha" == "$release_sha" && "$output" == *"verified squash integration"* ]] &&
+		grep -q -- "--expected-sha $release_sha" "$TEST_DIR/sync.log"; then
+		print_result "release sync recovers a verified squash-integrated active bundle" 0
+	else
+		print_result "release sync recovers a verified squash-integrated active bundle" 1 "$output"
+	fi
+	return 0
+}
+
+test_release_sync_rejects_incomplete_squash_evidence() {
+	local mode=""
+	local repo_path=""
+	local output=""
+	for mode in omitted changed newline-changed; do
+		repo_path=$(create_fake_repo "release-squash-$mode" "https://github.com/marcusquinn/aidevops.git")
+		prepare_squash_integrated_release "$repo_path" "$mode" >/dev/null || {
+			print_result "release sync rejects $mode squash integration" 1 "Could not prepare squash topology"
+			continue
+		}
+		: >"$TEST_DIR/sync.log"
+		if output=$(AIDEVOPS_RELEASE_SQUASH_RECOVERY=1 AIDEVOPS_RELEASE_LANE_SOURCE_PR=90 \
+			AIDEVOPS_RELEASE_LANE_TAG=v9.9.10 invoke_release_sync "$repo_path" 2>&1); then
+			print_result "release sync rejects $mode squash integration" 1 "Incomplete evidence was accepted"
+		elif [[ "$output" == *"changed path is not identical"* && ! -s "$TEST_DIR/sync.log" ]]; then
+			print_result "release sync rejects $mode squash integration" 0
+		else
+			print_result "release sync rejects $mode squash integration" 1 "$output"
+		fi
+	done
+	return 0
+}
+
+test_release_sync_requires_matching_squash_lane() {
+	local repo_path
+	local output=""
+	repo_path=$(create_fake_repo "release-squash-lane" "https://github.com/marcusquinn/aidevops.git")
+	prepare_squash_integrated_release "$repo_path" complete >/dev/null
+	: >"$TEST_DIR/sync.log"
+	if output=$(AIDEVOPS_RELEASE_SQUASH_RECOVERY=1 AIDEVOPS_RELEASE_LANE_SOURCE_PR=90 \
+		AIDEVOPS_RELEASE_LANE_TAG=v9.9.9 invoke_release_sync "$repo_path" 2>&1); then
+		print_result "release sync requires matching squash-recovery lane tag" 1 "Mismatched lane tag was accepted"
+	elif [[ "$output" == *"lane-authorized squash-integrated source"* && ! -s "$TEST_DIR/sync.log" ]]; then
+		print_result "release sync requires matching squash-recovery lane tag" 0
+	else
+		print_result "release sync requires matching squash-recovery lane tag" 1 "$output"
+	fi
+	: >"$TEST_DIR/sync.log"
+	if output=$(AIDEVOPS_RELEASE_SQUASH_RECOVERY=1 AIDEVOPS_RELEASE_LANE_SOURCE_PR=91 \
+		AIDEVOPS_RELEASE_LANE_TAG=v9.9.10 MOCK_RELEASE_LANE_SOURCE_PR=90 \
+		invoke_release_sync "$repo_path" 2>&1); then
+		print_result "release sync requires matching squash-recovery lane owner" 1 "Mismatched lane owner was accepted"
+	elif [[ "$output" == *"lane-authorized squash-integrated source"* && ! -s "$TEST_DIR/sync.log" ]]; then
+		print_result "release sync requires matching squash-recovery lane owner" 0
+	else
+		print_result "release sync requires matching squash-recovery lane owner" 1 "$output"
+	fi
+	return 0
+}
+
+test_release_sync_rejects_dirty_exact_tag_source() {
+	local repo_path
+	local output=""
+	repo_path=$(create_fake_repo "release-squash-dirty" "https://github.com/marcusquinn/aidevops.git")
+	prepare_squash_integrated_release "$repo_path" complete >/dev/null
+	printf 'concurrent source change\n' >"$repo_path/concurrent-change.txt"
+	: >"$TEST_DIR/sync.log"
+	if output=$(AIDEVOPS_RELEASE_SQUASH_RECOVERY=1 AIDEVOPS_RELEASE_LANE_SOURCE_PR=90 \
+		AIDEVOPS_RELEASE_LANE_TAG=v9.9.10 invoke_release_sync "$repo_path" 2>&1); then
+		print_result "release sync rejects concurrent exact-tag source changes" 1 "Dirty source was deployed"
+	elif [[ "$output" == *"dirty, changed, or concurrently replaced exact-tag source"* && ! -s "$TEST_DIR/sync.log" ]]; then
+		print_result "release sync rejects concurrent exact-tag source changes" 0
+	else
+		print_result "release sync rejects concurrent exact-tag source changes" 1 "$output"
 	fi
 	return 0
 }
@@ -821,8 +1174,15 @@ main() {
 	test_release_sync_rejects_stale_sentinel
 	test_release_sync_deploys_validated_active_ancestor
 	test_release_sync_accepts_validated_same_tree_descendant
-	test_release_sync_rejects_changed_tree_descendant
+	test_release_sync_accepts_changed_tree_protected_main_descendant
+	test_release_sync_accepts_changed_tree_non_tip_descendant
 	test_release_sync_rejects_unrelated_active_commit
+	test_release_sync_defers_verified_protected_integration
+	test_release_sync_rejects_unverified_protected_integration
+	test_release_sync_recovers_verified_squash_integration
+	test_release_sync_rejects_incomplete_squash_evidence
+	test_release_sync_requires_matching_squash_lane
+	test_release_sync_rejects_dirty_exact_tag_source
 	test_release_sync_rejects_malformed_active_manifest
 	test_release_sync_rejects_same_tree_descendant_with_stale_stamp
 	test_release_sync_rejects_same_tree_descendant_with_stale_sentinel

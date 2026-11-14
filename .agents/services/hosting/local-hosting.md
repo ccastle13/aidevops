@@ -68,6 +68,20 @@ Browser → /etc/hosts (127.0.0.1 myapp.local)
 
 **DNS:** macOS reserves `.local` for mDNS. Browsers use `/etc/hosts` → mDNS (intercepts resolver, never reached). `localdev add` always writes `/etc/hosts`. dnsmasq handles wildcard subdomains for CLI only. Future: `.test` (RFC 6761) avoids conflict but is breaking.
 
+### macOS IPv4-only proxy lookup delay
+
+Some macOS resolver configurations try the `.local` mDNS/AAAA route for about five seconds before using an IPv4-only local proxy, even when the hostname has a `127.0.0.1` hosts entry and `/etc/resolver/local` points to dnsmasq. Diagnose the actual HTTPS hostname without changing system configuration:
+
+```bash
+localdev-helper.sh diagnose myapp
+# or compare explicitly:
+curl -ksS -o /dev/null -w '%{time_namelookup} %{time_total}\n' https://myapp.local/
+curl -4ksS -o /dev/null -w '%{time_namelookup} %{time_total}\n' https://myapp.local/
+curl --resolve myapp.local:443:127.0.0.1 https://myapp.local/
+```
+
+Keep the existing IPv4 hosts entry and LocalWP entries unchanged. Do not add `::1`, disable IPv6, or rewrite unrelated hosts lines: `::1` is only valid when the real proxy listener is verified on IPv6. For affected CLI calls, `--resolve` is a bounded mitigation. Browser users need either a verified IPv6 proxy listener or a migration to a non-`.local` suffix; HTTP 200 alone does not prove lookup latency is fixed.
+
 ### Port Registry Format
 
 ```json
@@ -80,6 +94,19 @@ Browser → /etc/hosts (127.0.0.1 myapp.local)
   }
 }
 ```
+
+### Headless worker verification access
+
+Headless workers deny loopback and raw-IP HTTP by default. To let workers verify a repository's local site, register it from the canonical checkout (`localdev-helper.sh add <name>` or `run`); the app name must match that checkout's `package.json` name or directory basename. Workers can then use `curl`/`wget` against:
+
+- `https://<name>.local/` and registered branch subdomains (ports 80/443, including `--resolve <name>.local:443:127.0.0.1`).
+- `http://localhost:<port>/`, `127.0.0.1` or `[::1]` on the app's registered port or branch ports.
+
+Unregistered repos (GH#33969): start the server with `aidevops_bounded_operation` and keep that operation running. `curl`/`wget` may then reach `localhost`/`127.0.0.1`/`[::1]` on that port from Bash or another bounded operation in the same session. The plugin passes its live supervisor PIDs and start identities to the policy. The policy allows the port only when `lsof` shows that every listener on it descends from one of those supervisors. A port with no listener yet, or any listener outside the worker's operations (OpenCode, MCPs, operator services), stays denied. Retry once the server listens, or run server and client inside one bounded operation. A loopback denial names these routes and is never a terminal blocker on its own.
+
+Bounded-operation starts in worker sessions get the same command policy as Bash. Shell bodies the strict parser cannot represent (redirection, background jobs) and unrecognized clients (Node, Chrome/Lighthouse) are outside argv control. That limit is documented, not an allowance.
+
+Other repositories' apps, proxies and non-HTTP clients stay denied. Worker sandboxes use a separate `HOME`, so `localdev-helper.sh` inside a worker does not change the operator registry the policy reads (`$REAL_HOME/.local-dev-proxy/ports.json`). A whole-process egress backend still enforces `loopback_action: deny`. Policy notes: `configs/network-tiers.conf`.
 
 ## CLI — localdev-helper.sh
 
@@ -106,6 +133,14 @@ localdev-helper.sh serve --port 3100 \
 - Concurrent invocations serialize on the port. Followers reuse the first healthy launch rather than starting duplicates.
 - `--lock` is optional and must resolve inside `--root`. It is removed only after the port is confirmed unused and the launch lock is held.
 - An owned but unhealthy listener is not restarted implicitly. Stop it explicitly, diagnose it, then retry.
+
+### Stale-listener evidence and recovery
+
+Before attributing a blank or indefinitely loading page to source code or browser state, establish a read-only baseline for the listener: PID, cwd, PPID/PGID/TTY, elapsed time, RSS, executable and runtime, supervisor, bounded logs, and cold/warm request durations. A successful health URL can coexist with streaming or rendered requests stalled by a degraded long-running development server.
+
+Read the target repository's `packageManager`, `engines.node`, and runtime-version files, then verify the listener's executable/runtime rather than relying on the interactive shell's `node --version`. Extreme uptime, RSS, or multi-minute request duration are investigation signals, not universal restart thresholds. For SSR-specific runtime evidence, see `tools/runtime/node-server-admin.md`.
+
+After obtaining interruption authority, stop only the verified project-owned supervisor or process group gracefully. Relaunch through the repository's supported command under its declared runtime, retain accessible logs and a documented stop path, then repeat a real-browser check and an isolated-browser check. Never kill by process name alone, remove locks before confirming the port is unused, or lead with broad cache deletion, dependency reinstall, or source edits.
 
 ### Saved terminal profiles (Tabby)
 
@@ -159,8 +194,15 @@ localdev-helper.sh rm <name>           # removes all resources
 localdev-helper.sh branch <app> <branch> [port]   # add branch subdomain
 localdev-helper.sh branch rm <app> <branch>        # remove
 localdev-helper.sh branch list [app]               # list
+localdev-helper.sh branch prune [app] [--repo <path>] [--dry-run]  # reclaim ports of removed worktrees
 # Branch names sanitised (slashes→hyphens, lowercase). Wildcard cert covers *.myapp.local.
 ```
+
+Worktree removal (`worktree-helper.sh remove`) deregisters its branch. `branch prune`
+compares registrations with the repository's live `git worktree list`, backs up
+`ports.json`, and removes dead registrations plus orphan `{app}--{branch}.yml` routes;
+Pulse worktree cleanup runs it per registered repository. Registry writes are
+serialised by `ports.json.lock`. If the 3100-3999 pool is exhausted, run `branch prune`.
 
 **db** — Shared Postgres via `local-postgres` Docker container.
 
@@ -223,6 +265,8 @@ localhost-helper.sh start-mcp | stop-mcp | test-mcp | mcp-query "<sql>"
 
 **LocalWP coexistence:** `localdev add` checks for `#Local Site` collisions and rejects conflicts. `localdev list` shows both. Sites config: `~/Library/Application Support/Local/sites.json`.
 
+**Shared site, parallel worktrees:** a LocalWP (or any shared) site is shared by every session that syncs into it. A plain `rsync --delete` from an in-progress or stale worktree can silently remove another session's already-merged work, with no record of which session last deployed. Use `local-site-sync-helper.sh sync --src <worktree> --dest <plugin-or-theme-dir>` — it refuses to sync a worktree that lacks the default branch, warns on a recent sync from another worktree, and records a stamp; `local-site-sync-helper.sh status --dest <dir>` reports it. See `tools/wordpress/wp-dev.md` ("Sync to LocalWP").
+
 ## Database Patterns
 
 ```bash
@@ -258,6 +302,8 @@ docker exec local-traefik ls /certs/
 lsof -i :3100 && cat ~/.local-dev-proxy/ports.json | jq '.apps'
 localhost-helper.sh kill-port 3100 && localdev-helper.sh list
 ```
+
+For an owned listener that responds but appears stale, inspect its ownership and runtime before stopping it. Do not use `kill-port` as a diagnosis shortcut: it may interrupt the wrong session when multiple local projects coexist. If ownership, supervisor, runtime, or real-browser evidence cannot be verified, preserve the logs and report the gap rather than escalating to cache deletion or a wider process kill.
 
 **Traefik:**
 

@@ -53,6 +53,16 @@ cat >"${BIN}/git" <<'STUB'
 set -u
 printf '%s\n' "$*" >>"${FAKE_GIT_LOG:?}"
 args=" $* "
+if [[ "$args" == *" merge-base --is-ancestor ${RELEASE_COMMIT:?} ${STALE_BRANCH_HEAD:-unset} "* && "${STALE_ANCESTRY_ERROR:-0}" == 1 ]]; then
+	exit 128
+fi
+if [[ "$args" == *" push "* ]]; then
+	printf 'repo_verify=%s %s\n' "${AIDEVOPS_PREPUSH_REPO_VERIFY:-unset}" "$*" >>"${FAKE_PUSH_ENV_LOG:?}"
+fi
+if [[ "$args" == *" --force-with-lease="* && "${STALE_BRANCH_RACE:-0}" == 1 ]]; then
+	"${REAL_GIT:?}" --git-dir="${REMOTE:?}" update-ref \
+		refs/heads/chore/release-v1.2.3-provenance "${CURRENT_MAIN:?}"
+fi
 if [[ "$args" == *" push --atomic origin HEAD:refs/heads/main --tags "* ]]; then
 	count=0
 	if [[ -f "${DIRECT_PUSH_COUNT:?}" ]]; then
@@ -74,6 +84,17 @@ cat >"${BIN}/gh" <<'STUB'
 set -u
 printf '%s\n' "$*" >>"${FAKE_GH_LOG:?}"
 if [[ "${1:-}" == "api" && " $* " == *" repos/test/repo/pulls "* ]]; then
+	if [[ -n "${STALE_BRANCH_PR_MODE:-}" ]]; then
+		[[ "$STALE_BRANCH_PR_MODE" != api-failure ]] || exit 1
+		# An older blocking PR on page one must not be hidden by a newer closed PR.
+		jq -nc --arg mode "$STALE_BRANCH_PR_MODE" --arg head "${STALE_BRANCH_HEAD:?}" '[{
+			number: 70, state: (if $mode == "open" then "open" else "closed" end),
+			merged_at: (if $mode == "merged" then "2026-08-01T00:00:00Z" else null end),
+			head: {sha: $head}, base: {ref: "other-base"}
+		}]'
+		printf '[{"number":71,"state":"closed","merged_at":null}]\n'
+		exit 0
+	fi
 	if [[ -f "${STALE_PR_FILE:?}" && ! -f "${PR_RECREATED_FILE:?}" ]]; then
 		jq -nc --arg stale_head "${STALE_PR_HEAD:?}" '[{
 			number: 76,
@@ -147,13 +168,14 @@ chmod +x "${BIN}/gh"
 export REAL_GIT REMOTE RELEASE_COMMIT TAG_OBJECT
 export FAKE_GIT_LOG="${TEST_ROOT}/git.log"
 export FAKE_GH_LOG="${TEST_ROOT}/gh.log"
+export FAKE_PUSH_ENV_LOG="${TEST_ROOT}/push-env.log"
 export DIRECT_PUSH_COUNT="${TEST_ROOT}/direct-push-count"
 export PR_CREATED_FILE="${TEST_ROOT}/pr-created"
 export AUTO_MERGE_FILE="${TEST_ROOT}/auto-merge"
 export PR_MERGED_FILE="${TEST_ROOT}/pr-merged"
 export STALE_PR_FILE="${TEST_ROOT}/stale-pr"
 export PR_RECREATED_FILE="${TEST_ROOT}/pr-recreated"
-export PATH="${BIN}:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="${BIN}:${PATH}"
 export AIDEVOPS_VERSION_MANAGER_REPO_SLUG=test/repo
 
 print_error() {
@@ -187,6 +209,79 @@ unset AIDEVOPS_RELEASE_LANE_OPERATION_TOKEN
 unset -f _version_manager_verify_aggregate_lane_fence
 printf 'PASS stale aggregate lane is checked immediately before direct publication push\n'
 
+for unqueued_mode in status reconcile; do
+	_version_manager_reconcile_protected_release_tag test/repo v1.2.3 "$unqueued_mode" >/dev/null
+	[[ "$_VERSION_MANAGER_PROTECTED_RELEASE_RESULT" == "$_VERSION_MANAGER_RELEASE_PR_MISSING" ]]
+	[[ ! -e "$PR_CREATED_FILE" && ! -e "$DIRECT_PUSH_COUNT" ]]
+done
+[[ -z "$("$REAL_GIT" ls-remote --tags "$REMOTE" refs/tags/v1.2.3)" ]]
+printf 'PASS missing protected PR is typed read-only state, not invalid local provenance\n'
+
+_version_manager_verify_preserved_lane_fence() { return 1; }
+if _version_manager_queue_protected_main_release 1.2.3 >/dev/null 2>&1; then
+	printf 'FAIL stale preserved-tag lane queued publication\n'
+	exit 1
+fi
+[[ ! -e "$PR_CREATED_FILE" && ! -e "$DIRECT_PUSH_COUNT" ]]
+[[ -z "$("$REAL_GIT" ls-remote --heads "$REMOTE" refs/heads/chore/release-v1.2.3-provenance)" ]]
+unset -f _version_manager_verify_preserved_lane_fence
+printf 'PASS preserved-tag fence refuses branch and PR mutation\n'
+
+# GH#34756: model the orphan from an earlier retry with a different commit SHA.
+RECOVERY_BRANCH='chore/release-v1.2.3-provenance'
+RELEASE_PARENT=$("$REAL_GIT" -C "$REPO" rev-parse "${RELEASE_COMMIT}^1")
+STALE_BRANCH_HEAD=$("$REAL_GIT" -C "$REPO" commit-tree "${RELEASE_COMMIT}^{tree}" \
+	-p "$RELEASE_PARENT" -m 'previous failed release attempt')
+export STALE_BRANCH_HEAD CURRENT_MAIN
+"$REAL_GIT" -C "$REPO" push -q origin "${STALE_BRANCH_HEAD}:refs/heads/${RECOVERY_BRANCH}"
+for stale_pr_mode in open merged api-failure; do
+	if (
+		export STALE_BRANCH_PR_MODE="$stale_pr_mode"
+		_version_manager_prepare_protected_release_head 1.2.3 "$RELEASE_COMMIT" \
+			"$RELEASE_PARENT" "$RECOVERY_BRANCH" >/dev/null 2>&1
+	); then
+		printf 'FAIL stale branch was replaced despite PR mode %s\n' "$stale_pr_mode"
+		exit 1
+	fi
+	[[ "$("$REAL_GIT" --git-dir="$REMOTE" rev-parse "refs/heads/${RECOVERY_BRANCH}")" == "$STALE_BRANCH_HEAD" ]]
+done
+printf 'PASS open and merged PR ownership and failed API lookup prevent stale replacement\n'
+
+if (
+	export STALE_ANCESTRY_ERROR=1
+	_version_manager_prepare_protected_release_head 1.2.3 "$RELEASE_COMMIT" \
+		"$RELEASE_PARENT" "$RECOVERY_BRANCH" >/dev/null 2>&1
+); then
+	printf 'FAIL ancestry query error authorized stale branch replacement\n'
+	exit 1
+fi
+[[ "$("$REAL_GIT" --git-dir="$REMOTE" rev-parse "refs/heads/${RECOVERY_BRANCH}")" == "$STALE_BRANCH_HEAD" ]]
+printf 'PASS ancestry query errors cannot authorize stale branch replacement\n'
+
+if (
+	_version_manager_require_aggregate_fence() { return 1; }
+	_version_manager_prepare_protected_release_head 1.2.3 "$RELEASE_COMMIT" \
+		"$RELEASE_PARENT" "$RECOVERY_BRANCH" >/dev/null 2>&1
+); then
+	printf 'FAIL stale branch replacement bypassed the aggregate fence\n'
+	exit 1
+fi
+[[ "$("$REAL_GIT" --git-dir="$REMOTE" rev-parse "refs/heads/${RECOVERY_BRANCH}")" == "$STALE_BRANCH_HEAD" ]]
+printf 'PASS stale branch replacement requires the aggregate fence\n'
+
+if (
+	export STALE_BRANCH_RACE=1
+	_version_manager_prepare_protected_release_head 1.2.3 "$RELEASE_COMMIT" \
+		"$RELEASE_PARENT" "$RECOVERY_BRANCH" >/dev/null 2>&1
+); then
+	printf 'FAIL stale branch lease overwrote a concurrent remote update\n'
+	exit 1
+fi
+[[ "$("$REAL_GIT" --git-dir="$REMOTE" rev-parse "refs/heads/${RECOVERY_BRANCH}")" == "$CURRENT_MAIN" ]]
+"$REAL_GIT" --git-dir="$REMOTE" update-ref "refs/heads/${RECOVERY_BRANCH}" "$STALE_BRANCH_HEAD"
+"$REAL_GIT" -C "$REPO" update-ref "refs/remotes/origin/${RECOVERY_BRANCH}" "$STALE_BRANCH_HEAD"
+printf 'PASS stale branch lease preserves a concurrent remote update\n'
+
 push_rc=0
 push_output=$(push_changes 1.2.3 2>&1) || push_rc=$?
 if [[ "$push_rc" -ne 8 ]]; then
@@ -211,10 +306,39 @@ if grep -Eq ' rebase | commit --amend| tag -(d|s) ' "$FAKE_GIT_LOG"; then
 	exit 1
 fi
 printf 'PASS recovery branch preserves the original release commit and tag object\n'
+grep -q -- "--force-with-lease=refs/heads/${RECOVERY_BRANCH}:${STALE_BRANCH_HEAD}" "$FAKE_GIT_LOG"
+[[ "$RECOVERY_HEAD" != "$STALE_BRANCH_HEAD" ]]
+printf 'PASS stale PR-less branch is replaced using the observed-head lease\n'
+
+# GH#34753: GitHub refuses tag objects outside refs/tags, so the staging ref is
+# a commit envelope whose `tag` blob hashes back to the exact signed object.
+STAGED_ENVELOPE=$("$REAL_GIT" ls-remote "$REMOTE" refs/aidevops/release-tags/v1.2.3 | cut -f1)
+[[ "$("$REAL_GIT" --git-dir="$REMOTE" cat-file -t "$STAGED_ENVELOPE")" == "commit" ]]
+[[ "$("$REAL_GIT" --git-dir="$REMOTE" rev-parse "${STAGED_ENVELOPE}^1")" == "$RELEASE_COMMIT" ]]
+[[ "$("$REAL_GIT" --git-dir="$REMOTE" cat-file blob "${STAGED_ENVELOPE}:tag" |
+	"$REAL_GIT" --git-dir="$REMOTE" hash-object -t tag --stdin)" == "$TAG_OBJECT" ]]
+printf 'PASS protected PR queue first preserves the exact tag on a fetchable staging ref\n'
+
+# GH#34434: release-tool pushes run in dependency-free worktrees, so each one
+# skips only the repo-verify guard for that command.
+grep -q 'push --atomic origin HEAD:refs/heads/main --tags' "$FAKE_PUSH_ENV_LOG"
+grep -q "push origin --force-with-lease=refs/heads/${RECOVERY_BRANCH}:${STALE_BRANCH_HEAD} ${RECOVERY_HEAD}:refs/heads/${RECOVERY_BRANCH}" "$FAKE_PUSH_ENV_LOG"
+if grep -qv '^repo_verify=0 ' "$FAKE_PUSH_ENV_LOG"; then
+	printf 'FAIL a release push ran the dependency-bound repo-verify guard\n'
+	exit 1
+fi
+printf 'PASS release pushes skip only the repo-verify guard\n'
 
 grep -q '^pr create .*--head chore/release-v1.2.3-provenance .*--base main ' "$FAKE_GH_LOG"
 grep -q "^pr merge 77 --repo test/repo --auto --merge --match-head-commit ${RECOVERY_HEAD}$" "$FAKE_GH_LOG"
 printf 'PASS recovery queues merge topology against the exact PR head\n'
+
+create_calls_before=$(grep -c '^pr create ' "$FAKE_GH_LOG")
+_version_manager_queue_protected_main_release 1.2.3 >/dev/null
+create_calls_after=$(grep -c '^pr create ' "$FAKE_GH_LOG")
+[[ "$create_calls_after" -eq "$create_calls_before" ]]
+[[ "$("$REAL_GIT" -C "$REPO" rev-parse refs/tags/v1.2.3)" == "$TAG_OBJECT" ]]
+printf 'PASS resumed queue reuses the exact protected PR and immutable tag\n'
 
 merge_calls_before=$(grep -c '^pr merge ' "$FAKE_GH_LOG")
 AIDEVOPS_RELEASE_LANE_OPERATION_TOKEN=stale-token
@@ -350,5 +474,79 @@ tag_pushes_after=$({ grep -c 'push origin refs/tags/v1.2.3:refs/tags/v1.2.3' "$F
 [[ "$tag_pushes_after" -eq "$tag_pushes_before" ]]
 [[ "$_VERSION_MANAGER_PROTECTED_RELEASE_RESULT" == "aggregation-required" ]]
 printf 'PASS repeated aggregation-required reconciliation is idempotent\n'
+
+# A real SSH signature with no local trusted principal is a signer failure,
+# not a reason to replace a correctly snapshot-bound immutable release tag.
+ssh-keygen -q -t ed25519 -N '' -f "$TEST_ROOT/snapshot-key"
+"$REAL_GIT" -C "$REPO" config gpg.format ssh
+"$REAL_GIT" -C "$REPO" config user.signingkey "$TEST_ROOT/snapshot-key"
+: >"$TEST_ROOT/allowed_signers"
+"$REAL_GIT" -C "$REPO" config gpg.ssh.allowedSignersFile "$TEST_ROOT/allowed_signers"
+snapshot_source=$("$REAL_GIT" -C "$REPO" rev-parse "${RELEASE_COMMIT}^1")
+"$REAL_GIT" -C "$REPO" tag -s v1.2.4 "$RELEASE_COMMIT" -m "Release snapshot
+
+Aidevops-Snapshot-Base: $snapshot_source
+Aidevops-Source-Merge: $snapshot_source"
+snapshot_object=$("$REAL_GIT" -C "$REPO" rev-parse refs/tags/v1.2.4)
+if _version_manager_publish_reachable_tag v1.2.4 >"$TEST_ROOT/untrusted.log" 2>&1; then
+	printf 'FAIL untrusted snapshot signature permitted publication\n'
+	exit 1
+fi
+[[ "$_VERSION_MANAGER_PROTECTED_RELEASE_RESULT" == signer-untrusted ]]
+grep -q 'SHA256:' "$TEST_ROOT/untrusted.log"
+if grep -q 'Create a newly reviewed exact-tip aggregation release' "$TEST_ROOT/untrusted.log"; then
+	printf 'FAIL signer trust failure recommended aggregation\n'
+	exit 1
+fi
+[[ "$("$REAL_GIT" -C "$REPO" rev-parse refs/tags/v1.2.4)" == "$snapshot_object" ]]
+[[ -z "$("$REAL_GIT" ls-remote --tags "$REMOTE" refs/tags/v1.2.4)" ]]
+printf 'PASS untrusted SSH snapshot preserves its tag and reports signer-untrusted with fingerprint\n'
+
+printf 'test@example.invalid %s\n' "$(<"$TEST_ROOT/snapshot-key.pub")" >"$TEST_ROOT/allowed_signers"
+_version_manager_is_signed_snapshot v1.2.4
+[[ "$_VERSION_MANAGER_SNAPSHOT_SIGNATURE_UNTRUSTED" -eq 0 ]]
+_version_manager_publish_reachable_tag v1.2.4
+[[ "$_VERSION_MANAGER_PROTECTED_RELEASE_RESULT" == tag-pushed ]]
+[[ "$("$REAL_GIT" ls-remote --tags "$REMOTE" refs/tags/v1.2.4)" == "$snapshot_object"$'\trefs/tags/v1.2.4' ]]
+printf 'PASS restoring signer trust publishes the exact preserved snapshot despite main drift\n'
+
+# GH#34710: a recovery-pinned aggregate may trail main only when its signed pin
+# is the direct release parent and that parent names the same aggregator PR.
+pinned_aggregate=$("$REAL_GIT" -C "$REPO" commit-tree "${RELEASE_COMMIT}^{tree}" -p "$RELEASE_COMMIT" \
+	-m "reviewed aggregate" -m "Aidevops-Release-Aggregator-PR: 77
+Aidevops-Release-Aggregates: 76@${RELEASE_COMMIT}")
+pinned_release=$("$REAL_GIT" -C "$REPO" commit-tree "${pinned_aggregate}^{tree}" -p "$pinned_aggregate" \
+	-m "chore(release): bump version to 1.2.5")
+_pinned_tag() {
+	local tag="$1" source_pr="$2" pin="$3"
+	"$REAL_GIT" -C "$REPO" tag -s "$tag" "$pinned_release" -m "Release $tag
+
+Aidevops-Source-PR: $source_pr
+Aidevops-Source-Merge: $pinned_aggregate
+Aidevops-Aggregate-Pin: $pin
+Aidevops-Aggregated-Source: 76@${RELEASE_COMMIT}"
+	return 0
+}
+_pinned_tag v1.2.5 77 "$pinned_aggregate"
+_version_manager_is_signed_snapshot v1.2.5
+_pinned_tag v1.2.6 78 "$pinned_aggregate"
+if _version_manager_is_signed_snapshot v1.2.6 >/dev/null 2>&1; then
+	printf 'FAIL pinned tag accepted a source PR that is not the aggregator identity\n'
+	exit 1
+fi
+_pinned_tag v1.2.7 77 "$RELEASE_COMMIT"
+if _version_manager_is_signed_snapshot v1.2.7 >/dev/null 2>&1; then
+	printf 'FAIL pinned tag accepted a pin that is not its direct release parent\n'
+	exit 1
+fi
+"$REAL_GIT" -C "$REPO" tag -s v1.2.8 "$pinned_release" -m "Release v1.2.8
+
+Aidevops-Source-PR: 77
+Aidevops-Source-Merge: $pinned_aggregate"
+if _version_manager_is_signed_snapshot v1.2.8 >/dev/null 2>&1; then
+	printf 'FAIL unpinned aggregate tag was allowed to trail main\n'
+	exit 1
+fi
+printf 'PASS signed aggregate pin permits main drift only for its exact reviewed aggregate parent\n'
 
 exit 0

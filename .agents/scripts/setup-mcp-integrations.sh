@@ -12,6 +12,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)" || exit
 TEMPLATE_DIR="${REPO_ROOT}/configs/mcp-templates"
+readonly HIGGSFIELD_MCP_NAME="higgsfield"
 
 # shellcheck source=./shared-constants.sh
 source "${SCRIPT_DIR}/shared-constants.sh"
@@ -26,7 +27,7 @@ get_mcp_command() {
 	local integration="$1"
 	case "$integration" in
 	"chrome-devtools") echo "npx chrome-devtools-mcp@latest" ;;
-	"playwright") echo "npx playwright-mcp@latest" ;;
+	"playwright") echo "npx -y @playwright/mcp@0.0.79 --headless --isolated" ;;
 	"cloudflare-browser") echo "npx cloudflare-browser-rendering-mcp@latest" ;;
 	"ahrefs") echo "npx -y @ahrefs/mcp@latest" ;;
 	"perplexity") echo "npx perplexity-mcp@latest" ;;
@@ -42,6 +43,7 @@ get_mcp_command() {
 	"unstract") echo "docker:unstract/mcp-server" ;;
 	"context7") echo "npx -y @upstash/context7-mcp@latest" ;;
 	"shopify-dev-mcp") echo "npx -y @shopify/dev-mcp@latest" ;;
+	"$HIGGSFIELD_MCP_NAME") echo "node ${HOME}/.aidevops/agents/scripts/higgsfield-mcp-proxy.mjs" ;;
 	*) echo "" ;;
 	esac
 	return 0
@@ -65,6 +67,7 @@ MCP_LIST=(
 	"unstract"
 	"context7"
 	"shopify-dev-mcp"
+	"$HIGGSFIELD_MCP_NAME"
 )
 
 is_known_mcp() {
@@ -161,11 +164,10 @@ _install_chrome_devtools() {
 }
 
 _install_playwright() {
-	local mcp_command="$1"
 	print_info "Installing Playwright browsers..."
 	npx playwright install
 	if command -v claude &>/dev/null; then
-		claude mcp add playwright "$mcp_command"
+		claude mcp add playwright -- npx -y @playwright/mcp@0.0.79 --headless --isolated
 	fi
 	return 0
 }
@@ -328,18 +330,15 @@ _install_dataforseo() {
 	print_warning "DataForSEO MCP requires API credentials"
 	print_info "Get credentials from: https://app.dataforseo.com/"
 	echo ""
-	print_info "Store in ~/.config/aidevops/credentials.sh:"
-	print_info "  export DATAFORSEO_USERNAME=\"your_username\""
-	print_info "  export DATAFORSEO_PASSWORD=\"your_password\""
+	print_info "Store with aidevops secret set DATAFORSEO_API_LOGIN and"
+	print_info "aidevops secret set DATAFORSEO_API_PASSWORD (API password, not dashboard password)."
 	echo ""
-	print_info "Or use the helper script:"
-	print_info "  bash ~/.aidevops/agents/scripts/setup-local-api-keys.sh set DATAFORSEO_USERNAME your_username"
-	print_info "  bash ~/.aidevops/agents/scripts/setup-local-api-keys.sh set DATAFORSEO_PASSWORD your_password"
+	print_info "Alternatively, export DATAFORSEO_USERNAME and DATAFORSEO_PASSWORD in credentials.sh."
 	echo ""
 	print_info "For OpenCode, use bash wrapper pattern in opencode.json:"
 	print_info '  "dataforseo": {'
 	print_info '    "type": "local",'
-	print_info '    "command": ["/bin/bash", "-c", "source ~/.config/aidevops/credentials.sh && DATAFORSEO_USERNAME=\$DATAFORSEO_USERNAME DATAFORSEO_PASSWORD=\$DATAFORSEO_PASSWORD npx dataforseo-mcp-server"],'
+	print_info '    "command": ["/bin/bash", "-c", "source \"$HOME/.aidevops/agents/scripts/dataforseo-credentials.sh\" && dataforseo_load_credentials && exec npx dataforseo-mcp-server"],'
 	print_info '    "enabled": true'
 	print_info '  }'
 	echo ""
@@ -431,6 +430,30 @@ _install_shopify_dev_mcp() {
 	return 0
 }
 
+_install_higgsfield() {
+	local deployed_proxy="${HOME}/.aidevops/agents/scripts/higgsfield-mcp-proxy.mjs"
+	local source_proxy="${SCRIPT_DIR}/higgsfield-mcp-proxy.mjs"
+	local state_path="${HOME}/.config/aidevops/higgsfield-mcp-proxy/state.json"
+	local validation_proxy="$deployed_proxy"
+
+	if [[ ! -f "$validation_proxy" ]]; then
+		validation_proxy="$source_proxy"
+	fi
+	if [[ ! -f "$validation_proxy" ]]; then
+		print_error "Higgsfield MCP proxy source is not installed"
+		return 1
+	fi
+	node --check "$validation_proxy"
+	print_info "Higgsfield uses the tracked request-bound OAuth proxy."
+	print_info "OpenCode command: [\"node\", \"${deployed_proxy}\"]"
+	print_info "OAuth state: ${state_path}"
+	if [[ ! -f "$state_path" ]]; then
+		print_warning "OAuth state not found; complete the initial browser authorization before starting the proxy"
+	fi
+	print_info "Config template: configs/mcp-templates/higgsfield.json"
+	return 0
+}
+
 # Install specific MCP integration — thin dispatcher to per-integration helpers
 install_mcp() {
 	local mcp_name="$1"
@@ -447,7 +470,7 @@ install_mcp() {
 
 	case "$mcp_name" in
 	"chrome-devtools") _install_chrome_devtools "$mcp_command" ;;
-	"playwright") _install_playwright "$mcp_command" ;;
+	"playwright") _install_playwright ;;
 	"cloudflare-browser") _install_cloudflare_browser ;;
 	"ahrefs") _install_ahrefs ;;
 	"perplexity") _install_perplexity ;;
@@ -463,6 +486,7 @@ install_mcp() {
 	"unstract") _install_unstract ;;
 	"context7") _install_context7 ;;
 	"shopify-dev-mcp") _install_shopify_dev_mcp ;;
+	"$HIGGSFIELD_MCP_NAME") _install_higgsfield ;;
 	*)
 		print_error "Unknown MCP integration: $mcp_name"
 		print_info "Available integrations: ${MCP_LIST[*]}"
@@ -505,7 +529,23 @@ _write_playwright_template() {
   "mcpServers": {
     "playwright": {
       "command": "npx",
-      "args": ["playwright-mcp@latest"]
+      "args": ["-y", "@playwright/mcp@0.0.79", "--headless", "--isolated"]
+    }
+  }
+}
+EOF
+	return 0
+}
+
+# Write Higgsfield MCP config template
+_write_higgsfield_template() {
+	local config_dir="$1"
+	cat >"$config_dir/higgsfield.json" <<'EOF'
+{
+  "mcpServers": {
+    "higgsfield": {
+      "command": "node",
+      "args": ["${HOME}/.aidevops/agents/scripts/higgsfield-mcp-proxy.mjs"]
     }
   }
 }
@@ -608,6 +648,7 @@ create_config_templates() {
 
 	_write_chrome_devtools_template "$config_dir"
 	_write_playwright_template "$config_dir"
+	_write_higgsfield_template "$config_dir"
 	_write_stagehand_js_template "$config_dir"
 	_write_stagehand_python_template "$config_dir"
 	_write_stagehand_both_template "$config_dir"

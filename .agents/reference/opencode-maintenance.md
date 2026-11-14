@@ -26,6 +26,20 @@ keeping the DB compact and WAL truncated minimises write-lock hold time.
 
 ## What this routine does
 
+Two schedulers keep the DB compact: an archive run hourly 00:00–07:00 local
+until one complete pass per day (`opencode-db-archive-async-helper.sh` →
+`opencode-db-archive.sh archive-all`, split retention below) and the weekly
+maintenance below. Every `aidevops update`/auto-update (`setup.sh --stage
+ai-session`) re-installs both; the installers are idempotent, so unchanged
+schedulers are left as they are.
+
+**Held DBs (GH#35517):** archived only when every holder is `opencode` with a
+plugin heartbeat (`.agent-workspace/state/opencode-activity/`) showing no busy
+session for 15 min, plus 30 min of keyboard idle where measurable; 10 sessions
+per batch, re-checked each batch, open sessions excluded, no VACUUM. Tune via
+`OPENCODE_DB_ARCHIVE_{IDLE_SECONDS,USER_IDLE_SECONDS,HELD_BATCH_SIZE,IDLE_GATE}`
+in `opencode-db-idle-gate-lib.sh`.
+
 `r913 Weekly opencode DB maintenance` runs every Sunday at 04:00 local
 time and invokes `opencode-db-maintenance-helper.sh auto`, which:
 
@@ -121,11 +135,14 @@ All thresholds overrideable via environment variables:
 | `FORCE_VACUUM_SIZE_MB` | `500` | Always VACUUM above this size (MB) |
 | `AUTO_MIN_SECONDS_BETWEEN` | `518400` | Throttle for `auto` mode (6 days) |
 | `WAL_LARGE_THRESHOLD_MB` | `500` | Report checkpoint/busy details above this WAL size |
+| `AUTO_SKIP_ESCALATION_COUNT` | `3` | Consecutive holder-blocked `auto` skips before `notice` and `aidevops cleanup` advise `maintenance-window --force-opencode` |
 | `MAINTENANCE_WINDOW_KEEP_SESSIONS` | `500` | Count target used by `maintenance-window` archive |
 | `MAINTENANCE_WINDOW_RETENTION_DAYS` | `30` | Age target used by `maintenance-window` archive |
 | `OPENCODE_DB_MAINTENANCE_HOUR` | `4` | Scheduled local hour for the weekly routine |
 | `OPENCODE_DB_MAINTENANCE_MINUTE` | `0` | Scheduled local minute for the weekly routine |
 | `OPENCODE_DB_MAINTENANCE_MODE` | `auto` | `auto` or disruptive `maintenance-window` scheduler mode |
+
+Always-on hosts: `auto` never forces past holders, so VACUUM is unreachable; use `OPENCODE_DB_MAINTENANCE_MODE=maintenance-window`.
 
 Example: force VACUUM on every run regardless of fragmentation:
 
@@ -136,19 +153,31 @@ FORCE_VACUUM_SIZE_MB=0 VACUUM_FREELIST_THRESHOLD=0.0 \
 
 ## Archive retention modes
 
-`opencode-db-archive.sh archive` supports two retention targets:
+`opencode-db-archive.sh archive` supports these retention targets:
 
-- **Age-based retention** (`--retention-days N`) archives sessions whose last
-  update/activity is older than `N` days. This remains the default mode (`30`
-  days) and is best when session volume is predictable. A resumed or updated
-  session stays active even when its original creation time is older than the
-  cutoff.
+- **Split age-based retention (default, GH#35492)** archives headless/worker
+  sessions after 7 idle days (`--worker-retention-days`) and interactive ones
+  after 90 (`--interactive-retention-days`); ages use last update. Headless =
+  in the headless-runtime ledger (`headless-runtime/state.db` tables
+  `worker_sessions`, `provider_sessions`), a subagent of one, a temp-dir
+  one-shot run, or a supervisor session. Anything unproven stays interactive.
+- **Uniform age-based retention** (`--retention-days N`) sets both cutoffs.
 - **Count-based retention** (`--keep-sessions N`) keeps the newest `N` active
   sessions by last update/activity, with creation time and session ID as stable
   tie-breakers, and archives older sessions beyond that budget. Use this when
-  TUI startup cost tracks active session count more closely than calendar age,
-  for example keeping roughly the 500 most recently active sessions in the
-  active database.
+  TUI startup cost tracks active session count more closely than calendar age.
+  Under split retention it protects interactive sessions only.
+
+Env defaults: `OPENCODE_DB_ARCHIVE_WORKER_RETENTION_DAYS`,
+`OPENCODE_DB_ARCHIVE_INTERACTIVE_RETENTION_DAYS`, `OPENCODE_DB_HEADLESS_LEDGER`.
+
+**Archived worker history:** a worker resuming a persisted session that was
+archived restores it automatically (`_seed_worker_db_session_context` →
+`opencode-db-archive.sh restore --session <id>`, session plus subagent children
+in one transaction). Read-only lookup: `opencode-db-maintenance-helper.sh
+sessions --include-archive --id ses_...`. Manual: `opencode-db-archive.sh
+restore --session ses_... [--dry-run]` (exit `0` restored/already active, `4`
+not archived, `3` incompatible schema; nothing changed).
 
 The archive helper follows OpenCode's active DB resolution: `OPENCODE_DB_PATH`
 or `OPENCODE_DB` overrides win first, then `XDG_DATA_HOME/opencode/opencode.db`,
@@ -219,9 +248,11 @@ It does this in order:
 
 1. Stops aidevops-managed pulse/headless workers with `pulse-lifecycle-helper.sh
    stop`.
-2. Archives old sessions with `opencode-db-archive.sh archive --retention-days
-   ${MAINTENANCE_WINDOW_RETENTION_DAYS} --keep-sessions
-   ${MAINTENANCE_WINDOW_KEEP_SESSIONS}`.
+2. Archives old sessions with `opencode-db-archive.sh archive
+   --worker-retention-days ${MAINTENANCE_WINDOW_WORKER_RETENTION_DAYS:-7}
+   --interactive-retention-days ${MAINTENANCE_WINDOW_INTERACTIVE_RETENTION_DAYS:-90}
+   --keep-sessions ${MAINTENANCE_WINDOW_KEEP_SESSIONS}`. A legacy
+   `MAINTENANCE_WINDOW_RETENTION_DAYS` (or `--retention-days N`) sets both.
 3. Runs normal maintenance, including final post-VACUUM WAL checkpoint.
 4. Runs `PRAGMA quick_check`.
 5. Restarts pulse in a trap/finally path with `pulse-lifecycle-helper.sh start`.
@@ -294,6 +325,10 @@ aidevops opencode-desktop status          # show wrapper/source status
 
 ### Opt-in server-backed continuity prototype
 
+For a persistent per-user owner, setup/update behavior, rollback, and platform
+limits, see [Managed OpenCode service](opencode-service.md). The foreground
+commands below remain available for isolated experiments.
+
 Shared Desktop/TUI history uses one foreground server as the only SQLite owner.
 This is an explicit disposable-shard prototype; it does not replace direct
 launches or migrate an existing database.
@@ -313,6 +348,11 @@ shard. Dry-run is observational:
 ```bash
 aidevops opencode server --dir ~/Git/repo --port 49036 --dry-run
 ```
+
+The server loads the normal configured plugins, including aidevops. Do not use
+`--pure` or inherit `OPENCODE_PURE=1` for this workflow: agent definitions can
+remain visible while plugin tools, safety hooks, and provider integration are
+missing. Seeing Build+ in an agent selector alone is not a plugin health check.
 
 Keep that terminal open. In a second terminal, attach the TUI:
 
@@ -334,11 +374,34 @@ separate security-reviewed mode.
 
 To connect Desktop without editing Electron state files:
 
-1. Open OpenCode Desktop and its **Servers** dialog.
+1. Start the server and confirm `/global/health` is healthy before opening
+   Desktop. Then open Desktop and its **Servers** dialog.
 2. Choose **Add server** and enter `http://127.0.0.1:49036`.
-3. Select that endpoint as the **Default server**.
-4. Confirm the same `ses_...` ID is visible through the API, attached TUI, and
+3. Select that endpoint, not **Local Server**. Set it as the **Default server**
+   only if it should be the normal destination while the owner is running.
+4. In the home sidebar, hover over that server row and use its folder-plus
+   **Add project** button to open the exact directory passed to `--dir`.
+   Desktop tracks opened projects separately for each server; its home page
+   filters sessions to those projects even when the API already lists them.
+5. Confirm the same `ses_...` ID is visible through the API, attached TUI, and
    Desktop before treating the prototype as successful.
+6. Send a unique marker in the TUI with Build+ and confirm its completed reply in
+   Desktop. Continue that same session from Desktop and confirm the new reply in
+   the TUI. Verify the project directory and actual request destination; an
+   already-open local Desktop tab may still belong to its local server.
+
+On Desktop 1.18.32, opening the app while a saved server is offline can cache a
+V2 protocol assumption for that connection. Health polling can later turn green
+without rebuilding the protocol context. If `/project` returns the expected
+project but Desktop requests `/api/project` and gets HTML, fully quit Desktop
+and reopen it after the server is healthy. Confirm requests switch to `/project`
+and `/global/event`; then add the project under that server if the view remains
+empty. Do not delete history or reset settings to repair this connection state.
+
+For diagnosis, `/experimental/tool/ids` on the managed endpoint should include
+aidevops plugin tools such as `aidevops_memory` and `aidevops_pre_edit_check`.
+A green health response or a session list does not prove response streaming,
+plugin execution, or bidirectional Desktop/TUI continuity.
 
 Keep Desktop and CLI versions aligned. The launcher validates CLI/server
 compatibility, while Desktop reports its own connection incompatibility through

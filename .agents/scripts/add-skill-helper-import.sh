@@ -37,6 +37,9 @@ if [[ -z "${SCRIPT_DIR:-}" ]]; then
 	unset _lib_path
 fi
 
+# shellcheck source=./add-skill-helper-curated.sh
+source "${SCRIPT_DIR}/add-skill-helper-curated.sh"
+
 # =============================================================================
 # Security Scanning
 # =============================================================================
@@ -74,7 +77,8 @@ scan_skill_security() {
 	fi
 
 	local findings max_severity critical_count high_count medium_count
-	findings=$(echo "$scan_output" | jq -r '.total_findings // 0' 2>/dev/null || echo "0")
+	# Scanner JSON reports .findings_count (1.x and 2.x); fall back to the array length (GH#34619).
+	findings=$(echo "$scan_output" | jq -r '.findings_count // (.findings | length) // 0' 2>/dev/null || echo "0")
 	max_severity=$(echo "$scan_output" | jq -r '.max_severity // "SAFE"' 2>/dev/null || echo "SAFE")
 	critical_count=$(echo "$scan_output" | jq -r '.findings | map(select(.severity == "CRITICAL")) | length' 2>/dev/null || echo "0")
 	high_count=$(echo "$scan_output" | jq -r '.findings | map(select(.severity == "HIGH")) | length' 2>/dev/null || echo "0")
@@ -508,6 +512,12 @@ _convert_and_install_files() {
 	local target_file="$4"
 	local skill_name="$5"
 	local target_path="$6"
+
+	# Curated multi-skill layouts use explicit registry rules, not format guessing.
+	if has_curated_policy "$skill_name"; then
+		install_curated_tree "$source_dir" "$skill_name" "$TEMP_DIR/curated-stage"
+		return $?
+	fi
 
 	# Create target directory
 	local target_dir

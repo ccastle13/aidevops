@@ -334,6 +334,19 @@ _set_triage_recommendation_label() {
 	*) return 1 ;;
 	esac
 
+	local current_labels=""
+	current_labels=$(gh issue view "$issue_num" --repo "$repo_slug" \
+		--json labels --jq '[.labels[].name]' 2>/dev/null) || return 1
+	# Fail closed on an unreadable inventory; retries must not churn events.
+	jq -e 'type == "array" and all(.[]; type == "string")' \
+		<<<"$current_labels" >/dev/null 2>&1 || return 1
+	if jq -e --arg target "$target_label" \
+		--arg other_one "$remove_label_one" --arg other_two "$remove_label_two" \
+		'index($target) != null and index($other_one) == null and index($other_two) == null' \
+		<<<"$current_labels" >/dev/null 2>&1; then
+		return 0
+	fi
+
 	_ensure_triage_recommendation_labels "$repo_slug" || return 1
 	gh issue edit "$issue_num" --repo "$repo_slug" \
 		--remove-label "$remove_label_one" \
@@ -464,14 +477,18 @@ ESCALATION_EOF
 _triage_runtime_infra_failure_reason() {
 	local sample="$1"
 
-	if printf '%s' "$sample" | grep -qE 'Canary test FAILED|Canary failed.*aborting dispatch' 2>/dev/null; then
+	if [[ "$sample" == *'Public triage provider authentication unavailable'* ]] ||
+		[[ "$sample" == *'Model not found: anthropic/'* ]]; then
+		# Never persist the raw runtime line: it can contain untrusted content
+		# or credentials. Keep a fixed diagnostic visible in pulse.log.
+		if [[ -n "${LOGFILE:-}" ]]; then
+			printf '%s\n' '[pulse-wrapper] OpenCode error: Model not found (isolated provider authentication unavailable)' >>"$LOGFILE"
+		fi
+		printf '%s\n' 'triage-provider-auth-unsupported'
+	elif printf '%s' "$sample" | grep -E 'Canary test FAILED|Canary failed.*aborting dispatch' >/dev/null 2>&1; then
 		printf '%s\n' 'canary-unavailable'
-		return 0
-	fi
-
-	if printf '%s' "$sample" | grep -qE 'WORKER_ISSUE_NUMBER unset|WORKER_WORKTREE_PATH unset|worker env contract missing|worker --dir does not match WORKER_WORKTREE_PATH|worker worktree repo mismatch|WORKER_WORKTREE_PATH does not exist|incomplete worker ownership contract|worker ownership unavailable|worker_ownership_lost|runtime ownership fence stopped|worker_prepare_failed|OpenCode version drift|Failed to restore OpenCode|opencode version mismatch|launch cwd is deleted' 2>/dev/null; then
+	elif printf '%s' "$sample" | grep -E 'WORKER_ISSUE_NUMBER unset|WORKER_WORKTREE_PATH unset|worker env contract missing|worker --dir does not match WORKER_WORKTREE_PATH|worker worktree repo mismatch|WORKER_WORKTREE_PATH does not exist|incomplete worker ownership contract|worker ownership unavailable|worker_ownership_lost|runtime ownership fence stopped|worker_prepare_failed|OpenCode version drift|Failed to restore OpenCode|opencode version mismatch|launch cwd is deleted' >/dev/null 2>&1; then
 		printf '%s\n' 'prelaunch-contract-failure'
-		return 0
 	fi
 
 	return 0
@@ -483,7 +500,9 @@ _triage_runtime_result_failure_reason() {
 	local raw_sample="$3"
 	local failure_reason=""
 
-	failure_reason=$(_triage_runtime_infra_failure_reason "$raw_sample")
+	if [[ "$runtime_status" -ne 0 ]]; then
+		failure_reason=$(_triage_runtime_infra_failure_reason "$raw_sample")
+	fi
 	if [[ "$artifact_cleanup_status" -ne 0 ]]; then
 		failure_reason="$_PAD_TRIAGE_RUNTIME_TEMP_FAILURE_REASON"
 	elif [[ "$runtime_status" -ne 0 && -z "$failure_reason" ]]; then
@@ -506,7 +525,7 @@ _triage_failure_is_infrastructure() {
 	local failure_reason="$1"
 
 	case "$failure_reason" in
-	canary-unavailable | prelaunch-contract-failure | github-comment-write-failed | github-review-label-write-failed | triage-runtime-failed | triage-runtime-temp-failed | github-current-snapshot-* | github-pr-revision-* | github-public-revision-* | triage-current-snapshot-hash-failed | triage-evidence-* | triage-prompt-* | scanner-unavailable-* | scanner-tempfile-* | scanner-input-* | scanner-error-*) return 0 ;;
+	canary-unavailable | prelaunch-contract-failure | triage-provider-auth-unsupported | github-comment-write-failed | github-review-label-write-failed | triage-runtime-failed | triage-runtime-temp-failed | github-current-snapshot-* | github-pr-revision-* | github-public-revision-* | triage-current-snapshot-hash-failed | triage-evidence-* | triage-prompt-* | scanner-unavailable-* | scanner-tempfile-* | scanner-input-* | scanner-error-*) return 0 ;;
 	*) return 1 ;;
 	esac
 }

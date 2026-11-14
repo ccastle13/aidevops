@@ -43,11 +43,16 @@ check_git_repo() {
 
 # Check if there are planning file changes
 has_planning_changes() {
-	# Check both staged and unstaged changes
-	if git diff --name-only HEAD 2>/dev/null | grep -qE "$PLANNING_PATTERNS"; then
+	# Check both staged and unstaged changes. --no-renames lists a rename's
+	# source as well as its destination (GH#37002). Capture before matching so
+	# an early-exiting grep cannot SIGPIPE the writer under pipefail.
+	local changed_paths=""
+	changed_paths=$(git diff --no-renames --name-only HEAD 2>/dev/null || true)
+	if grep -qE "$PLANNING_PATTERNS" <<<"$changed_paths"; then
 		return 0
 	fi
-	if git diff --name-only --cached 2>/dev/null | grep -qE "$PLANNING_PATTERNS"; then
+	changed_paths=$(git diff --no-renames --name-only --cached 2>/dev/null || true)
+	if grep -qE "$PLANNING_PATTERNS" <<<"$changed_paths"; then
 		return 0
 	fi
 	# Also check untracked files in todo/
@@ -63,11 +68,11 @@ list_planning_changes() {
 
 	# Staged changes
 	local staged
-	staged=$(git diff --name-only --cached 2>/dev/null | grep -E "$PLANNING_PATTERNS" || true)
+	staged=$(git diff --no-renames --name-only --cached 2>/dev/null | grep -E "$PLANNING_PATTERNS" || true)
 
 	# Unstaged changes
 	local unstaged
-	unstaged=$(git diff --name-only 2>/dev/null | grep -E "$PLANNING_PATTERNS" || true)
+	unstaged=$(git diff --no-renames --name-only 2>/dev/null | grep -E "$PLANNING_PATTERNS" || true)
 
 	# Untracked
 	local untracked
@@ -164,8 +169,13 @@ _complete_task_validate_pr() {
 # Returns 0 if confirmed, 1 if cancelled.
 _complete_task_confirm_verified() {
 	log_warning "Using --verified mode (no PR proof)"
+	if [[ ! -t 0 ]]; then
+		log_error "--verified requires interactive confirmation on a TTY; use --pr <number> for non-interactive completion"
+		return 1
+	fi
+	local confirmation=""
 	echo -n "Are you sure this task is complete and verified? [y/N] "
-	read -r confirmation
+	read -r confirmation || return 1
 	if [[ "$confirmation" != "y" ]] && [[ "$confirmation" != "Y" ]]; then
 		log_info "Cancelled"
 		return 1
@@ -183,7 +193,7 @@ _complete_task_update_todo() {
 
 	# Find the task line
 	local task_line_num
-	task_line_num=$(grep -n "^\s*- \[ \] ${task_id} " "$todo_file" | head -1 | cut -d: -f1)
+	task_line_num=$(grep -n "^\s*- \[[ >]\] ${task_id} " "$todo_file" | head -1 | cut -d: -f1)
 
 	if [[ -z "$task_line_num" ]]; then
 		log_error "Task ${task_id} not found or already completed in TODO.md"
@@ -196,7 +206,7 @@ _complete_task_update_todo() {
 
 	# Mark as complete
 	local updated_line
-	updated_line=$(echo "$task_line" | sed 's/- \[ \]/- [x]/')
+	updated_line=$(echo "$task_line" | sed 's/- \[[ >]\]/- [x]/')
 
 	# Add proof-log field
 	local today
@@ -283,7 +293,20 @@ complete_task() {
 
 	# Require explicit confirmation for --verified
 	if [[ "$verified_mode" == "true" ]]; then
-		_complete_task_confirm_verified || return 0
+		_complete_task_confirm_verified || return 1
+	fi
+
+	# Canonical checkouts are read-only service mirrors. Refuse before touching
+	# TODO.md; publication from a linked worktree remains available.
+	local classification
+	classification=$(python3 "${SCRIPT_DIR}/canonical-write-policy-helper.py" classify \
+		--cwd "$repo_root" --field classification 2>/dev/null) || {
+		log_error "Cannot classify repository before task completion; refusing to edit TODO.md"
+		return 1
+	}
+	if [[ "$classification" == "canonical" ]]; then
+		log_error "Canonical checkout is read-only; complete from a linked worktree with full-loop-helper.sh commit-and-pr --completion-bookkeeping"
+		return 1
 	fi
 
 	# Update TODO.md
@@ -300,7 +323,7 @@ complete_task() {
 	fi
 
 	log_info "Committing: $commit_msg"
-	if todo_commit_push "$repo_root" "$commit_msg" "TODO.md todo/"; then
+	if commit_planning_files "$commit_msg"; then
 		if [[ "${TODO_COMMIT_PUSH_RESULT:-}" == "pr" ]]; then
 			log_success "Task completion submitted via planning PR: ${TODO_COMMIT_PUSH_PR_URL:-created}"
 		else
@@ -549,6 +572,20 @@ next_task_id() {
 	return "$claim_rc"
 }
 
+# List planning paths committed on the current branch but absent from the
+# remote default branch (e.g. WIP-committed briefs), one per line.
+list_committed_unpublished_planning() {
+	local repo_root="$1"
+	local default_branch="$2"
+	local current_branch="" base=""
+	current_branch=$(git -C "$repo_root" symbolic-ref --short -q HEAD 2>/dev/null || true)
+	[[ "$current_branch" != "$default_branch" ]] || return 0
+	base=$(git -C "$repo_root" merge-base HEAD "origin/${default_branch}" 2>/dev/null || true)
+	[[ -n "$base" ]] || return 0
+	git -C "$repo_root" diff --no-renames --name-only "$base" HEAD -- TODO.md todo/ 2>/dev/null || true
+	return 0
+}
+
 # Main commit function
 # Publishes from a temporary index and retries bounded fast-forward contention.
 commit_planning_files() {
@@ -558,6 +595,18 @@ commit_planning_files() {
 
 	# Check for changes
 	if ! has_planning_changes; then
+		local ahead_root="" ahead_branch="" ahead_paths=""
+		ahead_root=$(git rev-parse --show-toplevel)
+		ahead_branch=$(_todo_default_branch "$ahead_root")
+		ahead_paths=$(list_committed_unpublished_planning "$ahead_root" "$ahead_branch")
+		if [[ -n "$ahead_paths" ]]; then
+			log_error "Planning files are committed on this branch but not on origin/${ahead_branch}; this helper only publishes uncommitted changes:"
+			while IFS= read -r ahead_file; do
+				printf '  - %s\n' "$ahead_file" >&2
+			done <<<"$ahead_paths"
+			log_error "Recover: git reset --soft \$(git merge-base HEAD origin/${ahead_branch}) then rerun this helper"
+			return 1
+		fi
 		log_info "No planning file changes to commit"
 		return 0
 	fi
@@ -573,13 +622,21 @@ commit_planning_files() {
 
 	# Publish through a temporary index so caller HEAD/index/files stay untouched.
 	log_info "Committing: $commit_msg"
-	local current_branch=""
-	current_branch=$(git -C "$repo_root" symbolic-ref --short HEAD 2>/dev/null) || return 1
+	# No named local branch is required: publication uses a temporary index
+	# against the remote default branch, so detached HEAD is supported.
 	local default_branch=""
 	default_branch=$(_todo_default_branch "$repo_root")
 	if _todo_branch_requires_planning_pr "$repo_root" "$default_branch"; then
 		todo_commit_push "$repo_root" "$commit_msg" "TODO.md todo/"
 		local publication_rc=$?
+		if [[ "$publication_rc" -eq 0 && "${TODO_COMMIT_PUSH_RESULT:-}" == "direct" ]]; then
+			# GH#33707: never report direct unless the remote default branch has the commit.
+			git -C "$repo_root" fetch origin "$default_branch" >/dev/null 2>&1 || true
+			if ! git -C "$repo_root" merge-base --is-ancestor HEAD "origin/${default_branch}" 2>/dev/null; then
+				log_error "Planning commit is not on origin/${default_branch}; refusing to report direct publication"
+				return 1
+			fi
+		fi
 		[[ "$publication_rc" -eq 0 ]] &&
 			printf 'AIDEVOPS_PLANNING_COMMIT_RESULT=%s\n' "${TODO_COMMIT_PUSH_RESULT:-unknown}"
 		return "$publication_rc"
@@ -646,7 +703,7 @@ main() {
 		echo "Commands:"
 		echo "  next-id --title \"...\"              Allocate next task ID (via claim-task-id.sh)"
 		echo "  complete <task_id> --pr <number>   Mark task complete with PR proof"
-		echo "  complete <task_id> --verified      Mark task complete with manual verification"
+		echo "  complete <task_id> --verified      Mark task complete with manual verification (TTY confirmation required)"
 		echo ""
 		echo "Options:"
 		echo "  --check                            Check if planning files have changes"

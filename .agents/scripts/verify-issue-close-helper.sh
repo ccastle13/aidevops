@@ -16,6 +16,9 @@
 #     Verify that a PR's changed files overlap with files mentioned in the issue.
 #     Exit 0 = verified (safe to close), exit 1 = not verified (do NOT close)
 #
+#   verify-issue-close-helper.sh check-no-code <issue> <pr> <repo_slug> <parent>
+#     Verify premise-falsified no-code triage (merged For/Ref PR, trusted issue).
+#
 #   verify-issue-close-helper.sh extract-paths <issue_number> <repo_slug>
 #     Extract file paths mentioned in an issue body. Useful for debugging.
 #
@@ -44,6 +47,25 @@ readonly MIN_FILE_OVERLAP=1
 # =============================================================================
 
 #######################################
+# Remove generated provenance and URL metadata before path extraction.
+#
+# Args: $1 = issue body text
+# Outputs: issue content that may contain repository-relative references
+# Returns: 0 always
+#######################################
+_strip_non_repository_path_metadata() {
+	local text="$1"
+
+	# Remove metadata tokens rather than truncating at the marker: issue text is
+	# untrusted, so a signature-like comment must not hide later file references.
+	printf '%s' "$text" | sed -E \
+		-e '/^[[:space:]]*<!--[[:space:]]*aidevops:sig[[:space:]]*-->[[:space:]]*$/d' \
+		-e 's#\[[^]]*\]\(https?://[^)]*\)##g' \
+		-e 's#https?://[^[:space:])>]+##g'
+	return 0
+}
+
+#######################################
 # Extract file paths from an issue body.
 #
 # Looks for common file-path patterns in the issue text:
@@ -57,6 +79,7 @@ readonly MIN_FILE_OVERLAP=1
 #######################################
 extract_file_paths_from_text() {
 	local text="$1"
+	text=$(_strip_non_repository_path_metadata "$text")
 
 	# Extract paths that look like file references:
 	# - Must contain a dot (extension) or a slash (directory)
@@ -100,6 +123,16 @@ extract_file_paths_from_text() {
 		paths="${paths}${bare_files}"$'\n'
 	fi
 
+	# Pattern 5: Backtick-enclosed repository-relative glob entries (contain `*`).
+	# Emitted with a `glob:` prefix so classification keeps them apart from
+	# literal paths (batch issues cannot know slugs/timestamps in advance).
+	local backtick_globs
+	# shellcheck disable=SC2016 # Literal backtick regex, not shell expansion.
+	backtick_globs=$(printf '%s' "$text" | grep -oE '`[a-zA-Z0-9._*/-]*\*[a-zA-Z0-9._*/-]*`' | tr -d '`' | grep '/' | sed 's/^/glob:/' | sort -u || true)
+	if [[ -n "$backtick_globs" ]]; then
+		paths="${paths}${backtick_globs}"$'\n'
+	fi
+
 	# Deduplicate, remove empty lines, filter out false positives
 	printf '%s' "$paths" | sort -u | grep -v '^$' | grep -vE '^v?[0-9]+\.[0-9]+\.[0-9]+' || true
 	return 0
@@ -122,7 +155,7 @@ get_pr_changed_files() {
 	# native GraphQL `files` projection, which cannot report its exact cost.
 	pr_files=$(AIDEVOPS_GH_ROUTE_DECISION="verify-close-pr-files-rest" \
 		gh api --paginate "repos/${repo_slug}/pulls/${pr_number}/files?per_page=100" \
-			--jq '.[].filename' 2>/dev/null) || {
+		--jq '.[].filename' 2>/dev/null) || {
 		log_error "Failed to fetch PR #${pr_number} file list via REST"
 		return 1
 	}
@@ -181,15 +214,48 @@ _classify_issue_paths() {
 	local issue_paths="$1"
 	local pr_files="$2"
 
-	local specific_paths general_paths pr_basenames
-	specific_paths=$(printf '%s\n' "$issue_paths" | grep '/' || true)
-	general_paths=$(printf '%s\n' "$issue_paths" | grep -v '/' || true)
+	local specific_paths general_paths pr_basenames glob_paths
+	glob_paths=$(printf '%s\n' "$issue_paths" | grep '^glob:' | sed 's/^glob://' || true)
+	specific_paths=$(printf '%s\n' "$issue_paths" | grep -v '^glob:' | grep '/' || true)
+	general_paths=$(printf '%s\n' "$issue_paths" | grep -v '^glob:' | grep -v '/' || true)
 	pr_basenames=$(printf '%s\n' "$pr_files" | while IFS= read -r f; do printf '%s\n' "${f##*/}"; done | sort -u)
 
 	# Output as shell assignments for eval
 	printf 'specific_paths=%q\n' "$specific_paths"
 	printf 'general_paths=%q\n' "$general_paths"
+	printf 'glob_paths=%q\n' "$glob_paths"
 	printf 'pr_basenames=%q\n' "$pr_basenames"
+	return 0
+}
+
+#######################################
+# Convert a safe repository-relative glob into an anchored ERE.
+#
+# `*` matches within one path segment ([^/]*); every other character is
+# literal. Unsafe patterns (absolute, `..`, `**`, or no literal leading
+# directory such as `*/*.json`) produce no output and return 1.
+#
+# Args: $1 = glob pattern
+# Outputs: anchored regex on stdout
+# Returns: 0 = safe, 1 = unsafe
+#######################################
+_glob_to_safe_regex() {
+	local pattern="$1"
+	local first_segment="${pattern%%/*}"
+
+	[[ -z "$pattern" || "$pattern" == /* || "$pattern" == *..* || "$pattern" == *'**'* ]] && return 1
+	[[ "$pattern" != */* || "$first_segment" == *'*'* ]] && return 1
+
+	local regex="" ch i
+	for ((i = 0; i < ${#pattern}; i++)); do
+		ch="${pattern:i:1}"
+		case "$ch" in
+		'*') regex="${regex}[^/]*" ;;
+		[a-zA-Z0-9_/]) regex="${regex}${ch}" ;;
+		*) regex="${regex}\\${ch}" ;;
+		esac
+	done
+	printf '^%s$' "$regex"
 	return 0
 }
 
@@ -208,12 +274,13 @@ _classify_issue_paths() {
 _check_tier1_specific_paths() {
 	local specific_paths="$1"
 	local pr_files="$2"
+	local glob_paths="${3:-}"
 
 	local overlap_count=0
 	local overlapping_files=""
 	local specific_overlap=0
 
-	if [[ -z "$specific_paths" ]]; then
+	if [[ -z "$specific_paths" && -z "$glob_paths" ]]; then
 		printf 'tier1_overlap_count=%d\n' "$overlap_count"
 		printf 'tier1_specific_overlap=%d\n' "$specific_overlap"
 		printf 'tier1_overlapping_files=%q\n' "$overlapping_files"
@@ -231,6 +298,20 @@ _check_tier1_specific_paths() {
 			continue
 		fi
 	done <<<"$specific_paths"
+
+	local glob_pattern glob_regex pr_file
+	while IFS= read -r glob_pattern; do
+		[[ -z "$glob_pattern" ]] && continue
+		glob_regex=$(_glob_to_safe_regex "$glob_pattern") || continue
+		while IFS= read -r pr_file; do
+			[[ -z "$pr_file" ]] && continue
+			if [[ "$pr_file" =~ $glob_regex ]]; then
+				overlap_count=$((overlap_count + 1))
+				specific_overlap=$((specific_overlap + 1))
+				overlapping_files="${overlapping_files}  ${pr_file} (glob match: ${glob_pattern})"$'\n'
+			fi
+		done <<<"$pr_files"
+	done <<<"$glob_paths"
 
 	printf 'tier1_overlap_count=%d\n' "$overlap_count"
 	printf 'tier1_specific_overlap=%d\n' "$specific_overlap"
@@ -381,14 +462,14 @@ check_pr_fixes_issue() {
 	fi
 
 	# Classify paths and build PR basenames
-	local specific_paths general_paths pr_basenames
+	local specific_paths general_paths pr_basenames glob_paths
 	eval "$(_classify_issue_paths "$issue_paths" "$pr_files")"
 
 	# Tier 1: specific path matching (paths with directory separators)
 	local tier1_overlap_count tier1_specific_overlap tier1_overlapping_files
 	local tier1_output
 	tier1_output=$(_check_tier1_specific_paths \
-		"$specific_paths" "$pr_files")
+		"$specific_paths" "$pr_files" "$glob_paths")
 	eval "$tier1_output"
 
 	# Tier 2: independent general basename matching when no specific path matched
@@ -408,9 +489,153 @@ check_pr_fixes_issue() {
 		"$issue_number" "$pr_number" "$issue_paths" "$pr_files"
 }
 
+#######################################
+# Verify a no-code (premise-falsified) disposition for a triage issue.
+#
+# A merged prerequisite PR that references the parent task with For/Ref is not
+# an implementation fix for the triage issue, so it has no file overlap and
+# `check` correctly rejects it. This separate verdict never satisfies `check`;
+# callers must record it as a no-code resolution and must not close the parent.
+#
+# Requirements (all independently fetched, none taken from caller claims):
+#   - the issue author is OWNER/MEMBER/COLLABORATOR (#aidevops:trust-boundary)
+#   - the issue body names the parent as #<parent>
+#   - the PR is merged and its body links the parent with For/Ref #<parent>
+#   - the PR does not use a closing keyword for the triage issue or the parent
+#
+# Args: $1 = issue_number, $2 = pr_number, $3 = repo_slug, $4 = parent_number
+# Returns: 0 = verified no-code premise, 1 = rejected
+#######################################
+check_no_code_prerequisite() {
+	local issue_number="$1"
+	local pr_number="$2"
+	local repo_slug="$3"
+	local parent_number="$4"
+
+	local association issue_body
+	association=$(gh api "repos/${repo_slug}/issues/${issue_number}" --jq '.author_association // ""' 2>/dev/null) || association=""
+	case "$association" in
+	OWNER | MEMBER | COLLABORATOR) ;;
+	*)
+		printf 'REJECTED-NO-CODE: issue #%s author association %s is not trusted\n' "$issue_number" "${association:-unknown}"
+		return 1
+		;;
+	esac
+
+	issue_body=$(_fetch_issue_body "$issue_number" "$repo_slug") || {
+		printf '%s\n' "$issue_body" >&2
+		return 1
+	}
+	if ! grep -Eq "(^|[^0-9A-Za-z])#${parent_number}([^0-9]|$)" <<<"$issue_body"; then
+		printf 'REJECTED-NO-CODE: issue #%s does not reference parent #%s\n' "$issue_number" "$parent_number"
+		return 1
+	fi
+
+	local pr_state pr_body
+	pr_state=$(gh api "repos/${repo_slug}/pulls/${pr_number}" --jq 'if .merged_at then "merged" else "unmerged" end' 2>/dev/null) || pr_state=""
+	if [[ "$pr_state" != "merged" ]]; then
+		printf 'REJECTED-NO-CODE: PR #%s is not merged\n' "$pr_number"
+		return 1
+	fi
+	pr_body=$(gh api "repos/${repo_slug}/pulls/${pr_number}" --jq '.body // ""' 2>/dev/null) || pr_body=""
+
+	if ! grep -Eiq "(^|[^[:alnum:]])(for|ref)[[:space:]]+#${parent_number}([^0-9]|$)" <<<"$pr_body"; then
+		printf 'REJECTED-NO-CODE: PR #%s does not link parent #%s with For/Ref\n' "$pr_number" "$parent_number"
+		return 1
+	fi
+	if grep -Eiq "(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#(${issue_number}|${parent_number})([^0-9]|$)" <<<"$pr_body"; then
+		printf 'REJECTED-NO-CODE: PR #%s uses a closing keyword for #%s or #%s\n' "$pr_number" "$issue_number" "$parent_number"
+		return 1
+	fi
+
+	printf 'VERIFIED-NO-CODE: merged PR #%s links parent #%s (For/Ref); issue #%s may be resolved as no-code only. Not an implementation fix; do NOT close parent #%s.\n' \
+		"$pr_number" "$parent_number" "$issue_number" "$parent_number"
+	log_info "Verified no-code prerequisite: PR #${pr_number} parent #${parent_number} issue #${issue_number}"
+	return 0
+}
+
+# Read-only terminal evidence, NOT a pre-close verdict. Unlike `check`, every
+# canonical scope entry must be a literal path delivered by this merged PR.
+# Fresh evidence is returned directly to the runtime, never accepted from model
+# output or replayed from an issue comment/file. Missing/ambiguous scopes fail shut.
+check_scoped_delivery() {
+	local issue_number="${1:-}" pr_number="${2:-}" repo_slug="${3:-}" work_dir="${4:-}"
+	local attempt="${AIDEVOPS_ATTEMPT_ID:-}" started="${AIDEVOPS_ATTEMPT_STARTED_AT:-}"
+	[[ "$issue_number" =~ ^[1-9][0-9]*$ && "$pr_number" =~ ^[1-9][0-9]*$ ]] || return 1
+	[[ "$repo_slug" == */* && -n "$attempt" && "$started" =~ ^[0-9]{19}$ ]] || return 1
+	work_dir=$(cd "$work_dir" && pwd -P) || return 1
+	local issue_json pr_json scope files merge head branch path blob dirty delivered="[]"
+	local pr_endpoint="repos/${repo_slug}/pulls"
+	issue_json=$(gh api "repos/${repo_slug}/issues/${issue_number}" 2>/dev/null) || return 1
+	# aidevops:trust-boundary — only classify an existing trusted completed issue.
+	jq -e --argjson issue "$issue_number" '.number == $issue and .pull_request == null
+		and .state == "closed" and .state_reason == "completed"
+		and (.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR")' \
+		<<<"$issue_json" >/dev/null || return 1
+	# Deliberately support only canonical finite scopes. Globs, prose, duplicate
+	# headings and empty sections cannot establish complete authorized delivery.
+	scope=$(jq -er '.body
+		| select((split("\n") | map(select(test("^#{1,6}[ \t]+Files Scope([ \t]|$)"; "i"))) | length) == 1)
+		| split("### Files Scope\n") | select(length == 2) | .[1]
+		| split("\n#")[0] | split("\n") | map(select(length > 0))
+		| select(length > 0 and all(.[]; test("^- `([A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+`$")))
+		| map(ltrimstr("- `") | rtrimstr("`"))
+		| select(all(.[]; split("/") | all(.[]; . != ".." and . != "."))) | unique' \
+		<<<"$issue_json") || return 1
+	pr_json=$(gh api "${pr_endpoint}/${pr_number}" 2>/dev/null) || return 1
+	jq -e --argjson pr "$pr_number" --arg repo "$repo_slug" --arg issue "$issue_number" '
+		.number == $pr and .merged_at != null and .state == "closed"
+		and (.base.repo.full_name | ascii_downcase) == ($repo | ascii_downcase)
+		and (.body | test("(?im)(^|[^a-z0-9])(for|ref) +#" + $issue + "([^0-9]|$)"))' \
+		<<<"$pr_json" >/dev/null || return 1
+	merge=$(jq -er '.merge_commit_sha | select(test("^[0-9a-f]{40}$"))' <<<"$pr_json") || return 1
+	files=$(get_pr_changed_files "$pr_number" "$repo_slug") || return 1
+	head=$(git -C "$work_dir" rev-parse HEAD) || return 1
+	branch=$(git -C "$work_dir" branch --show-current) || return 1
+	dirty=$(git -C "$work_dir" status --porcelain --untracked-files=all) || return 1
+	[[ -n "$branch" && -z "$dirty" ]] || return 1
+	git -C "$work_dir" merge-base --is-ancestor "$merge" "$head" || return 1
+	while IFS= read -r path; do
+		grep -Fxq -- "$path" <<<"$files" || return 1
+		# Deleted paths, rewritten/reverted artifacts, and partial PRs fail shut.
+		blob=$(git -C "$work_dir" rev-parse "${merge}:${path}") || return 1
+		[[ "$(git -C "$work_dir" cat-file -t "$blob")" == blob ]] || return 1
+		[[ "$(git -C "$work_dir" rev-parse "${head}:${path}")" == "$blob" ]] || return 1
+		delivered=$(jq -c --arg path "$path" --arg blob "$blob" '. + [{path:$path,blob:$blob}]' <<<"$delivered") || return 1
+	done < <(jq -r '.[]' <<<"$scope")
+	jq -cn --arg repo "$repo_slug" --argjson issue "$issue_number" --argjson pr "$pr_number" \
+		--arg attempt "$attempt" --arg started "$started" --arg worktree "$work_dir" \
+		--arg branch "$branch" --arg head "$head" --arg merge "$merge" --argjson files "$delivered" \
+		--arg updated "$(jq -r '.updated_at' <<<"$issue_json")" \
+		'{schema_version:1,kind:"scoped_delivery",repository:$repo,issue:$issue,pr:$pr,
+		attempt_id:$attempt,attempt_started_at:$started,worktree:$worktree,branch:$branch,
+		head:$head,merge_commit:$merge,issue_updated_at:$updated,files:$files,verified:true}'
+	return 0
+}
+
 # =============================================================================
 # Commands
 # =============================================================================
+
+cmd_check_no_code() {
+	local issue_number="${1:-}"
+	local pr_number="${2:-}"
+	local repo_slug="${3:-}"
+	local parent_number="${4:-}"
+
+	if [[ -z "$issue_number" || -z "$pr_number" || -z "$repo_slug" || -z "$parent_number" ]]; then
+		print_error "Usage: verify-issue-close-helper.sh check-no-code <issue_number> <pr_number> <repo_slug> <parent_number>"
+		return 1
+	fi
+
+	if [[ ! "$issue_number" =~ ^[0-9]+$ ]] || [[ ! "$pr_number" =~ ^[0-9]+$ ]] || [[ ! "$parent_number" =~ ^[0-9]+$ ]]; then
+		print_error "Issue, PR and parent numbers must be numeric"
+		return 1
+	fi
+
+	check_no_code_prerequisite "$issue_number" "$pr_number" "$repo_slug" "$parent_number"
+	return $?
+}
 
 cmd_check() {
 	local issue_number="${1:-}"
@@ -468,6 +693,16 @@ COMMANDS
   check <issue> <pr> <slug>    Verify PR fixes issue (file overlap check)
                                Exit 0 = verified, exit 1 = rejected
 
+  check-scoped-delivery <issue> <pr> <slug> <worktree>
+                               Emit fresh attempt-bound JSON terminal evidence for
+                               complete literal Files Scope delivery; never close
+                               an issue or authorize publication
+
+  check-no-code <issue> <pr> <slug> <parent>
+                               Verify a merged For/Ref prerequisite PR supports a
+                               no-code triage resolution (never an implementation
+                               close; parent stays open)
+
   extract-paths <issue> <slug> List file paths mentioned in an issue body
 
   help                         Show this message
@@ -492,6 +727,8 @@ main() {
 
 	case "$command" in
 	check) cmd_check "$@" ;;
+	check-scoped-delivery) check_scoped_delivery "$@" ;;
+	check-no-code) cmd_check_no_code "$@" ;;
 	extract-paths) cmd_extract_paths "$@" ;;
 	help | --help | -h) cmd_help ;;
 	*)

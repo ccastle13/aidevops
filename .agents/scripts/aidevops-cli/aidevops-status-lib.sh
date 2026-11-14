@@ -89,21 +89,31 @@ _status_recommended_tools() {
 	return 0
 }
 
-_status_ai_tools() {
-	print_header "AI Tools & MCPs"
-	check_cmd opencode && print_success "OpenCode CLI" || print_warning "OpenCode CLI - not installed"
-	if check_cmd auggie; then
-		check_file "$HOME/.augment/session.json" && print_success "Augment Context Engine (authenticated)" || print_warning "Augment Context Engine (not authenticated)"
-	else print_warning "Augment Context Engine - not installed"; fi
-	check_cmd bd && print_success "Beads CLI (task graph)" || print_warning "Beads CLI (bd) - not installed"
-	echo ""
+_status_pulse_schedulers() {
+	[[ "$(uname -s)" == "Linux" ]] || return 0
+	command -v crontab >/dev/null 2>&1 || return 0
+	command -v systemctl >/dev/null 2>&1 || return 0
+	local current_cron=""
+	local routine=""
+	local cron_pattern=""
+	current_cron=$(crontab -l 2>/dev/null) || return 0
+	for routine in supervisor-pulse pulse-merge; do
+		cron_pattern="#[[:space:]]*aidevops: ${routine}([[:space:]]|$)"
+		if [[ "$routine" == "pulse-merge" ]]; then
+			cron_pattern='#[[:space:]]*aidevops: pulse-merge(-routine)?([[:space:]]|$)'
+		fi
+		if printf '%s\n' "$current_cron" | grep -qE "$cron_pattern" &&
+			{ systemctl --user is-enabled "aidevops-${routine}.timer" >/dev/null 2>&1 ||
+				systemctl --user is-active "aidevops-${routine}.timer" >/dev/null 2>&1; }; then
+			print_warning "Dual scheduler detected for ${routine}: cron and systemd timer; run: aidevops update"
+		fi
+	done
 	return 0
 }
 
-_status_dev_envs() {
-	print_header "Development Environments"
-	check_dir "$INSTALL_DIR/python-env/dspy-env" && print_success "DSPy Python environment" || print_warning "DSPy Python environment - not created"
-	check_cmd dspyground && print_success "DSPyGround" || print_warning "DSPyGround - not installed"
+_status_ai_tools() {
+	print_header "AI Tools & MCPs"
+	check_cmd opencode && print_success "OpenCode CLI" || print_warning "OpenCode CLI - not installed"
 	echo ""
 	return 0
 }
@@ -267,7 +277,38 @@ _status_runtime_bundle_integrity() {
 }
 
 # Status command
+_status_quick() {
+	local current_version
+	current_version=$(_status_active_bundle_version)
+	print_header "AI DevOps Framework Status (quick)"
+	echo "  Installed: $current_version"
+	echo "  Latest:    not checked (quick mode); run 'aidevops status' for the update check"
+	_status_runtime_bundle_integrity
+	echo ""
+	print_header "Required Dependencies"
+	local cmd
+	for cmd in git curl jq ssh; do check_cmd "$cmd" && print_success "$cmd" || print_error "$cmd - not installed"; done
+	echo ""
+	print_info "Full report (storage inventory, pulse stats, network update check): aidevops status --full"
+	return 0
+}
+
+# Status command. Flags: --quick/--brief (offline, seconds), --full (default).
 cmd_status() {
+	local arg
+	for arg in "$@"; do
+		case "$arg" in
+		--quick | --brief | -q)
+			_status_quick
+			return 0
+			;;
+		--full) ;;
+		*)
+			print_error "Unknown status option: $arg (use --quick or --full)"
+			return 1
+			;;
+		esac
+	done
 	print_header "AI DevOps Framework Status"
 	echo "=========================="
 	echo ""
@@ -314,20 +355,26 @@ cmd_status() {
 	check_cmd tea && print_success "Gitea CLI (tea)" || print_warning "Gitea CLI (tea) - not installed"
 	echo ""
 	_status_ai_tools
-	_status_dev_envs
 	_status_ai_configs
 	_status_runtime_config_parity
 	_status_headless_runtime_config
+	_status_pulse_schedulers
 	_status_capability_readiness
 	_status_storage_inventory
+	local orphan_state_helper="${SCRIPT_DIR%/aidevops-cli}/orphan-cleanup-state.py"
+	if [[ -f "$orphan_state_helper" ]] && check_cmd python3; then
+		print_header "Orphan Cleanup Holds"
+		python3 "$orphan_state_helper" report || print_warning "Orphan cleanup ledger unavailable"
+		echo ""
+	fi
 	print_header "SSH Configuration"
 	check_file "$HOME/.ssh/id_ed25519" && print_success "Ed25519 SSH key" || print_warning "Ed25519 SSH key - not found"
 	echo ""
 	print_header "Commit Signing"
 	local signing_format signing_key signing_enabled
-	signing_format=$(git config --global gpg.format 2>/dev/null || echo "")
-	signing_key=$(git config --global user.signingkey 2>/dev/null || echo "")
-	signing_enabled=$(git config --global commit.gpgsign 2>/dev/null || echo "")
+	signing_format=$(git config --global --get gpg.format 2>/dev/null || echo "")
+	signing_key=$(git config --global --get user.signingkey 2>/dev/null || echo "")
+	signing_enabled=$(git config --global --get commit.gpgsign 2>/dev/null || echo "")
 	if [[ "$signing_format" == "ssh" && -n "$signing_key" && "$signing_enabled" == "true" ]]; then
 		print_success "SSH commit signing enabled"
 		if check_file "$HOME/.ssh/allowed_signers"; then

@@ -16,6 +16,12 @@
 [[ -n "${_SHARED_CONSTANTS_LOADED:-}" ]] && return 0
 _SHARED_CONSTANTS_LOADED=1
 
+# Normalize non-login environments before any tool lookup or runtime re-exec.
+# Use the shared sibling-source convention so isolated fixtures discover it.
+_SC_SELF="${BASH_SOURCE[0]:-${0:-}}"
+# shellcheck source=runtime-env.sh
+source "${_SC_SELF%/*}/runtime-env.sh"
+
 # =============================================================================
 # GH#18950 (t2087): Bash 3.2 → bash 4+ runtime re-exec self-heal guard.
 # =============================================================================
@@ -68,15 +74,16 @@ if [[ "${BASH_VERSINFO[0]:-0}" -lt 4 ]] &&
 		if [[ "$(uname -s 2>/dev/null || true)" != "$_aidevops_macos_platform" ]]; then
 			_aidevops_bash_candidates="${_aidevops_bash_candidates} /home/linuxbrew/.linuxbrew/bin/bash"
 		fi
+		IFS=' ' read -r -a _aidevops_bash_candidate_paths <<<"$_aidevops_bash_candidates"
 		_aidevops_path_bash="$(command -v bash 2>/dev/null || true)"
-		[[ -n "$_aidevops_path_bash" ]] && _aidevops_bash_candidates="${_aidevops_bash_candidates} ${_aidevops_path_bash}"
-		for _aidevops_bash_candidate in $_aidevops_bash_candidates; do
+		[[ -n "$_aidevops_path_bash" ]] && _aidevops_bash_candidate_paths+=("$_aidevops_path_bash")
+		for _aidevops_bash_candidate in "${_aidevops_bash_candidate_paths[@]}"; do
 			if [[ -n "$_aidevops_bash_candidate" && -f "$_aidevops_bash_candidate" && -x "$_aidevops_bash_candidate" && "$_aidevops_bash_candidate" != "/bin/bash" ]]; then
 				export AIDEVOPS_BASH_REEXECED=1
 				exec "$_aidevops_bash_candidate" "$_aidevops_top_caller" "$@"
 			fi
 		done
-		unset _aidevops_bash_candidate _aidevops_bash_candidates _aidevops_path_bash _aidevops_macos_platform
+		unset _aidevops_bash_candidate _aidevops_bash_candidates _aidevops_bash_candidate_paths _aidevops_path_bash _aidevops_macos_platform
 	fi
 	unset _aidevops_top_caller
 	# Fall through: no modern bash found. The calling script will run
@@ -185,18 +192,78 @@ aidevops_ensure_symlink_target() {
 # 1.18.16 after a credential-free same-revision baseline comparison; GH#30393
 # promoted 1.18.18 after making that comparison self-contained; GH#30695
 # promoted 1.18.23 after the isolated baseline and candidate probes passed;
-# GH#30957 promoted 1.18.25 after the same isolated comparison passed. Keep the
-# complete compatibility decision visible and machine-readable; general installs
-# track latest because the observed failure scope is Linux headless.
-readonly OPENCODE_PINNED_VERSION="1.18.25"
+# GH#30957 promoted 1.18.25, GH#31588 promoted 1.18.29, GH#31909 promoted
+# 1.18.31, GH#32210 promoted 1.18.32, GH#32761 promoted 1.18.33, and GH#33788
+# promoted 1.18.34, GH#34542 promoted 1.19.0, GH#35180 promoted 1.19.3,
+# and GH#36563 promoted 1.19.5 after the same isolated comparison passed with
+# required plugin tools and an empty native-tool diff; plugin packages unchanged.
+# Keep the compatibility decision machine-readable;
+# general installs track latest because the observed failure scope is Linux
+# headless.
+readonly OPENCODE_PINNED_VERSION="1.19.5"
 readonly OPENCODE_PIN_REASON="GH#28766 Linux headless bootstrap stalled with isolated XDG_DATA_HOME"
 readonly OPENCODE_PIN_PLATFORM="Linux"
 readonly OPENCODE_PIN_RUNTIME_MODE="headless"
 readonly OPENCODE_PIN_INTRODUCED_DATE="2026-07-30"
-readonly OPENCODE_PIN_LAST_CANARY_DATE="2026-09-01"
-readonly OPENCODE_PIN_LAST_CANARY_RESULT="pass:1.18.25"
-readonly OPENCODE_PIN_REVIEW_DEADLINE="2026-09-08"
-readonly OPENCODE_PLUGIN_TESTED_VERSION="1.18.25"
+readonly OPENCODE_PIN_LAST_CANARY_DATE="2026-11-03"
+readonly OPENCODE_PIN_LAST_CANARY_RESULT="pass:1.19.5"
+readonly OPENCODE_PIN_REVIEW_DEADLINE="2026-11-10"
+readonly OPENCODE_PLUGIN_TESTED_VERSION="1.19.5"
+# GH#37580: V2 promoted 2.2.7 from 2.2.5 after isolated Linux-headless
+# baseline and candidate probes passed with no provider-visible native-tool diff.
+# V2 exposes plugin tools through execute; both probes passed the plugin health check.
+readonly OPENCODE_V2_PINNED_VERSION="2.2.7"
+readonly OPENCODE_V2_PLUGIN_TESTED_VERSION="2.2.7"
+
+aidevops_opencode_profile_id() {
+	local requested="${AIDEVOPS_OPENCODE_PROFILE:-}"
+	local helper="${AIDEVOPS_AGENTS_DIR:-${HOME}/.aidevops/agents}/scripts/opencode-runtime-profile.py"
+	if [[ -z "$requested" ]] && [[ -f "$helper" ]] && command -v python3 >/dev/null 2>&1; then
+		requested=$(python3 "$helper" default 2>/dev/null || true)
+	fi
+	case "$requested" in
+		v2) printf 'v2\n' ;;
+		*) printf 'v1\n' ;;
+	esac
+	return 0
+}
+
+aidevops_opencode_profile_value() {
+	local field="$1"
+	local profile="${2:-$(aidevops_opencode_profile_id)}"
+	local helper="${AIDEVOPS_AGENTS_DIR:-${HOME}/.aidevops/agents}/scripts/opencode-runtime-profile.py"
+	if [[ -f "$helper" ]] && command -v python3 >/dev/null 2>&1; then
+		python3 "$helper" get "$profile" "$field" 2>/dev/null && return 0
+	fi
+	case "$profile:$field" in
+		v2:package) printf '@opencode/cli\n' ;;
+		v2:binary) printf 'opencode2\n' ;;
+		v2:pluginEntry) printf 'v2.mjs\n' ;;
+		v2:pluginConfigTarget) printf 'v2-plugin\n' ;;
+		v2:headlessPin | v2:testedVersion) printf '%s\n' "$OPENCODE_V2_PINNED_VERSION" ;;
+		v2:introducedDate) printf '2026-09-15\n' ;;
+		v2:pinReason) printf 'Initial OpenCode V2 compatibility qualification\n' ;;
+		v2:pinPlatform) printf 'Linux\n' ;;
+		v2:pinRuntimeMode) printf 'headless\n' ;;
+		v2:lastCanaryDate) printf '2026-11-10\n' ;;
+		v2:lastCanaryResult) printf 'pass:2.2.7\n' ;;
+		v2:reviewDeadline) printf '2026-11-17\n' ;;
+		v1:package) printf 'opencode-ai\n' ;;
+		v1:binary) printf 'opencode\n' ;;
+		v1:pluginEntry) printf 'index.mjs\n' ;;
+		v1:pluginConfigTarget) printf 'index.mjs\n' ;;
+		v1:headlessPin | v1:testedVersion) printf '%s\n' "$OPENCODE_PINNED_VERSION" ;;
+		v1:introducedDate) printf '%s\n' "$OPENCODE_PIN_INTRODUCED_DATE" ;;
+		v1:pinReason) printf '%s\n' "$OPENCODE_PIN_REASON" ;;
+		v1:pinPlatform) printf '%s\n' "$OPENCODE_PIN_PLATFORM" ;;
+		v1:pinRuntimeMode) printf '%s\n' "$OPENCODE_PIN_RUNTIME_MODE" ;;
+		v1:lastCanaryDate) printf '%s\n' "$OPENCODE_PIN_LAST_CANARY_DATE" ;;
+		v1:lastCanaryResult) printf '%s\n' "$OPENCODE_PIN_LAST_CANARY_RESULT" ;;
+		v1:reviewDeadline) printf '%s\n' "$OPENCODE_PIN_REVIEW_DEADLINE" ;;
+		*) return 1 ;;
+	esac
+	return 0
+}
 
 aidevops_opencode_pin_applies() {
 	local platform="${1:-$(uname -s 2>/dev/null || printf 'unknown')}"
@@ -208,14 +275,35 @@ aidevops_opencode_pin_applies() {
 # tool updates and the fail-closed headless version guard. The optional
 # AIDEVOPS_OPENCODE_BIN environment variable lets callers preserve an already
 # resolved binary path that is not present on PATH.
-aidevops_opencode_upgrade_command() {
-	local pkg_version="$1"
+#
+# GH#34181: the aidevops daemon-safe shim (~/.local/bin/opencode) is a regular
+# script, so readlink cannot see the real install owner behind it. The payload
+# follows only recognised managed shims (terminal-title-owner marker) through
+# their literal `exec "<absolute path>" "$@"` line, mirroring
+# _setup_opencode_target_is_safe: never executed or sourced, depth-bounded, and
+# a cyclic/unresolvable chain keeps the original path. The payload stays on one
+# line for the tool-spec reader.
+#
+# GH#34252: the ownership decision is a separate payload prefix that sets
+# r_owner=brew|bun|npm|none, so tool-version-check.sh can classify the release
+# channel with the exact probe that later selects the upgrade route.
+aidevops_opencode_owner_payload() {
+	local profile="${1:-$(aidevops_opencode_profile_id)}"
+	local binary
+	binary=$(aidevops_opencode_profile_value binary "$profile") || return 1
 
 	# shellcheck disable=SC2016  # Single quotes intentional: bash -c payload
 	printf '%s' \
-		'r="${AIDEVOPS_OPENCODE_BIN:-}"; [[ -n "$r" ]] || r=$(command -v opencode 2>/dev/null || printf ""); ' \
-		'if [[ -n "$r" ]]; then ' \
-		'if command -v brew >/dev/null 2>&1; then ' \
+		'r="${AIDEVOPS_OPENCODE_BIN:-}"; [[ -n "$r" ]] || r=$(command -v '"${binary}"' 2>/dev/null || printf ""); ' \
+		'r_orig="$r"; r_depth=0; r_pat=' "'" '^exec[[:space:]]+"([^"\\]*)"[[:space:]]+"\$@"$' "'" '; ' \
+		'while [[ -n "$r" && -f "$r" && "$r_depth" -lt 16 ]] && grep -Fq "# aidevops:terminal-title-owner" "$r" 2>/dev/null; do ' \
+		'r_next=""; while IFS= read -r r_line || [[ -n "$r_line" ]]; do [[ "$r_line" =~ $r_pat ]] && r_next="${BASH_REMATCH[1]}"; done <"$r"; ' \
+		'if [[ "$r_next" == /* && -f "$r_next" && -x "$r_next" && ! "$r_next" -ef "$r" ]]; then r="$r_next"; r_depth=$((r_depth + 1)); else r="$r_orig"; break; fi; ' \
+		'done; ' \
+		'if [[ "$r_depth" -ge 16 ]] && grep -Fq "# aidevops:terminal-title-owner" "$r" 2>/dev/null; then r="$r_orig"; fi; ' \
+		'r_owner=none; if [[ -n "$r" ]]; then ' \
+		'r_owner=npm; if [[ "$r" == *bun* ]]; then r_owner=bun; fi; ' \
+		'if [[ '"${profile}"' == v1 ]] && command -v brew >/dev/null 2>&1; then ' \
 		'r_dir=$(cd "$(dirname "$r")" 2>/dev/null && pwd -P || printf ""); ' \
 		'r_link=$(readlink "$r" 2>/dev/null || printf ""); r_real="$r"; ' \
 		'if [[ -n "$r_link" ]]; then case "$r_link" in /*) r_real="$r_link" ;; *) r_real="$r_dir/$r_link" ;; esac; fi; ' \
@@ -226,10 +314,68 @@ aidevops_opencode_upgrade_command() {
 		'[[ -d "$brew_formula" ]] && brew_formula_real=$(cd "$brew_formula" && pwd -P || printf ""); ' \
 		'fi; ' \
 		'if [[ -n "$brew_formula_real" ]] && { [[ "$r_dir" == "$brew_formula_real"/* ]] || [[ "$r_real_dir" == "$brew_formula_real"/* ]]; }; then ' \
-		'brew upgrade opencode || brew reinstall opencode; exit $?; ' \
-		'fi; fi; ' \
-		'if [[ "$r" == *bun* ]]; then bun install -g opencode-ai@'"${pkg_version}"'; else npm install -g opencode-ai@'"${pkg_version}"'; fi; ' \
-		'else printf "OpenCode binary not found for repair\\n" >&2; exit 1; fi'
+		'r_owner=brew; ' \
+		'fi; fi; fi; '
+	return 0
+}
+
+# Print the package manager that owns the resolved OpenCode binary:
+# brew, bun, npm, or none (binary not found).
+aidevops_opencode_install_owner() {
+	local profile="${1:-$(aidevops_opencode_profile_id)}"
+	local payload
+	payload=$(aidevops_opencode_owner_payload "$profile") || return 1
+	# shellcheck disable=SC2016  # Single quotes intentional: bash -c payload
+	bash -c "${payload}"'printf "%s\n" "$r_owner"'
+	return $?
+}
+
+# GH#35942: print the owner of the resolved Claude Code CLI so routine tool
+# maintenance checks and upgrades through one channel (GH#34252 pattern):
+# brew-cask:<cask>, native (self-updating installer), npm, or none.
+aidevops_claude_code_install_owner() {
+	local path link dir home_real depth=0
+	path=$(command -v claude 2>/dev/null || true)
+	if [[ "$path" != /* ]]; then
+		printf 'none\n'
+		return 0
+	fi
+	while [[ -L "$path" && "$depth" -lt 16 ]]; do
+		link=$(readlink "$path" 2>/dev/null) || break
+		case "$link" in /*) path="$link" ;; *) path="$(dirname "$path")/$link" ;; esac
+		depth=$((depth + 1))
+	done
+	dir=$(cd "$(dirname "$path")" 2>/dev/null && pwd -P) || dir=$(dirname "$path")
+	path="${dir}/$(basename "$path")"
+	home_real=$(cd "$HOME" 2>/dev/null && pwd -P) || home_real="$HOME"
+	case "$path" in
+	*/Caskroom/claude-code*/*)
+		link="${path#*/Caskroom/}"
+		printf 'brew-cask:%s\n' "${link%%/*}"
+		;;
+	"$home_real"/.local/share/claude/* | "$home_real"/.claude/local/*) printf 'native\n' ;;
+	*) printf 'npm\n' ;;
+	esac
+	return 0
+}
+
+# Print the self-contained repair payload: brew upgrade for a verified
+# Homebrew-owned binary, otherwise bun/npm install of the requested version.
+aidevops_opencode_upgrade_command() {
+	local pkg_version="$1"
+	local profile="${2:-$(aidevops_opencode_profile_id)}"
+	local package owner_payload
+	package=$(aidevops_opencode_profile_value package "$profile") || return 1
+	owner_payload=$(aidevops_opencode_owner_payload "$profile") || return 1
+
+	# shellcheck disable=SC2016  # Single quotes intentional: bash -c payload
+	printf '%s' "$owner_payload" \
+		'case "$r_owner" in ' \
+		'brew) brew upgrade opencode || brew reinstall opencode; exit $? ;; ' \
+		'bun) bun install -g '"${package}"'@'"${pkg_version}"' ;; ' \
+		'npm) npm install -g '"${package}"'@'"${pkg_version}"' ;; ' \
+		'*) printf "OpenCode binary not found for repair\\n" >&2; exit 1 ;; ' \
+		'esac'
 	return 0
 }
 
@@ -241,7 +387,7 @@ readonly AIDEVOPS_GH_MIN_SLURP_VERSION="2.51.0"
 aidevops_parse_semver() {
 	local input="$1"
 	local parsed=""
-	parsed=$(printf '%s\n' "$input" | grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || true)
+	parsed=$(printf '%s\n' "$input" | grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | sed -n '1p' || true)
 	if [[ -z "$parsed" ]]; then
 		return 1
 	fi
@@ -284,9 +430,18 @@ aidevops_version_at_least() {
 	return 1
 }
 
+# GH#34415: the aidevops gh PATH shim satisfies `command -v gh` even when the
+# native GitHub CLI is absent; the shim then exits 127 for every command. A
+# successful `gh --version` proves a native binary is reachable through it.
+aidevops_gh_native_available() {
+	command -v gh >/dev/null 2>&1 || return 1
+	gh --version >/dev/null 2>&1 || return 1
+	return 0
+}
+
 aidevops_gh_installed_version() {
 	local output=""
-	if ! command -v gh >/dev/null 2>&1; then
+	if ! aidevops_gh_native_available; then
 		return 1
 	fi
 	output=$(gh --version 2>/dev/null || true)
@@ -303,12 +458,12 @@ aidevops_gh_slurp_supported() {
 
 aidevops_gh_slurp_status_message() {
 	local installed=""
-	if ! command -v gh >/dev/null 2>&1; then
+	if ! aidevops_gh_native_available; then
 		printf 'GitHub CLI (gh) is not installed; gh api --paginate --slurp requires gh >= %s. %s' \
 			"$AIDEVOPS_GH_MIN_SLURP_VERSION" "$(aidevops_gh_slurp_remediation_guidance)"
 		return 0
 	fi
-	installed=$(aidevops_gh_installed_version) || installed="unknown"
+	installed=$(aidevops_gh_installed_version) || installed='unknown'
 	if [[ "$installed" == "unknown" ]]; then
 		printf 'GitHub CLI (gh) version could not be parsed; gh api --paginate --slurp requires gh >= %s; gh --version output is malformed or empty. %s' \
 			"$AIDEVOPS_GH_MIN_SLURP_VERSION" "$(aidevops_gh_slurp_remediation_guidance "$installed")"
@@ -439,50 +594,8 @@ readonly TEMP_PREFIX="tmp_"
 # =============================================================================
 # launchd PATH hygiene
 # =============================================================================
-# Build a PATH value safe to embed in macOS LaunchAgent EnvironmentVariables.
-# launchd jobs inherit no useful interactive shell setup, but serialising the
-# caller's raw PATH bakes stale manager-specific entries into long-lived plists.
-# Keep stable user and known system/tool roots first, then preserve inherited
-# entries that exist on this host. Never persist immutable runtime-bundle paths:
-# long-lived sessions intentionally retain old bundles after stable activation.
-
-_aidevops_append_launchd_path_dir() {
-	local dir="$1"
-	[[ -n "$dir" ]] || return 0
-	case "$dir" in
-	*/.aidevops/runtime-bundles/*) return 0 ;;
-	esac
-	[[ -d "$dir" ]] || return 0
-	case ":${_aidevops_launchd_path_seen:-}:" in
-	*":${dir}:"*) return 0 ;;
-	esac
-	_aidevops_launchd_path_seen="${_aidevops_launchd_path_seen:+${_aidevops_launchd_path_seen}:}${dir}"
-	_aidevops_launchd_path_result="${_aidevops_launchd_path_result:+${_aidevops_launchd_path_result}:}${dir}"
-	return 0
-}
-
-aidevops_launchd_sanitized_path() {
-	local input_path="${1:-${PATH:-}}"
-	local stable_path=""
-	if [[ -n "${HOME:-}" ]]; then
-		stable_path="${HOME}/.bun/bin:${HOME}/.local/bin:${HOME}/.aidevops/agents/scripts:${HOME}/.aidevops/bin"
-	fi
-	local default_path="${stable_path:+${stable_path}:}/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-	local _aidevops_launchd_path_result=""
-	local _aidevops_launchd_path_seen=""
-	local dir=""
-	local IFS=':'
-
-	for dir in $default_path; do
-		_aidevops_append_launchd_path_dir "$dir"
-	done
-	for dir in $input_path; do
-		_aidevops_append_launchd_path_dir "$dir"
-	done
-
-	printf '%s' "$_aidevops_launchd_path_result"
-	return 0
-}
+# aidevops_service_path / aidevops_launchd_sanitized_path live in
+# runtime-env.sh (sourced above) so every generator shares one PATH builder.
 
 # =============================================================================
 # Credentials File Security
@@ -536,7 +649,7 @@ ensure_credentials_file() {
 # Pattern Tracking Constants
 # =============================================================================
 # All pattern-related memory types (dedicated + supervisor-generated)
-# Used by memory/_common.sh migrate_db backfill (pattern-tracker-helper.sh archived)
+# Used by memory/_common.sh migrate_db backfill for legacy pattern records
 # TIER_DOWNGRADE_OK: evidence that a cheaper model tier succeeded on a task type (t5148)
 readonly PATTERN_TYPES_SQL="'SUCCESS_PATTERN','FAILURE_PATTERN','WORKING_SOLUTION','FAILED_APPROACH','ERROR_FIX','TIER_DOWNGRADE_OK'"
 
@@ -600,6 +713,11 @@ readonly TASK_SIBLING_NON_ACTIVE_STATES_SQL="'verified','cancelled','deployed','
 #   echo "Remote: $(sanitize_url "$remote_url")"
 #   log_error "fetch failed: $(scrub_credentials "$error_output")"
 
+# Known credential token prefixes (ERE alternation, no grouping). Shared by
+# scrub_credentials and the security-posture tracked-template classifier
+# (GH#33339) so redaction and detection recognise the same signatures.
+[[ -z "${AIDEVOPS_CREDENTIAL_PREFIX_ERE+x}" ]] && AIDEVOPS_CREDENTIAL_PREFIX_ERE='sk-|GOCSPX-|ghp_|gho_|ghs_|ghu_|github_pat_|glpat-|xoxb-|xoxp-'
+
 scrub_credentials() {
 	local text="$1"
 	# Word-boundary anchor (^|non-word-char) prevents false positives where a
@@ -608,7 +726,7 @@ scrub_credentials() {
 	# but is NOT a credential. macOS BSD sed has no `\b`, so we capture the
 	# preceding boundary character and restore it via \1 in the replacement.
 	# (t2892, GH#21026)
-	printf '%s' "$text" | sed -E 's/(^|[^A-Za-z0-9_-])(sk-|GOCSPX-|ghp_|gho_|ghs_|ghu_|github_pat_|glpat-|xoxb-|xoxp-)[A-Za-z0-9_-]{10,}/\1[redacted-credential]/g'
+	printf '%s' "$text" | sed -E "s/(^|[^A-Za-z0-9_-])(${AIDEVOPS_CREDENTIAL_PREFIX_ERE})[A-Za-z0-9_-]{10,}/\\1[redacted-credential]/g"
 	return 0
 }
 
@@ -674,7 +792,11 @@ timeout_sec() {
 		local monitor_was_enabled=false
 		[[ $- == *m* ]] && monitor_was_enabled=true
 		set -m
-		"$@" &
+		# GH#33619: the explicit <&0 keeps the caller's stdin, matching GNU
+		# timeout/gtimeout. Without it, Bash gives an async command /dev/null
+		# whenever job control is unavailable (any subshell), so callers such as
+		# `timeout_sec N git fetch --stdin <file` silently received no input.
+		"$@" <&0 &
 		local cmd_pid=$!
 		# Restore monitor mode to its original state (set -m or set +m as appropriate)
 		$monitor_was_enabled && set -m || set +m
@@ -1145,6 +1267,12 @@ if [[ -r "${_shared_constants_dir}/pulse-temp-helper.sh" ]]; then
 	# shellcheck source=pulse-temp-helper.sh
 	source "${_shared_constants_dir}/pulse-temp-helper.sh"
 fi
+# aidevops_resolve_secret / aidevops_load_secret / aidevops_secret_available:
+# env → credentials.sh → gopass aidevops/NAME (GH#34892).
+if [[ -r "${_shared_constants_dir}/secret-resolver.sh" ]]; then
+	# shellcheck source=secret-resolver.sh
+	source "${_shared_constants_dir}/secret-resolver.sh"
+fi
 unset _shared_constants_dir
 
 # =============================================================================
@@ -1178,9 +1306,26 @@ unset _shared_constants_dir
 #       # ... single file, no clobbering risk
 #   }
 #
-# Nesting: RETURN traps are function-scoped in bash 3.2+, so nested
-# function calls each get their own trap. _save_cleanup_scope saves the
-# parent's cleanup list; _run_cleanups restores it after executing.
+# Nesting and ownership (t18679): the RETURN trap is one global setting, not
+# a per-function one. A callee's trap can persist into a trap-less caller
+# (and on bash 4+ even replace a caller's different trap), so the trap may
+# fire in frames that do not own the current scope. _save_cleanup_scope
+# therefore records the owning frame depth (${#FUNCNAME[@]}) with each scope,
+# and _run_cleanups acts only on scopes owned by the frame that is returning
+# (or by deeper frames that already returned without running theirs). A fire
+# in any other frame is a no-op. After running its own scope, _run_cleanups
+# clears the RETURN trap (it has the trace attribute, so `trap - RETURN`
+# reaches the returning frame); bash then restores the caller's saved trap,
+# so the cleared trap never keeps firing in trap-less callers.
+#
+# Helpers that open a scope on behalf of their caller pass the number of
+# extra frames: `_save_cleanup_scope 1` binds the scope to the helper's
+# caller (see _gh_wrapper_enter_cleanup_scope in shared-gh-wrappers.sh).
+#
+# Direct calls (EXIT/signal handlers, or an explicit call after
+# `trap - RETURN`) run the caller's own scope when it has one; otherwise,
+# when no _run_cleanups RETURN trap is active, they run the innermost
+# pending scope (exit-time behaviour).
 #
 # Migration from raw trap (only needed for multi-cleanup functions):
 #   BEFORE: trap 'rm -f "${a:-}"' RETURN  # second trap clobbers first
@@ -1193,8 +1338,14 @@ unset _shared_constants_dir
 # Global state for the cleanup stack.
 # _CLEANUP_CMDS: newline-separated list of commands for the current scope.
 # _CLEANUP_SAVE_STACK: saved parent scopes (unit-separator delimited).
+# _CLEANUP_OWNER: FUNCNAME depth of the frame owning the current scope
+#   (0 = unowned base scope).
+# _CLEANUP_OWNER_STACK: saved parent owners, kept in step with
+#   _CLEANUP_SAVE_STACK (unit-separator delimited).
 _CLEANUP_CMDS=""
 _CLEANUP_SAVE_STACK=""
+_CLEANUP_OWNER=0
+_CLEANUP_OWNER_STACK=""
 
 # Add a cleanup command to the current scope.
 # The command runs when the calling function returns (LIFO order).
@@ -1211,56 +1362,139 @@ push_cleanup() {
 	return 0
 }
 
-# Run all cleanup commands for the current scope (reverse order),
-# then restore the parent scope's cleanup list.
-# This is the RETURN trap handler — do not call directly.
-_run_cleanups() {
-	if [[ -n "$_CLEANUP_CMDS" ]]; then
-		# Reverse the command list (LIFO) without an external pipeline. Using
-		# echo | tail -r/tac can emit Broken pipe noise under pipefail when the
-		# consumer exits early.
-		local reversed
-		reversed=""
-		local line
-		while IFS= read -r line; do
-			[[ -z "$line" ]] && continue
-			if [[ -n "$reversed" ]]; then
-				reversed="${line}"$'\n'"${reversed}"
-			else
-				reversed="$line"
-			fi
-		done <<<"$_CLEANUP_CMDS"
-		while IFS= read -r line; do
-			[[ -z "$line" ]] && continue
-			# Bare function names must run in the current shell so cleanup can
-			# update process-local ownership state before removing resources.
-			# Compound commands remain isolated in a child shell.
-			if [[ "$line" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] && declare -F "$line" >/dev/null 2>&1; then
-				"$line" 2>/dev/null || true
-			else
-				bash -c "$line" 2>/dev/null || true
-			fi
-		done <<<"$reversed"
-	fi
-	# Restore parent scope (pop from save stack)
+# Run a newline-separated cleanup command list in reverse (LIFO) order.
+# A failing command never stops the remaining commands.
+# Arguments:
+#   $1 - command list (may be empty)
+_cleanup_run_commands() {
+	local cmds="$1"
+	[[ -n "$cmds" ]] || return 0
+	# Reverse the command list (LIFO) without an external pipeline. Using
+	# echo | tail -r/tac can emit Broken pipe noise under pipefail when the
+	# consumer exits early.
+	local reversed=""
+	local line
+	while IFS= read -r line; do
+		[[ -z "$line" ]] && continue
+		if [[ -n "$reversed" ]]; then
+			reversed="${line}"$'\n'"${reversed}"
+		else
+			reversed="$line"
+		fi
+	done <<<"$cmds"
+	while IFS= read -r line; do
+		[[ -z "$line" ]] && continue
+		# Bare function names must run in the current shell so cleanup can
+		# update process-local ownership state before removing resources.
+		# Compound commands remain isolated in a child shell.
+		if [[ "$line" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] && declare -F "$line" >/dev/null 2>&1; then
+			"$line" 2>/dev/null || true
+		else
+			bash -c "$line" 2>/dev/null || true
+		fi
+	done <<<"$reversed"
+	return 0
+}
+
+# Drop the current scope and restore the parent scope and its owner.
+_cleanup_pop_scope() {
 	local sep=$'\x1F'
-	if [[ -n "$_CLEANUP_SAVE_STACK" ]]; then
+	if [[ -n "${_CLEANUP_SAVE_STACK:-}" ]]; then
 		_CLEANUP_CMDS="${_CLEANUP_SAVE_STACK%%"${sep}"*}"
 		_CLEANUP_SAVE_STACK="${_CLEANUP_SAVE_STACK#*"${sep}"}"
 	else
 		_CLEANUP_CMDS=""
 	fi
+	if [[ -n "${_CLEANUP_OWNER_STACK:-}" ]]; then
+		_CLEANUP_OWNER="${_CLEANUP_OWNER_STACK%%"${sep}"*}"
+		_CLEANUP_OWNER_STACK="${_CLEANUP_OWNER_STACK#*"${sep}"}"
+	else
+		_CLEANUP_OWNER=0
+	fi
 	return 0
 }
 
-# Save the current cleanup scope and start a fresh one.
+# RETURN trap handler: run the scopes owned by the returning frame (and by
+# deeper frames that already returned), LIFO, then restore the parent scope.
+# A fire in a frame that owns no pending scope is a no-op (t18679).
+# Direct calls are supported for EXIT/signal handlers; see the usage notes.
+_run_cleanups() {
+	local depth=0
+	if [[ -n "${BASH_VERSION:-}" ]]; then
+		depth=$((${#FUNCNAME[@]} - 1))
+	fi
+	local owner cmds
+	local ran_own=0
+	local ran_any=0
+	while true; do
+		owner="${_CLEANUP_OWNER:-0}"
+		[[ "$owner" =~ ^[0-9]+$ ]] || owner=0
+		if [[ "$owner" -eq 0 || "$owner" -lt "$depth" ]]; then
+			break
+		fi
+		if [[ "$owner" -eq "$depth" ]]; then
+			ran_own=1
+		fi
+		ran_any=1
+		# Pop before running so scopes opened by cleanup functions cannot be
+		# confused with this one; a leftover deeper scope is swept next pass.
+		cmds="$_CLEANUP_CMDS"
+		_cleanup_pop_scope
+		_cleanup_run_commands "$cmds"
+	done
+	if [[ "$ran_own" -eq 1 ]]; then
+		# The owner's trap has done its job. Clearing it stops it firing again
+		# in trap-less callers; bash restores a caller's own saved trap.
+		if [[ -n "${BASH_VERSION:-}" ]]; then
+			trap - RETURN
+		fi
+		return 0
+	fi
+	if [[ "$ran_any" -eq 1 ]]; then
+		return 0
+	fi
+	# Nothing here belongs to this frame. When a _run_cleanups RETURN trap is
+	# active this is a fire in a non-owning frame: leave the stack alone.
+	local return_trap=""
+	if [[ -n "${BASH_VERSION:-}" ]]; then
+		return_trap="$(trap -p RETURN 2>/dev/null)" || return_trap=""
+	fi
+	if [[ "$return_trap" == *_run_cleanups* ]]; then
+		return 0
+	fi
+	# Direct call (EXIT/signal handler or explicit call without an active
+	# RETURN trap): run the innermost pending scope.
+	cmds="$_CLEANUP_CMDS"
+	_cleanup_pop_scope
+	_cleanup_run_commands "$cmds"
+	return 0
+}
+# Trace attribute: inherit (not save/restore) the RETURN trap so the
+# `trap - RETURN` above applies to the returning owner frame.
+if [[ -n "${BASH_VERSION:-}" ]]; then
+	declare -ft _run_cleanups
+fi
+
+# Save the current cleanup scope and start a fresh one owned by the caller.
 # Call at the top of any function that uses push_cleanup, BEFORE setting
 # `trap '_run_cleanups' RETURN`. This preserves the parent function's
 # cleanup list so nested calls don't interfere.
+# Arguments:
+#   $1 - extra frames between the caller and the owner (optional, default 0;
+#        a helper that opens a scope for its own caller passes 1)
 _save_cleanup_scope() {
+	local extra_frames="${1:-0}"
+	[[ "$extra_frames" =~ ^[0-9]+$ ]] || extra_frames=0
+	local owner=0
+	if [[ -n "${BASH_VERSION:-}" ]]; then
+		owner=$((${#FUNCNAME[@]} - 1 - extra_frames))
+		[[ "$owner" -gt 0 ]] || owner=0
+	fi
 	local sep=$'\x1F'
-	_CLEANUP_SAVE_STACK="${_CLEANUP_CMDS}${sep}${_CLEANUP_SAVE_STACK}"
+	_CLEANUP_SAVE_STACK="${_CLEANUP_CMDS}${sep}${_CLEANUP_SAVE_STACK:-}"
+	_CLEANUP_OWNER_STACK="${_CLEANUP_OWNER:-0}${sep}${_CLEANUP_OWNER_STACK:-}"
 	_CLEANUP_CMDS=""
+	_CLEANUP_OWNER="$owner"
 	return 0
 }
 
@@ -1283,40 +1517,74 @@ _source_shared_module_with_retry "${_SC_SELF%/*}/managed-label-provisioning-lib.
 # shellcheck disable=SC1091  # sub-library resolved at runtime via _SC_SELF
 _source_shared_module_with_retry "${_SC_SELF%/*}/shared-gh-wrappers.sh"
 
+# Machine-readable provenance for automated issue comments. Kind is an
+# identifier, never free-form issue content; callers prepend this to the body.
+aidevops_ops_marker() {
+	local kind="$1"
+	[[ "$kind" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || return 1
+	printf '<!-- aidevops:ops kind=%s -->\n' "$kind"
+	return 0
+}
+
+# A brief hold belongs to the exact body that produced it, not merely to a
+# status label. Only collaborator-authored comments can assert the marker.
+# Returns 0 for a matching hold, 1 for no matching hold, 2 for bad evidence.
+issue_has_active_brief_hold() {
+	local comments_json="$1"
+	local issue_body="$2"
+	local body_hash="" verdict=""
+	if command -v shasum >/dev/null 2>&1; then
+		body_hash=$(printf '%s' "$issue_body" | shasum -a 256 | cut -c1-24) || return 2
+	else
+		body_hash=$(printf '%s' "$issue_body" | sha256sum | cut -c1-24) || return 2
+	fi
+	[[ "$body_hash" =~ ^[a-f0-9]{24}$ ]] || return 2
+	verdict=$(printf '%s' "$comments_json" | jq -r --arg marker "<!-- aidevops:brief-hold reason=missing_files_scope body=${body_hash} -->" '
+		arrays
+		| (if ([.[0]? | arrays] | length) > 0 then add else . end)
+		| if any(.[]?; ((.author_association // "") | IN("OWNER", "MEMBER", "COLLABORATOR"))
+			and ((.body // "") | contains($marker))) then "held" else "absent" end
+	' 2>/dev/null) || return 2
+	case "$verdict" in
+	held) return 0 ;;
+	absent) return 1 ;;
+	esac
+	return 2
+}
+
+# Use before an automated blocked → available transition. An unreadable body
+# or comment history must not silently release a hold.
+issue_brief_hold_blocks_auto_release() {
+	local issue_num="$1"
+	local repo_slug="$2"
+	local issue_json="" comments_json="" issue_body="" held_rc=0
+	issue_json=$(gh api "repos/${repo_slug}/issues/${issue_num}" 2>/dev/null) || return 0
+	# Avoid a comments lookup on ordinary issues that are not blocked.
+	if ! printf '%s' "$issue_json" | jq -e '[.labels[]?.name] | index("status:blocked") != null' >/dev/null 2>&1; then
+		return 1
+	fi
+	issue_body=$(printf '%s' "$issue_json" | jq -r '.body // ""') || return 0
+	comments_json=$(gh api "repos/${repo_slug}/issues/${issue_num}/comments?per_page=100" --paginate --slurp 2>/dev/null) || return 0
+	issue_has_active_brief_hold "$comments_json" "$issue_body" || held_rc=$?
+	[[ "$held_rc" -ne 1 ]]
+}
+
 
 #######################################
-# Clear active-lifecycle status labels on dispatch claim release (t2420).
+# Project an authoritative lifecycle label on dispatch claim release (t2420).
 #
-# Removes only the four ACTIVE status labels (queued, claimed, in-progress,
-# in-review) and optionally the worker's assignment. PRESERVES terminal
-# states (done, blocked) and the eligible state (available) — those are set
-# by authoritative paths (PR merge, blocker triage, explicit re-queue) and
-# must survive a worker's claim release.
-#
-# Why not set_issue_status "" ? Because it would strip status:done set by
-# the PR merge path if the CLAIM_RELEASED comment races ahead — a worker
-# that succeeds, creates a PR, the PR merges (setting status:done), and
-# then the worker's EXIT trap fires CLAIM_RELEASED would regress the state.
-# This helper is the targeted, race-safe alternative.
-#
-# Why not just skip label cleanup entirely? Because without it, orphan
-# labels pin an issue as "active" even though no worker holds the claim,
-# blocking pulse re-dispatch via the t1996 combined-signal guard
-# (active-status + assignee = block). Observed in production: #19864 and
-# #19738 were both pinned status:queued/claimed for 40+ minutes after
-# worker completion, with dead PIDs (one case was PID 11742 reused by
-# Brave Browser — see t2421).
-#
-# Origin labels are provenance only. An interactive session may create an
-# auto-dispatch issue that a headless worker validly claims, so release must
-# not skip cleanup solely because origin:interactive is present (GH#29897).
-# The exact worker_login removal and linked-PR safeguards below preserve live
-# interactive ownership and completed-work audit state.
+# The current exact linked-PR state selects the projection: no linked PR is
+# available, an open draft is blocked, an open non-draft PR is in-review, and
+# an open PR with requested changes is available for repair, and a merged PR
+# is done only after the issue is closed. Unreadable or ambiguous metadata
+# is a no-write error; an open blocked issue retains its blocker.
 #
 # Args:
 #   $1 — issue number
 #   $2 — repo slug (owner/repo)
 #   $3 — worker login to remove as assignee (optional; empty = no assignee change)
+#   $4 — open-draft projection (optional; "blocked" default, or "available"
+#        for runner-local releases that a capable runner continues, GH#34758)
 #
 # Returns:
 #   0 on success, including idempotent no-ops
@@ -1329,93 +1597,74 @@ clear_active_status_on_release() {
 	local issue_num="$1"
 	local repo_slug="$2"
 	local worker_login="${3:-}"
+	local draft_projection="${4:-blocked}"
 
 	if [[ -z "$issue_num" || -z "$repo_slug" ]]; then
 		return 0
 	fi
+	[[ "$draft_projection" == available ]] || draft_projection="blocked"
 
-	local labels_json=""
-	labels_json=$(gh issue view "$issue_num" --repo "$repo_slug" \
-		--json labels --jq '[.labels[].name] | join(",")' 2>/dev/null) || labels_json=""
-
-	# Defensive: if a linked PR exists for this issue (OPEN or MERGED),
-	# preserve the worker's assignee and status:in-review.
-	#
-	# OPEN linked PR: the PR pipeline owns final cleanup on merge (see
-	# pulse-merge.sh::_release_interactive_claim_on_merge for the
-	# interactive mirror). Stripping here strands the PR in
-	# maintainer-gate Job 1 Check 2 because the assignee check fires
-	# after CLAIM_RELEASED but before PR merge. GH#20195/t2451 closed
-	# that trust-gate loop.
-	#
-	# MERGED linked PR: preserves the closing-time audit trail on the
-	# issues list — the assignee identifies which runner's worker
-	# completed the work once the issue auto-closes. Without this, a
-	# fast merge (CI green before the worker exit trap fires — observed
-	# as little as 16s) races the unassign and erases the audit trail.
-	# t2746/GH#20520.
-	#
-	# We still remove queued, claimed, and in-progress — those never
-	# outlive the worker process regardless of PR state. When no linked PR
-	# exists, add status:available in the same edit so failed workers do not
-	# leave issues pinned as assigned-but-queued until the next stale sweep.
-	#
-	# CLOSED-not-merged PRs do NOT trigger preserve: the work didn't
-	# complete, and leaving the assignee on the issue would block
-	# future dispatch via the combined-signal dedup rule (t1996).
-	#
-	# Closing-keyword regex matches pulse-merge.sh::_extract_linked_issue
-	# character-for-character (case-insensitive) so behaviour is consistent
-	# across the merge path and the release path. Do NOT widen this to
-	# `Ref` or `For` — those are planning references that MUST NOT block
-	# assignee cleanup (see t2046).
-	local has_linked_pr=false
-	local has_open_linked_pr=0
-	local linked_open_pr_numbers=""
-	local linked_prs_json=""
+	# The release event alone does not identify a review-ready PR. Read the
+	# current linked PR state before writing: drafts project as blocked partial
+	# work, while non-draft OPEN PRs without requested changes project as
+	# in-review. A failed or ambiguous read preserves the prior projection.
+	local linked_prs_json="" projection="" done_status="done"
+	local -a release_args=()
+	[[ -z "$worker_login" ]] || release_args+=(--remove-assignee "$worker_login")
 	linked_prs_json=$(gh pr list --repo "$repo_slug" --state all \
 		--search "#${issue_num} in:body" \
-		--json number,state,body --limit 20 2>/dev/null || true)
-	if [[ -z "$linked_prs_json" ]]; then
-		linked_prs_json="[]"
-	fi
-	if printf '%s' "$linked_prs_json" | jq -e --arg num "$issue_num" \
-		'[.[] | select((.state == "OPEN" or .state == "MERGED") and ((.body // "") | test("(close[ds]?|fix(es|ed)?|resolve[ds]?)[[:space:]]*#" + $num + "\\b"; "i")))] | length > 0' \
-		>/dev/null 2>&1; then
-		has_linked_pr=true
-	fi
-	linked_open_pr_numbers=$(printf '%s' "$linked_prs_json" | jq -r --arg num "$issue_num" \
-		'.[] | select(.state == "OPEN" and ((.body // "") | test("(close[ds]?|fix(es|ed)?|resolve[ds]?)[[:space:]]*#" + $num + "\\b"; "i"))) | .number' \
-		2>/dev/null || true)
-	if [[ -n "$linked_open_pr_numbers" ]]; then
-		has_open_linked_pr=1
-	fi
-
-	local -a _flags=()
-	_flags+=(--remove-label "status:queued")
-	_flags+=(--remove-label "status:claimed")
-	_flags+=(--remove-label "status:in-progress")
-
-	if [[ "$has_linked_pr" != "true" ]]; then
-		_flags+=(--remove-label "status:in-review")
-		_flags+=(--add-label "status:available")
-		if [[ -n "$worker_login" ]]; then
-			_flags+=(--remove-assignee "$worker_login")
+		--json number,state,isDraft,reviewDecision,body --limit 20 2>/dev/null) || return 1
+	projection=$(printf '%s' "$linked_prs_json" | jq -r --arg num "$issue_num" --arg draft "$draft_projection" '
+		def available: "available";
+		[.[] | select((.body // "") | test("(close[ds]?|fix(es|ed)?|resolve[ds]?)[[:space:]]*#" + $num + "\\b"; "i"))]
+		| if length == 0 then available
+		elif ([.[] | select(.state == "OPEN")] | length) != 0 and
+			([.[] | select(.state == "OPEN")] | length) != 1 then "ambiguous"
+		elif any(.state == "OPEN" and .isDraft == true) then $draft
+		elif any(.state == "OPEN" and .reviewDecision == "CHANGES_REQUESTED") then available
+		elif any(.state == "OPEN" and .isDraft == false) then "in-review"
+		elif any(.state == "MERGED") then "done"
+		else available end
+	' 2>/dev/null) || return 1
+	# GH#33374: a merged checkpoint (or a reopened issue) is not completion.
+	# Bound every projection to live issue state, not the release reason.
+	local issue_json="" issue_state=""
+	issue_json=$(gh api "repos/${repo_slug}/issues/${issue_num}" 2>/dev/null) || return 1
+	issue_state=$(printf '%s' "$issue_json" | jq -er '
+		select((.labels | type) == "array") | .state | ascii_downcase
+		| select(. == "open" or . == "closed")' 2>/dev/null) || return 1
+	if [[ "$issue_state" == "closed" ]]; then
+		projection="$done_status"
+	elif printf '%s' "$issue_json" | jq -e 'any(.labels[]; .name == "status:blocked")' >/dev/null 2>&1; then
+		if issue_brief_hold_blocks_auto_release "$issue_num" "$repo_slug"; then
+			return 0
 		fi
-	elif [[ "$has_open_linked_pr" -eq 1 && ",${labels_json}," != *",status:done,"* ]]; then
-		_flags+=(--remove-label "status:available")
-		_flags+=(--add-label "status:in-review")
+		projection="blocked"
+	elif [[ "$projection" == "$done_status" ]]; then
+		projection="available"
 	fi
-
-	gh issue edit "$issue_num" --repo "$repo_slug" "${_flags[@]}" 2>/dev/null || return 1
-	if [[ "$has_open_linked_pr" -eq 1 ]]; then
-		local linked_pr_number=""
-		while IFS= read -r linked_pr_number; do
-			[[ -z "$linked_pr_number" ]] && continue
-			set_issue_status "$linked_pr_number" "$repo_slug" "in-review" >/dev/null 2>&1 || true
-		done <<<"$linked_open_pr_numbers"
-	fi
-	return 0
+	case "$projection" in
+	available)
+		if issue_brief_hold_blocks_auto_release "$issue_num" "$repo_slug"; then
+			printf 'clear_active_status_on_release: preserving brief hold on #%s in %s\n' "$issue_num" "$repo_slug" >&2
+			return 0
+		fi
+		set_issue_status "$issue_num" "$repo_slug" available \
+			${release_args[@]+"${release_args[@]}"} >/dev/null 2>&1
+		;;
+	blocked)
+		set_issue_status "$issue_num" "$repo_slug" blocked \
+			${release_args[@]+"${release_args[@]}"} >/dev/null 2>&1
+		;;
+	in-review)
+		set_issue_status "$issue_num" "$repo_slug" in-review >/dev/null 2>&1
+		;;
+	done)
+		set_issue_status "$issue_num" "$repo_slug" "$done_status" >/dev/null 2>&1
+		;;
+	*) return 1 ;;
+	esac
+	return $?
 }
 
 # =============================================================================
@@ -1577,7 +1826,7 @@ _is_process_alive_and_matches() {
 		local cmd
 		cmd=$(ps -p "$pid" -o command= 2>/dev/null) || return 1
 		[[ -z "$cmd" ]] && return 1
-		printf '%s' "$cmd" | grep -qE "$pattern" || return 1
+		grep -qE "$pattern" <<<"$cmd" || return 1
 	fi
 
 	# Step 3: if a stored hash was provided, verify it matches

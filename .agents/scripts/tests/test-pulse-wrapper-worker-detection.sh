@@ -16,6 +16,7 @@ TESTS_FAILED=0
 
 TEST_ROOT=""
 PS_FIXTURE_FILE=""
+PS_FIXTURE_UID_AWARE=0
 
 print_result() {
 	local test_name="$1"
@@ -39,7 +40,15 @@ print_result() {
 setup_test_env() {
 	TEST_ROOT=$(mktemp -d)
 	PS_FIXTURE_FILE="${TEST_ROOT}/ps-fixture.txt"
+	# GH#33985: dispatch fixtures isolate pre-launch gates from runner state.
+	cat >"${TEST_ROOT}/runner-capability-helper.sh" <<'BASH'
+runner_capability_check_fresh() {
+	return 0
+}
+BASH
 	export HOME="${TEST_ROOT}/home"
+	export AIDEVOPS_TEMP_DIR="${TEST_ROOT}/tmp"
+	mkdir -p "$AIDEVOPS_TEMP_DIR"
 	mkdir -p "${HOME}/.aidevops/agents/configs" "${HOME}/.aidevops/logs"
 	cat >"${HOME}/.aidevops/agents/configs/aidevops.defaults.jsonc" <<'JSON'
 {}
@@ -84,6 +93,14 @@ restore_function_definitions() {
 
 set_ps_fixture() {
 	local content="$1"
+	PS_FIXTURE_UID_AWARE=0
+	printf '%s\n' "$content" >"$PS_FIXTURE_FILE"
+	return 0
+}
+
+set_uid_ps_fixture() {
+	local content="$1"
+	PS_FIXTURE_UID_AWARE=1
 	printf '%s\n' "$content" >"$PS_FIXTURE_FILE"
 	return 0
 }
@@ -99,8 +116,12 @@ ps() {
 	fi
 
 	# t2190: canonical path — ps axwwo (unlimited width; works on BSD and procps).
-	if [[ "${1:-}" == "axwwo" && "${2:-}" == "pid,stat,etime,command" ]]; then
-		cat "$PS_FIXTURE_FILE"
+	if [[ "${1:-}" == "axwwo" && "${2:-}" == "uid,pid,stat,etime,command" ]]; then
+		if [[ "$PS_FIXTURE_UID_AWARE" -eq 1 ]]; then
+			cat "$PS_FIXTURE_FILE"
+		else
+			awk -v uid="$(command id -u)" '{ print uid, $0 }' "$PS_FIXTURE_FILE"
+		fi
 		return 0
 	fi
 	if [[ "${1:-}" == "axwwo" && "${2:-}" == "pid,etime,command" ]]; then
@@ -170,8 +191,11 @@ set_successful_dispatch_helpers_fixture() {
 #!/usr/bin/env bash
 set -euo pipefail
 case "${1:-}" in
-claim) exit 0 ;;
-*) exit 1 ;;
+	claim)
+		printf 'CLAIMED comment_id=9001 lease_token=fixture-lease-token device=fixture-device\n'
+		exit 0
+		;;
+	*) exit 1 ;;
 esac
 FIXTURE
 	cat >"${TEST_ROOT}/dispatch-ledger-helper.sh" <<'FIXTURE'
@@ -187,22 +211,47 @@ FIXTURE
 }
 
 set_successful_dispatch_function_stubs() {
+	FIXTURE_ISSUE_LOCKED=false
 	gh_issue_view() {
-		printf '{"number":1,"state":"OPEN","title":"fixture dispatch","labels":[{"name":"tier:simple"}],"assignees":[],"body":"## Worker Guidance","author":{"login":"testuser"}}\n'
+		local issue_number="$1"
+		printf '{"number":%s,"state":"OPEN","title":"Issue #%s: fixture dispatch","labels":[{"name":"tier:simple"}],"assignees":[],"body":"## Worker Guidance","author":{"login":"testuser"}}\n' \
+			"${issue_number}" "${issue_number}"
 		return 0
 	}
 	export -f gh_issue_view
 	gh() {
+		if [[ "${1:-}" == "issue" && "${2:-}" == "view" ]]; then
+			printf 'OPEN\n'
+			return 0
+		fi
+		if [[ "${1:-}" == "issue" && "${2:-}" == "lock" ]]; then
+			FIXTURE_ISSUE_LOCKED=true
+			return 0
+		fi
 		if [[ "${1:-}" == "api" && "${2:-}" == *"/events?per_page=100" ]]; then
 			printf '[[]]\n'
 			return 0
 		fi
 		if [[ "${1:-}" == "api" && "${2:-}" == repos/*/issues/* ]]; then
 			if [[ " $* " == *" --jq "* ]]; then
-				printf 'OWNER|User|testuser\n'
+				# The final ownership fence refreshes the live REST issue state.
+				if [[ "${3:-}" == "--jq" && "${4:-}" == ".state" ]]; then
+					printf 'open\n'
+					return 0
+				fi
+				if [[ " $* " == *".locked"* ]]; then
+					printf '%s\n' "${FIXTURE_ISSUE_LOCKED}"
+					return 0
+				fi
+				printf 'OWNER|User|testuser|false\n'
 				return 0
 			fi
-			printf '{}\n'
+			if [[ "${2##*/}" =~ ^[0-9]+$ ]]; then
+				printf '{"number":%s,"state":"open","locked":%s,"author_association":"OWNER","user":{"type":"User","login":"testuser"},"labels":[{"name":"tier:simple"}]}\n' \
+					"${2##*/}" "${FIXTURE_ISSUE_LOCKED}"
+			else
+				printf '{}\n'
+			fi
 			return 0
 		fi
 		return 0
@@ -217,6 +266,10 @@ set_successful_dispatch_function_stubs() {
 		_DLW_WORKTREE_BRANCH="feature/test-gh${issue_number}"
 		_DLW_WORKTREE_REUSED=0
 		mkdir -p "$_DLW_WORKTREE_PATH"
+		return 0
+	}
+	_dispatch_registered_worktree_count() {
+		printf '0\n'
 		return 0
 	}
 	return 0
@@ -282,6 +335,28 @@ test_deduplicates_multiple_workers_with_process_chains() {
 	fi
 
 	print_result "count_active_workers counts 2 logical workers from 6 process-chain entries" 0
+	return 0
+}
+
+test_scopes_workers_to_effective_uid_before_deduplication() {
+	local own_uid foreign_uid count output
+	own_uid=$(command id -u)
+	foreign_uid=$((own_uid + 1))
+	set_uid_ps_fixture "${foreign_uid} 320 S 00:30 bash /home/foreign/.aidevops/agents/scripts/headless-runtime-helper.sh run --role worker --session-key issue-5100 --dir /tmp/aidevops --title Issue #5100 /full-loop
+${foreign_uid} 321 S 00:30 /opt/bin/.opencode run --session-key issue-5101 --dir /tmp/other /full-loop
+${own_uid} 330 S 00:20 bash /home/own/.aidevops/agents/scripts/headless-runtime-helper.sh run --role worker --session-key issue-5100 --dir /tmp/aidevops --title Issue #5100 /full-loop
+${own_uid} 331 S 00:20 /opt/bin/.opencode run --session-key issue-5100 --dir /tmp/aidevops /full-loop
+${own_uid} 340 S 00:10 /opt/bin/.opencode run --session-key local-maintenance --dir /tmp/other /full-loop"
+
+	output=$(list_active_worker_processes)
+	count=$(printf '%s\n' "$output" | grep -c '^[0-9]' || true)
+	if [[ "$count" != "2" || "$output" != *"330 "* || "$output" != *"340 "* || "$output" == *"320 "* || "$output" == *"321 "* ]]; then
+		print_result "worker discovery filters foreign UIDs before chain deduplication" 1 \
+			"Expected owned PIDs 330/340 only, got: ${output}"
+		return 0
+	fi
+
+	print_result "worker discovery filters foreign UIDs before chain deduplication" 0
 	return 0
 }
 
@@ -549,8 +624,8 @@ test_review_issue_pr_session_key_fallback_dedup() {
 
 test_review_thread_response_session_key_fallback_dedup() {
 	# GH#24625: review-thread response workers use pr-review-thread-response
-	# session keys. The dedup key extraction must fall back to that key and
-	# preserve only the trailing PR number, even when the repo slug contains digits.
+	# session keys. The dedup key extraction must preserve the complete key so
+	# repository and worker identities cannot collide on a trailing PR number.
 	set_ps_fixture "950 S 00:10 opencode run --dir /tmp/repo --session-key pr-review-thread-response-org2--repo-206 --title PR #206 \"/full-loop respond\"
 951 S 00:11 /opt/homebrew/lib/node_modules/opencode-ai/bin/.opencode run --dir /tmp/repo --session-key pr-review-thread-response-org2--repo-206 --title PR #206 \"/full-loop respond\"
 952 S 00:09 opencode run --dir /tmp/repo --session-key pr-review-thread-response-org2--repo-207 --title PR #207 \"/full-loop respond\""
@@ -582,6 +657,55 @@ test_review_thread_response_session_key_fallback_dedup() {
 	fi
 
 	print_result "review-thread response session-key fallback deduplicates correctly (GH#24625)" 0
+	return 0
+}
+
+test_non_issue_session_identity_dedup() {
+	# GH#31890: one non-issue worker process chain must count once, while
+	# distinct session keys, directories, and identity namespaces remain distinct.
+	local count output
+
+	set_ps_fixture "100 S 00:20 bash /home/user/.aidevops/agents/scripts/headless-runtime-helper.sh run --role worker --session-key maintenance --dir /tmp/repo --title maintenance \"/full-loop maintain\"
+101 S 00:19 bash /home/user/.aidevops/agents/scripts/sandbox-exec-helper.sh run -- opencode run \"/full-loop maintain\" --session-key maintenance --dir /tmp/repo
+102 S 00:18 /opt/opencode run \"/full-loop maintain\" --session-key maintenance --dir /tmp/repo"
+	count=$(count_active_workers)
+	output=$(list_active_worker_processes)
+	if [[ "$count" != "1" || "$output" != 100\ * ]]; then
+		print_result "non-issue worker identities deduplicate without collisions (GH#31890)" 1 \
+			"Expected one logical worker retaining PID 100, got count=${count}: ${output}"
+		return 0
+	fi
+
+	set_ps_fixture "200 S 00:20 opencode run \"/full-loop maintain\" --session-key maintenance-a --dir /tmp/repo
+201 S 00:19 opencode run \"/full-loop maintain\" --session-key maintenance-b --dir /tmp/repo
+202 S 00:18 opencode run \"/full-loop maintain\" --session-key maintenance-a --dir /tmp/other"
+	count=$(count_active_workers)
+	if [[ "$count" != "3" ]]; then
+		print_result "non-issue worker identities deduplicate without collisions (GH#31890)" 1 \
+			"Expected distinct session keys/directories to produce 3 workers, got ${count}"
+		return 0
+	fi
+
+	set_ps_fixture "300 S 00:20 opencode run \"/full-loop issue\" --session-key issue-206 --dir /tmp/repo --title Issue #206
+301 S 00:19 opencode run \"/full-loop review\" --session-key pr-review-thread-response-owner--one-206 --dir /tmp/repo --title PR #206
+302 S 00:18 opencode run \"/full-loop review\" --session-key pr-review-thread-response-owner--two-206 --dir /tmp/repo --title PR #206"
+	count=$(count_active_workers)
+	if [[ "$count" != "3" ]]; then
+		print_result "non-issue worker identities deduplicate without collisions (GH#31890)" 1 \
+			"Expected issue and full review-thread identities to produce 3 workers, got ${count}"
+		return 0
+	fi
+
+	set_ps_fixture "400 S 00:20 opencode run \"/full-loop unkeyed-a\" --dir /tmp/repo
+401 S 00:19 opencode run \"/full-loop unkeyed-b\" --dir /tmp/repo"
+	count=$(count_active_workers)
+	if [[ "$count" != "2" ]]; then
+		print_result "non-issue worker identities deduplicate without collisions (GH#31890)" 1 \
+			"Expected unkeyed processes to remain distinct, got ${count}"
+		return 0
+	fi
+
+	print_result "non-issue worker identities deduplicate without collisions (GH#31890)" 0
 	return 0
 }
 
@@ -624,17 +748,27 @@ test_check_dispatch_dedup_treats_merged_pr_as_duplicate() {
 
 test_dispatch_with_dedup_blocks_when_duplicate() {
 	local original_script_dir="$SCRIPT_DIR"
+	local original_function_definitions
+	original_function_definitions=$(capture_function_definitions gh_issue_view)
 	SCRIPT_DIR="$TEST_ROOT"
 
 	set_ps_fixture ""
 	# Dedup helper returns 0 for has-open-pr → duplicate detected → check_dispatch_dedup returns 0
 	set_dedup_helper_fixture 0 'merged PR #1145 references issue #9999 via "closes" keyword'
+	# GH#33524: load metadata so the dedup gate itself produces the block,
+	# rather than an incidental metadata-fetch failure.
+	gh_issue_view() {
+		printf '{"number":9999,"state":"OPEN","title":"Issue #9999: test dedup","labels":[],"assignees":[],"body":"## Worker Guidance","author":{"login":"testuser"}}\n'
+		return 0
+	}
+	export -f gh_issue_view
 
 	local dispatch_rc=0
 	dispatch_with_dedup "9999" "marcusquinn/aidevops" "Issue #9999: test dedup" "t9999: test dedup" \
 		"testuser" "/tmp/aidevops" "/full-loop test" || dispatch_rc=$?
 
 	SCRIPT_DIR="$original_script_dir"
+	restore_function_definitions "$original_function_definitions" gh_issue_view
 
 	if [[ "$dispatch_rc" -eq 1 ]]; then
 		print_result "dispatch_with_dedup blocks when dedup detects duplicate (GH#12436)" 0
@@ -660,27 +794,40 @@ test_dispatch_with_dedup_fails_closed_when_issue_metadata_missing() {
 	}
 	export -f gh_issue_view
 
+	# GH#33524: a failure without a permanent gh error is transient: retry once,
+	# then defer (rc=2, retry next cycle) instead of a hard block (rc=1).
 	local dispatch_rc=0
-	dispatch_with_dedup "7777" "marcusquinn/aidevops" "Issue #7777: fail-closed" "t7777: fail-closed" \
+	AIDEVOPS_DISPATCH_METADATA_RETRY_DELAY=0 \
+		dispatch_with_dedup "7777" "marcusquinn/aidevops" "Issue #7777: fail-closed" "t7777: fail-closed" \
 		"testuser" "/tmp/aidevops" "/full-loop test" || dispatch_rc=$?
+
+	# A permanent gh error (missing issue) still hard-blocks without retrying.
+	gh_issue_view() {
+		printf 'GraphQL: Could not resolve to an Issue with the number of 7778.\n' >&2
+		return 1
+	}
+	local permanent_rc=0
+	AIDEVOPS_DISPATCH_METADATA_RETRY_DELAY=0 \
+		dispatch_with_dedup "7778" "marcusquinn/aidevops" "Issue #7778: fail-closed" "t7778: fail-closed" \
+		"testuser" "/tmp/aidevops" "/full-loop test" || permanent_rc=$?
 
 	SCRIPT_DIR="$original_script_dir"
 	restore_function_definitions "$original_function_definitions" gh_issue_view
 
-	if [[ "$dispatch_rc" -eq 1 ]]; then
-		print_result "dispatch_with_dedup fails closed when issue metadata lookup fails (GH#14409)" 0
+	if [[ "$dispatch_rc" -eq 2 && "$permanent_rc" -eq 1 ]]; then
+		print_result "dispatch_with_dedup fails closed when issue metadata lookup fails (GH#14409, GH#33524)" 0
 		return 0
 	fi
 
-	print_result "dispatch_with_dedup fails closed when issue metadata lookup fails (GH#14409)" 1 \
-		"Expected exit 1 (blocked), got ${dispatch_rc}"
+	print_result "dispatch_with_dedup fails closed when issue metadata lookup fails (GH#14409, GH#33524)" 1 \
+		"Expected transient rc=2 and permanent rc=1, got ${dispatch_rc} and ${permanent_rc}"
 	return 0
 }
 
 test_dispatch_with_dedup_proceeds_when_no_duplicate() {
 	local original_script_dir="$SCRIPT_DIR"
 	local original_function_definitions
-	original_function_definitions=$(capture_function_definitions gh gh_issue_view is_blocked_by_unresolved _check_nmr_approval_gate set_issue_status _dlw_precreate_worktree)
+	original_function_definitions=$(capture_function_definitions gh gh_issue_view is_blocked_by_unresolved _check_nmr_approval_gate set_issue_status _dlw_precreate_worktree _dispatch_registered_worktree_count)
 	SCRIPT_DIR="$TEST_ROOT"
 
 	set_ps_fixture ""
@@ -707,7 +854,7 @@ STUB
 	# Restore
 	HEADLESS_RUNTIME_HELPER="$original_helper"
 	SCRIPT_DIR="$original_script_dir"
-	restore_function_definitions "$original_function_definitions" gh gh_issue_view is_blocked_by_unresolved _check_nmr_approval_gate set_issue_status _dlw_precreate_worktree
+	restore_function_definitions "$original_function_definitions" gh gh_issue_view is_blocked_by_unresolved _check_nmr_approval_gate set_issue_status _dlw_precreate_worktree _dispatch_registered_worktree_count
 
 	if [[ "$dispatch_rc" -eq 0 ]]; then
 		print_result "dispatch_with_dedup proceeds when no duplicate detected (GH#12436)" 0
@@ -723,7 +870,7 @@ test_dispatch_with_dedup_detaches_worker_stdio() {
 	local original_script_dir="$SCRIPT_DIR"
 	local original_helper="$HEADLESS_RUNTIME_HELPER"
 	local original_function_definitions
-	original_function_definitions=$(capture_function_definitions gh gh_issue_view is_blocked_by_unresolved _check_nmr_approval_gate set_issue_status _dlw_precreate_worktree)
+	original_function_definitions=$(capture_function_definitions gh gh_issue_view is_blocked_by_unresolved _check_nmr_approval_gate set_issue_status _dlw_precreate_worktree _dispatch_registered_worktree_count)
 	local stdin_capture="${TEST_ROOT}/worker-stdin.txt"
 	local issue_log="" fallback_log=""
 	issue_log=$(aidevops_pulse_worker_log_path "marcusquinn/aidevops" "8890")
@@ -762,7 +909,7 @@ EOF
 
 	HEADLESS_RUNTIME_HELPER="$original_helper"
 	SCRIPT_DIR="$original_script_dir"
-	restore_function_definitions "$original_function_definitions" gh gh_issue_view is_blocked_by_unresolved _check_nmr_approval_gate set_issue_status _dlw_precreate_worktree
+	restore_function_definitions "$original_function_definitions" gh gh_issue_view is_blocked_by_unresolved _check_nmr_approval_gate set_issue_status _dlw_precreate_worktree _dispatch_registered_worktree_count
 	rm -f "$issue_log" "$fallback_log"
 
 	if [[ "$dispatch_rc" -eq 0 && -z "$stdin_contents" && "$issue_log_contents" == *"stub worker output"* ]]; then
@@ -779,7 +926,7 @@ test_dispatch_with_dedup_passes_explicit_model_override() {
 	local original_script_dir="$SCRIPT_DIR"
 	local original_helper="$HEADLESS_RUNTIME_HELPER"
 	local original_function_definitions
-	original_function_definitions=$(capture_function_definitions gh gh_issue_view is_blocked_by_unresolved _check_nmr_approval_gate set_issue_status _dlw_precreate_worktree)
+	original_function_definitions=$(capture_function_definitions gh gh_issue_view is_blocked_by_unresolved _check_nmr_approval_gate set_issue_status _dlw_precreate_worktree _dispatch_registered_worktree_count)
 	local args_log="${TEST_ROOT}/worker-args.log"
 	SCRIPT_DIR="$TEST_ROOT"
 
@@ -810,7 +957,7 @@ EOF
 
 	HEADLESS_RUNTIME_HELPER="$original_helper"
 	SCRIPT_DIR="$original_script_dir"
-	restore_function_definitions "$original_function_definitions" gh gh_issue_view is_blocked_by_unresolved _check_nmr_approval_gate set_issue_status _dlw_precreate_worktree
+	restore_function_definitions "$original_function_definitions" gh gh_issue_view is_blocked_by_unresolved _check_nmr_approval_gate set_issue_status _dlw_precreate_worktree _dispatch_registered_worktree_count
 
 	if [[ "$dispatch_rc" -eq 0 && "$args_contents" == *"--initial-model anthropic/claude-haiku-4-5"* ]]; then
 		print_result "dispatch_with_dedup forwards explicit model override to worker launch" 0
@@ -819,6 +966,65 @@ EOF
 
 	print_result "dispatch_with_dedup forwards explicit model override to worker launch" 1 \
 		"dispatch_rc=${dispatch_rc}, pre-runtime failure=${pre_runtime_failure:-none}, args='${args_contents}'"
+	return 0
+}
+
+test_dispatch_re_resolves_mutated_tier_model() {
+	local original_definitions="" original_logfile="$LOGFILE"
+	local SCRIPT_DIR="$TEST_ROOT"
+	original_definitions=$(capture_function_definitions _dispatch_load_and_validate_metadata _dispatch_preclaim_brief_scope _dispatch_dedup_check_layers _dispatch_post_dedup_gates _dispatch_launch_checked_worker resolve_dispatch_model_for_labels)
+	LOGFILE="${TEST_ROOT}/tier-model-refresh.log"
+	_dispatch_load_and_validate_metadata() {
+		issue_meta_json='{"labels":[{"name":"tier:simple"}]}'
+		return 0
+	}
+	_dispatch_preclaim_brief_scope() { return 0; }
+	_dispatch_dedup_check_layers() { return 0; }
+	_dispatch_post_dedup_gates() {
+		_TIER_LABELS_MUTATED="$_TEST_MUTATE_TIER"
+		if [[ "$_TEST_MUTATE_TIER" -eq 1 ]]; then
+			issue_meta_json='{"labels":[{"name":"tier:standard"}]}'
+		fi
+		return 0
+	}
+	resolve_dispatch_model_for_labels() {
+		local labels_csv="$1"
+		case ",$labels_csv," in
+		*,tier:simple,*) printf '%s' 'simple/model' ;;
+		*,tier:standard,*) printf '%s' 'standard/model' ;;
+		esac
+		return 0
+	}
+	_dispatch_launch_checked_worker() {
+		local model_override="$9"
+		_CAPTURED_TIER_MODEL="$model_override"
+		return 0
+	}
+	local _CAPTURED_TIER_MODEL="" dispatch_rc=0 _TEST_MUTATE_TIER=1
+	dispatch_with_dedup 8892 example/repo 'Issue #8892' 'tier mutation' testuser "$TEST_ROOT" 'prompt' issue-8892 simple/model || dispatch_rc=$?
+	if [[ "$dispatch_rc" -eq 0 && "$_CAPTURED_TIER_MODEL" == standard/model ]] &&
+		[[ "$(<"$LOGFILE")" == *'tier tier:simple → tier:standard; model simple/model → standard/model'* ]]; then
+		print_result 'tier mutation re-resolves candidate default before worker launch' 0
+	else
+		print_result 'tier mutation re-resolves candidate default before worker launch' 1
+	fi
+	_CAPTURED_TIER_MODEL=""
+	dispatch_with_dedup 8893 example/repo 'Issue #8893' 'explicit pin' testuser "$TEST_ROOT" 'prompt' issue-8893 explicit/model || dispatch_rc=$?
+	if [[ "$_CAPTURED_TIER_MODEL" == explicit/model ]]; then
+		print_result 'tier mutation preserves explicit model pin' 0
+	else
+		print_result 'tier mutation preserves explicit model pin' 1
+	fi
+	_TEST_MUTATE_TIER=0
+	_CAPTURED_TIER_MODEL=""
+	dispatch_with_dedup 8894 example/repo 'Issue #8894' 'unchanged tier' testuser "$TEST_ROOT" 'prompt' issue-8894 simple/model || dispatch_rc=$?
+	if [[ "$_CAPTURED_TIER_MODEL" == simple/model ]]; then
+		print_result 'unchanged simple tier retains candidate model' 0
+	else
+		print_result 'unchanged simple tier retains candidate model' 1
+	fi
+	LOGFILE="$original_logfile"
+	restore_function_definitions "$original_definitions" _dispatch_load_and_validate_metadata _dispatch_preclaim_brief_scope _dispatch_dedup_check_layers _dispatch_post_dedup_gates _dispatch_launch_checked_worker resolve_dispatch_model_for_labels
 	return 0
 }
 
@@ -1071,38 +1277,53 @@ JSON
 	return 0
 }
 
+_test_capacity_model_for_labels() {
+	local labels="$1"
+	case ",${labels}," in
+	*,tier:thinking,*) printf '%s\n' "anthropic/claude-opus-4-6" ;;
+	*,tier:standard,*) printf '%s\n' "anthropic/claude-sonnet-5-5" ;;
+	*,tier:simple,*) printf '%s\n' "anthropic/claude-haiku-4-5" ;;
+	*) printf '\n' ;;
+	esac
+	return 0
+}
+
+_test_capacity_candidates() {
+	local mode="$1"
+	printf '%s\n' '[
+	  {"number":9101,"repo_slug":"marcusquinn/aidevops","repo_path":"/tmp/aidevops","url":"https://github.com/marcusquinn/aidevops/issues/9101","title":"candidate one","labels":["bug"],"updatedAt":"2026-03-31T00:00:00Z","score":8000},
+	  {"number":9102,"repo_slug":"marcusquinn/aidevops","repo_path":"/tmp/aidevops","url":"https://github.com/marcusquinn/aidevops/issues/9102","title":"candidate two","labels":["file-size-debt","tier:simple"],"updatedAt":"2026-03-31T00:01:00Z","score":4000},
+	  {"number":9103,"repo_slug":"marcusquinn/aidevops","repo_path":"/tmp/aidevops","url":"https://github.com/marcusquinn/aidevops/issues/9103","title":"candidate three","labels":["function-complexity-debt"],"updatedAt":"2026-03-31T00:02:00Z","score":4000}
+	]' | jq -c --arg mode "$mode" 'map(
+		if $mode == "product" and .number == 9102 then
+			.repo_slug="o/product" | .repo_path="/tmp/product" | .url="" | .repo_priority="product"
+		else .repo_priority="tooling" end | .product_discovery_complete=true)'
+	return $?
+}
+
 test_dispatch_max_dispatches_up_to_capacity() {
+	local reservation_mode="${1:-tooling}"
+	local REPOS_JSON="${TEST_ROOT}/reservation-integration.json"
+	local PRODUCT_RESERVATION_PCT=50
+	local original_rest_gate=""
+	original_rest_gate=$(capture_function_definitions _dispatch_rest_core_progress_allows_next)
+	_dispatch_rest_core_progress_allows_next() { return 0; }
+	jq -nc --arg mode "$reservation_mode" '{initialized_repos:
+		(if $mode == "product" then [{slug:"o/product",path:"/tmp/product",pulse:true,priority:"product"}] else [] end)}' >"$REPOS_JSON"
 	local dispatch_log="${TEST_ROOT}/deterministic-dispatch.log"
 	local original_function_definitions
 	original_function_definitions=$(capture_function_definitions gh resolve_dispatch_model_for_labels build_ranked_dispatch_candidates_json _dispatch_compute_capacity _dispatch_ranked_candidates_json _dispatch_run_prepasses _dispatch_order_idle_borrowing_candidates _dispatch_max_compute_parallel _dispatch_graphql_budget_allows_next _dispatch_should_skip_candidate _dispatch_check_model_concurrency_cap _pulse_refresh_repo _dispatch_with_timeout count_runnable_candidates count_queued_without_worker dispatch_with_dedup check_worker_launch _dispatch_maybe_engage_throttle)
 	: >"$dispatch_log"
 
 	resolve_dispatch_model_for_labels() {
-		# Tier label resolution uses canonical workload tiers.
-		case ",${1}," in
-		*,tier:thinking,*)
-			echo "anthropic/claude-opus-4-6"
-			return 0
-			;;
-		*,tier:standard,*)
-			echo "anthropic/claude-sonnet-4-6"
-			return 0
-			;;
-		*,tier:simple,*)
-			echo "anthropic/claude-haiku-4-5"
-			return 0
-			;;
-		esac
-		echo ""
-		return 0
+		local labels="${1:-}"
+		_test_capacity_model_for_labels "$labels"
+		return $?
 	}
 
 	build_ranked_dispatch_candidates_json() {
-		printf '%s\n' '[
-		  {"number":9101,"repo_slug":"marcusquinn/aidevops","repo_path":"/tmp/aidevops","url":"https://github.com/marcusquinn/aidevops/issues/9101","title":"candidate one","labels":["bug"],"updatedAt":"2026-03-31T00:00:00Z","score":8000},
-		  {"number":9102,"repo_slug":"marcusquinn/aidevops","repo_path":"/tmp/aidevops","url":"https://github.com/marcusquinn/aidevops/issues/9102","title":"candidate two","labels":["file-size-debt","tier:simple"],"updatedAt":"2026-03-31T00:01:00Z","score":4000},
-		  {"number":9103,"repo_slug":"marcusquinn/aidevops","repo_path":"/tmp/aidevops","url":"https://github.com/marcusquinn/aidevops/issues/9103","title":"candidate three","labels":["function-complexity-debt"],"updatedAt":"2026-03-31T00:02:00Z","score":4000}
-		]'
+		_test_capacity_candidates "$reservation_mode"
+		return $?
 	}
 	_dispatch_compute_capacity() {
 		printf '2 0 2\n'
@@ -1160,11 +1381,14 @@ test_dispatch_max_dispatches_up_to_capacity() {
 	local dispatch_count dispatched_numbers
 	dispatch_count=$(dispatch_max)
 	dispatched_numbers=$(tr '\n' ',' <"$dispatch_log" | sed 's/,$//')
+	restore_function_definitions "$original_rest_gate" _dispatch_rest_core_progress_allows_next
 
 	restore_function_definitions "$original_function_definitions" gh resolve_dispatch_model_for_labels build_ranked_dispatch_candidates_json _dispatch_compute_capacity _dispatch_ranked_candidates_json _dispatch_run_prepasses _dispatch_order_idle_borrowing_candidates _dispatch_max_compute_parallel _dispatch_graphql_budget_allows_next _dispatch_should_skip_candidate _dispatch_check_model_concurrency_cap _pulse_refresh_repo _dispatch_with_timeout count_runnable_candidates count_queued_without_worker dispatch_with_dedup check_worker_launch _dispatch_maybe_engage_throttle
 
-	if [[ "$dispatch_count" == "2" && "$dispatched_numbers" == "9101|,9102|anthropic/claude-haiku-4-5" ]]; then
-		print_result "dispatch_max dispatches ranked candidates up to capacity and honors simple-tier override" 0
+	local expected_numbers="9101|,9102|anthropic/claude-haiku-4-5"
+	[[ "$reservation_mode" != product ]] || expected_numbers="9102|anthropic/claude-haiku-4-5,9101|"
+	if [[ "$dispatch_count" == "2" && "$dispatched_numbers" == "$expected_numbers" ]]; then
+		print_result "dispatch_max enforces ${reservation_mode} policy, capacity, and simple-tier override" 0
 		return 0
 	fi
 
@@ -1309,6 +1533,9 @@ test_dispatch_max_honors_stop_flag() {
 }
 
 test_dispatch_max_skips_broad_prelaunch_counts() {
+	local original_rest_gate=""
+	original_rest_gate=$(capture_function_definitions _dispatch_rest_core_progress_allows_next)
+	_dispatch_rest_core_progress_allows_next() { return 0; }
 	local dispatch_log="${TEST_ROOT}/deterministic-no-broad-counts.log"
 	local count_call_log="${TEST_ROOT}/deterministic-broad-count-calls.log"
 	local login_call_log="${TEST_ROOT}/deterministic-login-calls.log"
@@ -1389,6 +1616,7 @@ test_dispatch_max_skips_broad_prelaunch_counts() {
 	dispatched_numbers=$(tr '\n' ',' <"$dispatch_log" | sed 's/,$//')
 	count_call_count=$(wc -l <"$count_call_log" | tr -d ' ')
 	login_call_count=$(wc -l <"$login_call_log" | tr -d ' ')
+	restore_function_definitions "$original_rest_gate" _dispatch_rest_core_progress_allows_next
 
 	restore_function_definitions "$original_function_definitions" gh build_ranked_dispatch_candidates_json _dispatch_compute_capacity _dispatch_ranked_candidates_json _dispatch_run_prepasses _dispatch_order_idle_borrowing_candidates _dispatch_max_compute_parallel _dispatch_graphql_budget_allows_next _dispatch_should_skip_candidate _dispatch_check_model_concurrency_cap _pulse_refresh_repo _dispatch_with_timeout count_runnable_candidates count_queued_without_worker dispatch_with_dedup check_worker_launch _dispatch_maybe_engage_throttle
 
@@ -1552,6 +1780,7 @@ main() {
 	test_counts_plain_and_dot_prefixed_opencode_workers
 	test_deduplicates_process_chain_to_one_logical_worker
 	test_deduplicates_multiple_workers_with_process_chains
+	test_scopes_workers_to_effective_uid_before_deduplication
 	test_repo_issue_detection_uses_filtered_worker_list
 	test_excludes_zombie_and_stopped_processes
 	test_has_worker_for_repo_issue_session_key_fallback
@@ -1560,6 +1789,7 @@ main() {
 	test_counts_review_issue_pr_workers
 	test_review_issue_pr_session_key_fallback_dedup
 	test_review_thread_response_session_key_fallback_dedup
+	test_non_issue_session_identity_dedup
 	test_worker_title_prefixes_issue_number
 	test_check_dispatch_dedup_treats_merged_pr_as_duplicate
 	test_dispatch_with_dedup_blocks_when_duplicate
@@ -1567,6 +1797,7 @@ main() {
 	test_dispatch_with_dedup_proceeds_when_no_duplicate
 	test_dispatch_with_dedup_detaches_worker_stdio
 	test_dispatch_with_dedup_passes_explicit_model_override
+	test_dispatch_re_resolves_mutated_tier_model
 	test_build_ranked_dispatch_candidates_json_scores_candidates
 	test_build_ranked_dispatch_candidates_json_respects_priority_labels
 	test_build_ranked_dispatch_candidates_json_prioritizes_security_quality_debt
@@ -1575,6 +1806,7 @@ main() {
 	test_build_ranked_dispatch_candidates_json_respects_schedule_gate
 	test_build_ranked_dispatch_candidates_json_accepts_array_pulse_hours
 	test_dispatch_max_dispatches_up_to_capacity
+	test_dispatch_max_dispatches_up_to_capacity product
 	test_dispatch_max_honors_stop_flag
 	test_dispatch_max_skips_broad_prelaunch_counts
 	test_active_pulse_refill_skips_without_idle_or_stall_signal

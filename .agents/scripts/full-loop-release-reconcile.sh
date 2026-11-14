@@ -15,20 +15,35 @@ _FULL_LOOP_RELEASE_EVENT_PUSH="push"
 _FULL_LOOP_RELEASE_EVENT_RECOVERY="workflow_dispatch"
 _FULL_LOOP_RELEASE_JSON_ARRAY_TYPE="array"
 _FULL_LOOP_RELEASE_JSON_NUMBER_TYPE="number"
+_FULL_LOOP_RELEASE_JSON_OBJECT_TYPE="object"
 _FULL_LOOP_RELEASE_STATUS_COMPLETED="completed"
 _FULL_LOOP_RELEASE_CONCLUSION_FAILURE="failure"
 _FULL_LOOP_RELEASE_CONCLUSION_SKIPPED="skipped"
 _FULL_LOOP_RELEASE_CONCLUSION_SUCCESS="success"
 _FULL_LOOP_RELEASE_JSON_STRING_TYPE="string"
 _FULL_LOOP_RELEASE_MODE_RECONCILE="reconcile"
+_FULL_LOOP_RELEASE_PHASE_REMOTE="remote-publication"
+_FULL_LOOP_RELEASE_PHASE_RECONCILE_REQUIRED="reconcile-required"
 _FULL_LOOP_RELEASE_STEP_QUEUE_POSTFLIGHT="Queue exact-tag postflight"
+_FULL_LOOP_RELEASE_STEP_DEFERRED_POSTFLIGHT="Record deferred postflight"
+_FULL_LOOP_RELEASE_STEP_DEFERRED_GITHUB_RELEASE="Record deferred GitHub release"
+# Correlated workflow_dispatch recoveries allowed while GitHub release creation
+# keeps deferring on installation quota; at the 15-minute grace this spans the
+# hourly quota window (GH#35565).
+_FULL_LOOP_RELEASE_MAX_RECOVERY_RUNS=4
+_FULL_LOOP_RELEASE_RECOVERY_RUN_COUNT=""
+_FULL_LOOP_RELEASE_POSTFLIGHT_ABSENT_RC=6
+_FULL_LOOP_RELEASE_POSTFLIGHT_FAILED_RC=9
 _FULL_LOOP_RELEASE_PROVENANCE_PREDICATE="https://slsa.dev/provenance/v1"
 _FULL_LOOP_RELEASE_TRUE="true"
+_FULL_LOOP_RELEASE_SHA_REGEX='^[0-9a-f]{40}$'
 _FULL_LOOP_RELEASE_VERSION_TAG_REGEX='^v[0-9]+\.[0-9]+\.[0-9]+$'
 _FULL_LOOP_RELEASE_TIMESTAMP_REGEX='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
 
 # shellcheck source=./version-manager-protected-main.sh
 source "${SCRIPT_DIR}/version-manager-protected-main.sh"
+# shellcheck source=./full-loop-release-worktree-lib.sh
+source "${SCRIPT_DIR}/full-loop-release-worktree-lib.sh"
 
 _full_loop_release_epoch_seconds() {
 	date +%s 2>/dev/null
@@ -120,7 +135,7 @@ _full_loop_release_verify_candidate_tag_provenance() {
 			>/dev/null || protected_state_rc=$?
 		[[ "$protected_state_rc" -eq 0 ]] || return 1
 		case "$_VERSION_MANAGER_PROTECTED_RELEASE_RESULT" in
-		pr-pending | tag-ready) return 0 ;;
+		pr-pending | tag-ready | "$_VERSION_MANAGER_RELEASE_PR_MISSING") return 0 ;;
 		remote-tag-present)
 			_full_loop_release_verify_tag_provenance "$repo" "$tag_name"
 			return $?
@@ -129,6 +144,153 @@ _full_loop_release_verify_candidate_tag_provenance() {
 		;;
 	esac
 	return 1
+}
+
+# GH#34433: every deferred claim names its reason and the next command instead
+# of returning a silent 75.
+_full_loop_release_preserved_claim_deferred() {
+	local source_pr="$1"
+	local reason="$2"
+	printf 'Preserved-tag recovery for PR #%s not claimed: %s\n' "$source_pr" "$reason" >&2
+	printf 'Inspect: aidevops release status %s; retry: aidevops release reconcile %s\n' \
+		"$source_pr" "$source_pr" >&2
+	return 0
+}
+
+#aidevops:trust-boundary
+# A signed candidate is not publication authority. Claim only its exact modern
+# snapshot lane, after proving the old local executor and descendants are gone.
+# GH#34433: a version-manager failure after local signing moves the lane from
+# preparing to reconcile-required without a tag. That state is still
+# pre-publication, so it is claimable under exactly the same proofs. A
+# same-source reclaim removes the fenced contract; as in dead-preparing
+# recovery, accept only lineage verified back to a fenced reservation.
+_full_loop_release_claim_preserved_tag() {
+	local repo="$1"
+	local source_pr="$2"
+	local tag_name="$3"
+	local expected_sources="" source_json="" snapshot="" release_parent=""
+	local lane_head="" release_path="" observation="" permission="" state_json="" token=""
+	local owner_pid="" lane_summary="" executor_state="" reclaim_evidence="" reclaim_rc=0
+	release_lane_read "$repo" || return 1
+	lane_head="$_AIDEVOPS_RELEASE_LANE_HEAD"
+	_version_manager_local_tag_identity "$tag_name" || return 1
+	reclaim_evidence=$(_release_lane_resolve_reclaim_evidence "$repo") || reclaim_rc=$?
+	case "$reclaim_rc" in
+	0) [[ -n "$reclaim_evidence" ]] || reclaim_evidence="null" ;;
+	3)
+		_full_loop_release_preserved_claim_deferred "$source_pr" \
+			"lane has neither the fenced reservation contract nor verified reclaim lineage"
+		return 75
+		;;
+	*) return 1 ;;
+	esac
+	if ! jq -e --argjson pr "$source_pr" --arg tag "$tag_name" \
+		--arg phase "$_FULL_LOOP_RELEASE_PHASE_REMOTE" \
+		--arg reconcile "$_FULL_LOOP_RELEASE_PHASE_RECONCILE_REQUIRED" \
+		--arg object "$_VERSION_MANAGER_LOCAL_TAG_OBJECT" \
+		--arg commit "$_VERSION_MANAGER_LOCAL_TAG_COMMIT" \
+		--argjson reclaim "$reclaim_evidence" '
+		.active == true and .source_pr == $pr and .terminal_receipt == null
+		and (.reservation_contract == "fenced-prepublication/v1" or $reclaim != null)
+		and .snapshot_manifest_bound == true
+		and (.aggregate_recovery // null) == null and (.aggregate_successor // null) == null
+		and (.reserved_authorization_refresh // null) == null
+		and (.prepublication_recovery // null) == null
+		and (((.phase == "preparing" or .phase == $reconcile) and .tag == null)
+			or (.phase == $phase and .tag == $tag
+				and .preserved_tag_recovery.tag_object == $object
+				and .preserved_tag_recovery.release_commit == $commit))
+	' <<<"$_AIDEVOPS_RELEASE_LANE_JSON" >/dev/null; then
+		lane_summary=$(jq -r '"source_pr=\(.source_pr // "none") phase=\(.phase // "unknown") tag=\(.tag // "pending")"' \
+			<<<"$_AIDEVOPS_RELEASE_LANE_JSON" 2>/dev/null) || lane_summary="unreadable"
+		_full_loop_release_preserved_claim_deferred "$source_pr" \
+			"lane ${lane_summary} is not a claimable pre-publication state for ${tag_name}"
+		return 75
+	fi
+	expected_sources=$(_full_loop_read_release_authorization "$repo" "$source_pr") || return 1
+	[[ "$expected_sources" == "$(jq -er '.expected_sources' <<<"$_AIDEVOPS_RELEASE_LANE_JSON")" ]] || return 1
+	source_json=$(_full_loop_release_source_json_from_tag "$tag_name") || return 1
+	_full_loop_recovery_source_matches_authorization "$expected_sources" "$source_json" || return 1
+	snapshot=$(jq -er '.snapshot_sha' <<<"$_AIDEVOPS_RELEASE_LANE_JSON") || return 1
+	release_parent=$(git -C "$REPO_ROOT" rev-parse "${_VERSION_MANAGER_LOCAL_TAG_COMMIT}^") || return 1
+	[[ "$snapshot" == "$release_parent" ]] || return 1
+	observation=$(_release_lane_executor_observe "$_AIDEVOPS_RELEASE_LANE_JSON") || return 1
+	executor_state=$(jq -r '.state // "unknown"' <<<"$observation" 2>/dev/null) || executor_state="unreadable"
+	if [[ "$executor_state" != "dead" ]]; then
+		_full_loop_release_preserved_claim_deferred "$source_pr" \
+			"previous release executor is ${executor_state}, not proven dead"
+		return 75
+	fi
+	owner_pid=$(jq -er '.executor.pid | select(type == "number" and . > 0 and floor == .)' \
+		<<<"$_AIDEVOPS_RELEASE_LANE_JSON") || return 1
+	# preparing and reconcile-required both belong to the original release run.
+	release_path="${AIDEVOPS_WORKTREE_BASE_DIR:-${HOME}/Git/_worktrees}/aidevops-release-${source_pr}-${owner_pid}"
+	if [[ "$(jq -r '.phase' <<<"$_AIDEVOPS_RELEASE_LANE_JSON")" == "$_FULL_LOOP_RELEASE_PHASE_REMOTE" ]]; then
+		release_path="${AIDEVOPS_WORKTREE_BASE_DIR:-${HOME}/Git/_worktrees}/aidevops-release-reconcile-${tag_name#v}-${owner_pid}"
+	fi
+	if ! _full_loop_recovery_process_uses_path "$release_path"; then
+		_full_loop_release_preserved_claim_deferred "$source_pr" \
+			"cannot prove no live process still uses ${release_path}"
+		return 75
+	fi
+	permission=$(gh api "repos/${repo}" \
+		--jq '.permissions.push == true or .permissions.maintain == true or .permissions.admin == true') || return 1
+	if [[ "$permission" != "true" ]]; then
+		_full_loop_release_preserved_claim_deferred "$source_pr" \
+			"GitHub credentials lack push, maintain or admin permission on ${repo}"
+		return 75
+	fi
+	_full_loop_recovery_verify_channels_absent "$repo" "$tag_name" || return 1
+	token=$(uuidgen) || return 1
+	state_json=$(jq -c --arg token "$token" --arg tag "$tag_name" \
+		--arg phase "$_FULL_LOOP_RELEASE_PHASE_REMOTE" \
+		--arg object "$_VERSION_MANAGER_LOCAL_TAG_OBJECT" --arg commit "$_VERSION_MANAGER_LOCAL_TAG_COMMIT" \
+		--arg owner "${_AIDEVOPS_RELEASE_LANE_OWNER_PREFIX}$$" \
+		--arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" --argjson executor "$(_release_lane_executor_capture)" \
+		--argjson reclaim "$reclaim_evidence" '
+		.executor as $previous_executor | .phase=$phase | .tag=$tag
+		| .operation_token=$token | .owner=$owner | .executor=$executor | .updated_at=$now
+		| .preserved_tag_recovery={tag_object:$object,release_commit:$commit,
+			previous_executor:$previous_executor,claimed_at:$now}
+		| if $reclaim == null then . else .preserved_tag_recovery.reservation_lineage=$reclaim end
+	' <<<"$_AIDEVOPS_RELEASE_LANE_JSON") || return 1
+	_release_lane_write "$repo" "$state_json" "$lane_head" || return $?
+	_AIDEVOPS_RELEASE_LANE_TOKEN="$token"
+	return 0
+}
+
+_full_loop_release_queue_preserved_tag() {
+	local repo="$1"
+	local source_pr="$2"
+	local tag_name="$3"
+	local tag_object="" release_commit="" lane_token=""
+	_full_loop_release_verify_protected_source_provenance "$repo" "$tag_name" || return 1
+	_full_loop_release_claim_preserved_tag "$repo" "$source_pr" "$tag_name" || return $?
+	tag_object="$_VERSION_MANAGER_LOCAL_TAG_OBJECT"
+	release_commit="$_VERSION_MANAGER_LOCAL_TAG_COMMIT"
+	lane_token="$_AIDEVOPS_RELEASE_LANE_TOKEN"
+	(
+		REPO_ROOT="$_FULL_LOOP_RELEASE_PATH"
+		AIDEVOPS_VERSION_MANAGER_REPO_SLUG="$repo"
+		#aidevops:trust-boundary
+		# Existing protected-main mutation boundaries recheck this rotated token
+		# and the immutable local tag, in addition to any aggregate fence.
+		_version_manager_verify_preserved_lane_fence() {
+			release_lane_read "$repo" || return 1
+			jq -e --argjson pr "$source_pr" --arg token "$lane_token" --arg tag "$tag_name" \
+				--arg phase "$_FULL_LOOP_RELEASE_PHASE_REMOTE" '
+				.active == true and .source_pr == $pr and .phase == $phase
+				and .operation_token == $token and .tag == $tag and .terminal_receipt == null
+			' <<<"$_AIDEVOPS_RELEASE_LANE_JSON" >/dev/null || return 1
+			_version_manager_local_tag_identity "$tag_name" || return 1
+			[[ "$_VERSION_MANAGER_LOCAL_TAG_OBJECT" == "$tag_object" &&
+				"$_VERSION_MANAGER_LOCAL_TAG_COMMIT" == "$release_commit" ]]
+			return $?
+		}
+		_version_manager_queue_protected_main_release "${tag_name#v}"
+	) || return 1
+	return 8
 }
 
 _full_loop_release_raw_candidate_tags_for_pr() {
@@ -225,6 +387,75 @@ _full_loop_release_candidate_tags_for_pr() {
 	return 0
 }
 
+#aidevops:trust-boundary
+# Discovery may adopt an object, never publish it. The caller still verifies the
+# signed source manifest and the protected PR's exact-head/main ancestry.
+_full_loop_release_recover_lane_tag() {
+	local repo="$1"
+	local requested_pr="$2"
+	local tag_name="" tag_ref="" branch_name="" body="" tag_object="" release_commit=""
+	local fetched_object="" fetched_commit="" staging_ref="" api_tag="" lane_rc=0
+	local marker_regex='<!-- aidevops:release-provenance tag=(v[0-9]+\.[0-9]+\.[0-9]+) tag-object=([0-9a-f]{40}) release-commit=([0-9a-f]{40}) merge-method=merge -->'
+
+	release_lane_read "$repo" || lane_rc=$?
+	case "$lane_rc" in 0) ;; 2) return 0 ;; *) return 1 ;; esac
+	if ! jq -e --argjson pr "$requested_pr" --arg phase "$_FULL_LOOP_RELEASE_PHASE_REMOTE" \
+		--arg string "$_FULL_LOOP_RELEASE_JSON_STRING_TYPE" '
+		.active == true and .source_pr == $pr and .phase == $phase
+		and .terminal_receipt == null and (.tag | type == $string)
+	' <<<"$_AIDEVOPS_RELEASE_LANE_JSON" >/dev/null; then
+		return 0
+	fi
+	tag_name=$(jq -er '.tag' <<<"$_AIDEVOPS_RELEASE_LANE_JSON") || return 1
+	[[ "$tag_name" =~ $_FULL_LOOP_RELEASE_VERSION_TAG_REGEX ]] || return 1
+	branch_name=$(_version_manager_protected_release_branch_name "${tag_name#v}") || return 1
+	_version_manager_find_protected_release_pr "$repo" "$branch_name" || return 1
+	[[ -n "$_VERSION_MANAGER_PROTECTED_PR_NUMBER" ]] || return 1
+	_version_manager_verify_protected_pr_state \
+		"$(jq -r '.state' <<<"$_VERSION_MANAGER_PROTECTED_PR_JSON")" \
+		"$(jq -r '.merged_at // ""' <<<"$_VERSION_MANAGER_PROTECTED_PR_JSON")" || return 1
+	[[ "$(jq -r '.state' <<<"$_VERSION_MANAGER_PROTECTED_PR_JSON")" == "closed" ]] || return 0
+	body=$(jq -r '.body // ""' <<<"$_VERSION_MANAGER_PROTECTED_PR_JSON") || return 1
+	[[ "$body" =~ $marker_regex && "${BASH_REMATCH[1]}" == "$tag_name" ]] || return 1
+	tag_object="${BASH_REMATCH[2]}"
+	release_commit="${BASH_REMATCH[3]}"
+	_version_manager_verify_protected_pr_identity "$repo" "$branch_name" "${tag_name#v}" \
+		"$tag_object" "$release_commit" || return 1
+	staging_ref=$(git -C "$REPO_ROOT" ls-remote origin "refs/aidevops/release-tags/${tag_name}") || return 1
+	if [[ -n "$staging_ref" ]]; then
+		git -C "$REPO_ROOT" fetch --no-tags origin "refs/aidevops/release-tags/${tag_name}" --quiet || return 1
+		fetched_object=$(git -C "$REPO_ROOT" rev-parse FETCH_HEAD) || return 1
+		# GH#34753: the ref holds a commit envelope carrying the raw tag bytes.
+		_version_manager_decode_staged_tag "$fetched_object" || return 1
+		fetched_object="$_VERSION_MANAGER_STAGED_TAG_OBJECT"
+	else
+		# Older protected PRs have no staging ref. GitHub retains the signed
+		# payload; restore only bytes hashing to the PR's pinned object. Its
+		# API verification verdict is NOT a substitute for local verify-tag.
+		api_tag=$(gh api "repos/${repo}/git/tags/${tag_object}") || return 1
+		jq -e --arg tag "$tag_name" --arg commit "$release_commit" \
+			--arg string "$_FULL_LOOP_RELEASE_JSON_STRING_TYPE" '
+			.tag == $tag and .object.sha == $commit and .object.type == "commit"
+			and (.verification.payload | type == $string)
+			and (.verification.signature | type == $string)
+		' <<<"$api_tag" >/dev/null || return 1
+		fetched_object=$(jq -j '.verification.payload + .verification.signature' <<<"$api_tag" |
+			git -C "$REPO_ROOT" hash-object -t tag -w --stdin) || return 1
+		[[ "$fetched_object" == "$tag_object" ]] || return 1
+		git -C "$REPO_ROOT" fetch --no-tags origin main --quiet || return 1
+	fi
+	fetched_commit=$(git -C "$REPO_ROOT" rev-parse "${fetched_object}^{commit}") || return 1
+	[[ "$fetched_object" == "$tag_object" && "$fetched_commit" == "$release_commit" ]] || return 1
+	[[ "$(git -C "$REPO_ROOT" cat-file -t "$fetched_object")" == "tag" ]] || return 1
+	# CAS creation refuses to replace any pre-existing local tag, including a
+	# concurrent discovery result. All publication remains in the verifier path.
+	printf -v tag_ref 'refs/tags/%s' "$tag_name"
+	git -C "$REPO_ROOT" update-ref "$tag_ref" "$tag_object" \
+		0000000000000000000000000000000000000000 || return 1
+	printf '%s\n' "$tag_name"
+	return 0
+}
+
 _full_loop_release_find_tag_for_pr() {
 	local repo="$1"
 	local requested_pr="$2"
@@ -232,7 +463,6 @@ _full_loop_release_find_tag_for_pr() {
 	local candidate_tags=""
 	local tag_body=""
 	local trailer=""
-	local source_json=""
 	local requested_present="false"
 	local textually_matched=0
 	local candidate_count=0
@@ -254,6 +484,9 @@ _full_loop_release_find_tag_for_pr() {
 		_full_loop_release_timing_finish release-tag-candidate-index "$phase_started" failed
 		_full_loop_release_timing_finish release-tag-discovery "$discovery_started" failed
 		return 1
+	fi
+	if [[ -z "$candidate_tags" ]]; then
+		candidate_tags=$(_full_loop_release_recover_lane_tag "$repo" "$requested_pr") || return 1
 	fi
 	while IFS= read -r candidate_tag; do
 		[[ -n "$candidate_tag" ]] && candidate_count=$((candidate_count + 1))
@@ -382,12 +615,18 @@ _full_loop_release_source_json_from_tag() {
 	local aggregate_merge=""
 	local aggregate_payload=""
 	local aggregates_json="[]"
+	local snapshot_base=""
 
 	tag_body=$(_full_loop_release_tag_body "$tag_name") || return 1
 	while IFS= read -r trailer; do
 		case "$trailer" in
 		"Aidevops-Source-PR: "*) source_pr="${trailer#Aidevops-Source-PR: }" ;;
 		"Aidevops-Source-Merge: "*) source_merge="${trailer#Aidevops-Source-Merge: }" ;;
+		"Aidevops-Snapshot-Base: "*)
+			[[ -z "$snapshot_base" ]] || return 1
+			snapshot_base="${trailer#Aidevops-Snapshot-Base: }"
+			[[ "$snapshot_base" =~ $_FULL_LOOP_SHA40_REGEX ]] || return 1
+			;;
 		"Aidevops-Aggregated-Source: "*)
 			aggregate_payload="${trailer#Aidevops-Aggregated-Source: }"
 			aggregate_pr="${aggregate_payload%%@*}"
@@ -402,16 +641,21 @@ _full_loop_release_source_json_from_tag() {
 		esac
 	done <<<"$tag_body"
 	[[ "$source_pr" =~ ^[0-9]+$ && "$source_merge" =~ $_FULL_LOOP_SHA40_REGEX ]] || return 1
-	if jq -e --argjson source_pr "$source_pr" 'any(.[]; .pr == $source_pr)' <<<"$aggregates_json" >/dev/null; then
+	if [[ -z "$snapshot_base" ]] && jq -e --argjson source_pr "$source_pr" 'any(.[]; .pr == $source_pr)' <<<"$aggregates_json" >/dev/null; then
 		return 1
+	fi
+	if [[ -n "$snapshot_base" ]]; then
+		jq -e --argjson pr "$source_pr" --arg sha "$source_merge" \
+			'any(.[]; .pr == $pr and .merge == $sha)' <<<"$aggregates_json" >/dev/null || return 1
 	fi
 	if [[ "$aggregates_json" == "[]" ]]; then
 		aggregates_json=$(_full_loop_release_manifest_json_from_source_merge \
 			"$source_pr" "$source_merge") || return 1
 	fi
 	jq -cn --argjson source_pr "$source_pr" --arg source_merge "$source_merge" \
-		--argjson aggregated_sources "$aggregates_json" \
-		'{source_pr:$source_pr,source_merge:$source_merge,aggregated_sources:$aggregated_sources}'
+		--argjson aggregated_sources "$aggregates_json" --arg snapshot_base "$snapshot_base" \
+		'{source_pr:$source_pr,source_merge:$source_merge,aggregated_sources:$aggregated_sources}
+		| if $snapshot_base != "" then . + {mode:"snapshot",snapshot_base:$snapshot_base} else . end'
 	return $?
 }
 
@@ -422,7 +666,7 @@ _full_loop_release_resolve_tag_expected_sources() {
 	local expected_sources="$4"
 	local resolver="${SCRIPT_DIR}/release-provenance-helper.sh"
 	local authorization_json=""
-	local resolver_args=(resolve-tag-authorization --tag "$tag_name" --source-pr "$requested_pr" --repo "$repo" --branch main)
+	local resolver_args=(resolve-tag-expected-sources --tag "$tag_name" --source-pr "$requested_pr" --repo "$repo" --branch main)
 	[[ -x "$resolver" ]] || return 1
 	[[ -n "$expected_sources" ]] && resolver_args+=(--expected-sources "$expected_sources")
 	_full_loop_release_prepare_tag_worktree "$tag_name" || return 1
@@ -476,10 +720,13 @@ _full_loop_release_record_authorization_gap() {
 }
 
 _full_loop_release_runs_payload_valid() {
-	local runs_json="$1"
-	jq -e --arg array_type "$_FULL_LOOP_RELEASE_JSON_ARRAY_TYPE" \
-		'type == "object" and (.workflow_runs | type == $array_type)' \
-		<<<"$runs_json" >/dev/null
+	local runs_file="$1"
+	[[ -f "$runs_file" ]] || return 1
+	jq -es --arg array_type "$_FULL_LOOP_RELEASE_JSON_ARRAY_TYPE" \
+		--arg object_type "$_FULL_LOOP_RELEASE_JSON_OBJECT_TYPE" '
+		length > 0
+		and all(.[]; type == $object_type and (.workflow_runs | type == $array_type))
+	' "$runs_file" >/dev/null
 	return $?
 }
 
@@ -487,39 +734,58 @@ _full_loop_release_find_workflow_run() {
 	local repo="$1"
 	local tag_name="$2"
 	local tag_commit="$3"
-	local push_runs=""
-	local recovery_runs=""
+	local push_runs_file=""
+	local recovery_runs_file=""
 	local display_title="Publish ${tag_name}"
 	local selection_mode="${4:-latest}"
+	local selection_rc=0
+	local selection_json=""
 	[[ "$selection_mode" == "latest" || "$selection_mode" == "successful" ]] || return 1
 
 	_FULL_LOOP_RELEASE_RUN_JSON=""
-	push_runs=$(gh api --method GET "repos/${repo}/actions/workflows/publish-packages.yml/runs" \
-		-f event=push -F per_page=50 2>/dev/null) || return 1
-	recovery_runs=$(gh api --method GET "repos/${repo}/actions/workflows/publish-packages.yml/runs" \
-		-f event=workflow_dispatch -F per_page=50 2>/dev/null) || return 1
-	_full_loop_release_runs_payload_valid "$push_runs" || return 1
-	_full_loop_release_runs_payload_valid "$recovery_runs" || return 1
-	_FULL_LOOP_RELEASE_RUN_JSON=$(jq -cn --arg sha "$tag_commit" --arg tag "$tag_name" --arg title "$display_title" \
+	_FULL_LOOP_RELEASE_RECOVERY_RUN_COUNT=""
+	push_runs_file=$(mktemp) || return 1
+	recovery_runs_file=$(mktemp) || {
+		rm -f "$push_runs_file"
+		return 1
+	}
+	if ! gh api --method GET "repos/${repo}/actions/workflows/publish-packages.yml/runs" \
+		-f event=push -f head_sha="$tag_commit" -F per_page=100 --paginate >"$push_runs_file" 2>/dev/null ||
+		! gh api --method GET "repos/${repo}/actions/workflows/publish-packages.yml/runs" \
+			-f event=workflow_dispatch -F per_page=100 --paginate >"$recovery_runs_file" 2>/dev/null ||
+		! _full_loop_release_runs_payload_valid "$push_runs_file" ||
+		! _full_loop_release_runs_payload_valid "$recovery_runs_file"; then
+		rm -f "$push_runs_file" "$recovery_runs_file"
+		return 1
+	fi
+	selection_json=$(jq -cn --arg sha "$tag_commit" --arg tag "$tag_name" --arg title "$display_title" \
 		--arg push_event "$_FULL_LOOP_RELEASE_EVENT_PUSH" \
 		--arg recovery_event "$_FULL_LOOP_RELEASE_EVENT_RECOVERY" \
 		--arg selection_mode "$selection_mode" --arg completed "$_FULL_LOOP_RELEASE_STATUS_COMPLETED" \
 		--arg success "$_FULL_LOOP_RELEASE_CONCLUSION_SUCCESS" \
 		--arg string_type "$_FULL_LOOP_RELEASE_JSON_STRING_TYPE" \
-		--argjson push "$push_runs" --argjson recovery "$recovery_runs" '
-		([($push.workflow_runs[]? | select(.event == $push_event and .head_branch == $tag and .head_sha == $sha))]
-		 + [($recovery.workflow_runs[]?
+		--arg sha_regex "$_FULL_LOOP_RELEASE_SHA_REGEX" \
+		--slurpfile push "$push_runs_file" --slurpfile recovery "$recovery_runs_file" '
+		[($recovery[]?.workflow_runs[]?
 			| select(.event == $recovery_event and .head_branch == "main"
 				and ((.head_sha | type) == $string_type)
-				and (.head_sha | test("^[0-9a-f]{40}$"))
-				and .display_title == ($title + " [" + $sha + "." + .head_sha + "]")))])
-		| if $selection_mode == "successful" then
-			map(select(.status == $completed and .conclusion == $success))
-		  else . end
-		| sort_by(.created_at // "") | last // empty
-	') || return 1
+				and (.head_sha | test($sha_regex))
+				and .display_title == ($title + " [" + $sha + "." + .head_sha + "]")))] as $recoveries
+		| {recovery_count: ($recoveries | length),
+		   selected: ([($push[]?.workflow_runs[]? | select(.event == $push_event and .head_branch == $tag and .head_sha == $sha))]
+			+ $recoveries
+			| if $selection_mode == "successful" then
+				map(select(.status == $completed and .conclusion == $success))
+			  else . end
+			| sort_by(.created_at // "") | last)}
+	') || selection_rc=$?
+	rm -f "$push_runs_file" "$recovery_runs_file"
+	[[ "$selection_rc" -eq 0 ]] || return 1
+	_FULL_LOOP_RELEASE_RECOVERY_RUN_COUNT=$(jq -er '.recovery_count' <<<"$selection_json") || return 1
+	_FULL_LOOP_RELEASE_RUN_JSON=$(jq -c '.selected // empty' <<<"$selection_json") || return 1
 	[[ -n "$_FULL_LOOP_RELEASE_RUN_JSON" && "$_FULL_LOOP_RELEASE_RUN_JSON" != "null" ]] || return 3
 	jq -e --arg string_type "$_FULL_LOOP_RELEASE_JSON_STRING_TYPE" \
+		--arg sha_regex "$_FULL_LOOP_RELEASE_SHA_REGEX" \
 		--arg number_type "$_FULL_LOOP_RELEASE_JSON_NUMBER_TYPE" \
 		--arg completed "$_FULL_LOOP_RELEASE_STATUS_COMPLETED" \
 		--arg push_event "$_FULL_LOOP_RELEASE_EVENT_PUSH" \
@@ -527,7 +793,7 @@ _full_loop_release_find_workflow_run() {
 		((.id | type) == $number_type)
 		and (.event == $push_event or .event == $recovery_event)
 		and ((.head_sha | type) == $string_type)
-		and (.head_sha | test("^[0-9a-f]{40}$"))
+		and (.head_sha | test($sha_regex))
 		and ((.status | type) == $string_type)
 		and ((.status // "") | length > 0)
 		and ((.created_at | type) == $string_type)
@@ -542,8 +808,9 @@ _full_loop_release_find_workflow_run() {
 _full_loop_release_run_jobs_payload_valid() {
 	local jobs_json="$1"
 	jq -e --arg array_type "$_FULL_LOOP_RELEASE_JSON_ARRAY_TYPE" \
-		--arg number_type "$_FULL_LOOP_RELEASE_JSON_NUMBER_TYPE" '
-		type == "object" and (.total_count | type == $number_type and . >= 0 and floor == .)
+		--arg number_type "$_FULL_LOOP_RELEASE_JSON_NUMBER_TYPE" \
+		--arg object_type "$_FULL_LOOP_RELEASE_JSON_OBJECT_TYPE" '
+		type == $object_type and (.total_count | type == $number_type and . >= 0 and floor == .)
 		and (.jobs | type == $array_type) and .total_count == (.jobs | length)
 	' <<<"$jobs_json" >/dev/null
 	return $?
@@ -654,6 +921,7 @@ _full_loop_release_verify_npm_provenance() {
 	local audit_json=""
 	local provenance_payload=""
 	local expected_digest=""
+	local audit_rc=0
 
 	_FULL_LOOP_RELEASE_NPM_VERSION=""
 	_FULL_LOOP_RELEASE_NPM_INTEGRITY=""
@@ -680,13 +948,21 @@ _full_loop_release_verify_npm_provenance() {
 	[[ "$expected_digest" =~ ^[0-9a-f]{128}$ ]] || return 1
 
 	audit_dir=$(mktemp -d "${TMPDIR:-/tmp}/aidevops-npm-provenance.XXXXXX") || return 1
-	if ! (
+	(
 		_FULL_LOOP_RELEASE_AUDIT_DIR="$audit_dir"
 		trap 'command rm -rf -- "$_FULL_LOOP_RELEASE_AUDIT_DIR"' EXIT
 		npm install --prefix "$audit_dir" --ignore-scripts --no-audit --no-fund --save-exact \
 			"aidevops@${version}" >/dev/null 2>&1 || exit 1
 		audit_json=$(npm --prefix "$audit_dir" audit signatures \
 			--json --include-attestations 2>/dev/null) || exit 1
+		if ! jq -e --arg array_type "$_FULL_LOOP_RELEASE_JSON_ARRAY_TYPE" --arg object_type 'object' '
+			type == $object_type and (.invalid | type == $array_type)
+			and (.missing | type == $array_type) and (.verified | type == $array_type)
+			and all(.verified[]; type == $object_type and (.attestationBundles | type == $array_type))
+		' <<<"$audit_json" >/dev/null 2>&1; then
+			printf 'release: npm audit output lacks verified-attestation capability or is malformed (npm %s); use an npm version that supports --include-attestations JSON output\n' "$(npm --version 2>/dev/null || printf 'unknown')" >&2
+			exit 2
+		fi
 		jq -e --arg version "$version" \
 			--arg array_type "$_FULL_LOOP_RELEASE_JSON_ARRAY_TYPE" \
 			--arg provenance_predicate "$_FULL_LOOP_RELEASE_PROVENANCE_PREDICATE" '
@@ -728,9 +1004,8 @@ _full_loop_release_verify_npm_provenance() {
 		and .predicate.runDetails.builder.id == "https://github.com/actions/runner/github-hosted"
 	' <<<"$provenance_payload" >/dev/null || exit 1
 		exit 0
-	); then
-		return 1
-	fi
+	) || audit_rc=$?
+	[[ "$audit_rc" -eq 0 ]] || return "$audit_rc"
 	_FULL_LOOP_RELEASE_NPM_VERSION="$npm_version"
 	_FULL_LOOP_RELEASE_NPM_INTEGRITY="$npm_integrity"
 	return 0
@@ -773,12 +1048,14 @@ _full_loop_release_verify_channels() {
 	local formula_sha=""
 	local tarball_url="https://github.com/${repo}/archive/refs/tags/${tag_name}.tar.gz"
 	local expected_sha=""
+	local npm_rc=0
 
 	release_json=$(gh api "repos/${repo}/releases/tags/${tag_name}" 2>/dev/null) || return 1
 	jq -e --arg tag "$tag_name" '
 		.tag_name == $tag and .draft == false and ((.published_at // "") | length > 0)
 	' <<<"$release_json" >/dev/null || return 1
-	_full_loop_release_verify_npm_provenance "$repo" "$tag_name" "$version" || return 1
+	_full_loop_release_verify_npm_provenance "$repo" "$tag_name" "$version" || npm_rc=$?
+	[[ "$npm_rc" -eq 0 ]] || return "$npm_rc"
 	npm_version="$_FULL_LOOP_RELEASE_NPM_VERSION"
 	npm_integrity="$_FULL_LOOP_RELEASE_NPM_INTEGRITY"
 	formula=$(gh api "repos/${tap_owner}/homebrew-tap/contents/Formula/aidevops.rb" \
@@ -808,6 +1085,166 @@ _full_loop_release_resolve_tag_commit() {
 	return 0
 }
 
+_full_loop_release_success_grace_expired() {
+	local run_json="$1"
+	local completed_at="" completed_epoch="" now_epoch=""
+	completed_at=$(jq -er '.updated_at | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))' <<<"$run_json") || return 8
+	completed_epoch=$(jq -nr --arg completed_at "$completed_at" '$completed_at | try fromdateiso8601 catch empty') || return 8
+	[[ "$completed_epoch" =~ ^[0-9]+$ ]] || return 8
+	now_epoch=$(date -u +%s) || return 8
+	[[ "$now_epoch" -ge "$completed_epoch" ]] || return 8
+	[[ $((now_epoch - completed_epoch)) -ge 900 ]] || return 8
+	return 0
+}
+
+# True when the selected publication run's jobs show a successful marker step.
+# Returns 0 (marker present), 1 (absent) or another code (unverifiable).
+_full_loop_release_run_has_marker_step() {
+	local repo="$1"
+	local step_name="$2"
+	local run_id=""
+	run_id=$(jq -er --arg number_type "$_FULL_LOOP_RELEASE_JSON_NUMBER_TYPE" \
+		'.id | select(type == $number_type and . > 0 and floor == .)' \
+		<<<"$_FULL_LOOP_RELEASE_RUN_JSON") || return 2
+	_full_loop_release_fetch_run_jobs "$repo" "$run_id" || return 2
+	jq -e --arg step "$step_name" \
+		--arg completed "$_FULL_LOOP_RELEASE_STATUS_COMPLETED" \
+		--arg success "$_FULL_LOOP_RELEASE_CONCLUSION_SUCCESS" '
+		any(.jobs[]?.steps[]?; .name == $step and .status == $completed and .conclusion == $success)
+	' <<<"$_FULL_LOOP_RELEASE_RUN_JOBS_JSON" >/dev/null
+	return $?
+}
+
+# True when the publication run's jobs show the quota-deferred postflight marker.
+_full_loop_release_run_postflight_deferred() {
+	local repo="$1"
+	_full_loop_release_run_has_marker_step "$repo" "$_FULL_LOOP_RELEASE_STEP_DEFERRED_POSTFLIGHT"
+	return $?
+}
+
+# True when the run deferred GitHub release creation on installation quota.
+_full_loop_release_run_github_release_deferred() {
+	local repo="$1"
+	_full_loop_release_run_has_marker_step "$repo" "$_FULL_LOOP_RELEASE_STEP_DEFERRED_GITHUB_RELEASE"
+	return $?
+}
+
+# Channels are unverified after a successful run: report a quota-deferred
+# GitHub release, then return 5 (dispatch one recovery now) or 8 (wait).
+# A push run earns one recovery after the grace. A successful dispatch run
+# never loops unless it also deferred on quota, bounded per correlation
+# (GH#35565).
+_full_loop_release_unverified_channels_action() {
+	local repo="$1"
+	local run_event=""
+	local deferred_rc=0
+	local retry_after=""
+	local recovery_count="$_FULL_LOOP_RELEASE_RECOVERY_RUN_COUNT"
+
+	run_event=$(jq -r '.event // ""' <<<"$_FULL_LOOP_RELEASE_RUN_JSON") || return 8
+	_full_loop_release_run_github_release_deferred "$repo" || deferred_rc=$?
+	if [[ "$deferred_rc" -eq 0 ]]; then
+		printf 'GITHUB_RELEASE=deferred reason=installation-rate-limit\n'
+		retry_after=$(jq -r '.updated_at | try (fromdateiso8601 + 900 | todateiso8601) catch empty' \
+			<<<"$_FULL_LOOP_RELEASE_RUN_JSON" 2>/dev/null) || retry_after=""
+		[[ -z "$retry_after" ]] || printf 'GITHUB_RELEASE_RETRY_AFTER=%s\n' "$retry_after"
+	fi
+	if [[ "$run_event" == "$_FULL_LOOP_RELEASE_EVENT_RECOVERY" ]]; then
+		[[ "$deferred_rc" -eq 0 ]] || return 8
+		[[ "$recovery_count" =~ ^[0-9]+$ ]] || return 8
+		if [[ "$recovery_count" -ge "$_FULL_LOOP_RELEASE_MAX_RECOVERY_RUNS" ]]; then
+			printf 'GITHUB_RELEASE_RECOVERY=exhausted runs=%s\n' "$recovery_count"
+			return 8
+		fi
+	fi
+	_full_loop_release_success_grace_expired "$_FULL_LOOP_RELEASE_RUN_JSON" || return 8
+	return 5
+}
+
+# Select postflight evidence bound to the exact verified tag by run-name.
+# Prints POSTFLIGHT_STATUS and returns 0 (terminal success), 8 (pending or
+# unverifiable), 6 (absent) or 9 (terminal non-success). Read-only.
+_full_loop_release_postflight_gate() {
+	local repo="$1"
+	local tag_name="$2"
+	local runs_file=""
+	local state=""
+	local deferred_rc=0
+
+	_full_loop_release_run_postflight_deferred "$repo" || deferred_rc=$?
+	case "$deferred_rc" in
+	0) ;;
+	1) return 0 ;;
+	*)
+		printf 'POSTFLIGHT_STATUS=unverified\n'
+		return 8
+		;;
+	esac
+	runs_file=$(mktemp) || return 8
+	if ! gh api --method GET "repos/${repo}/actions/workflows/postflight.yml/runs" \
+		-f event="$_FULL_LOOP_RELEASE_EVENT_RECOVERY" -f branch=main -F per_page=100 --paginate \
+		>"$runs_file" 2>/dev/null || ! _full_loop_release_runs_payload_valid "$runs_file"; then
+		rm -f "$runs_file"
+		printf 'POSTFLIGHT_STATUS=unverified\n'
+		return 8
+	fi
+	#aidevops:trust-boundary
+	state=$(jq -rs --arg title "Postflight Verification ${tag_name}" \
+		--arg completed "$_FULL_LOOP_RELEASE_STATUS_COMPLETED" \
+		--arg success "$_FULL_LOOP_RELEASE_CONCLUSION_SUCCESS" \
+		--arg event "$_FULL_LOOP_RELEASE_EVENT_RECOVERY" '
+		[.[].workflow_runs[]? | select(.event == $event and .head_branch == "main" and .display_title == $title)] as $runs
+		| if ($runs | length) == 0 then "absent"
+		  elif any($runs[]; .status == $completed and .conclusion == $success) then "succeeded"
+		  elif any($runs[]; .status != $completed) then "pending"
+		  else "failed" end
+	' "$runs_file") || {
+		rm -f "$runs_file"
+		return 8
+	}
+	rm -f "$runs_file"
+	printf 'POSTFLIGHT_STATUS=%s\n' "$state"
+	case "$state" in
+	succeeded) return 0 ;;
+	absent) return "$_FULL_LOOP_RELEASE_POSTFLIGHT_ABSENT_RC" ;;
+	failed) return "$_FULL_LOOP_RELEASE_POSTFLIGHT_FAILED_RC" ;;
+	*) return 8 ;;
+	esac
+}
+
+# Channels verified: the release is published only once any deferred postflight
+# has reached terminal success.
+_full_loop_release_published_if_postflight_ready() {
+	local repo="$1"
+	local tag_name="$2"
+	local gate_rc=0
+	_full_loop_release_postflight_gate "$repo" "$tag_name" || gate_rc=$?
+	[[ "$gate_rc" -eq 0 ]] || return "$gate_rc"
+	printf 'RELEASE_REMOTE_STATE=published\n'
+	return 0
+}
+
+#aidevops:trust-boundary
+# Queue postflight for the verified exact tag only, from main, without
+# republishing. Uses the operator's own gh credential.
+_full_loop_release_dispatch_postflight() {
+	local repo="$1"
+	local tag_name="$2"
+	local audit_helper="${SCRIPT_DIR}/audit-log-helper.sh"
+	local tag_detail="tag=$tag_name"
+
+	[[ "$tag_name" =~ $_FULL_LOOP_RELEASE_VERSION_TAG_REGEX ]] || return 1
+	_full_loop_release_resolve_tag_commit "$tag_name" >/dev/null || return 1
+	if [[ -x "$audit_helper" ]]; then
+		AUDIT_QUIET=true "$audit_helper" log operation.verify \
+			"Dispatching exact-tag postflight reconciliation" \
+			--detail "repo=${repo}" --detail "$tag_detail" || return 1
+	fi
+	gh workflow run postflight.yml --repo "$repo" --ref main -f "$tag_detail" || return 1
+	printf 'release:postflight-queued tag=%s\n' "$tag_name"
+	return 8
+}
+
 _full_loop_release_inspect_remote() {
 	local repo="$1"
 	local tag_name="$2"
@@ -816,11 +1253,21 @@ _full_loop_release_inspect_remote() {
 	local run_conclusion=""
 	local run_url=""
 	local find_rc=0
+	local channels_rc=0
 
 	tag_commit=$(_full_loop_release_resolve_tag_commit "$tag_name") || return 1
 	_full_loop_release_find_workflow_run "$repo" "$tag_name" "$tag_commit" || find_rc=$?
 	if [[ "$find_rc" -eq 3 ]]; then
 		printf 'RELEASE_TAG=%s\nWORKFLOW_STATUS=absent\n' "$tag_name"
+		# The run list can serve stale snapshots; published channels mean
+		# absence is uncorroborated, so do not dispatch a redundant recovery.
+		if _full_loop_release_verify_channels "$repo" "$tag_name"; then
+			printf 'WORKFLOW_LOOKUP=uncorroborated\n'
+			return 8
+		else
+			channels_rc=$?
+		fi
+		[[ "$channels_rc" -ne 2 ]] || return 1
 		return 3
 	fi
 	[[ "$find_rc" -eq 0 ]] || return 1
@@ -837,16 +1284,27 @@ _full_loop_release_inspect_remote() {
 			run_url=$(jq -r '.html_url // ""' <<<"$_FULL_LOOP_RELEASE_RUN_JSON") || return 1
 			[[ -z "$run_url" ]] || printf 'RECOVERED_WORKFLOW_URL=%s\n' "$run_url"
 			if _full_loop_release_verify_channels "$repo" "$tag_name"; then
-				printf 'RELEASE_REMOTE_STATE=published\n'
-				return 0
+				_full_loop_release_published_if_postflight_ready "$repo" "$tag_name"
+				return $?
+			else
+				channels_rc=$?
 			fi
+			[[ "$channels_rc" -ne 2 ]] || return 1
+			# A successful sibling is evidence of publication; a failed newer
+			# recovery must not trigger another dispatch during propagation.
+			return 8
 		fi
 		printf 'WORKFLOW_CONCLUSION=%s\n' "${run_conclusion:-unknown}"
 		return 4
 	fi
-	_full_loop_release_verify_channels "$repo" "$tag_name" || return 5
-	printf 'RELEASE_REMOTE_STATE=published\n'
-	return 0
+	_full_loop_release_verify_channels "$repo" "$tag_name" || channels_rc=$?
+	[[ "$channels_rc" -ne 2 ]] || return 1
+	if [[ "$channels_rc" -ne 0 ]]; then
+		_full_loop_release_unverified_channels_action "$repo"
+		return $?
+	fi
+	_full_loop_release_published_if_postflight_ready "$repo" "$tag_name"
+	return $?
 }
 
 _full_loop_release_dispatch_recovery() {
@@ -871,6 +1329,9 @@ _full_loop_release_dispatch_recovery() {
 	return 8
 }
 
+# Prepare a verified checkout for the requested release tag, re-pointing a
+# retained checkout when lifecycle ownership prevented its earlier removal.
+# Args: $1=version tag; sets _FULL_LOOP_RELEASE_PATH on success.
 _full_loop_release_prepare_tag_worktree() {
 	local tag_name="$1"
 	local worktree_base="${AIDEVOPS_WORKTREE_BASE_DIR:-${HOME}/Git/_worktrees}"
@@ -887,13 +1348,18 @@ _full_loop_release_prepare_tag_worktree() {
 		[[ "$checkout_commit" == "$tag_commit" ]] || return 1
 		return 0
 	fi
-	git -C "$REPO_ROOT" worktree add --detach "$release_path" "$tag_name" >/dev/null || return 1
+	case "${_FULL_LOOP_RELEASE_RETAINED_TAG_PATHS:-}" in
+	*"|${release_path}|"*)
+		_full_loop_release_repoint_tag_worktree "$REPO_ROOT" "$release_path" "$tag_commit" || return 1
+		;;
+	*) worktree_create_registered "$REPO_ROOT" "$release_path" "$tag_name" --detach >/dev/null || return 1 ;;
+	esac
 	checkout_commit=$(git -C "$release_path" rev-parse HEAD 2>/dev/null) || {
-		git -C "$REPO_ROOT" worktree remove "$release_path" >/dev/null 2>&1 || true
+		_full_loop_release_remove_worktree "$release_path" release-tag-unverified || true
 		return 1
 	}
 	if [[ "$checkout_commit" != "$tag_commit" ]]; then
-		git -C "$REPO_ROOT" worktree remove "$release_path" >/dev/null 2>&1 || true
+		_full_loop_release_remove_worktree "$release_path" release-tag-mismatch || true
 		return 1
 	fi
 	_FULL_LOOP_RELEASE_PATH="$release_path"
@@ -901,16 +1367,34 @@ _full_loop_release_prepare_tag_worktree() {
 	return 0
 }
 
+# Reset the active tag checkout without removing the control worktree.
+# A checkout that cannot be removed stays registered for post-exit retirement
+# and is re-pointed by a later prepare; clears _FULL_LOOP_RELEASE_PATH.
 _full_loop_release_reset_tag_worktree() {
 	local release_path="${_FULL_LOOP_RELEASE_PATH:-}"
 	local control_path="${_FULL_LOOP_RELEASE_CONTROL_PATH:-}"
 	[[ -n "$release_path" ]] || return 0
 	[[ -z "$control_path" || "$release_path" != "$control_path" ]] || return 1
-	if [[ -d "$release_path" ]]; then
-		git -C "$REPO_ROOT" worktree remove "$release_path" >/dev/null 2>&1 || return 1
+	# GH#37365: a refused removal keeps the tree registered for post-exit
+	# retirement; a later prepare of the same path re-points it.
+	if [[ -d "$release_path" ]] && ! _full_loop_release_remove_worktree "$release_path" release-tag-reset; then
+		_FULL_LOOP_RELEASE_RETAINED_TAG_PATHS="${_FULL_LOOP_RELEASE_RETAINED_TAG_PATHS:-}|${release_path}|"
 	fi
 	_FULL_LOOP_RELEASE_PATH=""
 	return 0
+}
+
+_full_loop_release_validate_explicit_reconciliation_intent() {
+	local repo="$1"
+	local requested_pr="$2"
+	local source_json="$3"
+	local persisted_sources="" persisted_json="" observed_json="" observed_sources=""
+	persisted_sources=$(_full_loop_read_release_authorization "$repo" "$requested_pr") || return 1
+	persisted_json=$(release_authorization_manifest_json "$persisted_sources") || return 1
+	observed_json=$(release_authorization_observed_sources_json "$persisted_json" "$source_json") || return 1
+	observed_sources=$(jq -r 'sort_by(.pr) | map([.pr, .merge] | join("@")) | join(",")' \
+		<<<"$observed_json") || return 1
+	release_authorization_compare "$persisted_sources" "$observed_sources"
 }
 
 _full_loop_release_validate_published_reconciliation_intent() {
@@ -934,12 +1418,34 @@ _full_loop_release_validate_published_reconciliation_intent() {
 		<<<"$observed_json") || return 1
 	release_authorization_compare "$persisted_sources" "$observed_sources" || return 1
 	release_lane_read "$repo" || return 1
-	jq -e --argjson source_pr "$requested_pr" --arg tag_name "$tag_name" '
-		.active == true and .source_pr == $source_pr and .tag == $tag_name
-		and (.expected_sources | type) == "string"
-		and (.phase == "remote-publication" or .phase == "exact-tag-deployment")
+	# A verified published tag can precede its interrupted lane bookkeeping.
+	# Recover only a missing tag bound to the exact modern signed snapshot.
+	#aidevops:trust-boundary
+	jq -e --argjson source_pr "$requested_pr" --arg tag_name "$tag_name" --argjson signed_source "$source_json" \
+		--arg string_type "$_FULL_LOOP_RELEASE_JSON_STRING_TYPE" --arg object_type "$_FULL_LOOP_RELEASE_JSON_OBJECT_TYPE" \
+		--arg sha_regex "$_FULL_LOOP_RELEASE_SHA_REGEX" --arg timestamp_regex "$_FULL_LOOP_RELEASE_TIMESTAMP_REGEX" \
+		--arg exact_phase "exact-tag-deployment" --arg reconcile_phase "reconcile-required" '
+		.active == true and .source_pr == $source_pr
+		and (.tag == $tag_name or (.tag == null and .snapshot_manifest_bound == true
+			and (.snapshot_sha | type) == $string_type
+			and (.snapshot_sha | test($sha_regex))
+			and .snapshot_sha == $signed_source.source_merge))
+		and (.expected_sources | type) == $string_type
+		and (.phase == "remote-publication" or .phase == $exact_phase or (
+			.phase == $reconcile_phase
+			and (.stale_runtime_recovery | type) == $object_type
+			and .stale_runtime_recovery.type == "stale-runtime/v1"
+			and .stale_runtime_recovery.failed_phase == $exact_phase
+			and (.stale_runtime_recovery.attempt_head | type) == $string_type
+			and (.stale_runtime_recovery.attempt_head | test($sha_regex))
+			and (.stale_runtime_recovery.deferred_at | type) == $string_type
+			and (.stale_runtime_recovery.deferred_at | test($timestamp_regex))
+		))
 		and ((.terminal_receipt // null) == null)
-	' <<<"$_AIDEVOPS_RELEASE_LANE_JSON" >/dev/null || return 1
+	' <<<"$_AIDEVOPS_RELEASE_LANE_JSON" >/dev/null || {
+		printf 'Published reconciliation refused: lane source/tag/snapshot identity does not match verified release %s for PR #%s.\n' "$tag_name" "$requested_pr" >&2
+		return 1
+	}
 	lane_sources=$(jq -er '.expected_sources' <<<"$_AIDEVOPS_RELEASE_LANE_JSON") || return 1
 	if [[ "$lane_sources" != "$persisted_sources" ]]; then
 		lane_intent_json=$(release_authorization_intent_json "$lane_sources") || return 1
@@ -962,6 +1468,9 @@ _full_loop_release_finalize_reconciliation() {
 	local tag_commit=""
 	local version_manager=""
 	local deploy_helper=""
+	local deployment_exit=0
+	local attempt_head=""
+	local attempt_owner=""
 
 	source_json=$(_full_loop_release_source_json_from_tag "$tag_name") || return 1
 	source_pr=$(jq -er '.source_pr' <<<"$source_json") || return 1
@@ -971,13 +1480,18 @@ _full_loop_release_finalize_reconciliation() {
 	[[ "$requested_present" == "$_FULL_LOOP_RELEASE_TRUE" ]] || return 1
 	tag_commit=$(_full_loop_release_resolve_tag_commit "$tag_name") || return 1
 	_full_loop_release_validate_published_reconciliation_intent \
-		"$repo" "$requested_pr" "$tag_name" "$source_json" || return 1
+		"$repo" "$requested_pr" "$tag_name" "$source_json" || {
+		printf 'Published reconciliation refused: missing/invalid local explicit publication authorization or active matching lane for PR #%s (%s); inspect release status and the verified source manifest. Terminal cross-host publication requires interactive adopt-published, not replacement publication intent.\n' "$requested_pr" "$tag_name" >&2
+		return 1
+	}
 	_full_loop_validate_release_candidates "$repo" "$source_json" \
 		"$_FULL_LOOP_RELEASE_RECONCILE_AUTHORIZED" "$tag_name" "$tag_commit" || return 1
 	_full_loop_release_prepare_tag_worktree "$tag_name" || return 1
 	if declare -F release_lane_update_if_owned >/dev/null 2>&1; then
 		release_lane_update_if_owned "$repo" "$requested_pr" "exact-tag-deployment" "$tag_name" || return 1
 	fi
+	attempt_head="${_AIDEVOPS_RELEASE_LANE_HEAD:-}"
+	attempt_owner=$(jq -r '.owner // empty' <<<"${_AIDEVOPS_RELEASE_LANE_JSON:-}") || return 1
 	version_manager="${SCRIPT_DIR}/version-manager.sh"
 	deploy_helper="${SCRIPT_DIR}/deploy-agents-on-merge.sh"
 	[[ -f "$version_manager" ]] || return 1
@@ -985,13 +1499,21 @@ _full_loop_release_finalize_reconciliation() {
 	(
 		cd "$_FULL_LOOP_RELEASE_PATH" || exit 1
 		AIDEVOPS_RELEASE_INTENT_TRUSTED=1 \
+			AIDEVOPS_RELEASE_SQUASH_RECOVERY=1 \
 			AIDEVOPS_TRUSTED_ISSUE_PRIORITY="${AIDEVOPS_TRUSTED_ISSUE_PRIORITY:-}" \
 			AIDEVOPS_RELEASE_LANE_SOURCE_PR="$requested_pr" \
 			AIDEVOPS_RELEASE_LANE_TAG="$tag_name" \
 			AIDEVOPS_SYNC_REPO_ROOT="$_FULL_LOOP_RELEASE_PATH" \
 			AIDEVOPS_SYNC_DEPLOY_SCRIPT="$deploy_helper" \
 			bash "$version_manager" post-release
-	) || return 1
+	) || deployment_exit=$?
+	if [[ "$deployment_exit" -ne 0 ]]; then
+		if [[ "$deployment_exit" -eq 76 ]] && declare -F release_lane_defer_stale_runtime_recovery >/dev/null 2>&1; then
+			[[ "$attempt_head" =~ ^[0-9a-f]{40}$ && "$attempt_owner" == "${_AIDEVOPS_RELEASE_LANE_OWNER_PREFIX}"* ]] || return 1
+			release_lane_defer_stale_runtime_recovery "$repo" "$requested_pr" "$tag_name" "$attempt_head" "$attempt_owner" || return 1
+		fi
+		return "$deployment_exit"
+	fi
 	_full_loop_persist_release_success "$repo" "$_FULL_LOOP_RELEASE_PATH" "$source_json" \
 		"$source_pr" "$source_merge" "$_FULL_LOOP_RELEASE_RECONCILE_AUTHORIZED"
 	return $?
@@ -1021,6 +1543,7 @@ _full_loop_release_write_protected_successor_receipt() {
 	[[ "$source_merge" =~ $_FULL_LOOP_SHA40_REGEX && "$successor_merge" =~ $_FULL_LOOP_SHA40_REGEX ]] || return 1
 	[[ "$release_tag" =~ $_FULL_LOOP_RELEASE_VERSION_TAG_REGEX && "$release_commit" =~ $_FULL_LOOP_SHA40_REGEX ]] || return 1
 	[[ "$release_run" =~ ^[0-9]+$ && "$release_run" -gt 0 ]] || return 1
+	_full_loop_release_require_successor_receipt "$repo" "$successor_pr" "$release_tag" || return 1
 	source_tag=$(jq -er '.source_tag' <<<"$protected_json") || return 1
 	source_tag_object=$(jq -er '.source_tag_object' <<<"$protected_json") || return 1
 	source_commit=$(jq -er '.source_commit' <<<"$protected_json") || return 1
@@ -1085,6 +1608,26 @@ _full_loop_release_write_protected_successor_receipt() {
 	return $?
 }
 
+_full_loop_release_require_successor_receipt() {
+	local repo="$1" successor_pr="$2" release_tag="$3"
+	local receipt="" status="" adoption="" authorization=""
+	receipt=$(_full_loop_release_receipt_path "$repo" "$successor_pr") || return 1
+	[[ -f "$receipt" ]] || {
+		printf 'Cannot settle stale release: local published receipt for successor PR #%s (%s) is missing; reconcile the successor or run aidevops release adopt-published %s --tag %s in an interactive maintainer session.\n' \
+			"$successor_pr" "$release_tag" "$successor_pr" "$release_tag" >&2
+		return 1
+	}
+	IFS= read -r status <"$receipt" || return 1
+	[[ "$status" == "$_FULL_LOOP_RELEASE_PUBLISHED" ]] || return 1
+	adoption="${receipt%.status}.adoption.json"
+	authorization="${receipt%.status}.adoption-authorization.json"
+	if cmp -s "$receipt" <(printf 'published\ncross-host-adoption/v1\n') ||
+		[[ -e "$adoption" || -L "$adoption" || -e "$authorization" || -L "$authorization" ]]; then
+		_full_loop_release_verify_adoption_evidence "$repo" "$successor_pr" "$release_tag" || return 1
+	fi
+	return 0
+}
+
 _full_loop_release_finalize_stale_supersession() {
 	local repo="$1"
 	local requested_pr="$2"
@@ -1101,8 +1644,6 @@ _full_loop_release_finalize_stale_supersession() {
 	local successor_merge=""
 	local release_commit=""
 	local release_run=""
-	local release_receipt=""
-	local release_status=""
 
 	source_json=$(_full_loop_release_source_json_from_tag "$source_tag") || return 1
 	source_merge=$(jq -er --argjson requested "$requested_pr" '
@@ -1149,10 +1690,7 @@ _full_loop_release_finalize_stale_supersession() {
 		'.id | select(type == $number_type and . > 0 and floor == .)' \
 		<<<"$_FULL_LOOP_RELEASE_RUN_JSON") || return 1
 	[[ -z "$source_run" || "$source_run" != "$release_run" ]] || return 1
-	release_receipt=$(_full_loop_release_receipt_path "$repo" "$successor_pr") || return 1
-	[[ -f "$release_receipt" ]] || return 1
-	IFS= read -r release_status <"$release_receipt" || return 1
-	[[ "$release_status" == "$_FULL_LOOP_RELEASE_PUBLISHED" ]] || return 1
+	_full_loop_release_require_successor_receipt "$repo" "$successor_pr" "$release_tag" || return 1
 
 	if [[ -n "$source_run" ]]; then
 		_full_loop_write_successor_release_receipt "$repo" "$requested_pr" "$source_merge" \
@@ -1166,6 +1704,165 @@ _full_loop_release_finalize_stale_supersession() {
 	return $?
 }
 
+# Preserve deployment proof separately from the supersession disposition. Only
+# the exact-tag post-release gate can attest the active bundle (manifest, stamp,
+# sentinels and materialized source); ancestry alone must not write evidence.
+#aidevops:trust-boundary
+_full_loop_release_record_stale_deployment() {
+	local repo="$1"
+	local requested_pr="$2"
+	local source_tag="$3"
+	local evidence_path=""
+	local active_sha=""
+	local tag_commit=""
+	local version_manager="${SCRIPT_DIR}/version-manager.sh"
+	local manifest=""
+	local now=""
+	local evidence_status=""
+	local verified_sha=""
+
+	evidence_path=$(_full_loop_release_evidence_path "$repo" "$requested_pr" successor) || return 1
+	[[ -f "$evidence_path" ]] || return 1
+	_full_loop_verify_successor_superseded_release_evidence "$evidence_path" "$repo" "$requested_pr" || return 1
+	tag_commit=$(_full_loop_release_resolve_tag_commit "$source_tag") || return 1
+	evidence_status=$(jq -r '.deployment.status // empty' "$evidence_path") || return 1
+	if [[ "$evidence_status" == "deployed" ]]; then
+		verified_sha=$(jq -r '.deployment.active_sha // empty' "$evidence_path") || return 1
+		[[ "$verified_sha" =~ $_FULL_LOOP_RELEASE_SHA_REGEX ]] || return 1
+		jq -e --arg tag "$source_tag" --arg timestamp_regex "$_FULL_LOOP_RELEASE_TIMESTAMP_REGEX" \
+			'.deployment.tag == $tag and (.deployment.verified_at | test($timestamp_regex))' \
+			"$evidence_path" >/dev/null || return 1
+		git -C "$REPO_ROOT" merge-base --is-ancestor "$tag_commit" "$verified_sha" 2>/dev/null
+		return $?
+	fi
+	[[ -z "$evidence_status" ]] || return 1
+	# shellcheck source=./runtime-bundle-verifier.sh
+	source "${SCRIPT_DIR}/runtime-bundle-verifier.sh" || return 1
+	_runtime_bundle_verify_active_link "$HOME/.aidevops/agents" || return 0
+	manifest="$_AIDEVOPS_RUNTIME_VERIFY_ACTIVE_ROOT/.bundle-manifest"
+	active_sha=$(_runtime_bundle_verify_manifest_value "$manifest" git_sha 2>/dev/null) || return 0
+	[[ "$active_sha" =~ $_FULL_LOOP_RELEASE_SHA_REGEX ]] || return 0
+	git -C "$REPO_ROOT" merge-base --is-ancestor "$tag_commit" "$active_sha" 2>/dev/null || return 0
+	_full_loop_release_prepare_tag_worktree "$source_tag" || return 1
+	[[ -f "$version_manager" ]] || return 1
+	(
+		cd "$_FULL_LOOP_RELEASE_PATH" || exit 1
+		AIDEVOPS_RELEASE_INTENT_TRUSTED=1 AIDEVOPS_RELEASE_SQUASH_RECOVERY=1 \
+			AIDEVOPS_RELEASE_LANE_SOURCE_PR="$requested_pr" AIDEVOPS_RELEASE_LANE_TAG="$source_tag" \
+			AIDEVOPS_SYNC_REPO_ROOT="$_FULL_LOOP_RELEASE_PATH" \
+			bash "$version_manager" post-release
+	) || return 1
+	_runtime_bundle_verify_active_link "$HOME/.aidevops/agents" || return 1
+	manifest="$_AIDEVOPS_RUNTIME_VERIFY_ACTIVE_ROOT/.bundle-manifest"
+	verified_sha=$(_runtime_bundle_verify_manifest_value "$manifest" git_sha 2>/dev/null) || return 1
+	[[ "$verified_sha" == "$active_sha" ]] || return 1
+	now=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || return 1
+	jq --arg tag "$source_tag" --arg sha "$active_sha" --arg now "$now" \
+		'.deployment={status:"deployed",tag:$tag,active_sha:$sha,verified_at:$now}' \
+		"$evidence_path" >"${evidence_path}.tmp.$$" || return 1
+	mv "${evidence_path}.tmp.$$" "$evidence_path" || return 1
+	_full_loop_verify_successor_superseded_release_evidence "$evidence_path" "$repo" "$requested_pr"
+}
+
+_full_loop_release_reconcile_protected_state() {
+	local repo="$1"
+	local requested_pr="$2"
+	local tag_name="$3"
+	local mode="$4"
+	_version_manager_reconcile_protected_release_tag "$repo" "$tag_name" "$mode" || return 1
+	case "$_VERSION_MANAGER_PROTECTED_RELEASE_RESULT" in
+	"$_VERSION_MANAGER_RELEASE_PR_MISSING")
+		[[ "$mode" == "$_FULL_LOOP_RELEASE_MODE_RECONCILE" ]] || return 8
+		_full_loop_release_queue_preserved_tag "$repo" "$requested_pr" "$tag_name"
+		return $?
+		;;
+	pr-pending | tag-ready | tag-pushed) return 8 ;;
+	remote-tag-present) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+#aidevops:trust-boundary
+# A protected PR is durable provenance, but it is not lane ownership. Verify the
+# exact PR read-only before rotating a dead preparing lane through the existing
+# preserved-tag CAS boundary.
+_full_loop_release_recover_existing_protected_pr_lane() {
+	local repo="$1"
+	local requested_pr="$2"
+	local tag_name="$3"
+	local mode="$4"
+	[[ "$mode" == "$_FULL_LOOP_RELEASE_MODE_RECONCILE" ]] || return 0
+	release_lane_read "$repo" || return 1
+	if ! jq -e --argjson source_pr "$requested_pr" '
+		.active == true and .source_pr == $source_pr and .phase == "preparing" and .tag == null
+		and .terminal_receipt == null and .reservation_contract == "fenced-prepublication/v1"
+		and .snapshot_manifest_bound == true
+	' <<<"$_AIDEVOPS_RELEASE_LANE_JSON" >/dev/null; then
+		return 0
+	fi
+	_full_loop_release_verify_protected_source_provenance "$repo" "$tag_name" || return 1
+	_version_manager_reconcile_protected_release_tag "$repo" "$tag_name" status || return 1
+	case "$_VERSION_MANAGER_PROTECTED_RELEASE_RESULT" in
+	pr-pending | tag-ready) ;;
+	*) return 1 ;;
+	esac
+	_full_loop_release_claim_preserved_tag "$repo" "$requested_pr" "$tag_name"
+}
+
+_full_loop_release_not_requested_status() {
+	local repo="$1"
+	local requested_pr="$2"
+	release_lane_read "$repo" || return 1
+	if jq -e --argjson source_pr "$requested_pr" '
+		.active == true and .source_pr == $source_pr and .terminal_receipt == null
+	' <<<"$_AIDEVOPS_RELEASE_LANE_JSON" >/dev/null; then
+		printf 'release:queued source_pr=%s phase=%s tag=%s\n' "$requested_pr" \
+			"$(jq -r '.phase' <<<"$_AIDEVOPS_RELEASE_LANE_JSON")" \
+			"$(jq -r '.tag // "pending"' <<<"$_AIDEVOPS_RELEASE_LANE_JSON")"
+		return 8
+	fi
+	printf 'release:not-requested already recorded for PR #%s\n' "$requested_pr"
+	return 0
+}
+
+# Map a non-success remote inspection result to the read-only or dispatching action.
+_full_loop_release_handle_inspect_rc() {
+	local mode="$1"
+	local repo="$2"
+	local tag_name="$3"
+	local inspect_rc="$4"
+	case "$inspect_rc" in
+	8) return 8 ;;
+	1) return 1 ;;
+	"$_FULL_LOOP_RELEASE_POSTFLIGHT_ABSENT_RC")
+		[[ "$mode" != "$_FULL_LOOP_RELEASE_MODE_RECONCILE" ]] && return 8
+		_full_loop_release_dispatch_postflight "$repo" "$tag_name"
+		return $?
+		;;
+	"$_FULL_LOOP_RELEASE_POSTFLIGHT_FAILED_RC")
+		printf 'Postflight for %s did not succeed; inspect the Postflight Verification run before reconciling again.\n' "$tag_name" >&2
+		return 1
+		;;
+	3 | 4 | 5)
+		[[ "$mode" == "status" ]] && return "$inspect_rc"
+		_full_loop_release_dispatch_recovery "$repo" "$tag_name"
+		return $?
+		;;
+	*) return 1 ;;
+	esac
+}
+
+_full_loop_release_local_adoption_required() {
+	local repo="$1" requested_pr="$2" tag_name="$3"
+	release_lane_read "$repo" || return 1
+	jq -e --argjson pr "$requested_pr" --arg tag "$tag_name" '
+		.active == false and .phase == "terminal" and .terminal_receipt == "published"
+		and .source_pr == $pr and .tag == $tag
+	' <<<"$_AIDEVOPS_RELEASE_LANE_JSON" >/dev/null || return 1
+	printf 'RELEASE_LOCAL_ADOPTION_REQUIRED=1\naidevops release adopt-published %s --tag %s\n' "$requested_pr" "$tag_name"
+	return 0
+}
+
 _full_loop_release_existing_command() {
 	local mode="$1"
 	local requested_pr="$2"
@@ -1173,7 +1870,6 @@ _full_loop_release_existing_command() {
 	local tag_name=""
 	local latest_tag=""
 	local inspect_rc=0
-	local protected_tag_state_rc=0
 	local receipt_path=""
 	local receipt_status=""
 	local source_json=""
@@ -1192,14 +1888,22 @@ _full_loop_release_existing_command() {
 		return 1
 		;;
 	esac
+	if [[ "$receipt_status" == "$_FULL_LOOP_RELEASE_NOT_REQUESTED" && "$mode" != "$_FULL_LOOP_RELEASE_MODE_RECONCILE" ]]; then
+		_full_loop_release_not_requested_status "$repo" "$requested_pr"
+		return $?
+	fi
 	_full_loop_release_find_tag_for_pr "$repo" "$requested_pr" || return $?
 	tag_name="$_FULL_LOOP_RELEASE_FOUND_TAG"
 	if [[ "$receipt_status" == "$_FULL_LOOP_RELEASE_NOT_REQUESTED" ]]; then
-		[[ "$mode" == "$_FULL_LOOP_RELEASE_MODE_RECONCILE" ]] || {
-			printf 'Cannot reconcile terminal release:not-requested evidence for PR #%s\n' "$requested_pr" >&2
+		source_json=$(_full_loop_release_source_json_from_tag "$tag_name") || return 1
+		_full_loop_release_validate_explicit_reconciliation_intent \
+			"$repo" "$requested_pr" "$source_json" || {
+			printf 'Cannot reconcile release:not-requested without matching explicit publication intent for PR #%s\n' \
+				"$requested_pr" >&2
 			return 1
 		}
-		source_json=$(_full_loop_release_source_json_from_tag "$tag_name") || return 1
+		_full_loop_release_recover_existing_protected_pr_lane \
+			"$repo" "$requested_pr" "$tag_name" "$mode" || return $?
 		_full_loop_release_validate_published_reconciliation_intent \
 			"$repo" "$requested_pr" "$tag_name" "$source_json" || {
 			printf 'Cannot reconcile release:not-requested without matching explicit publication intent for PR #%s\n' \
@@ -1213,6 +1917,7 @@ _full_loop_release_existing_command() {
 		if [[ "$receipt_status" == "$_FULL_LOOP_RELEASE_SUPERSEDED" ]]; then
 			_full_loop_verify_superseded_release_receipt "$repo" "$requested_pr" || return 1
 			if [[ "$mode" == "$_FULL_LOOP_RELEASE_MODE_RECONCILE" ]]; then
+				_full_loop_release_record_stale_deployment "$repo" "$requested_pr" "$tag_name" || return 1
 				_full_loop_update_superseded_cleanup_receipt "$repo" "$requested_pr" || return 1
 			fi
 			printf 'release:superseded already recorded for PR #%s\n' "$requested_pr"
@@ -1222,18 +1927,11 @@ _full_loop_release_existing_command() {
 		[[ -z "$receipt_status" || "$receipt_status" == "$_FULL_LOOP_PHASE_FAILED" ]] || return 1
 		_full_loop_release_finalize_stale_supersession \
 			"$repo" "$requested_pr" "$tag_name" "$latest_tag" || return 1
+		_full_loop_release_record_stale_deployment "$repo" "$requested_pr" "$tag_name" || return 1
 		printf 'release:superseded source_tag=%s successor_tag=%s\n' "$tag_name" "$latest_tag"
 		return 0
 	fi
-	_version_manager_reconcile_protected_release_tag "$repo" "$tag_name" "$mode" || protected_tag_state_rc=$?
-	[[ "$protected_tag_state_rc" -eq 0 ]] || return 1
-	case "$_VERSION_MANAGER_PROTECTED_RELEASE_RESULT" in
-	pr-pending | tag-ready | tag-pushed)
-		return 8
-		;;
-	remote-tag-present) ;;
-	*) return 1 ;;
-	esac
+	_full_loop_release_reconcile_protected_state "$repo" "$requested_pr" "$tag_name" "$mode" || return $?
 	_full_loop_release_inspect_remote "$repo" "$tag_name" || inspect_rc=$?
 	if [[ "$inspect_rc" -eq 0 ]]; then
 		if [[ "$mode" == "$_FULL_LOOP_RELEASE_MODE_RECONCILE" ]]; then
@@ -1247,6 +1945,9 @@ _full_loop_release_existing_command() {
 				printf 'release:superseded already recorded for PR #%s\n' "$requested_pr"
 				;;
 			*)
+				if [[ -z "$receipt_status" ]] && _full_loop_release_local_adoption_required "$repo" "$requested_pr" "$tag_name"; then
+					return 10
+				fi
 				_full_loop_release_finalize_reconciliation "$repo" "$requested_pr" "$tag_name" || return 1
 				printf 'release:published tag=%s\n' "$tag_name"
 				;;
@@ -1254,14 +1955,6 @@ _full_loop_release_existing_command() {
 		fi
 		return 0
 	fi
-	case "$inspect_rc" in
-	8) return 8 ;;
-	1) return 1 ;;
-	3 | 4 | 5)
-		[[ "$mode" == "status" ]] && return "$inspect_rc"
-		_full_loop_release_dispatch_recovery "$repo" "$tag_name"
-		return $?
-		;;
-	*) return 1 ;;
-	esac
+	_full_loop_release_handle_inspect_rc "$mode" "$repo" "$tag_name" "$inspect_rc"
+	return $?
 }

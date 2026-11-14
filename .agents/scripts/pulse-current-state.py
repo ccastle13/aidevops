@@ -23,7 +23,7 @@ CYCLE_STATE_BLOCKER_KINDS = {
     'dispatch-no-work-rate', 'runner-health', 'merge-authority', 'review-gate',
     'review-bot-threads', 'required-review-threads', 'checks-active',
     'checks-failed', 'quiet-period', 'snapshot-unavailable', 'head-changed',
-    'interrupted',
+    'interrupted', 'rest-core-quota',
 }
 
 
@@ -149,6 +149,16 @@ def valid_cycle_state_contract(state):
     return valid_terminal_cycle_state(state, progress, blocker)
 
 
+def cycle_state_problem(state):
+    if not isinstance(state, dict):
+        return 'malformed', 'cycle-state-object'
+    if not valid_cycle_state_contract(state):
+        return 'malformed', 'cycle-state-contract'
+    if parse_time(state['heartbeat_at']) > now:
+        return 'unavailable', 'future-heartbeat'
+    return None
+
+
 def build_cycle_state(path):
     try:
         with open(path, encoding='utf-8') as handle:
@@ -162,13 +172,16 @@ def build_cycle_state(path):
     state = health.get('cycle_state')
     if state is None:
         return unavailable_cycle_state('unavailable')
-    if not isinstance(state, dict) or not valid_cycle_state_contract(state):
-        reason = 'cycle-state-object' if not isinstance(state, dict) else 'cycle-state-contract'
-        return unavailable_cycle_state('malformed', reason)
+    problem = cycle_state_problem(state)
+    if problem:
+        return unavailable_cycle_state(*problem)
     progress = state['progress']
     blocker = state['blocker']
+    heartbeat_age = now - parse_time(state['heartbeat_at'])
     return {
-        'availability': 'available',
+        'availability': 'available' if heartbeat_age <= window_s else 'stale',
+        'heartbeat_age_seconds': int(heartbeat_age),
+        'freshness_window_seconds': window_s,
         'schema': state['schema'],
         'cycle_id': state['cycle_id'],
         'phase': state['phase'],
@@ -200,7 +213,60 @@ def parse_stage(line):
         'repo': parts[2] if len(parts) > 2 else '',
         'stage': parts[3] if len(parts) > 3 else 'unknown',
         'duration_ms': int(parts[4]) if len(parts) > 4 and str(parts[4]).isdigit() else 0,
+        'event': parts[5] if len(parts) > 5 and parts[5] in {'start', 'complete'} else 'complete',
+        'attempt_id': parts[6] if len(parts) > 6 else '',
+        'cycle_id': parts[7] if len(parts) > 7 else '',
+        'owner_pid': int(parts[8]) if len(parts) > 8 and str(parts[8]).isdigit() else 0,
     }
+
+
+def process_owner_state(pid):
+    if not pid:
+        return 'unknown'
+    try:
+        os.kill(pid, 0)
+        return 'alive'
+    except ProcessLookupError:
+        return 'absent'
+    except (PermissionError, OSError):
+        return 'unknown'
+
+
+def build_stage_execution(stage_records, cycle_state):
+    completed_attempts = {
+        record['attempt_id'] for record in stage_records
+        if record['event'] == 'complete' and record['attempt_id']
+    }
+    executions = []
+    for record in stage_records:
+        if record['event'] != 'start' or not record['attempt_id']:
+            continue
+        if record['attempt_id'] in completed_attempts:
+            continue
+        owner_state = process_owner_state(record['owner_pid'])
+        cycle_supports_liveness = all((
+            cycle_state.get('availability') == 'available',
+            cycle_state.get('cycle_id') == record['cycle_id'],
+            cycle_state.get('outcome') == 'running',
+        ))
+        if owner_state == 'alive' and cycle_supports_liveness:
+            classification = 'in_flight'
+            next_action = 'recheck_owner_and_matching_completion_within_60s'
+        elif owner_state == 'absent':
+            classification = 'interrupted'
+            next_action = 'inspect_matching_cycle_terminal_evidence'
+        else:
+            classification = 'unknown'
+            next_action = 'verify_owner_process_or_cycle_lineage'
+        executions.append({
+            'issue': record['issue'],
+            'stage': record['stage'],
+            'classification': classification,
+            'age_seconds': max(0, int(now - record['ts'])),
+            'cycle_id': record['cycle_id'] or None,
+            'next_diagnostic_action': next_action,
+        })
+    return executions
 
 
 def classify_metric(item):
@@ -308,6 +374,8 @@ def build_pre_launch_blockers(counter_hits):
     breaker_counters = {
         'graphql_circuit_breaker': 'dispatch_graphql_circuit_blocked',
         'runner_health_circuit_breaker': 'pulse_dispatch_runner_health_breaker_tripped',
+        'dirty_worktree_evidence_unavailable':
+            'dispatch_candidate_blocked_dirty_worktree_evidence_unavailable',
     }
     for reason, counter_name in breaker_counters.items():
         count = counter_hits.get(counter_name, 0)
@@ -361,6 +429,138 @@ def graphql_deferred_stages(counter_hits):
     }
 
 
+def matching_counter_counts(counter_hits, prefix):
+    return {
+        key[len(prefix):]: count
+        for key, count in sorted(counter_hits.items())
+        if key.startswith(prefix)
+    }
+
+
+def latest_counter_time(counter_latest, names):
+    observed = [counter_latest.get(name, 0) for name in names]
+    latest = max(observed, default=0)
+    if not latest:
+        return None
+    return datetime.datetime.fromtimestamp(latest, datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def rest_admission_status_from_env():
+    try:
+        status = json.loads(os.environ.get('AIDEVOPS_REST_ADMISSION_STATUS', '{}'))
+    except (json.JSONDecodeError, TypeError):
+        status = {}
+    if not isinstance(status, dict):
+        status = {}
+    allowed = {
+        'state', 'source', 'scope_mode', 'bound_credentials', 'ambiguity',
+        'remaining', 'limit', 'reserved', 'floor', 'blocked_until', 'reset',
+        'observation_age_seconds',
+    }
+    projection = {key: value for key, value in status.items() if key in allowed}
+    if projection.get('state') not in {'available', 'cooldown', 'exhausted', 'unknown'}:
+        projection = {'state': 'unknown'}
+    return projection
+
+
+def is_rest_deferral_counter(name):
+    aggregate_names = {
+        'pulse_rest_core_budget_stage_deferred',
+        'pulse_rest_core_unit_blocked',
+        'pulse_rest_core_progress_blocked',
+    }
+    detail_prefixes = (
+        'pulse_rest_core_budget_stage_deferred_',
+        'pulse_rest_core_unit_blocked_',
+        'pulse_rest_core_progress_blocked_',
+    )
+    if name in aggregate_names:
+        return True
+    return name.startswith(detail_prefixes)
+
+
+def build_rest_admission(counter_hits, counter_latest, transport_status, stats_state):
+    deferred_stages = matching_counter_counts(counter_hits, 'pulse_rest_core_budget_stage_deferred_')
+    blocked_modes = matching_counter_counts(counter_hits, 'pulse_rest_core_progress_blocked_')
+    counter_names = [
+        name for name in counter_hits
+        if is_rest_deferral_counter(name)
+    ]
+    stage_count = counter_hits.get('pulse_rest_core_budget_stage_deferred', 0)
+    unit_count = counter_hits.get('pulse_rest_core_unit_blocked', 0)
+    progress_count = counter_hits.get('pulse_rest_core_progress_blocked', 0)
+    deferral_count = stage_count + unit_count + progress_count
+    transport_observed = transport_status.get('state') != 'unknown'
+    stats_available = stats_state['availability'] == 'available'
+    availability = 'observed' if deferral_count or transport_observed else 'unknown'
+    if not stats_available and not transport_observed:
+        availability = stats_state['availability']
+    evidence_state = 'read_incomplete' if deferral_count else 'unknown'
+    return {
+        'availability': availability,
+        'evidence_state': evidence_state,
+        'deferred_by': 'local_admission' if deferral_count else None,
+        'request_attempted': False if deferral_count else None,
+        'deferral_count': deferral_count if stats_available else None,
+        'stage_deferral_count': stage_count if stats_available else None,
+        'unit_block_count': unit_count if stats_available else None,
+        'progress_block_count': progress_count if stats_available else None,
+        'deferred_stages': deferred_stages,
+        'blocked_modes': blocked_modes,
+        'last_observed_at': latest_counter_time(counter_latest, counter_names),
+        'source': 'pulse-stats',
+        'transport': transport_status,
+        'window_seconds': window_s,
+        'remote_rejection_observed': False,
+        'authentication_failure_inferred': False,
+    }
+
+
+def build_policy_holds(counter_events, stats_state):
+    # Newer dispatchers record policy gates as benign blocks. Retain the former
+    # failure-named counter for mixed-version readers, deduplicating timestamps
+    # where both names describe the same observed policy hold.
+    return _build_counter_hold(counter_events, stats_state, (
+        'dispatch_candidate_blocked_policy_gate',
+        'dispatch_candidate_failed_reason_policy_gate',
+    ))
+
+
+def build_permission_holds(counter_events, stats_state):
+    # GH#33330: candidates held by a maintainer permission request (label or
+    # unverified request history). Diagnose one with pulse-diagnose-helper.sh issue.
+    return _build_counter_hold(counter_events, stats_state, (
+        'dispatch_candidate_blocked_needs_maintainer_permissions',
+        'dispatch_candidate_blocked_permission_grant_unverified',
+    ))
+
+
+def _build_counter_hold(counter_events, stats_state, counter_names):
+    observations = {
+        timestamp
+        for counter_name in counter_names
+        for timestamp in counter_events.get(counter_name, [])
+    }
+    if stats_state['availability'] != 'available':
+        return {
+            'availability': stats_state['availability'],
+            'active_in_window': None,
+            'count': None,
+            'last_observed_at': None,
+            'source': 'pulse-stats',
+            'window_seconds': window_s,
+        }
+    count = len(observations)
+    return {
+        'availability': 'observed' if count else 'not_observed',
+        'active_in_window': count > 0,
+        'count': count,
+        'last_observed_at': max(observations) if observations else None,
+        'source': 'pulse-stats',
+        'window_seconds': window_s,
+    }
+
+
 def graphql_related_gauges(gauge_values):
     return {
         key: value
@@ -400,6 +600,104 @@ def build_current_state_guardrails(counter_hits, pre_launch_blockers, gauge_valu
     }
 
 
+def blocker_category(reason):
+    value = str(reason or '').lower()
+    if any(token in value for token in ('github', 'graphql', 'rest_', 'snapshot', 'enumeration', 'lookup_unavailable')):
+        return 'github_read_incomplete'
+    if any(token in value for token in ('dependency', 'blocked_by', 'prerequisite')):
+        return 'dependency_state'
+    if any(token in value for token in ('assign', 'claim', 'owner', 'lease')):
+        return 'assignment_ownership'
+    if any(token in value for token in ('label', 'status', 'auto_dispatch', 'dispatchable', 'eligible')):
+        return 'queue_labels'
+    return 'admission_failure'
+
+
+def build_zero_worker_underutilization(active_workers, worker_terminal_events, cycle_state,
+                                       pre_launch_blockers, gauge_values):
+    threshold_raw = os.environ.get('AIDEVOPS_ZERO_WORKER_MIN_CYCLES', '3')
+    threshold = int(threshold_raw) if threshold_raw.isdigit() and int(threshold_raw) > 0 else 3
+    available = gauge_values.get('pulse_dispatch_guardrail_available_slots')
+    available = int(available) if isinstance(available, (int, float)) else None
+    no_progress = ((cycle_state.get('progress') or {}).get('consecutive_no_progress_cycles')
+                   if cycle_state.get('availability') == 'available' else 0)
+    no_progress = no_progress if isinstance(no_progress, int) else 0
+    categories = {name: 0 for name in (
+        'queue_labels', 'dependency_state', 'assignment_ownership',
+        'admission_failure', 'github_read_incomplete',
+    )}
+    for reason, count in pre_launch_blockers.items():
+        categories[blocker_category(reason)] += count
+    prolonged = no_progress >= threshold
+    free_capacity = available is not None and available > 0
+    zero_delivery = active_workers == 0 and worker_terminal_events == 0
+    github_read_complete = None
+    if categories['github_read_incomplete'] > 0 or rest_admission['evidence_state'] == 'read_incomplete':
+        github_read_complete = False
+    return {
+        'actionable': bool(free_capacity and zero_delivery and prolonged),
+        'available_slots': available,
+        'zero_delivery': zero_delivery,
+        'consecutive_no_progress_cycles': no_progress,
+        'minimum_cycles': threshold,
+        'classifications': categories,
+        'github_read_complete': github_read_complete,
+        'github_read_status': (
+            'incomplete' if github_read_complete is False else 'unknown'
+        ),
+    }
+
+
+def build_permission_evidence(path):
+    latest = {}
+    retained_records = 0
+    try:
+        for line in recent_lines(path, 2000):
+            try:
+                item = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if item.get('schema') != 'aidevops-worker-blocker/v1':
+                continue
+            retained_records += 1
+            key = (item.get('repo_slug'), item.get('issue_number'),
+                   item.get('session_key'), item.get('request_id'))
+            if float(item.get('ts') or 0) >= float(latest.get(key, {}).get('ts') or 0):
+                latest[key] = item
+    except OSError:
+        pass
+    current = [item for item in latest.values()
+               if item.get('blocking') is True and item.get('status') == 'blocked'
+               and item.get('event') in {'permission_awaiting_approval', 'permission_request_persistence_failed'}]
+    historical = [item for item in latest.values() if item not in current]
+    return {
+        'retained_records': retained_records,
+        'distinct_requests': len(latest),
+        'proven_current_blockers': len(current),
+        'historical_or_reconciled': len(historical),
+        'current_reason_counts': dict(Counter(str(item.get('reason') or 'unknown') for item in current)),
+    }
+
+
+def build_resource_recovery_evidence(lines, worker_metrics):
+    direct_reasons = Counter()
+    for line in lines:
+        if '[lifecycle] worker_killed ' not in line or ' reason=' not in line:
+            continue
+        reason = line.split(' reason=', 1)[1].split(' ', 1)[0]
+        direct_reasons[reason] += 1
+    for item in worker_metrics:
+        result = str(item.get('result') or '')
+        if result in {'watchdog_stall_killed', 'watchdog_stall_continue'}:
+            direct_reasons[result] += 1
+    return {
+        'direct_evidence_count': sum(direct_reasons.values()),
+        'reason_counts': dict(direct_reasons),
+        'unattributed_service_kills': 0,
+        'attribution_policy': 'process lifecycle and worker metric evidence only',
+    }
+
+
 stage_records = []
 for line in recent_lines(os.path.join(log_dir, 'dispatch-stages.tsv')):
     record = parse_stage(line)
@@ -415,22 +713,41 @@ for line in recent_lines(os.path.join(log_dir, 'headless-runtime-metrics.jsonl')
         metrics.append(item)
 
 counter_hits = {}
+counter_latest = {}
+counter_events = {}
 gauge_values = {}
 stats_path = os.path.join(log_dir, 'pulse-stats.json')
+stats_state = {'availability': 'unavailable', 'reason': 'missing'}
 if os.path.exists(stats_path):
     try:
         with open(stats_path, encoding='utf-8') as stats_file:
             stats = json.load(stats_file)
+        if not isinstance(stats, dict) or not isinstance(stats.get('counters'), dict):
+            raise TypeError('pulse stats schema')
+        if not isinstance(stats.get('gauges', {}), dict) or not isinstance(stats.get('invocation_sources', {}), dict):
+            raise TypeError('pulse stats schema')
+        stats_state = {'availability': 'available', 'reason': None}
         for key, values in (stats.get('counters') or {}).items():
             if isinstance(values, list):
                 hits = [v for v in values if isinstance(v, (int, float)) and v >= since]
                 if hits:
                     counter_hits[key] = len(hits)
+                    counter_latest[key] = max(hits)
+                    counter_events[key] = hits
         for key, item in (stats.get('gauges') or {}).items():
             if isinstance(item, dict) and float(item.get('ts', 0)) >= since:
                 gauge_values[key] = item.get('value')
-    except (OSError, json.JSONDecodeError):
+    except (json.JSONDecodeError, TypeError, ValueError, OverflowError):
+        stats_state = {'availability': 'malformed', 'reason': 'invalid-json-or-schema'}
         counter_hits = {}
+        counter_latest = {}
+        counter_events = {}
+        gauge_values = {}
+    except OSError:
+        stats_state = {'availability': 'unavailable', 'reason': 'read-error'}
+        counter_hits = {}
+        counter_latest = {}
+        counter_events = {}
         gauge_values = {}
 
 wrapper_log_lines = recent_lines(os.path.join(log_dir, 'pulse-wrapper.log'), 400)
@@ -458,10 +775,27 @@ if canonical_reconciliation_refusal_count:
         else 'upstream_or_default_branch_mismatch'
     )
 
-metric_class_counts = Counter(classify_metric(item) for item in metrics)
-stage_counts = Counter(record['stage'] for record in stage_records)
-stage_timing = defaultdict(lambda: {'count': 0, 'sum_ms': 0, 'max_ms': 0})
+# The runtime ledger also contains triage, research and supervisor events.
+# Keep their resource context, but never credit them as implementation workers.
+worker_metrics = [item for item in metrics if item.get('role') == 'worker']
+metric_class_counts = Counter(classify_metric(item) for item in worker_metrics)
+successful_handoffs = sum(
+    1 for item in worker_metrics
+    if classify_metric(item) == 'post_pr_handoff' and item.get('exit_code') == 0
+)
+completed_stage_records = []
+completed_attempt_ids = set()
 for record in stage_records:
+    if record['event'] != 'complete':
+        continue
+    if record['attempt_id'] and record['attempt_id'] in completed_attempt_ids:
+        continue
+    completed_stage_records.append(record)
+    if record['attempt_id']:
+        completed_attempt_ids.add(record['attempt_id'])
+stage_counts = Counter(record['stage'] for record in completed_stage_records)
+stage_timing = defaultdict(lambda: {'count': 0, 'sum_ms': 0, 'max_ms': 0})
+for record in completed_stage_records:
     item = stage_timing[record['stage']]
     item['count'] += 1
     item['sum_ms'] += record['duration_ms']
@@ -492,6 +826,11 @@ pr_opened_count, pr_opened_examples = line_count(['pr opened', 'opened pr', 'pul
 pr_merged_count, pr_merged_examples = line_count(['pr merged', 'merged pr', 'squash merged'], wrapper_activity)
 issue_closed_count, issue_closed_examples = line_count(['issue closed', 'closed issue', 'status:done'], wrapper_activity)
 graphql_budget = build_graphql_budget(counter_hits, gauge_values)
+rest_admission = build_rest_admission(
+    counter_hits, counter_latest, rest_admission_status_from_env(), stats_state
+)
+policy_holds = build_policy_holds(counter_events, stats_state)
+permission_holds = build_permission_holds(counter_events, stats_state)
 dispatch_pacing = {
     'inter_launch_staggered_count': counter_hits.get('dispatch_inter_launch_staggered', 0),
     'last_inter_launch_delay_seconds': gauge_values.get('dispatch_inter_launch_delay_seconds'),
@@ -576,6 +915,7 @@ prefetch_cache = {
 }
 health_path = os.path.join(log_dir, 'pulse-health.json')
 cycle_state = build_cycle_state(health_path)
+stage_executions = build_stage_execution(stage_records, cycle_state)
 if os.path.exists(health_path):
     try:
         with open(health_path, encoding='utf-8') as health_file:
@@ -617,16 +957,26 @@ if os.path.isdir(review_thread_state_dir):
 objective_reconciliation = build_objective_reconciliation(
     os.environ.get('AIDEVOPS_OBJECTIVE_STATE_FILE', '')
 )
+zero_worker_underutilization = build_zero_worker_underutilization(
+    active_worker_processes, len(worker_metrics), cycle_state, pre_launch_blockers, gauge_values
+)
+permission_evidence = build_permission_evidence(
+    os.environ.get('AIDEVOPS_WORKER_BLOCKER_LOG_FILE', os.path.join(log_dir, 'worker-progress-blockers.jsonl'))
+)
+resource_recovery = build_resource_recovery_evidence(wrapper_log_lines, worker_metrics)
 
 result = {
     'window_seconds': window_s,
-    'dispatch_stage_events': len(stage_records),
+    'dispatch_stage_events': len(completed_stage_records),
     'dispatch_stage_counts': dict(stage_counts),
     'dispatch_stage_timing_ms': stage_timing_summary,
-    'worker_terminal_events': len(metrics),
+    'dispatch_stage_executions': stage_executions,
+    'worker_terminal_events': len(worker_metrics),
+    'non_worker_terminal_events': len(metrics) - len(worker_metrics),
     'worker_result_counts': dict(metric_class_counts),
     'worker_successes': metric_class_counts.get('success', 0),
-    'worker_failures_or_stalls': sum(count for key, count in metric_class_counts.items() if key != 'success'),
+    'worker_failures_or_stalls': sum(count for key, count in metric_class_counts.items() if key != 'success') - successful_handoffs,
+    'worker_post_pr_handoffs': successful_handoffs,
     'worker_outcomes': {
         'spawned': worker_spawn_count,
         'canary_failed': canary_fail_count,
@@ -649,12 +999,16 @@ result = {
         'load_blocked_count': load_blocked_count,
     },
     'graphql_budget': graphql_budget,
+    'rest_admission': rest_admission,
+    'policy_holds': policy_holds,
+    'permission_holds': permission_holds,
     'dispatch_pacing': dispatch_pacing,
     'current_state_guardrails': current_state_guardrails,
     'pre_launch_blockers': pre_launch_blockers,
     'top_pre_launch_blockers': top_pre_launch_blockers[:5],
     'pulse_counter_hits': counter_hits,
     'pulse_gauges': gauge_values,
+    'pulse_stats': stats_state,
     'canonical_reconciliation': {
         'refusal_count': canonical_reconciliation_refusal_count,
         'classification': canonical_reconciliation_classification,
@@ -672,6 +1026,9 @@ result = {
     'cycle_state': cycle_state,
     'review_thread_attention': review_thread_attention,
     'objective_reconciliation': objective_reconciliation,
+    'zero_worker_underutilization': zero_worker_underutilization,
+    'permission_evidence': permission_evidence,
+    'resource_recovery': resource_recovery,
 }
 
 runtime_state = {
@@ -691,14 +1048,20 @@ runtime_state = {
     'dispatch_pacing': dispatch_pacing,
     'dispatch_stage_counts': dict(stage_counts),
     'graphql_budget': graphql_budget,
+    'rest_admission': rest_admission,
+    'policy_holds': policy_holds,
     'prefetch_cache': prefetch_cache,
     'cycle_state': cycle_state,
     'pre_launch_blockers': pre_launch_blockers,
     'pulse_counter_hits': counter_hits,
     'pulse_gauges': gauge_values,
+    'pulse_stats': stats_state,
     'resource_context': result['resource_context'],
     'review_thread_attention_count': len(review_thread_attention),
     'objective_reconciliation': objective_reconciliation,
+    'zero_worker_underutilization': zero_worker_underutilization,
+    'permission_evidence': permission_evidence,
+    'resource_recovery': resource_recovery,
     'window_seconds': window_s,
     'worker_outcomes': result['worker_outcomes'],
     'worker_result_counts': dict(metric_class_counts),
@@ -720,14 +1083,19 @@ else:
     print(f'- Dispatch alive: {str(result["dispatch_alive"]).lower()}')
     print(f'- Dispatch stage events: {result["dispatch_stage_events"]}')
     print(f'- Dispatch stage counts: {json.dumps(result["dispatch_stage_counts"], sort_keys=True)}')
-    print(f'- Worker terminal events: {result["worker_terminal_events"]} ({result["worker_successes"]} success, {result["worker_failures_or_stalls"]} non-success)')
+    print(f'- Dispatch stages in progress or interrupted: {json.dumps(result["dispatch_stage_executions"], sort_keys=True)}')
+    print(f'- Worker terminal events: {result["worker_terminal_events"]} ({result["worker_successes"]} success, {result["worker_post_pr_handoffs"]} PR handoff, {result["worker_failures_or_stalls"]} failures or stalls)')
     print(f'- Worker outcomes: {json.dumps(result["worker_outcomes"], sort_keys=True)}')
     print(f'- Resource context: {json.dumps(result["resource_context"], sort_keys=True)}')
     print(f'- GraphQL budget: {json.dumps(result["graphql_budget"], sort_keys=True)}')
+    print(f'- REST admission: {json.dumps(rest_admission, sort_keys=True)}')
+    print(f'- Policy holds: {json.dumps(policy_holds, sort_keys=True)}')
+    print(f'- Maintainer permission holds: {json.dumps(permission_holds, sort_keys=True)}')
     print(f'- Dispatch pacing: {json.dumps(result["dispatch_pacing"], sort_keys=True)}')
     print(f'- Current-state guardrails: {json.dumps(result["current_state_guardrails"], sort_keys=True)}')
     print(f'- Top pre-launch blockers: {json.dumps(result["top_pre_launch_blockers"], sort_keys=True)}')
     print(f'- Pulse counter hits: {json.dumps(counter_hits, sort_keys=True)}')
+    print(f'- Pulse stats: {json.dumps(stats_state, sort_keys=True)}')
     print(f'- GraphQL budget: {graphql_budget_status}')
     print(f'- Prefetch cache: {json.dumps(prefetch_cache, sort_keys=True)}')
     print(f'- Cycle state: {json.dumps(cycle_state, sort_keys=True)}')
@@ -739,6 +1107,9 @@ else:
     print(f'- Review-thread maintainer attention: {json.dumps(review_thread_attention, sort_keys=True)}')
     print(f'- Objectives without next action: {objective_reconciliation["objectives_without_next_action"]}')
     print(f'- Oldest unverified assumption: {json.dumps(objective_reconciliation["oldest_unverified_assumption"], sort_keys=True)}')
+    print(f'- Zero-worker under-utilization: {json.dumps(zero_worker_underutilization, sort_keys=True)}')
+    print(f'- Permission evidence: {json.dumps(permission_evidence, sort_keys=True)}')
+    print(f'- Resource recovery evidence: {json.dumps(resource_recovery, sort_keys=True)}')
     print(f'- Worker worktrees: {result["worker_worktrees"]}')
     if wrapper_activity:
         print('- Recent wrapper activity:')

@@ -178,6 +178,33 @@ else
 fi
 
 # =============================================================================
+# Test 5b (GH#36978): footer carries the single origin marker
+# =============================================================================
+echo ""
+echo "Test 5b: body-file with a standalone origin marker keeps one marker"
+stub_sig_backup="$TMP/gh-signature-helper.sh.bak"
+cp "$TMP/scripts/gh-signature-helper.sh" "$stub_sig_backup"
+cat >"$TMP/scripts/gh-signature-helper.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '\n<!-- aidevops:origin:interactive -->\n<!-- aidevops:sig -->\n---\nstub footer\n'
+EOF
+chmod +x "$TMP/scripts/gh-signature-helper.sh"
+origin_file="$TMP/origin-marker.md"
+printf 'body text\n\n<!-- aidevops:origin:interactive -->\n' >"$origin_file"
+_reset_log
+"$SHIM_RUN" issue comment 791 --repo owner/repo --body-file "$origin_file" 2>/dev/null
+argv=$(_read_argv)
+resolved_body_file=$(printf '%s\n' "$argv" | awk 'prev { print; exit } $0 == "--body-file" { prev=1 }')
+origin_count=$(grep -Fxc '<!-- aidevops:origin:interactive -->' "$resolved_body_file" 2>/dev/null || true)
+if [[ "$origin_count" == "1" ]] && grep -q "body text" "$resolved_body_file"; then
+	_pass "origin marker appears exactly once after shim signing"
+else
+	_fail "origin marker deduplication" "count=$origin_count argv: $argv"
+fi
+cp "$stub_sig_backup" "$TMP/scripts/gh-signature-helper.sh"
+chmod +x "$TMP/scripts/gh-signature-helper.sh"
+
+# =============================================================================
 # Test 5a: managed ephemeral body is unlinked before native transport
 # =============================================================================
 echo ""
@@ -268,6 +295,74 @@ if [[ "$argv" == *$'--label\norigin:interactive'* ]]; then
 	_pass "interactive raw pr create gets one origin label"
 else
 	_fail "interactive raw pr create origin normalization" "argv: $argv"
+fi
+
+_reset_log
+pr_partial_url="https://github.com/owner/repo/pull/31503"
+pr_partial_output=""
+pr_partial_rc=0
+pr_partial_output=$(STUB_GH_PERMISSION=read STUB_PR_CREATE_EXIT_CODE=1 \
+	STUB_PR_CREATE_STDOUT="$pr_partial_url" \
+	STUB_PR_CREATE_STDERR='pull request update failed: GraphQL: permission denied (updatePullRequest)' \
+	"$SHIM_RUN" pr create --repo owner/repo --head contributor:feature/raw-partial \
+	--title "partial" --body "For #31509" 2>"$TMP/pr-create-partial.err") || pr_partial_rc=$?
+argv=$(_read_argv)
+pr_partial_create_calls=$(grep -c $'^pr\tcreate$' "$STUB_GH_CALL_LOG" || true)
+if [[ "$pr_partial_rc" -eq 78 && "$pr_partial_output" == "$pr_partial_url" ]] &&
+	[[ "$argv" != *"origin:interactive"* && "$pr_partial_create_calls" -eq 1 ]] &&
+	grep -q '\[aidevops\]\[gh-shim\]\[PARTIAL\].*not retrying creation' "$TMP/pr-create-partial.err"; then
+	_pass "external raw pr create preserves durable URL and reports stable partial success"
+else
+	_fail "external raw pr create partial-success recovery" \
+		"rc=${pr_partial_rc} output=${pr_partial_output} argv=${argv} err=$(cat "$TMP/pr-create-partial.err")"
+fi
+
+_reset_log
+pr_recovered_url="https://github.com/owner/repo/pull/31509"
+pr_recovered_output=""
+pr_recovered_rc=0
+pr_recovery_fixture="$TMP/pr-recovery.json"
+printf '%s\n' '[{"number":31509,"state":"open","html_url":"https://github.com/owner/repo/pull/31509","head":{"label":"contributor:feature/recover"},"base":{"repo":{"full_name":"owner/repo"}}}]' \
+	>"$pr_recovery_fixture"
+export STUB_REST_PULLS_FILE="$pr_recovery_fixture"
+pr_recovered_output=$(STUB_GH_PERMISSION=read STUB_PR_CREATE_EXIT_CODE=1 \
+	STUB_PR_CREATE_STDERR='pull request update failed' \
+	"$SHIM_RUN" pr create --repo owner/repo --head contributor:feature/recover \
+	--title "recover" --body "For #31509" 2>"$TMP/pr-create-recover.err") || pr_recovered_rc=$?
+if [[ "$pr_recovered_rc" -eq 78 && "$pr_recovered_output" == "$pr_recovered_url" ]] &&
+	grep -Fq 'head=contributor:feature/recover' "$STUB_GH_LOG"; then
+	_pass "raw pr create recovers one exact upstream and qualified-head identity"
+else
+	_fail "raw pr create exact identity recovery" \
+		"rc=${pr_recovered_rc} output=${pr_recovered_output} calls=$(cat "$STUB_GH_CALL_LOG")"
+fi
+
+_reset_log
+printf '%s\n' '[{"number":31510,"state":"open","html_url":"https://github.com/owner/repo/pull/31510","head":{"label":"other:feature/recover"},"base":{"repo":{"full_name":"owner/repo"}}}]' \
+	>"$pr_recovery_fixture"
+export STUB_REST_PULLS_FILE="$pr_recovery_fixture"
+pr_wrong_head_rc=0
+STUB_GH_PERMISSION_FAIL=1 STUB_PR_CREATE_EXIT_CODE=41 \
+	"$SHIM_RUN" pr create --repo owner/repo --head contributor:feature/recover \
+	--title "wrong head" --body "For #31509" >/dev/null 2>"$TMP/pr-create-wrong-head.err" || pr_wrong_head_rc=$?
+if [[ "$pr_wrong_head_rc" -eq 41 ]] &&
+	! grep -q '\[aidevops\]\[gh-shim\]\[PARTIAL\]' "$TMP/pr-create-wrong-head.err"; then
+	_pass "raw pr create rejects wrong-fork identity and unavailable authority"
+else
+	_fail "raw pr create wrong-fork recovery guard" "rc=${pr_wrong_head_rc} err=$(cat "$TMP/pr-create-wrong-head.err")"
+fi
+
+_reset_log
+pr_lookup_failure_rc=0
+STUB_GH_PERMISSION=read STUB_PR_CREATE_EXIT_CODE=42 STUB_REST_READ_FAIL=1 \
+	"$SHIM_RUN" pr create --repo owner/repo --head contributor:feature/recover \
+	--title "lookup failure" --body "For #31509" >/dev/null 2>"$TMP/pr-create-lookup-failure.err" || pr_lookup_failure_rc=$?
+if [[ "$pr_lookup_failure_rc" -eq 42 ]] &&
+	! grep -q '\[aidevops\]\[gh-shim\]\[PARTIAL\]' "$TMP/pr-create-lookup-failure.err"; then
+	_pass "raw pr create preserves failure when durable identity lookup is unavailable"
+else
+	_fail "raw pr create unavailable identity guard" \
+		"rc=${pr_lookup_failure_rc} err=$(cat "$TMP/pr-create-lookup-failure.err")"
 fi
 
 _reset_log
@@ -427,6 +522,11 @@ elif [[ ! -s "$STUB_GH_LOG" ]]; then
 else
 	_fail "universal linked issue policy" "native call unexpectedly reached transport"
 fi
+if grep -qF 'sync-workflows' "$TMP/pr-linked-universal.err"; then
+	_fail "explicit scope diagnostic unchanged" "legacy remedy unexpectedly printed"
+else
+	_pass "explicit scope diagnostic unchanged"
+fi
 
 printf '%s\n' '<!-- aidevops:issue-first-pr:start -->' \
 	'Issue-first; include For #NNN.' \
@@ -440,6 +540,25 @@ elif [[ ! -s "$STUB_GH_LOG" ]] && grep -q 'scope is universal' "$TMP/pr-linked-a
 	_pass "ambiguous policy fails closed as universal"
 else
 	_fail "ambiguous linked issue policy" "native call or diagnostic mismatch"
+fi
+if grep -qF 'predates the scope marker' "$TMP/pr-linked-ambiguous.err" &&
+	grep -qF 'aidevops sync-workflows --workflow linked-issue-check --apply --repo example/policy-repo --issue <N>' "$TMP/pr-linked-ambiguous.err"; then
+	_pass "legacy managed block provides conditional policy refresh remedy"
+else
+	_fail "legacy managed block remedy" "missing reason or refresh command"
+fi
+
+printf '%s\n' 'Issue-first; include For #NNN.' >"$policy_repo/CONTRIBUTING.md"
+_reset_log
+if (cd "$policy_repo" && env STUB_GH_PERMISSION=write "$SHIM_RUN" pr create \
+	--repo example/policy-repo --title "plan: unmanaged prose" --body "Planning publication" \
+	2>"$TMP/pr-linked-prose.err"); then
+	_fail "unmanaged prose policy" "verified write actor unexpectedly passed"
+elif [[ ! -s "$STUB_GH_LOG" ]] && grep -q 'scope is universal' "$TMP/pr-linked-prose.err" &&
+	! grep -qF 'sync-workflows' "$TMP/pr-linked-prose.err"; then
+	_pass "unmanaged prose remains universal without legacy remedy"
+else
+	_fail "unmanaged prose policy" "native call or diagnostic mismatch"
 fi
 
 printf '%s\n' '<!-- aidevops:issue-first-pr:start -->' \
@@ -456,6 +575,11 @@ elif [[ ! -s "$STUB_GH_LOG" ]] && grep -q 'scope is universal' "$TMP/pr-linked-m
 	_pass "malformed structured scope overrides exemption and fails closed"
 else
 	_fail "malformed linked issue scope" "native call or diagnostic mismatch"
+fi
+if grep -qF 'sync-workflows' "$TMP/pr-linked-malformed.err"; then
+	_fail "malformed scope diagnostic unchanged" "legacy remedy unexpectedly printed"
+else
+	_pass "malformed scope diagnostic unchanged"
 fi
 
 _reset_log

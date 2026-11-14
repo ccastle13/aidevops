@@ -4,7 +4,7 @@
 #
 # test-install-hooks-validator-preflight.sh — t2226 regression test.
 #
-# Validates the pre-install validator dry-run gate in install-hooks-helper.sh:
+# Validates the pre-install gates in install-hooks-helper.sh:
 #   1. _dry_run_validators function exists.
 #   2. Happy path: validators pass → install proceeds (function returns 0).
 #   3. Failure path: a broken validator → install aborts (function returns 1).
@@ -12,8 +12,8 @@
 #   5. install_hook accepts --force-install flag.
 #   6. Validator enumeration finds validate_* functions from pre-commit-hook.sh.
 #
-# These tests validate the preflight logic without running actual install
-# (no .git/hooks writes, no settings.json modifications).
+# Full-install tests avoid real installation. The scoped CLI cases install only
+# into disposable repositories with an isolated HOME, never the user's hooks.
 
 set -uo pipefail
 
@@ -194,6 +194,346 @@ test_help_text() {
 	return 0
 }
 
+_run_runtime_dependency_test() {
+	local mode="$1"
+	local test_tmpdir
+	test_tmpdir=$(mktemp -d)
+	local test_home="$test_tmpdir/home"
+	mkdir -p "$test_home/.aidevops/agents/scripts"
+
+	if [[ "$mode" != "missing" ]]; then
+		cat >"$test_home/.aidevops/agents/scripts/command-policy-helper.py" <<'PYEOF'
+#!/usr/bin/env python3
+raise SystemExit(0)
+PYEOF
+		cat >"$test_home/.aidevops/agents/scripts/canonical-write-policy-helper.py" <<'PYEOF'
+#!/usr/bin/env python3
+raise SystemExit(0)
+PYEOF
+		cat >"$test_home/.aidevops/agents/scripts/worker-lifecycle-session-helper.py" <<'PYEOF'
+import argparse
+import json
+import os
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+for name in ("cwd", "path", "runtime-pid", "session-id", "command"):
+    parser.add_argument("--" + name, required=True)
+args = parser.parse_args()
+assert Path(args.cwd).resolve() == Path.cwd()
+assert not (Path(args.cwd) / ".git").exists()
+assert os.environ["AIDEVOPS_LIFECYCLE_DISABLED"] == "1"
+assert os.environ["AIDEVOPS_LIFECYCLE_STATE_DIR"] == args.cwd + "/state"
+assert args.path == args.cwd + "/probe"
+assert int(args.runtime_pid) > 0
+assert args.session_id == "hook-install-preflight" and args.command == "true"
+print(json.dumps({"status": "not-applicable", "cleanup_authorized": False}))
+PYEOF
+		case "$mode" in
+		help-only)
+			printf 'import sys\nsys.exit(0 if "--help" in sys.argv else 75)\n' \
+				>"$test_tmpdir/override.py"
+			;;
+		invalid-response)
+			printf 'print("{}")\n' >"$test_tmpdir/override.py"
+			;;
+		denied)
+			printf 'print(\x27{"status":"denied","cleanup_authorized":false}\x27)\n' \
+				>"$test_tmpdir/override.py"
+			;;
+		esac
+	fi
+
+	cat >"$test_tmpdir/harness.sh" <<HARNESS_EOF
+#!/usr/bin/env bash
+set -uo pipefail
+SCRIPT_DIR="$TEST_SCRIPTS_DIR"
+source "\${SCRIPT_DIR}/shared-constants.sh"
+eval "\$(sed '/^set -euo pipefail\$/d; /^# Main\$/,\$ d' "$TEST_SCRIPTS_DIR/install-hooks-helper.sh")"
+_check_runtime_policy_dependencies
+HARNESS_EOF
+
+	local rc=0
+	local output=""
+	local helper="$test_home/.aidevops/agents/scripts/worker-lifecycle-session-helper.py"
+	[[ ! -f "$test_tmpdir/override.py" ]] || helper="$test_tmpdir/override.py"
+	output=$(HOME="$test_home" AIDEVOPS_LIFECYCLE_SESSION_HELPER="$helper" \
+		bash "$test_tmpdir/harness.sh" 2>&1) || rc=$?
+	rm -rf "$test_tmpdir"
+	if [[ "$rc" -ne 0 && "$mode" == "healthy" ]]; then
+		printf '%s\n' "$output" >&2
+	fi
+	return "$rc"
+}
+
+test_runtime_dependency_preflight() {
+	local rc=0
+	_run_runtime_dependency_test "missing" || rc=$?
+	if [[ "$rc" -ne 0 ]]; then
+		print_result "missing deployed policy graph blocks hook installation" 0
+	else
+		print_result "missing deployed policy graph blocks hook installation" 1 "expected non-zero exit"
+	fi
+
+	rc=0
+	_run_runtime_dependency_test "healthy" || rc=$?
+	if [[ "$rc" -eq 0 ]]; then
+		print_result "healthy deployed policy graph passes hook preflight" 0
+	else
+		print_result "healthy deployed policy graph passes hook preflight" 1 "exit=$rc"
+	fi
+	local mode=""
+	for mode in help-only invalid-response denied; do
+		rc=0
+		_run_runtime_dependency_test "$mode" || rc=$?
+		if [[ "$rc" -ne 0 ]]; then
+			print_result "$mode lifecycle override blocks hook preflight" 0
+		else
+			print_result "$mode lifecycle override blocks hook preflight" 1 "expected non-zero exit"
+		fi
+	done
+	return 0
+}
+
+test_installed_hook_probe() {
+	local test_tmpdir
+	test_tmpdir=$(mktemp -d)
+	local test_home="$test_tmpdir/home"
+	local installed_hook="$test_home/.aidevops/hooks/git_safety_guard.py"
+	mkdir -p "$(dirname "$installed_hook")"
+	cp "$TEST_SCRIPTS_DIR/../hooks/git_safety_guard.py" "$installed_hook"
+	cp "$TEST_SCRIPTS_DIR/../hooks/git_safety_lifecycle.py" "$(dirname "$installed_hook")/git_safety_lifecycle.py"
+	chmod +x "$installed_hook"
+	cat >"$test_tmpdir/harness.sh" <<HARNESS_EOF
+#!/usr/bin/env bash
+set -uo pipefail
+SCRIPT_DIR="$TEST_SCRIPTS_DIR"
+source "\${SCRIPT_DIR}/shared-constants.sh"
+eval "\$(sed '/^set -euo pipefail\$/d; /^# Main\$/,\$ d' "$TEST_SCRIPTS_DIR/install-hooks-helper.sh")"
+_probe_hook_runtime "$installed_hook"
+HARNESS_EOF
+
+	local missing_rc=0
+	local output=""
+	output=$(HOME="$test_home" bash "$test_tmpdir/harness.sh" 2>&1) || missing_rc=$?
+	if [[ "$missing_rc" -ne 0 ]]; then
+		print_result "installed hook probe detects policy.helper-unavailable" 0
+	else
+		print_result "installed hook probe detects policy.helper-unavailable" 1 "expected non-zero exit"
+	fi
+
+	ln -s "$TEST_SCRIPTS_DIR/.." "$test_home/.aidevops/agents"
+	local healthy_rc=0
+	output=$(HOME="$test_home" bash "$test_tmpdir/harness.sh" 2>&1) || healthy_rc=$?
+	if [[ "$healthy_rc" -eq 0 ]]; then
+		print_result "installed hook probe accepts complete deployed policy graph" 0
+	else
+		print_result "installed hook probe accepts complete deployed policy graph" 1 "exit=$healthy_rc output=$output"
+	fi
+
+	rm -rf "$test_tmpdir"
+	return 0
+}
+
+_prepare_pre_commit_fixture() {
+	local fixture="$1"
+	mkdir -p "$fixture/home/.aidevops/agents/scripts" "$fixture/home/.aidevops/hooks" \
+		"$fixture/home/.claude" "$fixture/scripts" "$fixture/repo" || return 1
+	cp "$TEST_SCRIPTS_DIR/install-hooks-helper.sh" "$TEST_SCRIPTS_DIR/git-hooks-path-lib.sh" "$fixture/scripts/" || return 1
+	# Load the real constants with their complete sibling dependency graph.
+	printf 'source %q\n' "$TEST_SCRIPTS_DIR/shared-constants.sh" >"$fixture/scripts/shared-constants.sh"
+	printf '%s\n' 'user settings sentinel' >"$fixture/home/.claude/settings.json"
+	printf '%s\n' 'user hook sentinel' >"$fixture/home/.aidevops/hooks/existing"
+	cat >"$fixture/home/.aidevops/agents/scripts/pre-commit-hook.sh" <<'HOOK'
+#!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/probe-dependency.sh"
+validate_probe() {
+	return "$PROBE_RESULT"
+}
+main() {
+	validate_probe || return 1
+	return "${RUNTIME_RESULT:-0}"
+}
+main "$@"
+HOOK
+	printf '%s\n' 'PROBE_RESULT=0' >"$fixture/home/.aidevops/agents/scripts/probe-dependency.sh"
+	chmod +x "$fixture/home/.aidevops/agents/scripts/pre-commit-hook.sh"
+	# A different adjacent checkout must not be mistaken for the runtime hook.
+	printf '%s\n' 'validate_wrong_checkout() { return 1; }' >"$fixture/scripts/pre-commit-hook.sh"
+	git -C "$fixture/repo" init -q || return 1
+	printf '%s\n' 'fixture' >"$fixture/repo/README.md"
+	git -C "$fixture/repo" add README.md || return 1
+	git -C "$fixture/repo" -c user.name=Fixture -c user.email=fixture@example.invalid \
+		-c commit.gpgSign=false commit -qm fixture || return 1
+	printf '%s\n' '#!/bin/sh' 'exit 0' >"$fixture/repo/.git/hooks/pre-push"
+	cp "$fixture/repo/.git/hooks/pre-push" "$fixture/pre-push-before"
+	return 0
+}
+
+test_pre_commit_only_case() {
+	local mode="$1"
+	local fixture
+	fixture=$(mktemp -d) || return 1
+	# Isolate Git configuration and every potential user-level installation target.
+	local HOME="$fixture/home" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+	export HOME GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL
+	if ! _prepare_pre_commit_fixture "$fixture"; then
+		print_result "scoped CLI fixture: $mode" 1
+		rm -rf "$fixture"
+		return 0
+	fi
+	local cwd="$fixture/repo" hook="$fixture/repo/.git/hooks/pre-commit"
+	local runtime_dir="$HOME/.aidevops/agents/scripts"
+	local expected=0 reason="" args=(install-pre-commit)
+	case "$mode" in
+	linked)
+		git -C "$cwd" worktree add -qb fixture-linked "$fixture/linked" || return 1
+		cwd="$fixture/linked"
+		;;
+	existing | managed)
+		printf '%s\n' '#!/bin/sh' 'exit 7' >"$hook"
+		if [[ "$mode" == "managed" ]]; then
+			printf '%s\n' '# aidevops-pre-commit-hook' '# preserve appended custom checks' >>"$hook"
+		else
+			expected=1
+			reason="Existing pre-commit hook requires manual review"
+		fi
+		chmod +x "$hook"
+		cp "$hook" "$fixture/pre-commit-before"
+		;;
+	symlink)
+		ln -s "$fixture/nonexistent" "$hook"
+		expected=1
+		reason="symlinked pre-commit"
+		;;
+	hooks-path)
+		git -C "$cwd" config core.hooksPath "$fixture/custom-hooks"
+		expected=1
+		reason="core.hooksPath is configured"
+		;;
+	missing-runtime)
+		rm "$runtime_dir/pre-commit-hook.sh"
+		expected=1
+		reason="No executable repository or deployed pre-commit validator"
+		;;
+	bad-validator)
+		printf '%s\n' 'PROBE_RESULT=1' >"$runtime_dir/probe-dependency.sh"
+		expected=1
+		reason="Validator preflight failed"
+		;;
+	bad-runtime)
+		printf '%s\n' 'RUNTIME_RESULT=1' >>"$runtime_dir/probe-dependency.sh"
+		expected=1
+		reason="Pre-commit runtime check failed"
+		;;
+	local-runtime)
+		mkdir -p "$cwd/.agents/scripts"
+		cp "$runtime_dir/"*.sh "$cwd/.agents/scripts/"
+		printf '%s\n' 'PROBE_RESULT=1' >"$runtime_dir/probe-dependency.sh"
+		;;
+	outside)
+		cwd="$fixture"
+		expected=1
+		reason="requires a Git working tree"
+		;;
+	bare)
+		git init -q --bare "$fixture/bare" || return 1
+		cwd="$fixture/bare"
+		expected=1
+		reason="requires a Git working tree"
+		;;
+	force | unknown)
+		args+=("--$mode-install")
+		expected=1
+		reason="accepts no options"
+		;;
+	happy) ;;
+	*) return 1 ;;
+	esac
+	cp -R "$HOME" "$fixture/home-before"
+	local rc=0 output="" result=0
+	output=$(cd "$cwd" && bash "$fixture/scripts/install-hooks-helper.sh" "${args[@]}" 2>&1) || rc=$?
+	_check_pre_commit_only_result "$mode" "$fixture" "$cwd" "$expected" "$reason" "$output" "$rc" || result=$?
+	print_result "install-pre-commit: $mode; preserves pre-push and user settings" "$result" "$output"
+	rm -rf "$fixture"
+	return 0
+}
+
+_check_pre_commit_only_result() {
+	local mode="$1" fixture="$2" cwd="$3" expected="$4" reason="$5" output="$6" rc="$7"
+	local hook="$fixture/repo/.git/hooks/pre-commit" result=0
+	if [[ "$expected" -eq 0 ]]; then
+		[[ "$rc" -eq 0 && -x "$hook" ]] || result=1
+		if [[ "$mode" != "managed" && "$rc" -eq 0 && -x "$hook" ]]; then
+			# Exercise Git's installed entrypoint, then verify a repeat is a no-op.
+			git -C "$cwd" hook run pre-commit >/dev/null 2>&1 || result=1
+			cp "$hook" "$fixture/pre-commit-before"
+			(cd "$cwd" && bash "$fixture/scripts/install-hooks-helper.sh" install-pre-commit) >/dev/null 2>&1 || result=1
+		fi
+	else
+		[[ "$rc" -ne 0 && "$output" == *"$reason"* ]] || result=1
+		if [[ "$mode" == "symlink" ]]; then
+			[[ -L "$hook" && ! -e "$fixture/nonexistent" ]] || result=1
+		elif [[ "$mode" != "existing" ]]; then
+			[[ ! -e "$hook" ]] || result=1
+		fi
+	fi
+	if [[ -f "$fixture/pre-commit-before" ]]; then
+		cmp -s "$fixture/pre-commit-before" "$hook" || result=1
+	fi
+	cmp -s "$fixture/pre-push-before" "$fixture/repo/.git/hooks/pre-push" || result=1
+	diff -rq "$fixture/home-before" "$fixture/home" >/dev/null || result=1
+	return "$result"
+}
+
+test_standalone_hook_bundle() {
+	local mode="$1"
+	local fixture="" install_dir="" result=0
+	local -a options=()
+	fixture=$(mktemp -d) || return 1
+	mkdir -p "$fixture/home" "$fixture/project" || return 1
+	install_dir="$fixture/home/.claude"
+	if [[ "$mode" == "project" ]]; then
+		options=(--project)
+		install_dir="$fixture/project/.claude"
+	fi
+	(cd "$fixture/project" && HOME="$fixture/home" \
+		AIDEVOPS_LIFECYCLE_SESSION_HELPER="$TEST_SCRIPTS_DIR/worker-lifecycle-session-helper.py" bash \
+		"$TEST_SCRIPTS_DIR/install-hooks.sh" "${options[@]}") >"$fixture/install.log" 2>&1 || result=1
+	HOME="$fixture/home" python3 -I -S -B -c \
+		'import sys; sys.path.insert(0, sys.argv[1]); import git_safety_guard' \
+		"$install_dir/hooks" >>"$fixture/install.log" 2>&1 || result=1
+	print_result "standalone $mode hook imports its installed lifecycle adapter" "$result"
+	rm -rf "$fixture"
+	return 0
+}
+
+test_standalone_missing_admission() {
+	local fixture="" mode="" result=0 helper=""
+	fixture=$(mktemp -d) || return 1
+	mkdir -p "$fixture/home/.claude" "$fixture/project" || return 1
+	printf '{"preserved":true}\n' >"$fixture/home/.claude/settings.json"
+	cp "$fixture/home/.claude/settings.json" "$fixture/before.json"
+	for mode in missing help-only invalid-response; do
+		helper="$fixture/$mode.py"
+		if [[ "$mode" == help-only ]]; then
+			printf 'import sys\nsys.exit(0 if "--help" in sys.argv else 75)\n' >"$helper"
+		elif [[ "$mode" == invalid-response ]]; then
+			printf 'print("{}")\n' >"$helper"
+		fi
+		result=0
+		(cd "$fixture/project" && HOME="$fixture/home" \
+			AIDEVOPS_LIFECYCLE_SESSION_HELPER="$helper" bash \
+			"$TEST_SCRIPTS_DIR/install-hooks.sh") >"$fixture/install.log" 2>&1 && result=1
+		cmp -s "$fixture/before.json" "$fixture/home/.claude/settings.json" || result=1
+		[[ ! -e "$fixture/home/.claude/hooks" ]] || result=1
+		print_result "standalone rejects $mode admission before changing hooks/settings" "$result"
+	done
+	rm -rf "$fixture"
+	return 0
+}
+
 # --- Run all tests ---
 main() {
 	echo "=== install-hooks-helper.sh validator preflight tests (t2226) ==="
@@ -207,6 +547,15 @@ main() {
 	test_dry_run_failure_path
 	test_force_install_bypass
 	test_help_text
+	test_runtime_dependency_preflight
+	test_installed_hook_probe
+	test_standalone_hook_bundle global
+	test_standalone_hook_bundle project
+	test_standalone_missing_admission
+	local mode
+	for mode in happy linked managed existing symlink hooks-path missing-runtime bad-validator bad-runtime local-runtime outside bare force unknown; do
+		test_pre_commit_only_case "$mode" || return 1
+	done
 
 	echo ""
 	echo "=== Results: $TESTS_RUN tests, $TESTS_FAILED failures ==="

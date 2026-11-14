@@ -48,7 +48,14 @@ _update_canonical_has_untracked_only() {
 _update_fetch_main() {
 	local branch="$1"
 	_AIDEVOPS_UPDATE_CANONICAL_FAST_FORWARDED=false
-	local real_git="${AIDEVOPS_REAL_GIT_BIN:-/usr/bin/git}"
+	local real_git="${AIDEVOPS_REAL_GIT_BIN:-}"
+	if [[ -z "$real_git" ]]; then
+		# Subshell: resolve native git from PATH (skipping the aidevops shim)
+		# without changing the CLI's own PATH.
+		# shellcheck source=../runtime-env.sh
+		real_git=$(source "${BASH_SOURCE[0]%/*}/../runtime-env.sh" && aidevops_resolve_native_git) ||
+			real_git="aidevops-native-git-not-found"
+	fi
 	local git_dir=""
 	local common_dir=""
 	git_dir=$("$real_git" -C "$INSTALL_DIR" rev-parse --git-dir 2>/dev/null || true)
@@ -134,6 +141,9 @@ _update_sync_projects() {
 	local repos_needing_upgrade=()
 	while IFS= read -r repo_path; do
 		[[ -z "$repo_path" ]] && continue
+		if [[ -d "$repo_path" && -f "$AGENTS_DIR/scripts/task-id-normalize-helper.sh" ]]; then
+			bash "$AGENTS_DIR/scripts/task-id-normalize-helper.sh" --repo "$repo_path" --advisory || true
+		fi
 		[[ -d "$repo_path" ]] && check_repo_needs_upgrade "$repo_path" && repos_needing_upgrade+=("$repo_path")
 	done < <(get_registered_repos)
 	_update_sync_agent_source_repos "$current_ver" || true
@@ -142,6 +152,7 @@ _update_sync_projects() {
 		return 0
 	fi
 	local synced=0 skipped=0 failed=0 preserved=0
+	_PROJECT_CONFIG_MIGRATIONS_QUEUED=0
 	for repo in "${repos_needing_upgrade[@]}"; do
 		[[ ! -f "$repo/.aidevops.json" ]] && {
 			skipped=$((skipped + 1))
@@ -158,12 +169,10 @@ _update_sync_projects() {
 					preserved=$((preserved + 1))
 				fi
 			else
-				local temp_file="${repo}/.aidevops.json.tmp"
-				if jq --arg version "$current_ver" '.version = $version' "$repo/.aidevops.json" >"$temp_file" 2>/dev/null && [[ -s "$temp_file" ]]; then
-					mv "$temp_file" "$repo/.aidevops.json"
+				if _project_config_write_version "$repo/.aidevops.json" "$current_ver"; then
 					register_repo "$repo" "$current_ver" "$features"
 					did_sync=true
-				else rm -f "$temp_file"; fi
+				fi
 			fi
 		fi
 		if [[ "$did_sync" != "$_AIDEVOPS_UPDATE_TRUE" ]] && ! _project_config_is_tracked "$repo"; then
@@ -258,16 +267,21 @@ _update_check_planning() {
 		local repo_name
 		repo_name=$(basename "$repo")
 		local todo_ver
-		todo_ver=$(grep -A1 "TOON:meta" "$repo/TODO.md" 2>/dev/null | tail -1 | cut -d',' -f1)
+		# Legacy TODO files (or plans-only projects) may have no metadata.
+		# This advisory must not abort the update under set -euo pipefail.
+		todo_ver=$(grep -A1 "TOON:meta" "$repo/TODO.md" 2>/dev/null | tail -1 | cut -d',' -f1 || true)
 		echo "  - $repo_name (v${todo_ver:-none})"
 	done
 	local template_ver
-	template_ver=$(grep -A1 "TOON:meta" "$AGENTS_DIR/templates/todo-template.md" 2>/dev/null | tail -1 | cut -d',' -f1)
+	template_ver=$(grep -A1 "TOON:meta" "$AGENTS_DIR/templates/todo-template.md" 2>/dev/null | tail -1 | cut -d',' -f1 || true)
 	echo ""
-	echo "  Latest template: v${template_ver} (adds risk field, active session time estimates)"
+	echo "  Latest template: v${template_ver:-none} (adds risk field, active session time estimates)"
 	echo ""
-	read -r -p "Upgrade planning templates in these projects? [y/N] " response
-	if [[ "$response" =~ ^[Yy]$ ]]; then
+	local response=""
+	# Never consume automation stdin or treat EOF as a failed update.
+	if [[ -t 0 && "${NON_INTERACTIVE:-false}" != "true" && -z "${AIDEVOPS_AUTO_UPDATE:-}" ]] &&
+		read -r -p "Upgrade planning templates in these projects? [y/N] " response &&
+		[[ "$response" =~ ^[Yy]$ ]]; then
 		for repo in "${repos_needing_planning[@]}"; do
 			print_info "Upgrading $(basename "$repo")..."
 			(cd "$repo" && cmd_upgrade_planning --force) || print_warning "Failed to upgrade $(basename "$repo")"
@@ -276,12 +290,20 @@ _update_check_planning() {
 	return 0
 }
 
-_update_check_tools() {
-	echo ""
-	print_header "Checking Key Tools"
-	local stale_count=0 stale_tools=""
-	local key_tool_cmds="opencode gh"
-	local key_tool_pkgs="opencode-ai brew:gh"
+_update_gh_apt_candidate() {
+	local installed="$1" apt_policy apt_installed apt_candidate
+	apt_policy=$(_timeout_cmd 30 apt-cache policy gh 2>/dev/null || true)
+	apt_installed=$(printf '%s\n' "$apt_policy" | awk '$1 == "Installed:" {print $2; exit}')
+	apt_candidate=$(printf '%s\n' "$apt_policy" | awk '$1 == "Candidate:" {print $2; exit}')
+	if [[ -n "$apt_candidate" && "$apt_candidate" != "$apt_installed" && "$apt_candidate" != "(none)" ]]; then
+		printf '%s\n' "$apt_candidate" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+	else
+		printf '%s\n' "$installed"
+	fi
+	return 0
+}
+
+_update_warn_gh_minimum() {
 	if declare -F aidevops_gh_slurp_supported >/dev/null 2>&1 && ! aidevops_gh_slurp_supported; then
 		local gh_slurp_message=""
 		if declare -F aidevops_gh_slurp_status_message >/dev/null 2>&1; then
@@ -296,6 +318,44 @@ _update_check_tools() {
 			print_info "Run aidevops setup or upgrade gh manually, then rerun aidevops status."
 		fi
 	fi
+	return 0
+}
+
+_update_check_tools() {
+	echo ""
+	print_header "Maintaining Key Tools"
+	local tool_check_script="$AGENTS_DIR/scripts/tool-version-check.sh"
+	if [[ -f "$tool_check_script" ]]; then
+		if ! bash "$tool_check_script" --update; then
+			print_warning "Automatic tool maintenance encountered a blocker; unchanged tools will be reported below"
+		fi
+	else
+		print_warning "Tool maintenance helper is unavailable; framework setup may be incomplete"
+	fi
+	local stale_count=0 stale_tools=""
+	local opencode_profile="${AIDEVOPS_OPENCODE_PROFILE:-v1}"
+	local opencode_binary="opencode"
+	local opencode_package="opencode-ai"
+	local opencode_pin="${OPENCODE_PINNED_VERSION:-latest}"
+	local opencode_tested="${OPENCODE_PLUGIN_TESTED_VERSION:-unknown}"
+	local opencode_introduced="${OPENCODE_PIN_INTRODUCED_DATE:-2026-07-30}"
+	local opencode_last_canary_date="${OPENCODE_PIN_LAST_CANARY_DATE:-unknown}"
+	local opencode_last_canary_result="${OPENCODE_PIN_LAST_CANARY_RESULT:-unknown}"
+	local opencode_review_deadline="${OPENCODE_PIN_REVIEW_DEADLINE:-9999-12-31}"
+	if declare -F aidevops_opencode_profile_id >/dev/null 2>&1; then
+		opencode_profile=$(aidevops_opencode_profile_id)
+		opencode_binary=$(aidevops_opencode_profile_value binary "$opencode_profile")
+		opencode_package=$(aidevops_opencode_profile_value package "$opencode_profile")
+		opencode_pin=$(aidevops_opencode_profile_value headlessPin "$opencode_profile")
+		opencode_tested=$(aidevops_opencode_profile_value testedVersion "$opencode_profile")
+		opencode_introduced=$(aidevops_opencode_profile_value introducedDate "$opencode_profile")
+		opencode_last_canary_date=$(aidevops_opencode_profile_value lastCanaryDate "$opencode_profile")
+		opencode_last_canary_result=$(aidevops_opencode_profile_value lastCanaryResult "$opencode_profile")
+		opencode_review_deadline=$(aidevops_opencode_profile_value reviewDeadline "$opencode_profile")
+	fi
+	local key_tool_cmds="$opencode_binary gh"
+	local key_tool_pkgs="$opencode_package brew:gh"
+	_update_warn_gh_minimum
 	local idx=0
 	local opencode_installed="not installed" opencode_registry="unknown"
 	for cmd_name in $key_tool_cmds; do
@@ -312,10 +372,12 @@ _update_check_tools() {
 			brew_bin=$(command -v brew 2>/dev/null || true)
 			if [[ -n "$brew_bin" && -x "$brew_bin" ]]; then
 				latest=$(_timeout_cmd 30 "$brew_bin" info --json=v2 "$brew_pkg" | jq -r '.formulae[0].versions.stable // empty' || true)
+			elif [[ "$brew_pkg" == "gh" ]] && command -v apt-cache >/dev/null 2>&1; then
+				latest=$(_update_gh_apt_candidate "$installed")
 			elif [[ "$brew_pkg" == "gh" ]] && command -v gh &>/dev/null; then latest=$(get_public_release_tag "cli/cli"); fi
 		else latest=$(_timeout_cmd 30 npm view "$pkg_ref" version || true); fi
 		[[ -z "$latest" ]] && continue
-		if [[ "$cmd_name" == "opencode" ]]; then
+		if [[ "$cmd_name" == "$opencode_binary" ]]; then
 			opencode_installed="$installed"
 			opencode_registry="$latest"
 		fi
@@ -330,20 +392,52 @@ _update_check_tools() {
 	else
 		print_warning "$stale_count tool(s) have updates: $stale_tools"
 		echo ""
-		print_info "No global tools were changed; run 'aidevops update-tools --update' to update explicitly"
+		print_warning "Automatic maintenance did not converge these tools; review the update output for permission or package-manager blockers"
 	fi
-	if [[ "${OPENCODE_PINNED_VERSION:-latest}" != "latest" ]]; then
+	if [[ "$opencode_pin" != "latest" ]]; then
 		local pin_age_days="unknown"
-		pin_age_days=$(python3 - "$OPENCODE_PIN_INTRODUCED_DATE" <<'PY' 2>/dev/null || printf 'unknown\n'
+		pin_age_days=$(python3 - "$opencode_introduced" <<'PY' 2>/dev/null || printf 'unknown\n'
 from datetime import date
 import sys
 print((date.today() - date.fromisoformat(sys.argv[1])).days)
 PY
 		)
-		print_info "OpenCode compatibility pin: installed=${opencode_installed}, pinned=${OPENCODE_PINNED_VERSION}, registry=${opencode_registry}"
-		print_info "Pin scope=${OPENCODE_PIN_PLATFORM}/${OPENCODE_PIN_RUNTIME_MODE}, age=${pin_age_days}d, plugin-tested=${OPENCODE_PLUGIN_TESTED_VERSION}, last-canary=${OPENCODE_PIN_LAST_CANARY_DATE} (${OPENCODE_PIN_LAST_CANARY_RESULT}), review-deadline=${OPENCODE_PIN_REVIEW_DEADLINE}"
-		if [[ "$(date -u +%Y-%m-%d)" > "$OPENCODE_PIN_REVIEW_DEADLINE" ]]; then
+		print_info "OpenCode ${opencode_profile} compatibility pin: installed=${opencode_installed}, pinned=${opencode_pin}, registry=${opencode_registry}"
+		print_info "Pin scope=${OPENCODE_PIN_PLATFORM}/${OPENCODE_PIN_RUNTIME_MODE}, age=${pin_age_days}d, plugin-tested=${opencode_tested}, last-canary=${opencode_last_canary_date} (${opencode_last_canary_result}), review-deadline=${opencode_review_deadline}"
+		if [[ "$(date -u +%Y-%m-%d)" > "$opencode_review_deadline" ]]; then
 			print_warning "OpenCode compatibility pin review is overdue; scheduled Linux-headless canary must retain or advance it"
+		fi
+	fi
+	return 0
+}
+
+_update_reconcile_tabby_config() {
+	local helper="${HOME}/.aidevops/agents/scripts/tabby-helper.sh"
+	local repos_json="${HOME}/.config/aidevops/repos.json"
+	local tabby_config="${TABBY_CONFIG:-}"
+
+	if [[ -z "$tabby_config" && -n "${TABBY_CONFIG_DIRECTORY:-}" ]]; then
+		tabby_config="${TABBY_CONFIG_DIRECTORY%/}/config.yaml"
+	elif [[ -z "$tabby_config" && "$(uname -s)" == "Darwin" ]]; then
+		tabby_config="${HOME}/Library/Application Support/tabby/config.yaml"
+	elif [[ -z "$tabby_config" ]]; then
+		tabby_config="${XDG_CONFIG_HOME:-${HOME}/.config}/tabby/config.yaml"
+	fi
+
+	[[ -f "$helper" && -f "$repos_json" && -f "$tabby_config" ]] || return 0
+
+	print_info "Reconciling Tabby configuration..."
+	local result
+	if result=$(TABBY_CONFIG="$tabby_config" bash "$helper" sync 2>&1); then
+		print_success "Tabby configuration reconciled and verified"
+	else
+		print_warning "Framework update completed, but Tabby configuration was not changed"
+		# YAML parser exceptions may quote private config values. Report the
+		# known dependency failure without dumping arbitrary helper output.
+		if [[ "$result" == *"isolated Tabby Python environment"* || "$result" == *"pinned PyYAML"* ]]; then
+			print_warning "Automatic Tabby Python setup failed; run aidevops tabby sync for the detailed failure"
+		else
+			print_warning "Run aidevops tabby status for the detailed failure"
 		fi
 	fi
 	return 0

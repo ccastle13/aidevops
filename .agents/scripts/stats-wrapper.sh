@@ -16,12 +16,10 @@ set -euo pipefail
 #######################################
 # PATH normalisation — same as pulse-wrapper.sh
 #######################################
-_aidevops_path_prefix="/opt/homebrew/bin:/usr/local/bin:/bin:/usr/bin"
-if [[ "$(uname -s 2>/dev/null || true)" != "Darwin" && -d "/home/linuxbrew/.linuxbrew/bin" ]]; then
-	_aidevops_path_prefix="/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin:/bin:/usr/bin"
-fi
-export PATH="${_aidevops_path_prefix}:${PATH}"
-unset _aidevops_path_prefix
+AIDEVOPS_PATH_PROFILE=daemon _aidevops_self="${BASH_SOURCE[0]:-$0}"
+[[ "$_aidevops_self" == */* ]] || _aidevops_self="./${_aidevops_self}"
+# shellcheck source=runtime-env.sh
+[[ ! -f "${_aidevops_self%/*}/runtime-env.sh" ]] || source "${_aidevops_self%/*}/runtime-env.sh"
 
 # Use ${BASH_SOURCE[0]:-$0} for shell portability — BASH_SOURCE is undefined
 # in zsh (MCP shell environment). See GH#3931.
@@ -188,8 +186,12 @@ _stats_wrapper_remove_own_pidfile() {
 }
 
 _stats_wrapper_run_health_update() {
-	local update_ec=0
-	update_health_issues || update_ec=$?
+	# Keep one third of the existing ceiling for quality work. The health
+	# stage gets an earlier deadline, never a new/extended aggregate budget.
+	local update_ec=0 aggregate_deadline health_deadline
+	aggregate_deadline="${AIDEVOPS_GH_DEADLINE_EPOCH:-$(($(date +%s) + STATS_TIMEOUT - 30))}"
+	health_deadline=$((aggregate_deadline - STATS_TIMEOUT / 3))
+	AIDEVOPS_GH_DEADLINE_EPOCH="$health_deadline" update_health_issues || update_ec=$?
 	case "$update_ec" in
 	0)
 		return 0
@@ -222,16 +224,20 @@ _stats_wrapper_run_work() {
 		return 1
 	}
 
-	# The quality sweep can use the full scheduler ceiling while GitHub is slow.
 	# Refresh the health dashboard first so that an eventual timeout cannot leave
 	# the primary operator health surface stale for another scheduler interval.
-	_stats_wrapper_run_health_update || return $?
+	# A failed dashboard refresh must not starve the independent quality sweep:
+	# both remain bounded by this child's aggregate GitHub deadline and the outer
+	# process-tree timeout. Preserve the dashboard failure after the sweep so the
+	# existing EXIT trap keeps its operator-visible diagnostics.
+	local health_ec=0
+	_stats_wrapper_run_health_update || health_ec=$?
 
 	run_daily_quality_sweep || {
 		local sweep_ec=$?
 		echo "[stats-wrapper] QUALITY-SWEEP-FAIL exit=${sweep_ec} at $(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$STATS_LOGFILE"
 	}
-	return 0
+	return "$health_ec"
 }
 
 _stats_wrapper_run_with_timeout() {

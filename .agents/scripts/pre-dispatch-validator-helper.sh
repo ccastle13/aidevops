@@ -17,9 +17,11 @@
 #   0  — dispatch proceeds (premise holds, or no validator registered)
 #   10 — premise falsified; caller closes the issue with a rationale comment
 #   20 — validator error; dispatch proceeds with a warning log
+#   30 — malformed implementation brief; dispatch is blocked for repair
 #
 # Usage:
 #   pre-dispatch-validator-helper.sh validate <issue-number> <slug>
+#   pre-dispatch-validator-helper.sh scope-check <issue-number> <body> <auto-dispatch:0|1> [labels-csv]
 #   pre-dispatch-validator-helper.sh help
 #
 # Emergency bypass:
@@ -38,15 +40,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)" || exit 1
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/shared-constants.sh"
 
-_pdv_gh_read() {
-	local rc=0
-	if declare -F _gh_with_timeout >/dev/null 2>&1; then
-		_gh_with_timeout read "$@" || rc=$?
-	else
-		"$@" || rc=$?
-	fi
-	return "$rc"
-}
+# shellcheck source=./pre-dispatch-validator-lib-core.sh
+# shellcheck disable=SC1091  # sub-library resolved at runtime via $SCRIPT_DIR
+source "${SCRIPT_DIR}/pre-dispatch-validator-lib-core.sh"
+# shellcheck source=./pre-dispatch-validator-lib-brief-scope.sh
+# shellcheck disable=SC1091  # sub-library resolved at runtime via $SCRIPT_DIR
+source "${SCRIPT_DIR}/pre-dispatch-validator-lib-brief-scope.sh"
 
 : "${REPOS_JSON:=${HOME}/.config/aidevops/repos.json}"
 
@@ -59,27 +58,6 @@ if [[ -f "${SCRIPT_DIR}/pulse-repo-meta.sh" ]]; then
 	# shellcheck source=./pulse-repo-meta.sh
 	source "${SCRIPT_DIR}/pulse-repo-meta.sh"
 fi
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-_log() {
-	local level="$1"
-	shift
-	printf '[pre-dispatch-validator] %s: %s\n' "$level" "$*" >&2
-	return 0
-}
-
-_log_error() {
-	_log "ERROR" "$@"
-	return 0
-}
-
-_github_clone_url() {
-	local slug="$1"
-	printf 'https://github.com/%s.git' "$slug"
-	return 0
-}
 
 # ---------------------------------------------------------------------------
 # Registry — maps generator name → validator function name
@@ -146,6 +124,24 @@ _register_validators() {
 	_VALIDATOR_REGISTRY["upstream-watch"]="_validator_upstream_watch"
 	_VALIDATOR_REGISTRY["runtime-audit"]="_validator_runtime_audit"
 	return 0
+}
+
+_load_validated_issue_context() {
+	local issue_number="$1"
+	local slug="$2"
+
+	_PDV_ISSUE_API_PATH="repos/${slug}/issues/${issue_number}"
+	_PDV_ISSUE_BODY=$(gh api "$_PDV_ISSUE_API_PATH" --jq '.body // ""' 2>/dev/null) || {
+		_log "WARN" "Failed to fetch issue body for #${issue_number} — proceeding (validator error)"
+		return 20
+	}
+
+	local issue_labels=""
+	issue_labels=$(gh api "$_PDV_ISSUE_API_PATH" --jq '[.labels[].name] | join(",")' 2>/dev/null) || issue_labels=""
+
+	local scope_rc=0
+	_validate_implementation_brief_scope "$issue_number" "$_PDV_ISSUE_BODY" 0 "$issue_labels" || scope_rc=$?
+	return "$scope_rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -1859,6 +1855,8 @@ _run_pre_generator_validators() {
 #   0  — dispatch proceeds
 #   10 — premise falsified (caller should close issue; this function already did)
 #   20 — validator error (dispatch proceeds with warning)
+#   30 — duplicate-state lookup uncertain (dispatch fails closed)
+#   40 — generated implementation brief lacks required worker context
 # ---------------------------------------------------------------------------
 cmd_validate() {
 	local issue_number="$1"
@@ -1875,13 +1873,9 @@ cmd_validate() {
 		return 20
 	fi
 
-	# Fetch issue body
-	local issue_body
-	local issue_api_path="repos/${slug}/issues/${issue_number}"
-	issue_body=$(gh api "$issue_api_path" --jq '.body // ""' 2>/dev/null) || {
-		_log "WARN" "Failed to fetch issue body for #${issue_number} — proceeding (validator error)"
-		return 20
-	}
+	_load_validated_issue_context "$issue_number" "$slug" || return $?
+	local issue_body="$_PDV_ISSUE_BODY"
+	local issue_api_path="$_PDV_ISSUE_API_PATH"
 
 	local pre_generator_rc=0
 	_run_pre_generator_validators "$issue_number" "$slug" "$issue_body" "$issue_api_path" || pre_generator_rc=$?
@@ -1972,6 +1966,7 @@ Exit codes (validate):
   10 — premise falsified; issue closed with rationale comment
   20 — validator error; dispatch proceeds with warning
   30 — duplicate-state lookup uncertain; dispatch must fail closed
+  40 — generated brief invalid; dispatch must fail closed for owner repair
 
 Environment:
   AIDEVOPS_SKIP_PREDISPATCH_VALIDATOR=1  — bypass all validators (exit 0)
@@ -1981,6 +1976,7 @@ EOF
 
 case "${1:-help}" in
 validate) cmd_validate "${2:-}" "${3:-}" ;;
+scope-check) _validate_implementation_brief_scope "${2:-}" "${3:-}" "${4:-0}" "${5:-}" ;;
 check-review-supersession) cmd_check_review_supersession "${2:-}" "${3:-}" ;;
 help | --help | -h) _usage ;;
 *)

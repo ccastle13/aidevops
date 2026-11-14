@@ -17,6 +17,7 @@
 #   - OAuth token refresh: launchd/systemd/cron/schtasks
 #   - OpenCode DB archive (GH#25136): daily archive/VACUUM scheduler
 #   - OpenCode DB maintenance (r913, t2183): weekly checkpoint/vacuum
+#   - Storage hygiene (r922, GH#35245): daily owning-cleaner reclaim
 #   - Repo sync: daily fast-forward pull
 #   - Repo aidevops health (r914): daily drift keeper
 #   - Peer productivity monitor (t2932): adaptive cross-runner coordination
@@ -933,6 +934,77 @@ setup_opencode_db_maintenance() {
 	return 0
 }
 
+# Print the opencode DB archive LaunchAgent plist: one StartCalendarInterval
+# entry per hour in [start_hour, end_hour] (GH#35517).
+_opencode_db_archive_plist() {
+	local label="$1"
+	local script="$2"
+	local home="$3"
+	local log="$4"
+	local budget_sec="$5"
+	local start_hour="$6"
+	local end_hour="$7"
+	local minute="$8"
+	local calendar_xml="" hour=""
+	local xml_script xml_home xml_log xml_path xml_bash
+	for ((hour = start_hour; hour <= end_hour; hour++)); do
+		calendar_xml="${calendar_xml}
+		<dict>
+			<key>Hour</key>
+			<integer>${hour}</integer>
+			<key>Minute</key>
+			<integer>${minute}</integer>
+		</dict>"
+	done
+	xml_script=$(_xml_escape "$script")
+	xml_home=$(_xml_escape "$home")
+	xml_log=$(_xml_escape "$log")
+	xml_path=$(_xml_escape "$(aidevops_launchd_sanitized_path "${PATH}")")
+	xml_bash=$(_xml_escape "$(_resolve_modern_bash)")
+	cat <<ARCHIVE_PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>${label}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>${xml_bash}</string>
+		<string>${xml_script}</string>
+	</array>
+	<key>StartCalendarInterval</key>
+	<array>${calendar_xml}
+	</array>
+	<key>StandardOutPath</key>
+	<string>${xml_log}</string>
+	<key>StandardErrorPath</key>
+	<string>${xml_log}</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>${xml_home}</string>
+		<key>PATH</key>
+		<string>${xml_path}</string>
+		<key>OPENCODE_DB_ARCHIVE_ASYNC_BUDGET_SEC</key>
+		<string>${budget_sec}</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>KeepAlive</key>
+	<false/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityBackgroundIO</key>
+	<true/>
+	<key>Nice</key>
+	<integer>10</integer>
+</dict>
+</plist>
+ARCHIVE_PLIST
+	return 0
+}
+
 # Setup opencode DB archive scheduler (GH#25136).
 # Runs independently from pulse preflight so archive/VACUUM work does not track
 # dispatch-loop cadence. The async helper keeps its single-runner lock and
@@ -950,53 +1022,114 @@ setup_opencode_db_archive() {
 	fi
 
 	local archive_log_dir="$archive_home/.aidevops/logs"
-	local archive_hour="${OPENCODE_DB_ARCHIVE_HOUR:-5}"
+	# GH#35517: hourly attempts across an overnight window so DBs held by
+	# OpenCode get several idle-gated chances; the helper no-ops after one
+	# complete pass per day.
+	local archive_start_hour="${OPENCODE_DB_ARCHIVE_START_HOUR:-0}"
+	local archive_end_hour="${OPENCODE_DB_ARCHIVE_END_HOUR:-7}"
 	local archive_minute="${OPENCODE_DB_ARCHIVE_MINUTE:-0}"
 	local archive_budget_sec="${OPENCODE_DB_ARCHIVE_ASYNC_BUDGET_SEC:-60}"
 	local archive_env="OPENCODE_DB_ARCHIVE_ASYNC_BUDGET_SEC=${archive_budget_sec}"
+	if ! [[ "$archive_start_hour" =~ ^[0-9]+$ && "$archive_end_hour" =~ ^[0-9]+$ && "$archive_minute" =~ ^[0-9]+$ ]] ||
+		((archive_start_hour > archive_end_hour || archive_end_hour > 23 || archive_minute > 59)); then
+		print_warning "Invalid OPENCODE_DB_ARCHIVE_START_HOUR/END_HOUR/MINUTE — using 0-7 at :00"
+		archive_start_hour=0
+		archive_end_hour=7
+		archive_minute=0
+	fi
+	local archive_window="${archive_start_hour}-${archive_end_hour}"
+	local archive_on_calendar
+	archive_on_calendar=$(printf '*-*-* %02d..%02d:%02d:00' "$archive_start_hour" "$archive_end_hour" "$archive_minute")
 	mkdir -p "$archive_log_dir"
 
 	if [[ "$(uname -s)" == "Darwin" ]]; then
 		local archive_label="sh.aidevops.opencode-db-archive"
 		local archive_plist="$archive_home/Library/LaunchAgents/${archive_label}.plist"
-		local _xml_archive_script _xml_archive_home _xml_archive_log _xml_archive_path
-		_xml_archive_script=$(_xml_escape "$archive_script")
-		_xml_archive_home=$(_xml_escape "$archive_home")
-		_xml_archive_log=$(_xml_escape "${archive_log_dir}/opencode-db-archive.log")
-		_xml_archive_path=$(_xml_escape "$(aidevops_launchd_sanitized_path "/bin:/usr/bin:/usr/local/bin:/opt/homebrew/bin${PATH:+:${PATH}}")")
-
 		local archive_plist_content
-		archive_plist_content=$(cat <<ARCHIVE_PLIST
+		archive_plist_content=$(_opencode_db_archive_plist "$archive_label" "$archive_script" "$archive_home" \
+			"${archive_log_dir}/opencode-db-archive.log" "$archive_budget_sec" \
+			"$archive_start_hour" "$archive_end_hour" "$archive_minute")
+		if _launchd_install_if_changed "$archive_label" "$archive_plist" "$archive_plist_content"; then
+			print_info "OpenCode DB archive enabled (launchd, hourly ${archive_window}h until a full daily pass)"
+		else
+			print_warning "Failed to install opencode DB archive LaunchAgent"
+		fi
+	elif _is_windows; then
+		return 0
+	else
+		_install_scheduler_linux \
+			"aidevops-opencode-db-archive" \
+			"aidevops: opencode-db-archive" \
+			"${archive_minute} ${archive_window} * * *" \
+			"\"${archive_script}\"" \
+			"3600" \
+			"${archive_log_dir}/opencode-db-archive.log" \
+			"${archive_env}" \
+			"OpenCode DB archive enabled (hourly ${archive_window}h until a full daily pass)" \
+			"Failed to install opencode DB archive scheduler" \
+			"false" \
+			"true" \
+			"${archive_on_calendar}" \
+			"3600"
+	fi
+	return 0
+}
+
+# Setup storage hygiene scheduler (r922, GH#35245).
+# Daily `storage-cleanup-helper.sh all --apply` through the existing owning
+# cleaners. A dedicated platform job keeps tmp/worktree/DB/observability
+# reclaim running when the supervisor Pulse is disabled; Pulse treats r922 as
+# platform-owned and only runs it as a fallback.
+setup_storage_hygiene() {
+	local hygiene_home="${HOME:-}"
+	[[ -n "$hygiene_home" ]] || return 0
+	local hygiene_script="$hygiene_home/.aidevops/agents/scripts/storage-cleanup-helper.sh"
+	[[ -x "$hygiene_script" ]] || return 0
+
+	local hygiene_log_dir="$hygiene_home/.aidevops/.agent-workspace/logs"
+	local hygiene_hour="${STORAGE_HYGIENE_HOUR:-5}"
+	local hygiene_minute="${STORAGE_HYGIENE_MINUTE:-30}"
+	local hygiene_log="${hygiene_log_dir}/storage-hygiene.log"
+	mkdir -p "$hygiene_log_dir"
+
+	if [[ "$(uname -s)" == "Darwin" ]]; then
+		local hygiene_label="sh.aidevops.storage-hygiene"
+		local hygiene_plist="$hygiene_home/Library/LaunchAgents/${hygiene_label}.plist"
+		# read -d '' instead of $(cat <<...): Bash 3.2 cannot parse a heredoc
+		# inside command substitution (reference/bash-compat.md). read keeps
+		# the trailing newline, so strip it to match the installed-plist compare.
+		local hygiene_plist_content=""
+		IFS='' read -r -d '' hygiene_plist_content <<HYGIENE_PLIST || true
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>${archive_label}</string>
+	<string>${hygiene_label}</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>$(_xml_escape "$(_resolve_modern_bash)")</string>
-		<string>${_xml_archive_script}</string>
+		<string>$(_xml_escape "$hygiene_script")</string>
+		<string>all</string>
+		<string>--apply</string>
 	</array>
 	<key>StartCalendarInterval</key>
 	<dict>
 		<key>Hour</key>
-		<integer>${archive_hour}</integer>
+		<integer>${hygiene_hour}</integer>
 		<key>Minute</key>
-		<integer>${archive_minute}</integer>
+		<integer>${hygiene_minute}</integer>
 	</dict>
 	<key>StandardOutPath</key>
-	<string>${_xml_archive_log}</string>
+	<string>$(_xml_escape "$hygiene_log")</string>
 	<key>StandardErrorPath</key>
-	<string>${_xml_archive_log}</string>
+	<string>$(_xml_escape "$hygiene_log")</string>
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>HOME</key>
-		<string>${_xml_archive_home}</string>
+		<string>$(_xml_escape "$hygiene_home")</string>
 		<key>PATH</key>
-		<string>${_xml_archive_path}</string>
-		<key>OPENCODE_DB_ARCHIVE_ASYNC_BUDGET_SEC</key>
-		<string>${archive_budget_sec}</string>
+		<string>$(_xml_escape "$(aidevops_launchd_sanitized_path "${PATH}")")</string>
 	</dict>
 	<key>RunAtLoad</key>
 	<false/>
@@ -1010,29 +1143,29 @@ setup_opencode_db_archive() {
 	<integer>10</integer>
 </dict>
 </plist>
-ARCHIVE_PLIST
-		)
-		if _launchd_install_if_changed "$archive_label" "$archive_plist" "$archive_plist_content"; then
-			print_info "OpenCode DB archive enabled (launchd, daily ${archive_hour}:${archive_minute})"
+HYGIENE_PLIST
+		hygiene_plist_content="${hygiene_plist_content%$'\n'}"
+		if _launchd_install_if_changed "$hygiene_label" "$hygiene_plist" "$hygiene_plist_content"; then
+			print_info "Storage hygiene enabled (launchd, daily ${hygiene_hour}:${hygiene_minute})"
 		else
-			print_warning "Failed to install opencode DB archive LaunchAgent"
+			print_warning "Failed to install storage hygiene LaunchAgent"
 		fi
 	elif _is_windows; then
 		return 0
 	else
 		_install_scheduler_linux \
-			"aidevops-opencode-db-archive" \
-			"aidevops: opencode-db-archive" \
-			"${archive_minute} ${archive_hour} * * *" \
-			"\"${archive_script}\"" \
+			"aidevops-storage-hygiene" \
+			"aidevops: storage-hygiene" \
+			"${hygiene_minute} ${hygiene_hour} * * *" \
+			"\"${hygiene_script}\" all --apply" \
 			"86400" \
-			"${archive_log_dir}/opencode-db-archive.log" \
-			"${archive_env}" \
-			"OpenCode DB archive enabled (daily ${archive_hour}:${archive_minute})" \
-			"Failed to install opencode DB archive scheduler" \
+			"$hygiene_log" \
+			"" \
+			"Storage hygiene enabled (daily ${hygiene_hour}:${hygiene_minute})" \
+			"Failed to install storage hygiene scheduler" \
 			"false" \
 			"true" \
-			"*-*-* ${archive_hour}:${archive_minute}:00" \
+			"*-*-* ${hygiene_hour}:${hygiene_minute}:00" \
 			"3600"
 	fi
 	return 0
@@ -1074,6 +1207,68 @@ setup_repo_sync() {
 				print_info "Skipped. Enable later: aidevops repo-sync enable"
 			fi
 		fi
+	fi
+	return 0
+}
+
+_mirror_sync_plist_content() {
+	local label="$1" script="$2" log_dir="$3"
+	cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- aidevops:mirror-sync -->
+<plist version="1.0"><dict>
+<key>Label</key><string>${label}</string>
+<key>ProgramArguments</key><array><string>$(_xml_escape "$(_resolve_modern_bash)")</string><string>$(_xml_escape "$script")</string><string>sync</string></array>
+<key>StartCalendarInterval</key><dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+<key>StandardOutPath</key><string>$(_xml_escape "$log_dir/mirror-sync.log")</string>
+<key>StandardErrorPath</key><string>$(_xml_escape "$log_dir/mirror-sync.log")</string>
+<key>RunAtLoad</key><false/>
+</dict></plist>
+EOF
+	return 0
+}
+
+# Install the private mirror sync only for explicit string upstream slugs.
+# A foreign healthy job with the legacy label is never replaced implicitly.
+setup_mirror_sync() {
+	local script="$HOME/.aidevops/agents/scripts/mirror-sync-helper.sh"
+	local config="$HOME/.config/aidevops/repos.json"
+	local label='sh.aidevops.mirror-sync'
+	[[ -f "$config" && -f "$script" ]] || return 0
+	command -v jq >/dev/null 2>&1 || return 0
+	jq -e '.initialized_repos[]? | select((.mirror_upstream | type) == "string" and (.mirror_upstream | test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and .mirror_sync != false)' "$config" >/dev/null || return 0
+	local log_dir="$HOME/.aidevops/logs"
+	mkdir -p "$log_dir"
+	if [[ "$(uname -s)" == Darwin ]]; then
+		local plist="$HOME/Library/LaunchAgents/${label}.plist"
+		if [[ -f "$plist" ]] && ! grep -qF '<!-- aidevops:mirror-sync -->' "$plist"; then
+			# Do not take ownership of a live custom program, even with our label.
+			local existing_program existing_script
+			existing_program=$(plutil -extract ProgramArguments.0 raw -o - "$plist" 2>/dev/null) || existing_program=""
+			existing_script=$(plutil -extract ProgramArguments.1 raw -o - "$plist" 2>/dev/null) || existing_script=""
+			# Shell wrappers (bash -c/-lc "<script> args"): judge the script token.
+			if [[ "$existing_script" == -c || "$existing_script" == -lc ]]; then
+				local shell_command
+				shell_command=$(plutil -extract ProgramArguments.2 raw -o - "$plist" 2>/dev/null) || shell_command=""
+				existing_script="${shell_command%%[[:space:]]*}"
+			fi
+			# Unparseable or non-absolute arguments are ambiguous: fail closed.
+			if [[ "$existing_program" != /* ]] ||
+				{ [[ -e "$existing_program" ]] &&
+					{ [[ "$existing_script" != /* ]] || [[ -e "$existing_script" ]]; }; }; then
+				print_warning "Mirror sync label collision: existing program is live; leaving it unchanged"
+				return 0
+			fi
+			print_info "Replacing dead legacy ${label} LaunchAgent (missing script: ${existing_script:-unknown})"
+		fi
+		local content
+		content=$(_mirror_sync_plist_content "$label" "$script" "$log_dir")
+		_launchd_install_if_changed "$label" "$plist" "$content" || print_warning 'Mirror sync scheduler installation failed'
+	else
+		_install_scheduler_linux 'aidevops-mirror-sync' 'aidevops: mirror-sync' '0 20 * * *' \
+			"\"$(_resolve_modern_bash)\" \"${script}\" sync" '86400' \
+			"${log_dir}/mirror-sync.log" '' 'Mirror sync enabled (daily)' \
+			'Mirror sync scheduler installation failed' 'false' 'true'
 	fi
 	return 0
 }

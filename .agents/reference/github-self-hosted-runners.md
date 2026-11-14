@@ -10,7 +10,86 @@ The goal is that any maintainer can answer three questions without private chat
 history: what is running, how to prove whether it is healthy, and what to change
 when a runner is offline or mis-sized.
 
-## Current deployment
+## Org-scoped GitHub App runners (recommended)
+
+Model: one GitHub App per org (only the `organization_self_hosted_runners: write`
+permission, webhook inactive, installable only on that org), one org runner group
+restricted to selected private repos with public repositories disallowed, and
+ephemeral JIT-registered runners (one container per job) whose registration
+tokens come from App installation tokens. A key compromise is limited to one org,
+and fork PRs on public repos can never reach the host. Public repos keep free
+GitHub-hosted minutes.
+
+`runs-on` guidance: private repos use `[self-hosted, linux, <POOL_LABEL>]`;
+public repos stay on GitHub-hosted runners. In particular, issue #37499 does not
+authorize a public aidevops pool: reduce CI demand without exposing private
+infrastructure through public runner or machine names in job logs.
+
+Shared or template workflows (starters synced into public and private repos)
+should keep one file for both: `runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}`,
+and pass the same expression as `runner:` to aidevops reusable workflows. Set
+`CI_RUNNER=<POOL_LABEL>` only on private repos in the runner group whose
+fork pull-request workflows are off:
+
+- Use a repository variable (`gh variable set CI_RUNNER --repo <ORG>/<REPO> --body <POOL_LABEL>`).
+  On the GitHub Free plan, organization variables are listed for private repos but
+  are not passed to their workflows, so the job falls back to `ubuntu-latest`.
+- Check fork workflows: `gh api repos/<ORG>/<REPO>/actions/permissions/fork-pr-workflows-private-repos`
+  must show `"run_workflows_from_fork_pull_requests":false`.
+- Verify: `gh api repos/<ORG>/<REPO>/actions/runs/<RUN_ID>/jobs --jq '.jobs[] | "\(.name): \(.runner_name)"'`
+  shows the pool's runner names.
+
+The server-side pool (systemd, rootless or DinD containers, JIT registration) is
+operator-owned. `github-runner-org-helper.sh` prepares and verifies its inputs.
+
+### New private plugin repositories
+
+`wp-plugin-new-helper.sh create` calls `github-runner-org-helper.sh repo-ensure
+--repo <ORG>/<REPO>` immediately after repository creation, before the first
+identity-branch push/PR. The `quality` command also runs this check for existing
+repositories. Public repositories and personal accounts are skipped.
+
+The command discovers one private-only, selected-repository group and one custom
+label common to its registered runners. It refuses ambiguous groups/labels,
+inherited groups, workflow-restricted groups, or fork PR workflows that are not
+explicitly disabled. It never disables fork workflows or changes group policy.
+An org without selected-repository groups retains the GitHub-hosted fallback. For ambiguous
+pools, rerun with `--group <GROUP> --label <POOL_LABEL>`; `--dry-run` performs
+reads only and prints the commands without applying them. An empty ephemeral
+pool must first register a runner so the label can be verified.
+
+Enrollment uses the single-repository `PUT` endpoint, preserving all other group
+members (do **not** use `group-ensure --repos <NEW_REPO>`, which reconciles the
+entire membership list). It then sets the repository `CI_RUNNER` variable and
+reads back both settings. A permission failure stops plugin creation before the
+first PR, preserves the generated repository, and prints an admin retry command;
+once discovery succeeds it also prints the exact membership and variable commands.
+Run the retry with an authorized token (`admin:org` for classic tokens, or the
+equivalent fine-grained runner-group and repository Actions-variable permissions).
+After recovery, clone the preserved repository and resume customization/quality;
+do not rerun `create` against an existing repository. The final runtime check is
+still the first PR's job `runner_name` inspection above, not just variable presence.
+
+One-time onboarding per org:
+
+1. In the GitHub web UI, create the App (permission above, webhook inactive,
+   installable only on `<ORG>`), install it on `<ORG>`, and generate a private key.
+2. Store the key: `aidevops secret set <ORG>_RUNNERS_APP_KEY` (never paste it in chat).
+3. Create or reconcile the private-only runner group (needs `admin:org` on `gh`):
+   `github-runner-org-helper.sh group-ensure --org <ORG> --name <GROUP> --repos all-private --dry-run`,
+   then rerun without `--dry-run`. It refuses any public repo.
+4. Verify the key, App owner and installation permissions:
+   `github-runner-org-helper.sh verify-key --org <ORG> --app-id <APP_ID> --secret <ORG>_RUNNERS_APP_KEY`
+5. Deliver the key to the runner host (mode 600, fingerprint compared):
+   `github-runner-org-helper.sh push-key --secret <ORG>_RUNNERS_APP_KEY --host <USER>@<HOST> --dest <KEY_PATH>`
+6. Start the pool for the group, then check it:
+   `github-runner-org-helper.sh status --org <ORG> --group <GROUP>`
+
+The helper reads the key only from an env var injected by
+`aidevops secret NAME -- ...`; it never prints it, puts it in argv or writes it to
+a local file. Only the public-key SHA-256 is displayed.
+
+## Current deployment (legacy repo-scoped pool)
 
 Verified on the server during the 2026-06-20 inspection. Concrete repository,
 image, and environment names are represented with placeholders so this public
@@ -35,6 +114,10 @@ removed implicitly. Completed ephemeral jobs are replaced after the
 `RestartSec=5` delay.
 
 ## Runner capacity and labels
+
+### Stale queued workflow watchdog
+
+Pulse cancels queued workflow runs older than `AIDEVOPS_STALE_QUEUED_RUN_MAX_AGE_HOURS` (default 8h), at most hourly per repository, via `.agents/scripts/pulse-stale-queued-runs.sh`; job-less, log-less ghost runs are deleted. Settings, outcomes, ghost handling and verification: `reference/github-runner-stale-queued-watchdog.md`.
 
 The launch script supports the enabled service instance numbers only:
 
@@ -128,6 +211,10 @@ than starting Docker as a child or background process. This lets systemd deliver
 stop signals to the Docker client directly and reduces the risk of orphaned
 runner containers, restart loops, or later container-name conflicts.
 
+## Registry mirror
+
+Ephemeral inner `dockerd` instances start empty and can hit Docker Hub anonymous pull limits (`429 Too Many Requests`, Docker exit code 125). A private pull-through cache passed to the inner daemon with `--registry-mirror` avoids this. Setup, secrets, verification and the `github-runner-org-helper.sh status` mirror check: `reference/github-runner-registry-mirror.md`.
+
 ## Health checks
 
 Use read-only commands first:
@@ -145,6 +232,22 @@ Expected healthy state:
   loaded and running or restarting after an ephemeral job exit.
 - `docker ps` shows one `github-runner-dind-N` container for each active service.
 - GitHub shows the self-hosted runners online for the target repository.
+
+These process checks are necessary but insufficient. A runner can remain
+`active`, keep its container `running`, and log `Listening for Jobs` while its
+GitHub broker session no longer accepts compatible work. Diagnose that state by
+correlating old compatible jobs that remain unassigned (`runner_id: 0` and no
+runner name), GitHub runner busy/online state, and local listener state:
+
+```bash
+BROKER_HEALTH_REPO=<OWNER>/<REPO> github-runner-broker-health-helper.sh diagnose
+```
+
+The helper distinguishes `HEALTHY`, `BUSY_CAPACITY`, `NO_MATCHING_RUNNER`,
+`STALE_BROKER_SUSPECTED`, and fail-closed `UNKNOWN_*` results. Reading runner
+inventory can require repository administration or fine-grained Actions runner
+permission. Permission, network, empty-result, or local-observability failures
+never authorize recovery. Repository values and API errors are not printed.
 
 Ephemeral runners can restart after completing a job, so a short-lived
 `activating auto-restart` state is not automatically a failure. Treat it as a
@@ -171,6 +274,32 @@ Restart one runner after a failed or stale job:
 ```bash
 sudo systemctl restart github-runner-dind@1.service
 ```
+
+For suspected stale broker sessions, prefer the broker helper's opt-in canary
+mode over a manual pool restart. Configure a root-owned executable adapter that
+accepts one validated runner name and maps it to the corresponding service;
+then run:
+
+```bash
+BROKER_HEALTH_REPO=<OWNER>/<REPO> \
+  BROKER_HEALTH_RESTART_ADAPTER=<APPROVED_LOCAL_ADAPTER> \
+  github-runner-broker-health-helper.sh repair
+```
+
+Recovery acquires a host-local lock, re-reads both evidence planes, rejects any
+ambiguous or busy candidate, and restarts at most one idle runner. It succeeds
+only when the runner has a fresh GitHub registration ID and the old unassigned
+queue shrinks. Cooldown, lock contention, permission loss, or failed canary
+verification stops the cycle; never continue with another runner. A new process
+or container PID alone is not proof of recovery.
+
+The default cooldown is 30 minutes and the default old-job threshold is 15
+minutes. Override them locally with `BROKER_HEALTH_COOLDOWN_SECONDS` and
+`BROKER_HEALTH_QUEUE_AGE_SECONDS`. Disable scheduled repair by removing its
+explicit adapter/configuration; diagnosis remains read-only. To reset local
+cooldown after operator review, remove
+`~/.aidevops/cache/github-runner-broker-health.json`. Reverting the helper does
+not alter existing runner services.
 
 Restart the whole pool:
 
@@ -268,6 +397,7 @@ capacity incident, not ordinary job latency.
 | Service restarts repeatedly | `systemctl show ... NRestarts ExecMainStatus` | Check image entrypoint, registration token freshness, and network access. |
 | Runner registers, then logs `Runner version vX is deprecated and cannot receive messages` | Runner image tag and embedded `actions/runner` release | Rebuild and publish the runner image with the current upstream runner version, then canary one instance before rotating the pool; do not treat this as a token or network failure. |
 | Docker commands fail inside workflow | Container process list for inner `dockerd` | Confirm the runner container is privileged and inner Docker daemon started. |
+| `429 Too Many Requests` from `registry-1.docker.io` before tests start | Inner `docker info` mirror list, cache reachability/access logs and upstream quota | Configure or repair the shared registry mirror, or use authenticated pulls with a read-only token; repeated reruns can exhaust the same shared limit. |
 | Builds are slow or disk-heavy | Inner Docker storage driver and job cache usage | Confirm `overlay2` is active for the inner daemon; migrate off `vfs`, then clean stale job artifacts and review image layers. |
 | Container name conflict | `docker ps -a --filter name=github-runner-dind-N` | Startup should fail before replacing the container; inspect whether a job is still running, then remove only verified stale containers manually. |
 

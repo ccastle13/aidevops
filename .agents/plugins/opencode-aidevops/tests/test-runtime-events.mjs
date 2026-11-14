@@ -27,6 +27,7 @@ import {
   resolveRuntimeEventsDbPath,
 } from "../../../scripts/runtime-events.mjs";
 import { canonicalizeSqliteDbPath } from "../../../scripts/sqlite-process.mjs";
+import { validateObjectiveRuntimeEvent } from "../../../scripts/runtime-events-objectives.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -40,6 +41,37 @@ function sqliteAvailable() {
 }
 
 describe("runtime-event envelopes", () => {
+  test("validates explicit objective evidence without inferring verification", () => {
+    const base = {
+      attempt_id: "attempt:1",
+      objective_id: "objective:1",
+      objective_version: 1,
+      run_id: "run:1",
+    };
+    assert.doesNotThrow(() => validateObjectiveRuntimeEvent("objective.session.attached", {
+      ...base,
+      allocation: "unique",
+      boundary: "request:10-request:12",
+      contribution_id: "contribution:child",
+      request_ids: ["request:10", "request:11"],
+    }));
+    assert.doesNotThrow(() => validateObjectiveRuntimeEvent("subagent.acceptance", {
+      ...base,
+      contribution_id: "contribution:repair",
+      contribution_outcome: "accepted_repaired",
+      intervention_count: 1,
+      observed_at: "2026-09-10T00:00:00.000Z",
+      policy_version: "v1",
+      source: "parent_assertion",
+    }));
+    assert.throws(() => validateObjectiveRuntimeEvent("objective.outcome", {
+      ...base,
+      observed_at: "2026-09-10T00:00:00.000Z",
+      outcome: "verified",
+      policy_version: "v1",
+      source: "caller",
+    }), /evidence_kind/);
+  });
   test("strictly allowlists ordinary payloads and redacts secret fixtures", () => {
     const privateRoot = process.env.AIDEVOPS_PRIVATE_ROOTS;
     process.env.AIDEVOPS_PRIVATE_ROOTS = "/srv/private-root";
@@ -560,7 +592,7 @@ test("OpenCode observability emits runtime evidence without changing legacy tabl
       termination: "confirmed",
       truncated: false,
     }, { childSessionID: "session:child", parentSessionID: "session:1" })) process.exit(3);
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await new Promise((resolve) => setTimeout(resolve, 1000));
     process.exit(0);
   `;
 
@@ -576,7 +608,7 @@ test("OpenCode observability emits runtime evidence without changing legacy tabl
         (SELECT COUNT(*) FROM tool_calls),
         (SELECT COUNT(*) FROM runtime_events),
         (SELECT group_concat(event_type, ',') FROM (
-          SELECT event_type FROM runtime_events ORDER BY id
+          SELECT event_type FROM runtime_events ORDER BY event_type
         )),
         (SELECT json_extract(payload_json, '$.suppressed_part_events')
           FROM runtime_events WHERE event_type = 'message.completed'),
@@ -594,7 +626,7 @@ test("OpenCode observability emits runtime evidence without changing legacy tabl
     `], { encoding: "utf8" }).trim();
     assert.equal(
       counts,
-      "1|1|6|session.created,message.part.updated,message.completed,session.error,tool.completed,subagent.cancellation.receipt|100|PartFailure|gateway_denied|req-safe|1|success|1",
+      "1|1|8|message.completed,message.part.updated,objective.session.attached,objective.started,session.created,session.error,subagent.cancellation.receipt,tool.completed|100|PartFailure|gateway_denied|req-safe|1|success|1",
     );
   } finally {
     rmSync(tempDir, { force: true, recursive: true });

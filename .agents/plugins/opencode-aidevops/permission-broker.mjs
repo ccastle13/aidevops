@@ -5,15 +5,17 @@ import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { homedir } from "os";
-import { appendWorkerBlockerEvent } from "../../scripts/worker-blocker-log.mjs";
+import { recordPermissionBlocker } from "./permission-broker-blocker-log.mjs";
 import { isManagedToolOutputRead } from "./permission-broker-tool-output.mjs";
+import { impossibleExternalRead as classifyImpossibleRead, rejectImpossibleToolRead } from "./permission-broker-read-target.mjs";
+import { isReadOnlyRootRead, resolvedRiskTargets } from "./permission-broker-read-only-root.mjs";
 
 const REQUEST_SCHEMA = "aidevops-permission-capture/v1";
 const MAX_PATTERN_LENGTH = 500;
 const MAX_INTENT_LENGTH = 500;
 const MAX_REQUESTS = 20;
 const PATTERN_CAPABLE_PERMISSIONS = new Set(["bash", "external_directory"]);
-const FORBIDDEN_PATTERN = /(?:approval-keys\/private|\/(?:\.ssh|\.gnupg|\.aws|\.azure|\.kube)(?:\/|$)|\/(?:\.config\/(?:gh|gcloud|glab-cli|hub)|\.docker)(?:\/|$)|\/(?:\.netrc|\.npmrc|\.pypirc|\.git-credentials)(?:$|\*)|auth\.json(?:$|\*)|credentials?(?:\.|\/|$)|(?:^|\/)\.env(?:\.|$|\/))/i;
+const FORBIDDEN_PATTERN = /(?:approval-keys\/private|\/(?:\.ssh|\.gnupg|\.aws|\.azure|\.kube)(?:\/|$)|\/(?:\.config\/(?:gh|gcloud|glab-cli|hub)|\.docker)(?:\/|$)|\/(?:\.netrc|\.npmrc|\.pypirc|\.git-credentials)(?:$|\*)|\/etc\/npmrc(?:$|\*)|auth\.json(?:$|\*)|credentials?(?:\.|\/|$)|(?:^|\/)\.env(?:\.|$|\/))/i;
 const HIGH_RISK_PATTERN = /(?:\.config\/opencode|node_modules\/@opencode-ai\/plugin|(?:^|\/)\.git(?:\/|$))/i;
 
 function redactSecrets(value) {
@@ -34,14 +36,14 @@ export function sanitizePermissionText(value, options = {}) {
   return sanitized.slice(0, options.maxLength || MAX_PATTERN_LENGTH);
 }
 
-function classifyRisk(permission, patterns, tool) {
+function classifyRisk(permission, patterns, tool, targets = []) {
   const combined = patterns.join("\n");
   let risk;
   if (!PATTERN_CAPABLE_PERMISSIONS.has(permission)) {
     risk = { level: "critical", grantable: false, reason: "permission cannot be represented as an exact OpenCode pattern rule" };
   } else if (patterns.length === 0) {
     risk = { level: "critical", grantable: false, reason: "request omitted an exact permission pattern" };
-  } else if (patterns.some((pattern) => FORBIDDEN_PATTERN.test(pattern))) {
+  } else if ([...patterns, ...targets].some((pattern) => FORBIDDEN_PATTERN.test(pattern))) {
     risk = { level: "critical", grantable: false, reason: "sensitive credential or signing-key location" };
   } else if (["bash", "edit", "write"].includes(tool) || ["bash", "edit"].includes(permission)) {
     risk = { level: "high", grantable: true, reason: "capability can modify or execute content" };
@@ -112,31 +114,35 @@ function recordPermissionToolCall(toolCalls, isHeadless, home, input, output) {
   toolCalls.set(callID, {
     tool: sanitizePermissionText(input?.tool || input?.name || "unknown", { home, maxLength: 100 }),
     intent: sanitizePermissionText(args?.agent__intent || "", { home, maxLength: MAX_INTENT_LENGTH }),
+    target: args.filePath || args.path || "",
   });
   while (toolCalls.size > 100) toolCalls.delete(toolCalls.keys().next().value);
 }
 
-function recordPermissionBlocker({ loggedEvents, home, blockerLogPath, capture, request, event, reason, detail }) {
-  const dedupeKey = `${event}:${request?.request_id || "unknown"}`;
-  if (loggedEvents.has(dedupeKey)) return;
-  loggedEvents.add(dedupeKey);
-  while (loggedEvents.size > 100) loggedEvents.delete(loggedEvents.values().next().value);
-  appendWorkerBlockerEvent({
-    event,
-    status: "blocked",
-    reason,
-    blocking: true,
-    source: "opencode-permission-broker",
-    issue_number: capture?.issue || process.env.WORKER_ISSUE_NUMBER || "",
-    repo_slug: capture?.repo || process.env.WORKER_REPO_SLUG || process.env.DISPATCH_REPO_SLUG || "",
-    session_key: capture?.worker_session || process.env.WORKER_SESSION_KEY || "",
-    request_id: request?.request_id || "",
-    permission: request?.permission || "",
-    tool: request?.tool || "",
-    risk_level: request?.risk?.level || "",
-    grantable: request?.risk?.grantable,
-    detail,
-  }, { home, logPath: blockerLogPath });
+function impossibleExternalRead(context, raw) {
+  return classifyImpossibleRead(context, raw, FORBIDDEN_PATTERN);
+}
+
+function recordReadOnlyRootAllow(context, raw) {
+  const patterns = normalizePatterns(raw?.patterns ?? raw?.pattern, { home: context.home });
+  const callID = raw?.tool?.callID || raw?.callID || "";
+  recordPermissionBlocker({
+    loggedEvents: context.loggedEvents,
+    home: context.home,
+    blockerLogPath: context.blockerLogPath,
+    capture: null,
+    request: {
+      request_id: `read-only-root-${createHash("sha256").update(`${callID}\n${patterns.join("\n")}`).digest("hex").slice(0, 16)}`,
+      permission: "external_directory",
+      tool: context.toolCalls.get(callID)?.tool || "",
+      risk: { level: "low", grantable: true },
+    },
+    event: "permission_read_only_root_allowed",
+    reason: "read_only_root",
+    detail: `Auto-allowed read-only access: ${patterns.join(", ").slice(0, 200)}`,
+    status: "allowed",
+    blocking: false,
+  });
 }
 
 function capturePermissionRequest(toolCalls, loggedEvents, home, blockerLogPath, raw) {
@@ -153,7 +159,7 @@ function capturePermissionRequest(toolCalls, loggedEvents, home, blockerLogPath,
     patterns,
     tool,
     intent: sanitizePermissionText(toolContext.intent || raw?.metadata?.description || raw?.title || "", { ...options, maxLength: MAX_INTENT_LENGTH }),
-    risk: classifyRisk(permission, patterns, tool),
+    risk: classifyRisk(permission, patterns, tool, resolvedRiskTargets(raw, toolContext.target)),
     opencode: {
       request_id: sanitizePermissionText(raw?.id || "", { ...options, maxLength: 100 }),
       session_id: sanitizePermissionText(raw?.sessionID || "", { ...options, maxLength: 100 }),
@@ -220,8 +226,16 @@ async function handlePermissionEvent(context, input) {
   const event = input?.event;
   if (!isHeadless() || event?.type !== "permission.asked") return;
   const request = event.properties || {};
+  if (impossibleExternalRead(context, request)) {
+    await replyPermissionRequest(client, request, "reject");
+    return;
+  }
   if (isManagedToolOutputRead(toolCalls, request, dataHome)
     && await replyPermissionRequest(client, request, "once")) return;
+  if (isReadOnlyRootRead(context, request, FORBIDDEN_PATTERN) && await replyPermissionRequest(client, request, "once")) {
+    recordReadOnlyRootAllow(context, request);
+    return;
+  }
   capturePermissionRequest(toolCalls, loggedEvents, home, blockerLogPath, request);
   await replyPermissionRequest(client, request, "reject");
 }
@@ -229,8 +243,19 @@ async function handlePermissionEvent(context, input) {
 function handlePermissionAsk(context, input, output) {
   const { isHeadless, toolCalls, loggedEvents, home, dataHome, blockerLogPath } = context;
   if (!isHeadless()) return;
+  const impossible = impossibleExternalRead(context, input);
+  if (impossible) {
+    output.status = "deny";
+    output.message = impossible;
+    return;
+  }
   if (isManagedToolOutputRead(toolCalls, input, dataHome)) {
     output.status = "allow";
+    return;
+  }
+  if (isReadOnlyRootRead(context, input, FORBIDDEN_PATTERN)) {
+    output.status = "allow";
+    recordReadOnlyRootAllow(context, input);
     return;
   }
   capturePermissionRequest(toolCalls, loggedEvents, home, blockerLogPath, input || {});
@@ -256,7 +281,10 @@ export function createPermissionBroker({
     blockerLogPath,
   };
   return {
-    recordToolCall: (input, output) => recordPermissionToolCall(toolCalls, isHeadless, home, input, output),
+    recordToolCall: (input, output) => {
+      recordPermissionToolCall(toolCalls, isHeadless, home, input, output);
+      rejectImpossibleToolRead(context, input, FORBIDDEN_PATTERN);
+    },
     handleEvent: (input) => handlePermissionEvent(context, input),
     permissionAsk: (input, output) => handlePermissionAsk(context, input, output),
   };

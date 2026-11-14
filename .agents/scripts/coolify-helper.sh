@@ -11,18 +11,54 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit
 source "${SCRIPT_DIR}/shared-constants.sh"
 
 
-# Error message constants
-# readonly USAGE_PREFIX="Usage:"  # Currently unused
+# Usage message constants (not provided by shared-constants.sh)
+readonly USAGE_COMMAND_OPTIONS="Usage: $0 [command] [options]"
+readonly HELP_USAGE_INFO="Use '$0 help' for usage information"
 
-# Configuration file
-CONFIG_FILE="../configs/coolify-config.json"
+# Configuration file: explicit override, repo/deployed configs/ (SCRIPT_DIR/../../
+# is the repo root or ~/.aidevops), then ~/.aidevops/configs. Never CWD-relative.
+DEFAULT_CONFIG_FILE="${HOME}/.aidevops/configs/coolify-config.json"
+CONFIG_FILE="$DEFAULT_CONFIG_FILE"
+for config_candidate in "${COOLIFY_CONFIG_FILE:-}" \
+    "${SCRIPT_DIR}/../../configs/coolify-config.json" "$DEFAULT_CONFIG_FILE"; do
+    if [[ -n "$config_candidate" && -f "$config_candidate" ]]; then
+        CONFIG_FILE="$config_candidate"
+        break
+    fi
+done
+unset config_candidate
 
-# Function to print colored output
+# Credential-registry fallback (GH#34817): the stored token's metadata names the
+# instance as `instance:<host>` reach. Token values are never read or printed.
+COOLIFY_SECRET_NAME="${COOLIFY_SECRET_NAME:-COOLIFY_API_TOKEN}"
+REGISTRY_RECORD_HINT="aidevops secret record ${COOLIFY_SECRET_NAME} --provider coolify --account REF --resources instance:coolify.example.com"
+
+# Print "NAME<TAB>https://HOST<TAB>ACCOUNT" for the registry's Coolify credential.
+registry_instances() {
+    local inventory="${SCRIPT_DIR}/credential_inventory.py"
+    local name record
+    if ! command -v python3 >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || [[ ! -f "$inventory" ]]; then
+        return 1
+    fi
+    name=$(python3 "$inventory" resolve coolify 2>/dev/null) || name="$COOLIFY_SECRET_NAME"
+    record=$(python3 "$inventory" describe "$name" --json 2>/dev/null) || return 1
+    jq -r --arg name "$name" '(.account.name // .account_ref // "account unrecorded") as $account
+        | .reach.resources[]? | select(startswith("instance:"))
+        | [$name, ("https://" + sub("^instance:"; "")), $account] | @tsv' <<<"$record"
+    return 0
+}
+
+print_config_guidance() {
+    print_error "Configuration file not found: $CONFIG_FILE"
+    print_info "Copy and customize: cp configs/coolify-config.json.txt $DEFAULT_CONFIG_FILE"
+    print_info "Or record the API token's instance: $REGISTRY_RECORD_HINT"
+    return 0
+}
+
 # Check if config file exists
 check_config() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
-        print_error "Configuration file not found: $CONFIG_FILE"
-        print_info "Copy and customize: cp ../configs/coolify-config.json.txt $CONFIG_FILE"
+        print_config_guidance
         exit 1
     fi
 
@@ -34,22 +70,56 @@ check_config() {
     return 0
 }
 
+# List instances recorded in the credential registry (no JSON config needed)
+list_registry_instances() {
+    local instances
+    instances=$(registry_instances) || instances=""
+    if [[ -z "$instances" ]]; then
+        print_config_guidance
+        return 1
+    fi
+    print_info "Coolify instances from the credential registry (no $CONFIG_FILE):"
+    local name url account
+    while IFS=$'\t' read -r name url account; do
+        echo "  - $url"
+        echo "    API token: $name (value not shown)"
+        echo "    Account: $account"
+        echo ""
+    done <<<"$instances"
+    print_info "SSH commands (connect/exec/status) still need $CONFIG_FILE"
+    return 0
+}
+
+# Read one field of a server entry. Keys are passed via --arg so hyphenated
+# names such as coolify-main are not parsed by jq as subtraction.
+_coolify_server_field() {
+    local server="$1"
+    local field="$2"
+    jq -r --arg s "$server" --arg f "$field" '.servers[$s][$f]' "$CONFIG_FILE"
+    return $?
+}
+
 # List all Coolify servers
 list_servers() {
-    check_config
-    print_info "Available Coolify servers:"
-    
     if ! command -v jq >/dev/null 2>&1; then
         print_error "jq is required for JSON parsing. Install with: brew install jq"
         return 1
     fi
-    
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        list_registry_instances
+        return $?
+    fi
+
+    check_config
+    print_info "Available Coolify servers:"
+
     servers=$(jq -r '.servers | keys[]' "$CONFIG_FILE")
     for server in $servers; do
-        name=$(jq -r ".servers.$server.name" "$CONFIG_FILE")
-        host=$(jq -r ".servers.$server.host" "$CONFIG_FILE")
-        coolify_url=$(jq -r ".servers.$server.coolify_url" "$CONFIG_FILE")
-        description=$(jq -r ".servers.$server.description" "$CONFIG_FILE")
+        name=$(_coolify_server_field "$server" name)
+        host=$(_coolify_server_field "$server" host)
+        coolify_url=$(_coolify_server_field "$server" coolify_url)
+        description=$(_coolify_server_field "$server" description)
         
         echo "  - $server: $name"
         echo "    Host: $host"
@@ -73,13 +143,13 @@ connect_server() {
     check_config
     
     local host
-    host=$(jq -r ".servers.$server.host" "$CONFIG_FILE")
+    host=$(_coolify_server_field "$server" host)
     local port
-    port=$(jq -r ".servers.$server.port" "$CONFIG_FILE")
+    port=$(_coolify_server_field "$server" port)
     local username
-    username=$(jq -r ".servers.$server.username" "$CONFIG_FILE")
+    username=$(_coolify_server_field "$server" username)
     local ssh_key
-    ssh_key=$(jq -r ".servers.$server.ssh_key" "$CONFIG_FILE")
+    ssh_key=$(_coolify_server_field "$server" ssh_key)
     
     if [[ "$host" == "null" ]]; then
         print_error "Server '$server' not found in configuration"
@@ -100,11 +170,23 @@ connect_server() {
 # Open Coolify web interface
 open_coolify() {
     local server="${1:-coolify-main}"
-    
-    check_config
-    
     local coolify_url
-    coolify_url=$(jq -r ".servers.$server.coolify_url" "$CONFIG_FILE")
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        local instances first_instance
+        instances=$(registry_instances) || instances=""
+        # Fields: NAME<TAB>URL<TAB>ACCOUNT; take URL from the first line.
+        first_instance="${instances%%$'\n'*}"
+        first_instance="${first_instance#*$'\t'}"
+        coolify_url="${first_instance%%$'\t'*}"
+        if [[ -z "$coolify_url" ]]; then
+            print_config_guidance
+            return 1
+        fi
+    else
+        check_config
+        coolify_url=$(_coolify_server_field "$server" coolify_url)
+    fi
     
     if [[ "$coolify_url" == "null" ]]; then
         print_error "Coolify URL not found for server '$server'"
@@ -134,7 +216,7 @@ list_apps() {
     print_info "Applications on $server:"
     
     local apps
-    apps=$(jq -r ".applications.${server}[]?.name" "$CONFIG_FILE" 2>/dev/null)
+    apps=$(jq -r --arg s "$server" '.applications[$s][]?.name' "$CONFIG_FILE" 2>/dev/null)
     if [[ -z "$apps" ]]; then
         print_warning "No applications configured for server '$server'"
         return 1
@@ -143,11 +225,11 @@ list_apps() {
     echo "$apps" | while read -r app; do
         if [[ -n "$app" ]]; then
             local type
-            type=$(jq -r ".applications.${server}[] | select(.name==\"$app\") | .type" "$CONFIG_FILE")
+            type=$(jq -r --arg s "$server" --arg app "$app" '.applications[$s][] | select(.name == $app) | .type' "$CONFIG_FILE")
             local domain
-            domain=$(jq -r ".applications.${server}[] | select(.name==\"$app\") | .domain" "$CONFIG_FILE")
+            domain=$(jq -r --arg s "$server" --arg app "$app" '.applications[$s][] | select(.name == $app) | .domain' "$CONFIG_FILE")
             local branch
-            branch=$(jq -r ".applications.${server}[] | select(.name==\"$app\") | .branch" "$CONFIG_FILE")
+            branch=$(jq -r --arg s "$server" --arg app "$app" '.applications[$s][] | select(.name == $app) | .branch' "$CONFIG_FILE")
             
             echo "  - $app ($type)"
             echo "    Domain: $domain"
@@ -171,13 +253,13 @@ exec_command() {
     check_config
     
     local host
-    host=$(jq -r ".servers.$server.host" "$CONFIG_FILE")
+    host=$(_coolify_server_field "$server" host)
     local port
-    port=$(jq -r ".servers.$server.port" "$CONFIG_FILE")
+    port=$(_coolify_server_field "$server" port)
     local username
-    username=$(jq -r ".servers.$server.username" "$CONFIG_FILE")
+    username=$(_coolify_server_field "$server" username)
     local ssh_key
-    ssh_key=$(jq -r ".servers.$server.ssh_key" "$CONFIG_FILE")
+    ssh_key=$(_coolify_server_field "$server" ssh_key)
     
     if [[ "$host" == "null" ]]; then
         print_error "Server '$server' not found in configuration"
@@ -201,9 +283,9 @@ check_status() {
     check_config
 
     local host
-    host=$(jq -r ".servers.$server.host" "$CONFIG_FILE")
+    host=$(_coolify_server_field "$server" host)
     local coolify_url
-    coolify_url=$(jq -r ".servers.$server.coolify_url" "$CONFIG_FILE")
+    coolify_url=$(_coolify_server_field "$server" coolify_url)
 
     if [[ "$host" == "null" ]]; then
         print_error "Server '$server' not found in configuration"
@@ -232,56 +314,75 @@ check_status() {
     return 0
 }
 
-# Generate SSH configs for Coolify servers
+# Print the generated SSH config fragment for all configured Coolify servers
+_coolify_ssh_entries() {
+    echo "# Coolify Servers - Generated by coolify-helper.sh"
+    echo "# $(date)"
+    echo ""
+
+    local servers server name host port username ssh_key
+    # Explicit returns: errexit is suspended when the caller tests this function.
+    servers=$(jq -r '.servers | keys[] | select(test("^[A-Za-z0-9._-]+$"))' "$CONFIG_FILE") || return 1
+    for server in $servers; do
+        # --arg keeps hyphenated keys (coolify-main) valid; rows with control
+        # characters are dropped so a value cannot inject extra ssh directives.
+        IFS=$'\t' read -r name host port username ssh_key < <(jq -r --arg s "$server" \
+            '.servers[$s] | [.name, .host, .port, .username, .ssh_key]
+             | if any(.[]; tostring | test("[[:cntrl:]]")) then empty else map(tostring) | @tsv end' \
+            "$CONFIG_FILE") || {
+            print_warning "Skipping server '$server': missing or unsafe values" >&2
+            continue
+        }
+
+        echo "Host $server"
+        echo "    HostName $host"
+        echo "    Port $port"
+        echo "    User $username"
+        if [[ "$ssh_key" != "null" ]]; then
+            echo "    IdentityFile $ssh_key"
+        fi
+        echo "    # $name"
+        echo ""
+    done
+    return 0
+}
+
+# Generate SSH configs for Coolify servers into a private ~/.ssh fragment.
+# Never a shared /tmp path (GH#34951): a fresh mktemp file in ~/.ssh is
+# renamed over the target, so a planted symlink is replaced, not followed.
 generate_ssh_configs() {
     check_config
 
     print_info "Generating SSH configurations for Coolify servers..."
 
-    local ssh_config="$HOME/.ssh/config"
-    local temp_config="/tmp/coolify_ssh_config"
+    local ssh_dir="$HOME/.ssh"
+    local target="$ssh_dir/coolify_config"
+    local temp_config
+    if [[ ! -d "$ssh_dir" ]]; then
+        mkdir -m 700 "$ssh_dir" || return 1
+    fi
+    temp_config=$(mktemp "$ssh_dir/.coolify_config.XXXXXX") || return 1
 
-    echo "# Coolify Servers - Generated by coolify-helper.sh" > "$temp_config"
-    echo "# $(date)" >> "$temp_config"
-    echo "" >> "$temp_config"
+    if ! _coolify_ssh_entries >"$temp_config" || ! chmod 600 "$temp_config" ||
+        ! mv -f "$temp_config" "$target"; then
+        rm -f "$temp_config"
+        print_error "Failed to generate $target"
+        return 1
+    fi
 
-    servers=$(jq -r '.servers | keys[]' "$CONFIG_FILE")
-    for server in $servers; do
-        local name
-        name=$(jq -r ".servers.$server.name" "$CONFIG_FILE")
-        local host
-        host=$(jq -r ".servers.$server.host" "$CONFIG_FILE")
-        local port
-        port=$(jq -r ".servers.$server.port" "$CONFIG_FILE")
-        local username
-        username=$(jq -r ".servers.$server.username" "$CONFIG_FILE")
-        local ssh_key
-        ssh_key=$(jq -r ".servers.$server.ssh_key" "$CONFIG_FILE")
-
-        echo "Host $server" >> "$temp_config"
-        echo "    HostName $host" >> "$temp_config"
-        echo "    Port $port" >> "$temp_config"
-        echo "    User $username" >> "$temp_config"
-
-        if [[ "$ssh_key" != "null" ]]; then
-            echo "    IdentityFile $ssh_key" >> "$temp_config"
-        fi
-
-        echo "    # $name" >> "$temp_config"
-        echo "" >> "$temp_config"
-    done
-
-    print_success "SSH configuration generated: $temp_config"
-    print_info "To add to your SSH config: cat $temp_config >> $ssh_config"
+    print_success "SSH configuration generated: $target"
+    print_info "Add 'Include ~/.ssh/coolify_config' to your ~/.ssh/config"
     return 0
 }
 
 # Main function
 main() {
-    # Assign positional parameters to local variables
+    # Assign positional parameters to local variables. Optional positions
+    # default to empty so `help`, `list` and one-argument commands work under
+    # `set -u`; each command keeps its own missing-argument validation.
     local command="${1:-help}"
-    local param2="$2"
-    local param3="$3"
+    local param2="${2:-}"
+    local param3="${3:-}"
 
     local server_name="$param2"
     local command_to_run="$param3"

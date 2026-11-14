@@ -21,12 +21,13 @@ tools:
 
 - **Recommendation**: Prefer when server control, custom infrastructure, workload density, or price-performance justify self-managing hardening, updates, backups, and monitoring
 - **WordPress selection**: Hostinger is the lower-ops starting point; use `aidevops/recommendations.md` to compare priorities before provisioning
+- **OS/architecture**: [OS selection](../../reference/os-selection.md) — prefer CAX ARM for compatible price-sensitive workloads; verify location/capacity and the exact image architecture. Manual installability is not a ready-made image. Cloudron requires x64
 - **Type**: Cloud VPS, dedicated servers, storage
 - **API**: REST at `https://api.hetzner.cloud/v1`
 - **Auth**: Bearer token per project (stored in `~/.config/aidevops/credentials.sh`)
-- **Token format**: `HCLOUD_TOKEN_{PROJECT}` (e.g. `HCLOUD_TOKEN_MYPROJECT`)
+- **Token names**: new tokens `HCLOUD_<PROJECT>_TOKEN` (e.g. `HCLOUD_MYPROJECT_TOKEN`), per `tools/credentials/credential-inventory.md` "Naming new credentials"; existing `HCLOUD_TOKEN_<PROJECT>` names stay valid
 - **Locations**: Germany (fsn1, nbg1), Finland (hel1), USA (ash, hil)
-- **Server types**: CX (shared), CPX (dedicated vCPU), CCX (dedicated CPU)
+- **Server types**: CX/CPX (shared x86), CAX (shared ARM), CCX (dedicated vCPU); verify current catalogue before provisioning
 - **Docs**: https://docs.hetzner.cloud/
 
 **No MCP required** - uses curl directly. Zero context cost until invoked.
@@ -112,6 +113,19 @@ curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
   https://api.hetzner.cloud/v1/servers/{id}/actions/create_image
 ```
 
+### Helper Commands (`hetzner-helper.sh`)
+
+Token resolution per project: JSON config `api_token`, then `HCLOUD_TOKEN_<PROJECT_UPPER>` (dashes become underscores) from the environment, `~/.config/aidevops/credentials.sh` (parsed, never sourced) or `aidevops secret get`. Tokens are never printed.
+
+```bash
+hetzner-helper.sh snapshot-create <project> <server> <description> [label=value]
+hetzner-helper.sh snapshot-list <project> [label-selector]
+hetzner-helper.sh snapshot-delete <project> <image-id> --confirm   # destructive
+hetzner-helper.sh action-status <project> <action-id>
+hetzner-helper.sh metrics <project> <server> [minutes]   # CPU/disk; useful while SSH is down
+hetzner-helper.sh server-net <project> <server>          # public IPv4 / IPv6 /64
+```
+
 ### Output Formatters
 
 ```bash
@@ -131,11 +145,13 @@ for i in json.load(sys.stdin)['images']:
 
 ## Multi-Project Setup
 
-Each Hetzner Cloud project gets its own API token. Store in `~/.config/aidevops/credentials.sh`:
+Each Hetzner Cloud project gets its own API token. Store each one with its project recorded (value entered at the hidden prompt):
 
 ```bash
-export HCLOUD_TOKEN_PROJECTA="hc_..."
-export HCLOUD_TOKEN_PROJECTB="hc_..."
+aidevops secret account add hetzner-projecta --provider hetzner --name "Project A"
+aidevops secret set HCLOUD_PROJECTA_TOKEN --provider hetzner --account hetzner-projecta
+aidevops secret account add hetzner-projectb --provider hetzner --name "Project B"
+aidevops secret set HCLOUD_PROJECTB_TOKEN --provider hetzner --account hetzner-projectb
 ```
 
 To get a token:

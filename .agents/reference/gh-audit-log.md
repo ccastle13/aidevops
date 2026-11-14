@@ -42,7 +42,7 @@ Each log line is a compact JSON object (NDJSON):
 | `op` | string | Operation type (see below) |
 | `repo` | string | `owner/repo` slug |
 | `number` | integer | Issue or PR number |
-| `caller_script` | string | `BASH_SOURCE` of the code that called the safe wrapper |
+| `caller_script` | string | `BASH_SOURCE` of the code that called the safe wrapper; relative paths that still name an existing file are made absolute so provenance patterns match (GH#34821) |
 | `caller_function` | string | `FUNCNAME` of the calling function |
 | `caller_line` | integer | `BASH_LINENO` of the call site |
 | `pid` | integer | Process ID of the caller |
@@ -221,6 +221,65 @@ Check `caller_script`, `caller_function`, and `caller_line` to find the code pat
 2. Check if `FORCE_ENRICH` or similar flags in `flags` explain the unexpected change
 3. File a bug report if the root cause is a framework defect
 
+### Worked example: a legitimate review handoff (GH#34135)
+
+The alert for issue #34115 at `2026-10-09T02:01:30Z` reported
+`protected_label_removed:status:in-progress`. Investigation established an
+intentional lifecycle transition, not content loss:
+
+- Both audit snapshots had `capture_status:ok` and `delta.comparable:true`.
+  Title length remained 129 and body length remained 3559; both content deltas
+  were zero. Length equality alone does not prove unchanged text, but this entry
+  supplies no evidence of truncation or wiping.
+- The only label delta was removal of `status:in-progress` and addition of
+  `status:in-review`. The ownership label `origin:interactive` remained present.
+- GitHub issue events independently recorded both label changes at
+  `2026-10-09T02:01:28Z`, by the issue's assigned runner. The two-second offset
+  reflects the audit's post-operation record time.
+- [PR #34118](https://github.com/marcusquinn/aidevops/pull/34118) merged at
+  `2026-10-09T02:16:26Z`; issue #34115 closed one second later and subsequently
+  received `status:done`. No restoration or label repair was needed.
+
+The audit caller was the generic `gh-write-helper.sh` entrypoint (`main`), with
+empty `flags`. This is **not** the verified full-loop provenance that
+`expected_full_loop_review_transition` in `gh-audit-anomaly-filter.jq` requires.
+The scanner therefore correctly retained the event for investigation, even
+though independent evidence later established that the transition was benign.
+Do not suppress all progress-to-review transitions, backfill verification flags
+into historical audit entries, or remove the current-state proof requirement
+just to silence such an alert. Resolve the alert with the snapshot, event and
+delivery evidence; preserve the original audit record and completed issue state.
+
+### Worked example: worker exit transitions (GH#34361)
+
+The `2026-10-11T09:53:40Z` scan reported three removals of
+`status:in-progress` in a private source repository. Investigation matched each
+audit entry to independent GitHub label events and contemporaneous worker
+checkpoints. Source identities and private delivery links are deliberately omitted.
+
+| Audit timestamp (UTC, 2026-10-11) | Title/body lengths, before = after | Label delta | Independent evidence |
+| --- | --- | --- | --- |
+| 03:13:29 | 69 / 15659 | Remove `status:in-progress`; add `status:blocked` and `hold-for-review` | GitHub records all three changes at 03:13:27. The 03:13:24 checkpoint describes partial delivery and a maintainer-owned continuity decision; the subsequent claim release records `input_required`. |
+| 04:18:00 | 37 / 15373 | Remove `status:in-progress`; add `status:available` | GitHub records both changes and unassignment at 04:17:58. The 04:15:53 checkpoint explicitly keeps the task open after partial delivery; the subsequent claim release records `worker_merged_partial`. |
+| 05:04:20 | 53 / 14929 | Remove `status:in-progress`; retain existing `status:blocked` | GitHub records blocking at 05:04:08 and progress-label removal at 05:04:18. The 05:03:59 checkpoint reports unfinished prerequisite phases and no repository or publication changes; the subsequent claim release records `external_trigger_pending`. |
+
+All six snapshots have `capture_status:ok`, and all three deltas have
+`comparable:true` with zero title/body percentage changes. Exact lengths also
+match within each pair; this supplies no evidence of content loss, but length
+equality alone cannot prove text identity. The checked current issues remain open
+with nonempty content and the respective blocked, available, and blocked states.
+The available task also has a later `needs-consolidation` label; that is not part
+of the audited delta.
+
+These are evidenced worker exit transitions, not destructive edits requiring
+restoration. Retain the source holds and continuation state: closing this audit
+alert does not complete the source tasks or authorize another publication.
+Each entry has generic `gh-write-helper.sh` / `main` provenance and empty
+`flags`, so independent forensic evidence must not be retroactively treated as
+verified transition provenance. Leave the audit entries and scanner filters
+unchanged; do not suppress generic progress-to-blocked or progress-to-available
+removals based only on their destination labels.
+
 ## Retention and Rotation Policy
 
 - **Log file:** `~/.aidevops/logs/gh-audit.log`
@@ -252,16 +311,62 @@ The daily routine `r-gh-audit-scan` runs `gh-audit-anomaly-helper.sh scan`:
 ```
 
 The scanner:
-1. Reads entries since the last scan (tracked in `~/.aidevops/logs/gh-audit-scanner.state`)
+1. Reads entries since the last scan (tracked in `~/.aidevops/logs/gh-audit-scanner.state`).
+   After a rotation it first reads the rotated file that held the checkpoint
+   (from the saved line onward) and any later rotated files, then the whole live
+   log; a live log shorter than the checkpoint with no rotated file is rescanned
+   from line 1 (GH#37904)
 2. Filters entries with `suspicious[] | length > 0`, excluding only exact,
    fully comparable expected transitions: verified issue/PR approval removal of
    `needs-maintainer-review`, independently revalidated trusted-author NMR
-   normalization, and worker permission blocking that replaces active lifecycle
+   normalization, verified PR-review handoffs that replace only
+   `status:in-progress` with `status:in-review` without content-length changes,
+   runtime-owned blocked exits replacing only `status:in-progress` with
+   `status:blocked` with `worker_blocked_exit_verified: v1-release-persisted`
+   (live blocked state and a trusted blocked release newer than the last claim),
+   signed worker-permission grants that remove `needs-maintainer-permissions`
+   (optionally with `status:blocked`, adding only `status:available` or
+   `auto-dispatch`) with `permission_approval_verified: v1-current-state`
+   (the signed grant re-verified against the latest live request, GH#37906),
+   and worker permission blocking that replaces active lifecycle
    labels with `needs-maintainer-permissions` (the original audit entry remains
    unchanged)
 3. Redacts source repository names unless GitHub confirms they are public (or
    they match the destination repository), failing closed on lookup errors
 4. Files a GitHub issue on `marcusquinn/aidevops` with a summary table when anomalies are found
+
+The explicit handoff command is `gh-write-helper.sh issue review-handoff <issue>
+--repo <owner/repo> --pr <pr>`. Its `_issue_review_handoff` provenance requires
+`flags.pr_review_handoff_verified == "v2-owned-pr-current-state"`: the current
+actor is assigned to the open issue and authored an open, non-draft PR with a
+same-repository closing reference to it. The audit independently rechecks that
+PR and the live issue (open, in-review, not in-progress). Legacy full-loop caller
+paths retain the `v1-current-state` proof. Generic `issue edit` / `main` is not
+exempt, even with a PR identifier in the environment. Unavailable reads, changed
+ownership, draft/unlinked PRs, or additional destructive signals remain
+reportable. Historical audit entries are never rewritten or backfilled.
+
+Protected-label removals also have a narrow timeline-backed `self_reversal`
+exemption (GH#35881). Every signal on the entry must be a protected-label removal.
+For each label, the latest preceding add and the matching removal must both be
+by the scanner's authenticated login, at most 24 hours apart, with no other actor
+labelling or unlabelling it in between. The removal must be unique within the
+minute preceding the post-operation audit timestamp. This conservative match
+keeps delayed or ambiguous records reportable rather than trusting an older cycle.
+The login is read once per scan; timeline reads are capped at five 100-event
+pages. API errors, missing events, malformed or truncated timelines, actor
+mismatches, and additional signals (including body loss or capture failures)
+retain the alert. Each exclusion logs `self_reversal`; the original log stays
+unchanged and the scan cursor still advances. Historical alerts are not rewritten.
+
+Alerts are labelled `monitoring` and `no-auto-dispatch` (GH#34499). The evidence
+is in the producing runner's local `gh-audit.log`, so the review owner is the
+runner that filed the alert (the issue author). Other runners' workers cannot read
+it: before this hold, #34495 used three worker launches that each ended blocked.
+Investigate on the producing runner with the Forensics Workflow above. Then close
+the alert with evidence, or file a separately scoped repair task. Do not remove
+`no-auto-dispatch` to "unstick" an alert; that removal is itself a
+protected-label audit signal.
 
 To run the scanner manually:
 
@@ -269,7 +374,7 @@ To run the scanner manually:
 # Normal run (incremental, files issue)
 gh-audit-anomaly-helper.sh scan
 
-# Scan all entries without filing an issue (dry run)
+# Scan the whole live log (not rotated logs) without filing an issue (dry run)
 gh-audit-anomaly-helper.sh scan --all --dry-run
 
 # Check scanner state

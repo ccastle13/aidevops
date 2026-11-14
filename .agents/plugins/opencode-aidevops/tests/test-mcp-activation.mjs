@@ -3,18 +3,20 @@
 
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { join, relative } from "node:path";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -23,20 +25,133 @@ import {
   createMcpActivationTool,
   enforceManagedMcpArtifactPath,
 } from "../mcp-activation-tool.mjs";
-import { createMcpSessionRuntime, registerMcpServers } from "../mcp-registry.mjs";
+import { createMcpSessionRuntime, getMcpRegistry, getOnDemandMcpAgents, registerMcpServers } from "../mcp-registry.mjs";
+import { normalizeMcpArtifactPaths } from "../mcp-artifact-paths.mjs";
+
+test("normalizes Playwright artifact links using the MCP cwd, not the worktree", () => {
+  // Symlink-free fixture root: macOS /home and /var are symlinks, which the
+  // normalizer deliberately refuses to traverse.
+  const fixtureRoot = join(realpathSync(tmpdir()), "aidevops-links-fixture-absent");
+  const runtime = createMcpSessionRuntime(join(fixtureRoot, ".aidevops/.agent-workspace"), { nonce: "links" });
+  const workspace = runtime.workspaces.playwright;
+  const snapshot = join(workspace.outputDirectory, "page.yml");
+  const output = { output: `[Snapshot](${relative(workspace.outputDirectory, snapshot)})\n[Screenshot](./shot.png)` };
+  normalizeMcpArtifactPaths({ tool: "playwright_browser_navigate" }, output, runtime.workspaces);
+  assert.equal(output.output, `[Snapshot](${snapshot})\n[Screenshot](${join(workspace.outputDirectory, "shot.png")})`);
+
+  // A ../../.. link is valid only when its resolved destination is in this session.
+  const nested = { directory: workspace.directory, outputDirectory: join(workspace.directory, "a", "b", "c") };
+  const traversing = { output: "[Snapshot](../../../.aidevops/.agent-workspace/page.yml)\n[Escape](../../../../outside.png)\n[Web](https://example.com/a.png)" };
+  normalizeMcpArtifactPaths({ tool: "playwright_browser_snapshot" }, traversing, { playwright: nested });
+  assert.equal(traversing.output, `[Snapshot](${join(workspace.directory, ".aidevops/.agent-workspace/page.yml")})\n[Escape](../../../../outside.png)\n[Web](https://example.com/a.png)`);
+  const unrelated = { output: "[Screenshot](./shot.png)" };
+  normalizeMcpArtifactPaths({ tool: "read" }, unrelated, runtime.workspaces);
+  assert.equal(unrelated.output, "[Screenshot](./shot.png)");
+});
+
+test("leaves artifact links through a symlink escape unchanged", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "aidevops-artifact-links-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const directory = join(root, "session");
+  const outputDirectory = join(directory, ".playwright-mcp");
+  const outside = join(root, "outside");
+  mkdirSync(outputDirectory, { recursive: true });
+  mkdirSync(outside);
+  symlinkSync(outside, join(outputDirectory, "linked"), "dir");
+  const output = { output: "[Screenshot](./linked/shot.png)\n[Traversal](./linked/../shot.png)" };
+  normalizeMcpArtifactPaths({ tool: "playwright_browser_take_screenshot" }, output, { playwright: { directory, outputDirectory } });
+  assert.equal(output.output, "[Screenshot](./linked/shot.png)\n[Traversal](./linked/../shot.png)");
+});
 
 const TEST_DIR = fileURLToPath(new URL(".", import.meta.url));
 const AGENTS_DIR = join(TEST_DIR, "../../..");
 const schemaNode = { describe() { return this; } };
 const z = { enum() { return schemaNode; } };
-const tool = (definition) => definition;
+const activationAgents = Object.fromEntries(getOnDemandMcpAgents().map(({ name, agentName }) => [name, agentName]));
+const tool = (definition) => ({
+  ...definition,
+  execute: (args, context = { agent: activationAgents[args.name] }) => definition.execute(args, context),
+});
 
-test("registers only the explicit browser MCP activation profiles", () => {
-  const config = {};
+test("plain-text Playwriter mention in another agent never changes MCP lifecycle", async () => {
+  const calls = [];
+  const activation = createMcpActivationTool(tool, z, {
+    allowedNames: ["playwriter", ...(process.platform === "darwin" ? ["affinity-studio"] : [])],
+    activationAgents,
+    client: {
+      async connect() { calls.push("connect"); },
+      async disconnect() { calls.push("disconnect"); },
+    },
+  });
+  assert.match(
+    await activation.execute({ action: "connect", name: "playwriter" }, { agent: "SEO" }),
+    /no lifecycle change.*Select @playwriter from OpenCode autocomplete.*pasting the text/,
+  );
+  assert.match(
+    await activation.execute({ action: "disconnect", name: "playwriter" }, { agent: "SEO" }),
+    /no lifecycle change/,
+  );
+  assert.match(
+    await activation.execute({ action: "connect", name: "playwriter" }, {}),
+    /no lifecycle change/,
+  );
+  assert.deepEqual(calls, []);
+  assert.match(
+    await activation.execute({ action: "connect", name: "playwriter" }, { agent: "playwriter" }),
+    /Connected MCP playwriter for the playwriter agent/,
+  );
+  assert.match(
+    await activation.execute({ action: "disconnect", name: "playwriter" }, { agent: "playwriter" }),
+    /Disconnected MCP playwriter/,
+  );
+  assert.deepEqual(calls, ["connect", "disconnect"]);
+  if (process.platform === "darwin") {
+    assert.match(
+      await activation.execute({ action: "connect", name: "affinity-studio" }, { agent: "affinity" }),
+      /Connected MCP affinity-studio/,
+    );
+    assert.match(
+      await activation.execute({ action: "disconnect", name: "affinity-studio" }, { agent: "affinity" }),
+      /Disconnected MCP affinity-studio/,
+    );
+    assert.deepEqual(calls, ["connect", "disconnect", "connect", "disconnect"]);
+  }
+});
+
+test("each registry entry has an agent source or an explicit opt-out", () => {
+  for (const mcp of getMcpRegistry()) {
+    if (!mcp.activationAgent) {
+      assert.equal(mcp.activation, "none", mcp.name);
+      assert.ok(mcp.activationReason?.trim(), mcp.name);
+      continue;
+    }
+    assert.ok(Array.isArray(mcp.agentSource) && mcp.agentSource.length > 0, mcp.name);
+    assert.ok(existsSync(join(AGENTS_DIR, ...mcp.agentSource)), mcp.name);
+    assert.ok(mcp.toolPattern, mcp.name);
+  }
+});
+
+test("registers only the explicit MCP activation profiles", () => {
+  const config = { mcp: {}, tools: {} };
+  registerMcpServers(config);
   const count = registerOnDemandMcpAgents(config, AGENTS_DIR);
 
-  assert.equal(count, 2);
-  assert.deepEqual(Object.keys(config.agent), ["playwriter", "playwright"]);
+  const onDemand = getOnDemandMcpAgents();
+  assert.equal(count, onDemand.length);
+  assert.deepEqual(Object.keys(config.agent), onDemand.map((mcp) => mcp.agentName));
+  assert.equal(new Set(onDemand.map((mcp) => mcp.agentName)).size, onDemand.length);
+  if (process.platform === "darwin") {
+    assert.equal(config.agent["macos-automator"].tools.aidevops_mcp, true);
+    assert.equal(config.agent["macos-automator"].tools["macos-automator_*"], true);
+    assert.equal(config.mcp["macos-automator"].enabled, false);
+    assert.equal(config.tools["macos-automator_*"], false);
+    assert.match(config.agent["macos-automator"].prompt, /AXManualAccessibility/);
+  }
+  // Every registered MCP must be launchable on demand through a bounded agent.
+  assert.deepEqual(Object.keys(config.mcp).filter((name) => !onDemand.some((mcp) => mcp.name === name)), []);
+  for (const name of ["playwriter", "context7", "posthog", "playwright", "sentry", "shadcn", "cloudflare-mcp", "shopify", "docker-mcp"]) {
+    assert.ok(config.agent[name], `missing activation agent ${name}`);
+  }
   assert.equal(config.tools.aidevops_mcp, false);
   assert.equal(config.agent.playwriter.mode, "subagent");
   assert.equal(config.agent.playwriter.tools.aidevops_mcp, true);
@@ -44,12 +159,26 @@ test("registers only the explicit browser MCP activation profiles", () => {
   assert.equal(config.agent.playwriter.permission.aidevops_mcp, "allow");
   assert.equal(config.agent.playwriter.permission["playwriter_*"], "allow");
   assert.match(config.agent.playwriter.prompt, /connect.*playwriter/);
-  assert.match(config.agent.playwriter.prompt, /no browser tab is approved/i);
+  // GH#34648: a not-connected report is classified, never relayed as "click the icon".
+  assert.match(config.agent.playwriter.prompt, /no approved tab or a disconnected extension/i);
+  assert.match(config.agent.playwriter.prompt, /mcp-diagnose\.sh playwriter.*Relay extension state/);
   assert.match(config.agent.playwriter.prompt, /before requesting authentication/i);
   assert.match(config.agent.playwriter.prompt, /enumerate.*context\.pages\(\)/i);
+  assert.match(config.agent.playwriter.prompt, /exactly one `about:blank` bootstrap page/i);
+  // GH#34549: 0.8.0+ opens no tab and has no `page` global.
+  // Markdown line wrapping must not change this guidance contract.
+  assert.match(config.agent.playwriter.prompt, /Playwriter\s+0\.8\.0\+\s+never\s+opens\s+a\s+tab\s+on\s+its\s+own/);
+  assert.match(config.agent.playwriter.prompt, /state\.page = await context\.newPage\(\)/);
+  assert.match(config.agent.playwriter.prompt, /PLAYWRITER_TELEMETRY=0/);
+  assert.match(config.agent.playwriter.prompt, /already approved the exact HTTPS destination/i);
+  // Accept the original classification and GH#35955's bounded attachment wording
+  // on the merge base, without making Markdown line wrapping significant.
+  assert.match(config.agent.playwriter.prompt, /unmatched\s+non-blank\s+or\s+multiple\s+pages|`attachment-timeout`,\s+multiple\s+new\s+matching\s+pages/i);
+  assert.match(config.agent.playwriter.prompt, /prior attachment was invalidated/i);
+  assert.match(config.agent.playwriter.prompt, /not consent to inspect another page/i);
   assert.match(config.agent.playwriter.prompt, /never silently substitute.*playwright/i);
   assert.match(config.agent.playwriter.prompt, /never close\s+user-owned[\s\S]*browser windows/i);
-  assert.match(config.agent.playwriter.prompt, /# Playwriter - Browser Extension MCP/);
+  assert.match(config.agent.playwriter.prompt, /# Playwriter - Legacy Browser Extension MCP/);
   assert.equal(config.agent.playwright.mode, "subagent");
   assert.equal(config.agent.playwright.tools.aidevops_mcp, true);
   assert.equal(config.agent.playwright.tools["playwright_*"], true);
@@ -57,6 +186,77 @@ test("registers only the explicit browser MCP activation profiles", () => {
   assert.equal(config.agent.playwright.permission["playwright_*"], "allow");
   assert.match(config.agent.playwright.prompt, /connect.*playwright/);
   assert.match(config.agent.playwright.prompt, /# Playwright MCP/);
+  assert.equal(config.agent.posthog.mode, "subagent");
+  assert.equal(config.agent.posthog.tools.aidevops_mcp, true);
+  assert.equal(config.agent.posthog.tools["posthog_*"], true);
+  assert.equal(config.agent.posthog.permission.aidevops_mcp, "allow");
+  assert.equal(config.agent.posthog.permission["posthog_*"], "allow");
+  assert.match(config.agent.posthog.prompt, /connect.*posthog/);
+  assert.match(config.agent.posthog.prompt, /# PostHog MCP/);
+  assert.equal(config.agent.quickfile.mode, "subagent");
+  assert.equal(config.agent.quickfile.tools.aidevops_mcp, true);
+  assert.equal(config.agent.quickfile.tools["quickfile_*"], true);
+  assert.equal(config.agent.quickfile.permission.aidevops_mcp, "allow");
+  assert.equal(config.agent.quickfile.permission["quickfile_*"], "allow");
+  assert.match(config.agent.quickfile.prompt, /connect.*quickfile/);
+  assert.match(config.agent.quickfile.prompt, /# QuickFile Agent/);
+  assert.match(config.agent.quickfile.prompt, /business\/accounting\.md/);
+  assert.doesNotMatch(config.agent.quickfile.prompt, /browser tab/i);
+  assert.equal(config.agent["mobile-mcp"].tools.aidevops_mcp, true);
+  assert.equal(config.agent["mobile-mcp"].tools["mobile-mcp_*"], false);
+  assert.equal(config.agent["mobile-mcp"].permission["mobile-mcp_*"], "deny");
+  assert.equal(config.agent["mobile-mcp"].tools["mobile-mcp_mobile_list_available_devices"], true);
+  assert.equal(config.agent["mobile-mcp"].tools["mobile-mcp_mobile_batch_commands"], undefined);
+  assert.equal(config.agent["mobile-mcp"].tools["mobile-mcp_mobile_allocate_remote_device"], undefined);
+  assert.match(config.agent["mobile-mcp"].prompt, /Cloud login, allocation, release and batch commands are not available/);
+  if (process.env.PATH?.split(process.platform === "win32" ? ";" : ":").some((dir) => existsSync(join(dir, "mcp-server-mobile")))) {
+    assert.deepEqual(config.mcp["mobile-mcp"], {
+      type: "local",
+      command: [join(homedir(), ".aidevops", "agents", "scripts", "mobile-mcp-launcher.sh")],
+      enabled: false,
+    });
+  } else {
+    assert.equal(config.mcp["mobile-mcp"], undefined);
+  }
+  assert.equal(config.tools["mobile-mcp_*"], false);
+  if (!config.mcp["mobile-mcp"]) {
+    const stale = { mcp: { "mobile-mcp": { type: "remote", url: "https://example.invalid/mcp", enabled: true } }, tools: {} };
+    registerMcpServers(stale);
+    assert.equal(stale.mcp["mobile-mcp"], undefined);
+    assert.equal(stale.tools["mobile-mcp_*"], false);
+  }
+  assert.equal(config.agent["backblaze-b2"].mode, "subagent");
+  assert.equal(config.agent["backblaze-b2"].tools.aidevops_mcp, true);
+  assert.equal(config.agent["backblaze-b2"].tools["backblaze-b2_*"], true);
+  assert.equal(config.agent["backblaze-b2"].permission.aidevops_mcp, "allow");
+  assert.equal(config.agent["backblaze-b2"].permission["backblaze-b2_*"], "allow");
+  assert.match(config.agent["backblaze-b2"].prompt, /connect.*backblaze-b2/);
+  assert.match(config.agent["backblaze-b2"].prompt, /# Backblaze B2 Agent/);
+  assert.deepEqual(config.mcp["backblaze-b2"], {
+    type: "local",
+    command: [join(homedir(), ".aidevops", "agents", "scripts", "backblaze-b2-mcp-launcher.sh")],
+    enabled: false,
+  });
+  assert.equal(config.tools["backblaze-b2_*"], false);
+});
+
+test("keeps custom Backblaze B2 commands disconnected", () => {
+  const config = {
+    mcp: { "backblaze-b2": { type: "local", command: ["custom-b2-mcp"], enabled: true } },
+    tools: { "backblaze-b2_*": true },
+  };
+
+  registerMcpServers(config);
+
+  assert.deepEqual(config.mcp["backblaze-b2"].command, ["custom-b2-mcp"]);
+  assert.equal(config.mcp["backblaze-b2"].enabled, false);
+  assert.equal(config.tools["backblaze-b2_*"], false);
+});
+
+test("keeps Playwriter reachable from the Build+ routing profile", () => {
+  const buildPlus = readFileSync(join(AGENTS_DIR, "build-plus.md"), "utf8");
+
+  assert.match(buildPlus, /^\s+- playwriter$/m);
 });
 
 test("pins legacy Playwriter commands while preserving custom commands", () => {
@@ -65,6 +265,14 @@ test("pins legacy Playwriter commands while preserving custom commands", () => {
     ["/opt/aidevops/bin/npx", "playwriter@latest"],
     ["npx", "-y", "playwriter@latest"],
     ["bun", "x", "playwriter@latest"],
+    // GH#34549: the previous reviewed pin migrates like any generated command.
+    ["npx", "playwriter@0.5.0"],
+    ["/opt/aidevops/bin/npx", "-y", "playwriter@0.5.0"],
+    ["bun", "x", "playwriter@0.5.0"],
+    // GH#35514: generated 0.8.0 entries migrate to the 0.9.0 pin.
+    ["npx", "playwriter@0.8.0"],
+    ["/opt/aidevops/bin/npx", "-y", "playwriter@0.8.0"],
+    ["bun", "x", "playwriter@0.8.0"],
   ];
 
   for (const command of legacyCommands) {
@@ -84,8 +292,13 @@ test("pins legacy Playwriter commands while preserving custom commands", () => {
     registerMcpServers(config);
 
     assert.strictEqual(config.mcp.playwriter, playwriter);
-    assert.equal(playwriter.command.at(-1), "playwriter@0.5.0");
+    assert.deepEqual(playwriter.command.slice(0, 1), ["bash"]);
+    assert.match(playwriter.command[1], /browser-mcp-launcher\.sh$/);
+    assert.equal(playwriter.command[2], "playwriter");
+    assert.equal(playwriter.command.at(-1), "playwriter@0.9.0");
     assert.ok(!playwriter.command.includes("playwriter@latest"));
+    assert.ok(!playwriter.command.includes("playwriter@0.5.0"));
+    assert.ok(!playwriter.command.includes("playwriter@0.8.0"));
     assert.equal(playwriter.enabled, false);
     assert.deepEqual(playwriter.environment, { PLAYWRITER_RELAY: "local" });
     assert.equal(playwriter.timeout, 5_000);
@@ -151,15 +364,19 @@ test("pins legacy Playwriter commands while preserving custom commands", () => {
   assert.equal(customLatestWithYesConfig.tools["playwriter_*"], false);
 });
 
-test("opts framework-generated Playwriter commands into the authenticated relay launcher", () => {
+// GH#34651: guarded by default on POSIX, with no launch flag or operator token.
+test("runs framework-generated Playwriter commands under the guarded relay launcher by default", { skip: process.platform === "win32" }, () => {
   const previous = process.env.AIDEVOPS_PLAYWRITER_AUTHENTICATED_RELAY;
-  process.env.AIDEVOPS_PLAYWRITER_AUTHENTICATED_RELAY = "1";
+  delete process.env.AIDEVOPS_PLAYWRITER_AUTHENTICATED_RELAY;
   try {
     const generated = { mcp: {}, tools: {} };
     registerMcpServers(generated);
-    assert.match(generated.mcp.playwriter.command[0], /node$/);
-    assert.match(generated.mcp.playwriter.command[1], /playwriter-authenticated-relay\.mjs$/);
-    assert.equal(generated.mcp.playwriter.command.at(-1), "playwriter@0.5.0");
+    assert.equal(generated.mcp.playwriter.command[0], "bash");
+    assert.match(generated.mcp.playwriter.command[1], /browser-mcp-launcher\.sh$/);
+    assert.equal(generated.mcp.playwriter.command[2], "playwriter");
+    assert.match(generated.mcp.playwriter.command[3], /node$/);
+    assert.match(generated.mcp.playwriter.command[4], /playwriter-authenticated-relay\.mjs$/);
+    assert.equal(generated.mcp.playwriter.command.at(-1), "playwriter@0.9.0");
     assert.ok(!generated.mcp.playwriter.command.some((part) => part.includes("TOKEN")));
 
     const previousGenerated = {
@@ -173,9 +390,17 @@ test("opts framework-generated Playwriter commands into the authenticated relay 
       tools: {},
     };
     registerMcpServers(previousGenerated);
+    assert.equal(previousGenerated.mcp.playwriter.command.at(-1), "playwriter@0.9.0");
+    assert.match(previousGenerated.mcp.playwriter.command[1], /browser-mcp-launcher\.sh$/);
     assert.match(
-      previousGenerated.mcp.playwriter.command[1],
+      previousGenerated.mcp.playwriter.command[4],
       /playwriter-authenticated-relay\.mjs$/,
+    );
+    registerMcpServers(previousGenerated);
+    assert.equal(
+      previousGenerated.mcp.playwriter.command.filter((part) => part === "playwriter").length,
+      1,
+      "repeated registration must not re-wrap the confined command",
     );
     assert.equal(previousGenerated.mcp.playwriter.enabled, false);
 
@@ -224,18 +449,160 @@ test("migrates browser MCPs to disconnected and globally denied", () => {
   registerMcpServers(config, { runtime });
 
   assert.equal(config.mcp.playwriter.enabled, false);
-  assert.ok(config.mcp.playwriter.command.includes("playwriter@0.5.0"));
+  assert.ok(config.mcp.playwriter.command.includes("playwriter@0.9.0"));
   assert.ok(!config.mcp.playwriter.command.includes("playwriter@latest"));
   assert.equal(config.mcp.playwright.enabled, false);
-  assert.equal(config.mcp.playwright.command[0], "/bin/bash");
+  assert.equal(config.mcp.playwright.command[0], "bash");
   assert.ok(config.mcp.playwright.command.includes(runtime.workspaces.playwright.directory));
   assert.ok(config.mcp.playwright.command.includes(
     join(runtime.workspaces.playwright.directory, ".playwright-mcp"),
   ));
   assert.match(config.mcp.playwright.command[2], /--output-dir/);
   assert.ok(config.mcp.playwright.command.includes("@playwright/mcp@0.0.79"));
+  assert.ok(config.mcp.playwright.command.includes("--headless"));
+  assert.ok(config.mcp.playwright.command.includes("--isolated"));
+  assert.ok(!config.mcp.playwright.command.includes("--extension"));
   assert.equal(config.tools["playwriter_*"], false);
   assert.equal(config.tools["playwright_*"], false);
+});
+
+test("uses Playwright extension mode only when explicitly requested interactively", () => {
+  const previousToken = process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN;
+  const previousMode = process.env.PLAYWRIGHT_MCP_EXTENSION;
+  const previousHeaded = process.env.AIDEVOPS_PLAYWRIGHT_HEADED;
+  const headlessKeys = [
+    "FULL_LOOP_HEADLESS", "AIDEVOPS_HEADLESS", "OPENCODE_HEADLESS",
+    "CLAUDE_HEADLESS", "Claude_HEADLESS", "HEADLESS", "GITHUB_ACTIONS", "CI",
+    "AIDEVOPS_WORKER_ID", "AIDEVOPS_SESSION_ORIGIN",
+  ];
+  const previousHeadless = Object.fromEntries(headlessKeys.map((key) => [key, process.env[key]]));
+  process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN = "test-only-placeholder";
+  process.env.PLAYWRIGHT_MCP_EXTENSION = "1";
+  delete process.env.AIDEVOPS_PLAYWRIGHT_HEADED;
+  for (const key of headlessKeys) delete process.env[key];
+  process.env.AIDEVOPS_SESSION_ORIGIN = "interactive";
+
+  try {
+    const runtime = createMcpSessionRuntime("/managed/workspace", {
+      tempRoot: "/managed/tmp",
+      nonce: "extension-mode",
+      markerToken: "extension-mode-token",
+    });
+    const config = {};
+
+    registerMcpServers(config, { runtime });
+
+    assert.ok(config.mcp.playwright.command.includes("--extension"));
+    assert.ok(!config.mcp.playwright.command.includes("--headless"));
+    assert.ok(!config.mcp.playwright.command.includes("--isolated"));
+    assert.ok(!config.mcp.playwright.command.includes("test-only-placeholder"));
+
+    process.env.HEADLESS = "0";
+    const falseMarkerConfig = {};
+    registerMcpServers(falseMarkerConfig, { runtime });
+    assert.ok(falseMarkerConfig.mcp.playwright.command.includes("--extension"));
+
+    process.env.AIDEVOPS_SESSION_ORIGIN = "worker";
+    process.env.AIDEVOPS_PLAYWRIGHT_HEADED = "1";
+    const workerConfig = {};
+    registerMcpServers(workerConfig, { runtime });
+    assert.ok(!workerConfig.mcp.playwright.command.includes("--extension"));
+    assert.ok(workerConfig.mcp.playwright.command.includes("--headless"));
+    assert.ok(workerConfig.mcp.playwright.command.includes("--isolated"));
+  } finally {
+    if (previousToken === undefined) delete process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN;
+    else process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN = previousToken;
+    if (previousMode === undefined) delete process.env.PLAYWRIGHT_MCP_EXTENSION;
+    else process.env.PLAYWRIGHT_MCP_EXTENSION = previousMode;
+    if (previousHeaded === undefined) delete process.env.AIDEVOPS_PLAYWRIGHT_HEADED;
+    else process.env.AIDEVOPS_PLAYWRIGHT_HEADED = previousHeaded;
+    for (const [key, value] of Object.entries(previousHeadless)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test("keeps token-only work standalone and supports a separate headed Brave process", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "aidevops-playwright-brave-"));
+  const braveExecutable = join(root, "brave");
+  writeFileSync(braveExecutable, "#!/bin/sh\nexit 0\n");
+  chmodSync(braveExecutable, 0o755);
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  const previousToken = process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN;
+  const previousMode = process.env.PLAYWRIGHT_MCP_EXTENSION;
+  const previousExecutable = process.env.AIDEVOPS_PLAYWRIGHT_EXECUTABLE;
+  const previousHeaded = process.env.AIDEVOPS_PLAYWRIGHT_HEADED;
+  const headlessKeys = [
+    "FULL_LOOP_HEADLESS", "AIDEVOPS_HEADLESS", "OPENCODE_HEADLESS",
+    "CLAUDE_HEADLESS", "Claude_HEADLESS", "HEADLESS", "GITHUB_ACTIONS", "CI",
+    "AIDEVOPS_WORKER_ID", "AIDEVOPS_SESSION_ORIGIN",
+  ];
+  const previousHeadless = Object.fromEntries(headlessKeys.map((key) => [key, process.env[key]]));
+  process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN = "test-only-placeholder";
+  delete process.env.PLAYWRIGHT_MCP_EXTENSION;
+  process.env.AIDEVOPS_PLAYWRIGHT_EXECUTABLE = braveExecutable;
+  process.env.AIDEVOPS_PLAYWRIGHT_HEADED = "1";
+  for (const key of headlessKeys) delete process.env[key];
+  process.env.AIDEVOPS_SESSION_ORIGIN = "interactive";
+
+  try {
+    const runtime = createMcpSessionRuntime("/managed/workspace", {
+      tempRoot: "/managed/tmp",
+      nonce: "standalone-brave",
+      markerToken: "standalone-brave-token",
+    });
+    const config = {};
+    registerMcpServers(config, { runtime });
+
+    assert.ok(!config.mcp.playwright.command.includes("--extension"));
+    assert.ok(!config.mcp.playwright.command.includes("--headless"));
+    assert.ok(config.mcp.playwright.command.includes("--isolated"));
+    assert.ok(config.mcp.playwright.command.includes("--executable-path"));
+    assert.ok(config.mcp.playwright.command.includes(braveExecutable));
+    assert.ok(!config.mcp.playwright.command.includes("test-only-placeholder"));
+    assert.ok(!config.mcp.playwright.command.includes("--init-page"));
+
+    // GH#35617: headed-hidden keeps a headed browser and minimises its windows.
+    process.env.AIDEVOPS_PLAYWRIGHT_HEADED = "hidden";
+    const hiddenConfig = {};
+    registerMcpServers(hiddenConfig, { runtime });
+    const hiddenCommand = hiddenConfig.mcp.playwright.command;
+    assert.ok(!hiddenCommand.includes("--headless"));
+    assert.ok(hiddenCommand.includes("--isolated"));
+    const initPage = hiddenCommand[hiddenCommand.indexOf("--init-page") + 1];
+    assert.match(initPage, /scripts\/playwright-headed-hidden-init\.cjs$/);
+    assert.ok(existsSync(initPage));
+
+    process.env.AIDEVOPS_SESSION_ORIGIN = "worker";
+    const hiddenWorkerConfig = {};
+    registerMcpServers(hiddenWorkerConfig, { runtime });
+    assert.ok(hiddenWorkerConfig.mcp.playwright.command.includes("--headless"));
+    assert.ok(!hiddenWorkerConfig.mcp.playwright.command.includes("--init-page"));
+    process.env.AIDEVOPS_SESSION_ORIGIN = "interactive";
+    process.env.AIDEVOPS_PLAYWRIGHT_HEADED = "1";
+
+    const invalidExecutable = join(root, "missing-brave");
+    process.env.AIDEVOPS_PLAYWRIGHT_EXECUTABLE = invalidExecutable;
+    const invalidConfig = {};
+    registerMcpServers(invalidConfig, { runtime });
+    assert.ok(invalidConfig.mcp.playwright.command.includes("--executable-path"));
+    assert.ok(invalidConfig.mcp.playwright.command.includes(invalidExecutable));
+  } finally {
+    if (previousToken === undefined) delete process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN;
+    else process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN = previousToken;
+    if (previousMode === undefined) delete process.env.PLAYWRIGHT_MCP_EXTENSION;
+    else process.env.PLAYWRIGHT_MCP_EXTENSION = previousMode;
+    if (previousExecutable === undefined) delete process.env.AIDEVOPS_PLAYWRIGHT_EXECUTABLE;
+    else process.env.AIDEVOPS_PLAYWRIGHT_EXECUTABLE = previousExecutable;
+    if (previousHeaded === undefined) delete process.env.AIDEVOPS_PLAYWRIGHT_HEADED;
+    else process.env.AIDEVOPS_PLAYWRIGHT_HEADED = previousHeaded;
+    for (const [key, value] of Object.entries(previousHeadless)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
 
 test("disables an inherited Playwright MCP when no safe runtime is available", () => {
@@ -311,7 +678,7 @@ done
 mkdir -p -- "$output_dir"
 printf 'snapshot' >"$output_dir/page.yml"
 printf 'console' >"$output_dir/console.log"
-printf 'named screenshot' >"$output_dir/review-home-desktop.png"
+printf 'named screenshot' >"review-home-desktop.png"
 `, { mode: 0o755 });
 
   const config = {};
@@ -344,7 +711,7 @@ printf 'named screenshot' >"$output_dir/review-home-desktop.png"
 
   assert.match(
     await activation.execute({ action: "connect", name: "playwright" }),
-    /Connected MCP playwright/,
+    /Connected MCP playwright for the playwright agent.*tools remain scoped/,
   );
   const managedDir = runtime.workspaces.playwright.directory;
   assert.deepEqual(readdirSync(canonical), []);

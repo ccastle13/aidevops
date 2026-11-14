@@ -33,6 +33,13 @@
 [[ -n "${_CLAIM_TASK_ID_ISSUE_LIB_LOADED:-}" ]] && return 0
 _CLAIM_TASK_ID_ISSUE_LIB_LOADED=1
 
+# Typed issue-body composition outcomes. Callers use these to distinguish
+# absent author input from a supplied body that failed normalization or later
+# composition. Keep these values stable for sourced consumers and tests.
+CLAIM_COMPOSE_MISSING_INPUT_RC="${CLAIM_COMPOSE_MISSING_INPUT_RC:-10}"
+CLAIM_COMPOSE_NORMALIZE_RC="${CLAIM_COMPOSE_NORMALIZE_RC:-11}"
+CLAIM_COMPOSE_FAILED_RC="${CLAIM_COMPOSE_FAILED_RC:-12}"
+
 # Defensive SCRIPT_DIR fallback (matches issue-sync-lib.sh:35-41 pattern)
 if [[ -z "${SCRIPT_DIR:-}" ]]; then
 	_lib_path="${BASH_SOURCE[0]%/*}"
@@ -324,7 +331,8 @@ _verify_publication_pending_label() {
 	[[ -n "$issue_num" && -n "$repo" ]] || return 1
 	gh issue view "$issue_num" --repo "$repo" --json labels \
 		--jq 'any(.labels[]?; .name == "publication:pending")' 2>/dev/null |
-		grep -qx true
+		grep -x true >/dev/null
+	return $?
 }
 
 # Try delegating issue creation to issue-sync-helper.sh for rich bodies,
@@ -333,6 +341,12 @@ _verify_publication_pending_label() {
 _try_issue_sync_delegation() {
 	local title="$1"
 	local repo_path="$2"
+
+	# issue-sync reads only the durable task brief, not an explicit caller brief.
+	# Use direct composition so a successful sync cannot silently ignore it.
+	if [[ -n "${TASK_BRIEF_FILE:-}" && -f "$TASK_BRIEF_FILE" && -r "$TASK_BRIEF_FILE" ]]; then
+		return 1
+	fi
 
 	# Extract task ID from title (format: "tNNN: description")
 	local task_id=""
@@ -343,15 +357,21 @@ _try_issue_sync_delegation() {
 		return 1
 	fi
 
+	# Author-owned creation prepares the durable brief before read-only sync.
+	local brief_file="$repo_path/todo/tasks/${task_id}-brief.md"
+	if [[ -f "$brief_file" ]]; then
+		bash "$SCRIPT_DIR/brief-readiness-helper.sh" prepare-scope "$brief_file" || return 1
+	fi
+
 	local push_output
 	push_output=$("$issue_sync_helper" push "$task_id" 2>&1 || echo "")
 
 	local issue_num
-	issue_num=$(printf '%s' "$push_output" | grep -oE 'Created #[0-9]+' | grep -oE '[0-9]+' | head -1 || echo "")
+	issue_num=$(printf '%s' "$push_output" | grep -oE 'Created #[0-9]+' | grep -oE '[0-9]+' | sed -n '1p' || echo "")
 
 	# Also check if it found an existing issue (already has ref)
 	if [[ -z "$issue_num" ]]; then
-		issue_num=$(printf '%s' "$push_output" | grep -oE 'already has issue #[0-9]+' | grep -oE '[0-9]+' | head -1 || echo "")
+		issue_num=$(printf '%s' "$push_output" | grep -oE 'already has issue #[0-9]+' | grep -oE '[0-9]+' | sed -n '1p' || echo "")
 	fi
 
 	if [[ -n "$issue_num" ]]; then
@@ -364,7 +384,18 @@ _try_issue_sync_delegation() {
 	return 1
 }
 
+# Compare two issue titles ignoring case and whitespace differences (GH#33157).
+_titles_equivalent() {
+	local a="$1"
+	local b="$2"
+	a=$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//')
+	b=$(printf '%s' "$b" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//')
+	[[ "$a" == "$b" ]]
+}
+
 # t1446: Broader dedup check before bare issue creation.
+# Returns 2 (TASK_ID_COLLISION) when the tNNN prefix belongs to a differently
+# titled open issue (GH#33157).
 # GitHub search matches across the full title (not just prefix), catching
 # duplicates with different title formats (e.g., "t1344:" vs "coderabbit:").
 # Echoes the existing issue number if found, returns 1 if no duplicate.
@@ -402,15 +433,23 @@ _check_duplicate_issue() {
 
 	# Exact tNNN: prefix match, case-sensitive; use jq --arg to avoid embedding
 	# the variable in the filter string (defense-in-depth, GH#18550)
-	local existing_issue
-	existing_issue=$(gh issue list --repo "$repo_slug" \
+	local existing_issue existing_title match=""
+	match=$(gh issue list --repo "$repo_slug" \
 		--state open --search "${task_id_prefix}: in:title" \
 		--json number,title --limit 10 |
 		jq -r --arg prefix "${task_id_prefix}: " \
-			'.[] | select(.title | startswith($prefix)) | .number // ""' |
-		head -1)
+			'[.[] | select(.title | startswith($prefix))][0] // empty | "\(.number)\t\(.title)"' |
+		sed -n '1p')
+	existing_issue="${match%%$'\t'*}"
+	existing_title="${match#*$'\t'}"
 
 	if [[ -n "$existing_issue" ]]; then
+		# GH#33157: same prefix but a different title is another session's
+		# issue (ID collision), not an idempotent retry of this request.
+		if ! _titles_equivalent "$title" "$existing_title"; then
+			log_error "TASK_ID_COLLISION: ${task_id_prefix} is already used by open issue #${existing_issue} with a different title; refusing to report it as recovered"
+			return 2
+		fi
 		log_info "Found existing OPEN issue #$existing_issue with exact ${task_id_prefix} prefix, skipping duplicate creation"
 		echo "$existing_issue"
 		return 0
@@ -422,6 +461,18 @@ _check_duplicate_issue() {
 # Issue Body Composition
 # =============================================================================
 
+# Resolve the same source for summary, scope preparation and full body inlining.
+_resolve_claim_brief_file() {
+	local task_id="$1"
+	local repo_path="$2"
+	if [[ -n "${TASK_BRIEF_FILE:-}" && -f "$TASK_BRIEF_FILE" && -r "$TASK_BRIEF_FILE" ]]; then
+		printf '%s' "$TASK_BRIEF_FILE"
+	elif [[ -n "$task_id" ]]; then
+		printf '%s' "${repo_path}/todo/tasks/${task_id}-brief.md"
+	fi
+	return 0
+}
+
 # Read the "What" section from a task brief file (t1906).
 # Extracts content between "## What" and the next "##" heading.
 # Returns 0 and echoes the content if found, returns 1 if not.
@@ -429,7 +480,8 @@ _read_brief_what_section() {
 	local task_id="$1"
 	local repo_path="$2"
 
-	local brief_file="${repo_path}/todo/tasks/${task_id}-brief.md"
+	local brief_file=""
+	brief_file=$(_resolve_claim_brief_file "$task_id" "$repo_path")
 	if [[ ! -f "$brief_file" ]]; then
 		return 1
 	fi
@@ -449,7 +501,7 @@ _read_brief_what_section() {
 # Compose a structured issue body from title and description (t1899, t2063).
 #
 # Behaviour (t2063 — brief-first inlining):
-#   1. If a brief file exists at `${REPO_PATH}/todo/tasks/${task_id}-brief.md`:
+#   1. If a readable --brief-file or durable todo/tasks/${task_id}-brief.md exists:
 #      - Use --description (or the brief's What section) as the summary paragraph
 #      - Inline Worker Guidance (from the brief's How section) via shared helper
 #      - Inline full Task Brief (stripped of frontmatter) via shared helper
@@ -461,15 +513,15 @@ _read_brief_what_section() {
 #        refuse to create a stub issue (t1937) when neither description nor
 #        brief is available
 #
-# Echoes the composed body text. Returns 0 on success, 1 when neither a
-# description nor a brief file is available (caller should skip issue creation).
+# Echoes the composed body text. Returns 0 on success or a typed
+# CLAIM_COMPOSE_* status when the caller should skip issue creation.
 _compose_issue_body() {
 	local title="$1"
 	local description="$2"
 	local fmt_helper="${SCRIPT_DIR}/issue-body-format-helper.sh"
 	if [[ -n "$description" && -x "$fmt_helper" ]]; then
 		local normalized_description=""
-		normalized_description=$("$fmt_helper" normalize "$description" 2>/dev/null) || normalized_description="$description"
+		normalized_description=$("$fmt_helper" normalize "$description") || return "$CLAIM_COMPOSE_NORMALIZE_RC"
 		description="$normalized_description"
 	fi
 
@@ -479,12 +531,15 @@ _compose_issue_body() {
 
 	# Resolve brief file path (may or may not exist)
 	local brief_file=""
-	if [[ -n "$task_id" ]]; then
-		brief_file="${REPO_PATH}/todo/tasks/${task_id}-brief.md"
-	fi
+	brief_file=$(_resolve_claim_brief_file "$task_id" "$REPO_PATH")
 
 	# t2063 brief-first path: when a brief exists, the brief is the source of truth
 	if [[ -n "$brief_file" && -f "$brief_file" ]] && [[ "$(type -t _compose_issue_worker_guidance 2>/dev/null)" == "function" ]]; then
+		# External briefs are caller-owned: validate without relaxing prepare-scope's
+		# linked-worktree write boundary. Durable briefs keep delegation preparation.
+		if [[ "$brief_file" == "${TASK_BRIEF_FILE:-}" ]]; then
+			bash "$SCRIPT_DIR/brief-readiness-helper.sh" scope-check "$(<"$brief_file")" >&2 || return "$CLAIM_COMPOSE_FAILED_RC"
+		fi
 		local body=""
 
 		# Summary paragraph: caller's --description, OR brief's What section, OR empty
@@ -494,15 +549,15 @@ _compose_issue_body() {
 			local brief_what=""
 			brief_what=$(_read_brief_what_section "$task_id" "$REPO_PATH") || true
 			if [[ -n "$brief_what" ]]; then
-				log_info "Auto-read summary from brief What section: todo/tasks/${task_id}-brief.md"
+				log_info "Auto-read summary from resolved brief What section"
 				body="## Task"$'\n\n'"$brief_what"
 			fi
 		fi
 
 		# Inline Worker Guidance (How section) and full Task Brief.
 		# These helpers are sourced from issue-sync-lib.sh at the top of this script.
-		body=$(_compose_issue_worker_guidance "$body" "$brief_file")
-		body=$(_compose_issue_brief "$body" "$brief_file")
+		body=$(_compose_issue_worker_guidance "$body" "$brief_file") || return "$CLAIM_COMPOSE_FAILED_RC"
+		body=$(_compose_issue_brief "$body" "$brief_file") || return "$CLAIM_COMPOSE_FAILED_RC"
 		if declare -F _compose_issue_brief_workflow_reference >/dev/null 2>&1; then
 			body=$(_compose_issue_brief_workflow_reference "$body")
 		fi
@@ -538,7 +593,7 @@ _compose_issue_body() {
 		log_error "  issue-sync-helper.sh push ${task_id}"
 		log_error "  OR: gh issue create --title \"${title}\" --body \"<description>\"" # aidevops-allow: raw-gh-wrapper
 		echo ""
-		return 1
+		return "$CLAIM_COMPOSE_MISSING_INPUT_RC"
 	fi
 
 	# t2838: inject Parent: line so _gh_auto_link_sub_issue (when called)
@@ -562,6 +617,34 @@ _compose_issue_body() {
 	return 0
 }
 
+# Report a typed composition failure without claiming supplied input was absent.
+# The task ID has already been allocated, so diagnostics must preserve its
+# recovery path instead of suggesting allocation rollback or reuse.
+_report_issue_body_compose_failure() {
+	local title="$1"
+	local compose_rc="$2"
+	local task_id=""
+	[[ "$title" =~ ^(t[0-9]+) ]] && task_id="${BASH_REMATCH[1]}"
+
+	case "$compose_rc" in
+	"$CLAIM_COMPOSE_MISSING_INPUT_RC")
+		log_warn "Skipping issue creation — no description or task brief is available. Task ID is secured."
+		;;
+	"$CLAIM_COMPOSE_NORMALIZE_RC")
+		log_warn "Skipping issue creation — supplied description failed canonical body normalization. Task ID is secured."
+		log_warn "Recovery: under an existing Files Scope heading, use bare '- path/to/file' bullets."
+		;;
+	*)
+		log_warn "Skipping issue creation — issue body composition failed (status ${compose_rc}). Task ID is secured."
+		;;
+	esac
+
+	if [[ -n "$task_id" ]]; then
+		log_warn "Then add or update TODO.md and todo/tasks/${task_id}-brief.md, and run: issue-sync-helper.sh push ${task_id}"
+	fi
+	return 0
+}
+
 # =============================================================================
 # TODO.md Management
 # =============================================================================
@@ -575,7 +658,7 @@ _insert_todo_line() {
 
 	local backlog_start
 	backlog_start=$(grep -nE '^## Backlog[[:space:]]*$' "$todo_file" 2>/dev/null \
-		| head -1 | cut -d: -f1 || true)
+		| sed -n '1p' | cut -d: -f1 || true)
 
 	local tmp
 	tmp=$(mktemp)
@@ -616,6 +699,50 @@ _insert_todo_line() {
 	return 0
 }
 
+# Resolve the TODO projection only; preserve the original refs for GitHub labels
+# and native dependency relationships. Prefer exact local ref tokens over API.
+_todo_predecessor_task_ids() {
+	local refs="$1"
+	local repo_path="$2"
+	local ref task_id issue_num title slug="" result=""
+	local -a predecessors=()
+	IFS=',' read -r -a predecessors <<<"$refs"
+	for ref in "${predecessors[@]}"; do
+		task_id=""
+		if task_identity_validate "$ref"; then
+			task_id="$ref"
+		elif [[ "$ref" =~ ^GH#([0-9]+)$ ]]; then
+			issue_num="${BASH_REMATCH[1]}"
+			task_id=$(awk -v token="ref:GH#${issue_num}" '
+				/^[[:space:]]*- \[.\] / {
+					line = $0
+					sub(/^[[:space:]]*- \[.\] /, "", line)
+					split(line, fields, /[[:space:]]+/)
+					for (i = 1; i <= NF; i++)
+						if ($i == token) { print fields[1]; exit }
+				}' "${repo_path}/TODO.md")
+			if ! task_identity_validate "$task_id"; then
+				[[ -n "$slug" ]] || slug=$(git -C "$repo_path" remote get-url origin 2>/dev/null \
+					| sed 's|.*github\.com[:/]||;s|\.git$||' || true)
+				title=""
+				if [[ -n "$slug" ]]; then
+					title=$(gh_issue_view "$issue_num" --repo "$slug" --json title --jq '.title' 2>/dev/null || true)
+				fi
+				task_id=$(task_identity_parse_title_prefix "$title" || true)
+			fi
+		fi
+		if ! task_identity_validate "$task_id"; then
+			log_warn "Cannot resolve predecessor ${ref} to a task ID; omitting it from the TODO dependency field" >&2
+			continue
+		fi
+		if [[ ",${result}," != *",${task_id},"* ]]; then
+			result="${result:+${result},}${task_id}"
+		fi
+	done
+	printf '%s' "$result"
+	return 0
+}
+
 # _ensure_todo_entry_written TASK_ID ISSUE_NUM TITLE LABELS REPO_PATH
 # t2548: Idempotently appends a TODO.md entry after verified GitHub issue
 # creation. Closes the orphan gap where both create_github_issue() paths
@@ -628,8 +755,20 @@ _insert_todo_line() {
 # - Labels with status:, tier:, origin:, dispatched:, implemented: prefixes
 #   are skipped — they are not TODO-file-format tags.
 # GH#21473: 3rd arg is TITLE (one-line summary), not DESCRIPTION (full body).
-# Returns 0 only when the target TODO ref is present after the write attempt.
+# Returns 0 when the target TODO ref is present after the write attempt, or
+# when a canonical checkout is deliberately left unchanged.
 # Returns 1 when TODO.md exists but the ref could not be written/verified.
+_repo_path_is_canonical_checkout() {
+	local repo_path="$1"
+	local git_dir=""
+	local common_dir=""
+
+	git_dir=$(git -C "$repo_path" rev-parse --path-format=absolute --git-dir 2>/dev/null) || return 1
+	common_dir=$(git -C "$repo_path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+	[[ -n "$git_dir" && -n "$common_dir" && "$git_dir" == "$common_dir" ]] && return 0
+	return 1
+}
+
 _ensure_todo_entry_written() {
 	local task_id="$1"
 	local issue_num="$2"
@@ -641,18 +780,10 @@ _ensure_todo_entry_written() {
 	[[ -f "$todo_file" ]] || return 0
 	[[ -n "$task_id" && -n "$issue_num" ]] || return 0
 
-	# Fast path: entry already exists — stamp the ref if missing.
-	if grep -qE "^[[:space:]]*- \[.\] ${task_id}( |$)" "$todo_file"; then
-		if declare -F add_gh_ref_to_todo >/dev/null 2>&1; then
-			add_gh_ref_to_todo "$task_id" "$issue_num" "$todo_file" 2>/dev/null || true
-		fi
-		_todo_entry_has_gh_ref "$task_id" "$issue_num" "$todo_file" && return 0
-		return 1
-	fi
-
 	# Build tag suffix from labels (skip reserved-prefix labels applied
 	# server-side by issue-sync / pulse, not authored in TODO).
 	local tags_str=""
+	local predecessor_refs="${_CLAIM_BLOCKED_BY_REFS:-}"
 	if [[ -n "$labels" ]]; then
 		local _saved_ifs="$IFS"
 		IFS=','
@@ -664,6 +795,8 @@ _ensure_todo_entry_written() {
 			case "$label" in
 			status:* | tier:* | origin:* | dispatched:* | implemented:* | aidevops:*)
 				continue ;;
+			blocked-by:*)
+				predecessor_refs="${predecessor_refs:+${predecessor_refs},}${label#blocked-by:}" ;;
 			bug)         tags_str="${tags_str:+${tags_str} }#bug" ;;
 			enhancement) tags_str="${tags_str:+${tags_str} }#feat" ;;
 			*)           tags_str="${tags_str:+${tags_str} }#${label}" ;;
@@ -689,13 +822,40 @@ _ensure_todo_entry_written() {
 	fi
 	local todo_line="- [ ] ${task_id} ${safe_desc}"
 	[[ -n "$tags_str" ]] && todo_line="${todo_line} ${tags_str}"
-	# GH#20834: append blocked-by tag when predecessor refs were auto-detected.
+	# GH#34152: resolve label and description predecessors together, emitting
+	# one bare blocked-by token with unique task IDs rather than hashtag labels.
 	# _CLAIM_BLOCKED_BY_REFS is populated by _apply_blocked_by_detection in
 	# claim-task-id.sh before _ensure_todo_entry_written is called.
-	if [[ -n "${_CLAIM_BLOCKED_BY_REFS:-}" ]]; then
-		todo_line="${todo_line} blocked-by:${_CLAIM_BLOCKED_BY_REFS}"
+	if [[ -n "$predecessor_refs" ]]; then
+		local todo_predecessors
+		todo_predecessors=$(_todo_predecessor_task_ids "$predecessor_refs" "$repo_path")
+		[[ -z "$todo_predecessors" ]] || todo_line="${todo_line} blocked-by:${todo_predecessors}"
 	fi
 	todo_line="${todo_line} ref:GH#${issue_num}"
+
+	# GH#32561: canonical checkouts are read-only service mirrors. Issue
+	# creation and counter CAS already use isolated Git state, so preserve those
+	# successful operations while directing the mutable TODO projection to a
+	# linked worktree.
+	if _repo_path_is_canonical_checkout "$repo_path"; then
+		printf 'TODO.md was not changed in canonical checkout; add this line in a linked worktree:\n%s\n' "$todo_line" >&2
+		if [[ -n "${TASK_BRIEF_FILE:-}" ]]; then
+			printf 'copy the brief to todo/tasks/%s-brief.md in the same linked worktree\n' "$task_id" >&2
+		else
+			printf 'a brief at todo/tasks/%s-brief.md is still required for publication (see reference/planning-publication-lifecycle.md)\n' "$task_id" >&2
+		fi
+		printf 'publish both with: planning-commit-helper.sh "plan: add %s ..."\n' "$task_id" >&2
+		return 0
+	fi
+
+	# Fast path: entry already exists — stamp the ref if missing.
+	if grep -qE "^[[:space:]]*- \[.\] ${task_id}( |$)" "$todo_file"; then
+		if declare -F add_gh_ref_to_todo >/dev/null 2>&1; then
+			add_gh_ref_to_todo "$task_id" "$issue_num" "$todo_file" 2>/dev/null || true
+		fi
+		_todo_entry_has_gh_ref "$task_id" "$issue_num" "$todo_file" && return 0
+		return 1
+	fi
 
 	_insert_todo_line "$todo_file" "$todo_line"
 
@@ -722,6 +882,12 @@ _converge_created_issue_ref() {
 
 	[[ -f "$todo_file" ]] || return 0
 	[[ -n "$task_id" && "$issue_num" =~ ^[1-9][0-9]*$ ]] || return 1
+	# The canonical guard prints the exact entry for the caller and is a
+	# successful convergence: it must not retry or make issue creation fail.
+	if _repo_path_is_canonical_checkout "$repo_path"; then
+		_ensure_todo_entry_written "$task_id" "$issue_num" "$title" "$labels" "$repo_path"
+		return $?
+	fi
 	repo=$(_extract_github_slug "$repo_path" "${REMOTE_NAME:-origin}" 2>/dev/null || true)
 
 	while [[ $attempt -le 3 ]]; do
@@ -789,7 +955,7 @@ create_gitlab_issue() {
 	fi
 
 	local issue_num
-	issue_num=$(echo "$issue_output" | grep -oE '#[0-9]+' | head -1 | tr -d '#')
+	issue_num=$(echo "$issue_output" | grep -oE '#[0-9]+' | sed -n '1p' | tr -d '#')
 
 	if [[ -z "$issue_num" ]]; then
 		log_warn "Failed to extract issue number from: $issue_output"

@@ -41,6 +41,10 @@
 #     pause dispatch before another claim/comment is posted.
 #     Exit 0 = threshold reached (do NOT dispatch), exit 1 = no hold.
 #
+#   dispatch-dedup-helper.sh release-stale-recovery <issue> <slug> <reason>
+#     Maintainer-only: release a reviewed stale-recovery escalation without
+#     deleting audit history or bypassing independent review/security holds.
+#
 #   dispatch-dedup-helper.sh is-assigned <issue> <slug> [self-login]
 #     Check if issue is assigned to another runner (not self, owner, or maintainer).
 #     GH#10521: Ignores repo owner (from slug) and maintainer (from repos.json).
@@ -389,36 +393,40 @@ normalize_title() {
 
 #######################################
 # List dedup keys for all currently running workers.
-# Scans process list for /full-loop workers and extracts keys from their titles.
+# Reuses the canonical worker-process classifier so orchestration commands that
+# merely carry a /full-loop prompt are not mistaken for launched workers.
 # Returns: one "pid|key" pair per line on stdout
 #######################################
 list_running_keys() {
-	# Get PIDs of running worker processes using portable pgrep -f (no -a flag).
-	# pgrep -f matches against the full command line on both Linux and macOS.
-	# We then resolve the full command line per PID via ps -p <pid> -o args=
-	# which is POSIX-compatible and works on Linux, macOS, and BSD.
-	local worker_pids=""
-	worker_pids=$(pgrep -f '/full-loop|opencode run|claude.*run' || true)
+	local effective_uid=""
+	local worker_lines=""
+	local worker_classifier="${SCRIPT_DIR}/list_active_workers.awk"
+	effective_uid=$(id -u) || return 0
+	[[ "$effective_uid" =~ ^[0-9]+$ ]] || return 0
+	[[ -f "$worker_classifier" ]] || return 0
 
-	if [[ -z "$worker_pids" ]]; then
+	# Keep this scan aligned with list_active_worker_processes(). That classifier
+	# requires an actual OpenCode/headless worker shape and excludes Pulse itself,
+	# while preserving real worker launchers and their process chains.
+	worker_lines=$(ps axwwo uid,pid,stat,etime,command 2>/dev/null |
+		awk -v effective_uid="$effective_uid" -f "$worker_classifier" || true)
+	if [[ -z "$worker_lines" ]]; then
 		return 0
 	fi
 
-	while IFS= read -r pid; do
-		[[ -z "$pid" ]] && continue
-		local cmdline=""
-		# ps -p <pid> -o args= prints only the command line (no header, no PID prefix)
-		cmdline=$(ps -p "$pid" -o args= 2>/dev/null || true)
-		[[ -z "$cmdline" ]] && continue
+	while IFS= read -r worker_line; do
+		[[ -z "$worker_line" ]] && continue
+		local pid="${worker_line%% *}"
+		[[ "$pid" =~ ^[0-9]+$ ]] || continue
 
 		local extracted_keys=""
-		extracted_keys=$(extract_keys "$cmdline")
+		extracted_keys=$(extract_keys "$worker_line")
 		if [[ -n "$extracted_keys" ]]; then
 			while IFS= read -r key; do
 				[[ -n "$key" ]] && printf '%s|%s\n' "$pid" "$key"
 			done <<<"$extracted_keys"
 		fi
-	done <<<"$worker_pids"
+	done <<<"$worker_lines"
 
 	return 0
 }
@@ -453,7 +461,7 @@ _match_candidate_key() {
 	local pattern
 	for pattern in "${match_patterns[@]}"; do
 		local match
-		match=$(printf '%s\n' "$running_keys" | grep "|${pattern}$" | head -1 || true)
+		match=$(printf '%s\n' "$running_keys" | grep "|${pattern}$" | sed -n '1p' || true)
 		if [[ -n "$match" ]]; then
 			local match_pid
 			match_pid=$(printf '%s' "$match" | cut -d'|' -f1)
@@ -837,9 +845,8 @@ _dd_fetch_trusted_issue_comments() {
 
 	raw_comments=$(gh api "repos/${repo_slug}/issues/${issue_number}/comments?per_page=100" \
 		--paginate --slurp 2>/dev/null) || return 1
-	printf '%s' "$raw_comments" | jq -c '
-		def trusted_association:
-			. == "OWNER" or . == "MEMBER" or . == "COLLABORATOR";
+	local comments_json="" permission_trusted_authors=""
+	comments_json=$(printf '%s' "$raw_comments" | jq -c '
 		[ (
 			if (type == "array" and ((.[0]? | type) == "array")) then
 				.[]
@@ -855,7 +862,13 @@ _dd_fetch_trusted_issue_comments() {
 			author_association: (.author_association // ""),
 			created_at: .created_at
 		}
-		| select((.author_association // "") | trusted_association)]
+		]
+	' 2>/dev/null) || return 1
+	permission_trusted_authors=$(_claim_permission_trusted_authors "$comments_json" "$repo_slug") || return 1
+	printf '%s' "$comments_json" | jq -c --argjson permission_trusted_authors "$permission_trusted_authors" '
+		map(select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR"
+			or ((.author_association == "CONTRIBUTOR" or .author_association == "NONE")
+				and (.author as $login | $permission_trusted_authors | index($login) != null))))
 	' 2>/dev/null || return 1
 	return 0
 }
@@ -878,6 +891,7 @@ _dd_has_matching_terminal_lease() {
 	local dispatch_author="$4"
 	local dispatch_body="${5:-}"
 	local lease_filter="${SCRIPT_DIR}/dispatch-lease-claims.jq"
+	local repo_slug="${6:-}"
 	local claims_json="[]"
 	local parsed_claims="[]"
 	local now_epoch=""
@@ -889,9 +903,12 @@ _dd_has_matching_terminal_lease() {
 		2>/dev/null) || return 1
 	[[ "$claims_json" != "[]" ]] || return 1
 	now_epoch=$(date -u '+%s')
+	local permission_trusted_authors=""
+	permission_trusted_authors=$(_claim_permission_trusted_authors "$comments_json" "$repo_slug") || return 1
 	parsed_claims=$(printf '%s\n%s\n' "$claims_json" "$comments_json" | jq -nc \
 		--argjson now "$now_epoch" --argjson max_age 2147483647 \
 		--argjson include_terminal true \
+		--argjson permission_trusted_authors "$permission_trusted_authors" \
 		-f "$lease_filter" 2>/dev/null) || return 1
 
 	local marker_json=""
@@ -899,50 +916,66 @@ _dd_has_matching_terminal_lease() {
 		try capture("aidevops:dispatch lease_token=(?<lease_token>[^ ]+) device=(?<device>[^ ]+) session=(?<session>[^ ]+) attempt_id=(?<attempt_id>[^ ]+) claim_id=(?<claim_id>[0-9]+)")
 		catch empty
 	' 2>/dev/null) || marker_json=""
-	if [[ -n "$marker_json" ]] && printf '%s' "$parsed_claims" | jq -e \
-		--argjson marker "$marker_json" --arg dispatch_author "$dispatch_author" '
-		any(.[];
-			.lease_phase == "terminal" and
-			.claim_author == $dispatch_author and
-			.lease_token == $marker.lease_token and
-			.device == $marker.device and
-			.session == $marker.session and
-			.lease_terminal_attempt_id == $marker.attempt_id and
-			((.id // 0) | tostring) == $marker.claim_id
-		)' >/dev/null 2>&1; then
-		return 0
+	# aidevops:trust-boundary — an explicit generation never falls back to
+	# timestamp-only or prose evidence, including when its marker is malformed.
+	if [[ "$dispatch_body" == *"aidevops:dispatch"* ]]; then
+		[[ -n "$marker_json" ]] || return 1
+		if printf '%s' "$parsed_claims" | jq -e \
+			--argjson marker "$marker_json" --arg dispatch_author "$dispatch_author" '
+			any(.[];
+				.lease_phase == "terminal" and
+				.claim_author == $dispatch_author and
+				.lease_token == $marker.lease_token and
+				.device == $marker.device and
+				.session == $marker.session and
+				(.lease_terminal_attempt_id == $marker.attempt_id or .lease_terminal_attempt_id == "release") and
+				((.id // 0) | tostring) == $marker.claim_id
+			)' >/dev/null 2>&1; then
+			return 0
+		fi
+		return 1
 	fi
 
 	if printf '%s' "$parsed_claims" | jq -e \
 		--arg dispatch_ts "$dispatch_created_at" --argjson dispatch_id "$dispatch_id" \
 		--arg dispatch_author "$dispatch_author" '
-		any(.[];
-			.lease_phase == "terminal" and
+		map(select(
 			.claim_author == $dispatch_author and
-			[.created_at, ((.id // 0) | tonumber? // 0)] <= [$dispatch_ts, $dispatch_id] and
+			[.created_at, ((.id // 0) | tonumber? // 0)] <= [$dispatch_ts, $dispatch_id]))
+		| sort_by([.created_at, ((.id // 0) | tonumber? // 0)]) | last
+		| .lease_phase == "terminal" and
 			[.lease_terminal_at, (.lease_terminal_id // 0)] > [$dispatch_ts, $dispatch_id]
-		)' >/dev/null 2>&1; then
+		' >/dev/null 2>&1; then
 		return 0
 	fi
 	return 1
 }
 
 #######################################
-# Check for trusted completion evidence ordered after a dispatch comment.
+# Preserve historical prose completion only for streams without claim identity.
 #
-# Args: comments JSON, dispatch timestamp, dispatch comment ID
+# Args: comments JSON, dispatch timestamp, dispatch ID, author, body
 # Returns: 0 when trusted completion evidence supersedes dispatch; 1 otherwise
 #######################################
 _dd_has_trusted_completion_after_dispatch() {
 	local comments_json="$1"
 	local dispatch_created_at="$2"
 	local dispatch_id="$3"
+	local dispatch_author="${4:-}"
+	local dispatch_body="${5:-}"
 
-	[[ -n "$dispatch_created_at" ]] || return 1
+	[[ -n "$dispatch_created_at" && -n "$dispatch_author" ]] || return 1
+	[[ "$dispatch_body" != *"aidevops:dispatch"* ]] || return 1
 	[[ "$dispatch_id" =~ ^[0-9]+$ ]] || dispatch_id=0
+	# aidevops:trust-boundary — once a stream has claim generations, unbound
+	# completion prose cannot retire one of them, even from the same login.
 	if printf '%s' "$comments_json" | jq -e \
-		--arg dispatch_ts "$dispatch_created_at" --argjson dispatch_id "$dispatch_id" '
+		--arg dispatch_ts "$dispatch_created_at" --argjson dispatch_id "$dispatch_id" \
+		--arg author "$dispatch_author" '
+		(any(.[]; (.body // "") | test("(^|[[:space:]])DISPATCH_CLAIM[[:space:]]+nonce="; "i")) | not) and
 		any(.[];
+			.author == $author and
+			(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") and
 			[.created_at, ((.id // 0) | tonumber? // 0)] > [$dispatch_ts, $dispatch_id] and (
 				(.body_start | test("TASK_COMPLETE"; "i")) or
 				(.body_start | test("FULL_LOOP_COMPLETE"; "i")) or
@@ -965,8 +998,10 @@ _dd_has_trusted_completion_after_dispatch() {
 has_dispatch_comment() {
 	local issue_number="$1"
 	local repo_slug="$2"
-	# $3 = self_login — unused since GH#15317 (trusted dispatch comments from
-	# every repository actor are checked regardless of author identity)
+	# self_login: dispatch comments from every trusted actor are checked
+	# regardless of author (GH#15317); it only identifies this runner's own
+	# terminal-blocker hold evidence (GH#33025).
+	local self_login="${3:-}"
 
 	if [[ ! "$issue_number" =~ ^[0-9]+$ ]] || [[ -z "$repo_slug" ]]; then
 		return 1
@@ -989,8 +1024,10 @@ has_dispatch_comment() {
 	if [[ -z "$comments_json" || "$comments_json" == "null" || "$comments_json" == "[]" ]]; then
 		return 1
 	fi
-	if terminal_blocker_circuit_active "$comments_json" "${ISSUE_META_JSON:-}" \
-		"$repo_slug" "$issue_number" "${DISPATCH_REPO_PATH:-}"; then
+	# GH#33025: this runner's own collaborator-authored releases count as hold
+	# evidence; see terminal-blocker-circuit.sh _TBC_HOLD_EVIDENCE_JQ.
+	if TERMINAL_BLOCKER_SELF_LOGIN="$self_login" terminal_blocker_circuit_active "$comments_json" \
+		"${ISSUE_META_JSON:-}" "$repo_slug" "$issue_number" "${DISPATCH_REPO_PATH:-}"; then
 		return 0
 	fi
 
@@ -1026,13 +1063,13 @@ has_dispatch_comment() {
 	# A CLAIM_RELEASED write can fail after the worker has already emitted its
 	# structured terminal lease transition. Reconcile that authenticated
 	# transition as equivalent durable completion evidence (GH#28437).
-	if _dd_has_matching_terminal_lease "$comments_json" "$dispatch_created_at" "$dispatch_id" "$dispatch_author" "$dispatch_body"; then
+	if _dd_has_matching_terminal_lease "$comments_json" "$dispatch_created_at" "$dispatch_id" "$dispatch_author" "$dispatch_body" "$repo_slug"; then
 		return 1
 	fi
 
 	# GH#17503: trusted completion/failure evidence posted after dispatch retires
 	# the lock early; untrusted issue comments cannot mutate coordination state.
-	if _dd_has_trusted_completion_after_dispatch "$comments_json" "$dispatch_created_at" "$dispatch_id"; then
+	if _dd_has_trusted_completion_after_dispatch "$comments_json" "$dispatch_created_at" "$dispatch_id" "$dispatch_author" "$dispatch_body"; then
 		# Worker completed or failed — dispatch comment superseded, safe to re-dispatch
 		return 1
 	fi
@@ -1148,7 +1185,7 @@ _classify_structural_dispatch_blocker_reason() {
 			printf 'publication_pending\n'
 			return 0
 			;;
-		*infrastructure_blocked* | *label=infrastructure* | *hold_for_review_blocked* | *hold-for-review* | *external*author*gate* | *nmr*gate* | *approval*required*)
+		*infrastructure_blocked* | *label=infrastructure* | *hold_for_review_blocked* | *hold-for-review* | *needs_info_blocked* | *status:needs-info* | *external*author*gate* | *nmr*gate* | *approval*required*)
 			printf 'policy_gate\n'
 			return 0
 			;;
@@ -1168,14 +1205,8 @@ _classify_structural_dispatch_blocker_reason() {
 #   $1 = blocker signal text emitted by dispatch-dedup-helper or pulse logs
 # Output: one of the dispatch_candidate_failed reason tokens
 #######################################
-classify_dispatch_blocker_reason() {
-	local signal="$1"
-	local lower_signal
-	lower_signal=$(printf '%s' "$signal" | tr '[:upper:]' '[:lower:]')
-	if _classify_structural_dispatch_blocker_reason "$lower_signal"; then
-		return 0
-	fi
-
+_classify_runtime_dispatch_blocker_reason() {
+	local lower_signal="$1"
 	case "$lower_signal" in
 		*interactive_review_hold* | *interactive*review*hold*)
 			printf 'interactive_review_hold\n'
@@ -1205,12 +1236,40 @@ classify_dispatch_blocker_reason() {
 			printf 'terminal_blocker_circuit\n'
 			return 0
 			;;
+		*terminal_blocker_backoff*)
+			# GH#33332: report the shared backoff as its own hold, not as an
+			# active claim, so pulse can cache it across cycles.
+			printf 'terminal_blocker_backoff\n'
+			return 0
+			;;
+		*terminal_blocker_fleet_hold*probe=falsified*)
+			# GH#36772: a falsified fleet hold wakes only on a brief revision or
+			# a trusted retry comment; both bump updatedAt, like the circuit.
+			printf 'terminal_blocker_circuit\n'
+			return 0
+			;;
+		*terminal_blocker_fleet_hold*)
+			# GH#36772: a capability wake is runner-local and leaves updatedAt
+			# unchanged, so pulse caches this hold only for the short TTL.
+			printf 'terminal_blocker_fleet_hold\n'
+			return 0
+			;;
+		*runner_capability_unmet*)
+			# GH#33743: runner-local capability deferral, retried after cooldown.
+			printf 'runner_capability_unmet\n'
+			return 0
+			;;
 		*dispatch_block_reason*ever_nmr_without_approval* | *blocked*ever*nmr*lacks*approval* | *requires*cryptographic*approval*)
 			printf 'ever_nmr_without_approval\n'
 			return 0
 			;;
 		*blocked_by_native_lookup_unavailable* | *native*blocked*by*lookup*unavailable*)
 			printf 'blocked_by_native_lookup_unavailable\n'
+			return 0
+			;;
+		*issue_metadata_unavailable* | *unable*to*load*issue*metadata*)
+			# GH#33524: transient gh failures retry next cycle; not unclassified.
+			printf 'issue_metadata_unavailable\n'
 			return 0
 			;;
 		*pr_lookup_uncertain* | *pr_lookup_result=uncertain*)
@@ -1225,8 +1284,28 @@ classify_dispatch_blocker_reason() {
 			printf 'launch_error\n'
 			return 0
 			;;
+		*brief_scope_hold*)
+			printf 'brief_scope_hold\n'
+			return 0
+			;;
+	esac
+	return 1
+}
+
+# Classify context and intake blockers before active-claim signals.
+_classify_intake_dispatch_blocker_reason() {
+	local lower_signal="$1"
+	case "$lower_signal" in
 		*missing*worker*context* | *needs-brief* | *missing*implementation*context*)
 			printf 'missing_worker_context\n'
+			return 0
+			;;
+		*dependabot_target_unverified* | *dependabot*intake*lookup*unavailable* | *invalid*dependabot*intake*evidence* | *dependabot*intake*repository*mismatch*)
+			printf 'dependabot_target_unverified\n'
+			return 0
+			;;
+		*dependabot_target_owned* | *owns*the*same*dependabot*pr*target* | *dependabot*blocked*by*target*owner*)
+			printf 'dependabot_target_owned\n'
 			return 0
 			;;
 		*renovate*dependency*dashboard*)
@@ -1235,6 +1314,22 @@ classify_dispatch_blocker_reason() {
 			;;
 		*local*capacity*gate* | *worktree*cap* | *max*worktree* | *disk*space* | *large*file*)
 			printf 'local_capacity_gate\n'
+			return 0
+			;;
+	esac
+	return 1
+}
+
+# Keep claim signal precedence, including the broad unverified fallback.
+_classify_claim_dispatch_blocker_reason() {
+	local lower_signal="$1"
+	case "$lower_signal" in
+		stale_draft_checkpoint:*)
+			printf 'stale_draft_checkpoint\n'
+			return 0
+			;;
+		worker_draft_checkpoint:*)
+			printf 'worker_draft_checkpoint_blocked\n'
 			return 0
 			;;
 		*worker*already*running* | *live_worker=true* | *process_evidence=live*)
@@ -1261,12 +1356,26 @@ classify_dispatch_blocker_reason() {
 			printf 'dedup_active_claim_unverified\n'
 			return 0
 			;;
-		"")
-			printf 'no_recent_log_evidence\n'
-			return 0
-			;;
 	esac
+	return 1
+}
 
+# Preserve the original ordered classification chain and its final fallback.
+classify_dispatch_blocker_reason() {
+	local signal="$1"
+	local lower_signal
+	lower_signal=$(printf '%s' "$signal" | tr '[:upper:]' '[:lower:]')
+	if _classify_structural_dispatch_blocker_reason "$lower_signal" ||
+		_classify_runtime_dispatch_blocker_reason "$lower_signal" ||
+		_classify_intake_dispatch_blocker_reason "$lower_signal" ||
+		_classify_claim_dispatch_blocker_reason "$lower_signal"; then
+		return 0
+	fi
+
+	if [[ -z "$lower_signal" ]]; then
+		printf 'no_recent_log_evidence\n'
+		return 0
+	fi
 	printf 'unclassified_signal\n'
 	return 0
 }
@@ -1301,8 +1410,8 @@ Usage:
                                                        t2007: aggregate token spend (returns "spent|attempts")
   dispatch-dedup-helper.sh check-orphan-loop <issue> <slug> <branch> [todo-file] [worktree-path]
                                                        Hold repeated worker_branch_orphan loops or unreconciled remote children
-  dispatch-dedup-helper.sh check-recovery-loop <issue> <slug>
-                                                       Hold repeated worker recovery failures across branches before posting a new claim
+  dispatch-dedup-helper.sh check-recovery-loop <issue> <slug>  Hold repeated worker recovery failures
+  dispatch-dedup-helper.sh release-stale-recovery <issue> <slug> <reason>  Reviewed maintainer release (not NMR approval)
   dispatch-dedup-helper.sh has-fix-the-fixer-label <issue> <slug>
                                                        t3077: detect the fix-the-fixer label (exit 0=labeled, 1=unlabeled).
                                                        Used by headless-runtime-helper.sh to enable verbose lifecycle,
@@ -1467,6 +1576,75 @@ _ddh_main_issue_command() {
 	esac
 }
 
+# Release only the stale-recovery hold after a maintainer has reviewed the
+# worker attempts. The marker resets future tick accounting; other safety
+# labels and cryptographic approval requirements remain untouched.
+#aidevops:trust-boundary
+_ddh_release_stale_recovery() {
+	local issue_number="$1" repo_slug="$2" reason="$3"
+	[[ "$issue_number" =~ ^[1-9][0-9]*$ && "$repo_slug" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]] || return 1
+	[[ ${#reason} -le 160 && "$reason" =~ ^[a-zA-Z0-9\ ,._:-]+$ ]] || return 1
+	local login="" permission="" issue_json="" comments="" release_state=""
+	login=$(gh api user --jq '.login' 2>/dev/null) || return 1
+	[[ "$login" =~ ^[a-zA-Z0-9-]+$ ]] || return 1
+	permission=$(gh api "repos/${repo_slug}/collaborators/${login}/permission" --jq '.permission' 2>/dev/null) || return 1
+	case "$permission" in admin | maintain) ;; *) return 1 ;; esac
+	issue_json=$(gh api "repos/${repo_slug}/issues/${issue_number}" 2>/dev/null) || return 1
+	printf '%s' "$issue_json" | jq -e '
+		.state == "open"
+		and ([.labels[].name | select(startswith("status:"))]
+			| . == ["status:blocked"] or . == ["status:available"])
+		and ([.labels[].name] | all(
+			. != "no-auto-dispatch"
+			and . != "hold-for-review"
+			and . != "lockdown"
+			and . != "parent-task"
+		))
+		and ([.assignees[]] | length == 0) and (.pull_request == null)
+	' >/dev/null || return 1
+	comments=$(gh api "repos/${repo_slug}/issues/${issue_number}/comments" --paginate --slurp 2>/dev/null) || return 1
+	release_state=$(printf '%s' "$comments" | jq -r --arg login "$login" --arg owner OWNER --arg member MEMBER '
+		[.[][] | select((.body // "")
+			| test("<!-- stale-recovery-tick:escalated|<!-- stale-recovery-release:verified -->"))]
+		| sort_by(.created_at, .id) | last
+		| if ((.body // "")
+			| contains("<!-- stale-recovery-tick:escalated")) then "escalated"
+		  elif ((.body // "")
+			| contains("<!-- stale-recovery-release:verified -->"))
+			and (.author_association | IN($owner, $member))
+			and .user.login == $login then "retry"
+		  else "invalid" end
+	' 2>/dev/null) || return 1
+	[[ "$release_state" == escalated || "$release_state" == retry ]] || return 1
+	# Do not turn a newer independent circuit breaker into a dispatchable issue.
+	printf '%s' "$comments" | jq -e '
+		[.[][] | select((.body // "")
+			| test("cost-circuit-breaker:fired|worker-recovery-loop:blocked|dispatch-circuit-breaker:worker_recovery_loop"))]
+		| length == 0
+	' >/dev/null || return 1
+	# Commit the reset event first. If the label transition failed, a verified
+	# same-maintainer marker allows an idempotent retry without another comment.
+	if [[ "$release_state" == escalated ]]; then
+		gh_issue_comment "$issue_number" --repo "$repo_slug" \
+			--body "<!-- ops:start — workers: skip this comment, it is audit trail not implementation context -->
+<!-- stale-recovery-release:verified -->
+Stale-recovery dispatch hold reviewed and released by maintainer ${login}.
+Reason: ${reason}
+Other independent dispatch and review gates remain in force.
+<!-- ops:end -->" >/dev/null || return 1
+	fi
+	set_issue_status "$issue_number" "$repo_slug" available --add-label auto-dispatch || return 1
+	issue_json=$(gh api "repos/${repo_slug}/issues/${issue_number}" 2>/dev/null) || return 1
+	printf '%s' "$issue_json" | jq -e '
+		.state == "open"
+		and ([.labels[].name] | index("status:available") != null)
+		and ([.labels[].name] | index("status:blocked") == null)
+		and ([.labels[].name] | index("auto-dispatch") != null)
+	' >/dev/null || return 1
+	printf 'STALE_RECOVERY_RELEASED: issue #%s in %s\n' "$issue_number" "$repo_slug"
+	return 0
+}
+
 _ddh_main_loop_command() {
 	local command_name="$1"
 	shift || true
@@ -1481,6 +1659,11 @@ _ddh_main_loop_command() {
 		_require_args check-recovery-loop 2 "$#" "issue-number repo-slug" || return 1
 		local recovery_issue="$1" recovery_repo="$2"
 		check_worker_recovery_failure_loop "$recovery_issue" "$recovery_repo"
+		return $?
+		;;
+	release-stale-recovery)
+		_require_args release-stale-recovery 3 "$#" "issue-number repo-slug reason" || return 1
+		_ddh_release_stale_recovery "$1" "$2" "$3"
 		return $?
 		;;
 	test-recover)
@@ -1562,7 +1745,7 @@ main() {
 		_ddh_main_issue_command "$command" "$@"
 		return $?
 		;;
-	check-orphan-loop | check-recovery-loop | test-recover | has-fix-the-fixer-label)
+	check-orphan-loop | check-recovery-loop | release-stale-recovery | test-recover | has-fix-the-fixer-label)
 		_ddh_main_loop_command "$command" "$@"
 		return $?
 		;;

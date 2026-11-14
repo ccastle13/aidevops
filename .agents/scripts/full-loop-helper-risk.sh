@@ -8,6 +8,8 @@
 _FULL_LOOP_RISK_LIB_LOADED=1
 _full_loop_runtime_verified_marker="runtime-verified"
 _full_loop_pending_diff_target="WORKTREE"
+# Runtime-owned paths never enter product staging or prospective PR metadata.
+_full_loop_runtime_paths=(".agents/loop-state" ".agents/.full-loop-cleanup-deferred")
 
 # Normalize a caller-supplied risk level to the spelling used in PR bodies.
 _normalize_runtime_risk() {
@@ -78,7 +80,7 @@ _runtime_path_is_low() {
 		.github/* | .qlty/* | .shellcheckrc | */.shellcheckrc | .markdownlint* | */.markdownlint* | .yamllint* | */.yamllint* | \
 		.eslintrc* | */.eslintrc* | eslint.config.* | */eslint.config.* | .prettierrc* | */.prettierrc* | prettier.config.* | */prettier.config.* | \
 		.stylelintrc* | */.stylelintrc* | stylelint.config.* | */stylelint.config.* | biome.json | */biome.json | *lint*.config.* | *linters*.conf | \
-		.agents/prompts/*)
+		.agents/prompts/* | .agents/configs/prompt-hook-candidates.conf | todo/*.json | todo/*.jsonl | */todo/*.json | */todo/*.jsonl)
 		return 0
 		;;
 	*) return 1 ;;
@@ -118,6 +120,7 @@ _runtime_paths_keyword_context() {
 
 # Print diff hunks for the requested files without mutating the real index.
 # WORKTREE includes tracked branch/index/worktree changes plus untracked files.
+# Callers must pass a resolved merge base, not a moving upstream tree.
 _runtime_diff_output() {
 	local base_ref="$1"
 	local diff_target="${2:-HEAD}"
@@ -141,7 +144,7 @@ _runtime_diff_output() {
 			fi
 		else
 			git diff --unified=0 --no-color --no-ext-diff \
-				"${base_ref}..${diff_target}" -- "$path" 2>/dev/null || return 1
+				"$base_ref" "$diff_target" -- "$path" 2>/dev/null || return 1
 		fi
 	done < <(printf '%s\n' "$files_changed" | tr ',' '\n')
 	return 0
@@ -467,9 +470,7 @@ _runtime_evidence_is_substantive() {
 	case "$normalized" in
 	"" | none | n/a | na | self-assessed) return 1 ;;
 	esac
-	if [[ "$normalized" == *"no additional evidence"* ]] ||
-		[[ "$normalized" == *"no evidence"* ]] ||
-		[[ "$normalized" == *"no runtime evidence"* ]] ||
+	if [[ "$normalized" =~ ^no\ (runtime\ |additional\ )?evidence([[:space:][:punct:]]|$) ]] ||
 		[[ "$normalized" == *"not ${_full_loop_runtime_verified_marker}"* ]] ||
 		[[ "$normalized" == *"not runtime verified"* ]]; then
 		return 1
@@ -513,15 +514,33 @@ _resolve_runtime_testing_level() {
 	return 0
 }
 
+# Resolve branch ownership before comparing pending work. The remote tip may
+# contain incoming changes that are not part of this PR. Reject missing or
+# ambiguous ancestry rather than selecting an arbitrary merge base.
+_pending_runtime_comparison_base() {
+	local base_ref="$1"
+	local comparison_base=""
+	git rev-parse --verify "${base_ref}^{commit}" >/dev/null 2>&1 || return 1
+	comparison_base=$(git merge-base --all "$base_ref" HEAD) || return 1
+	[[ -n "$comparison_base" && "$comparison_base" != *$'\n'* ]] || return 1
+	printf '%s\n' "$comparison_base"
+	return 0
+}
+
 # Collect the complete prospective PR file list without staging pending files.
+# Callers supply the resolved branch-owned comparison base, not the remote tip.
 _pending_runtime_files_changed() {
 	local base_ref="$1"
-	local files_changed=""
+	local files_changed="" path=""
+	local -a product_paths=(":/")
+	for path in "${_full_loop_runtime_paths[@]}"; do
+		product_paths+=(":(top,exclude,literal)${path}")
+	done
 	git rev-parse --verify "${base_ref}^{commit}" >/dev/null 2>&1 || return 1
 	files_changed=$(
 		{
-			git diff --name-only "$base_ref" --
-			git ls-files --others --exclude-standard
+			git diff --name-only "$base_ref" -- "${product_paths[@]}"
+			git ls-files --others --exclude-standard -- "${product_paths[@]}"
 		} | LC_ALL=C sort -u | tr '\n' ',' | sed 's/,$//; s/,/, /g'
 	) || return 1
 	printf '%s\n' "$files_changed"
@@ -536,11 +555,12 @@ _validate_pending_runtime_metadata() {
 	local summary_testing="${3:-}"
 	local summary_what="${4:-}"
 	local base_ref="$5"
-	local files_changed="" runtime_risk=""
+	local files_changed="" runtime_risk="" comparison_base=""
 
-	files_changed=$(_pending_runtime_files_changed "$base_ref") || return 1
+	comparison_base=$(_pending_runtime_comparison_base "$base_ref") || return 1
+	files_changed=$(_pending_runtime_files_changed "$comparison_base") || return 1
 	runtime_risk=$(_derive_runtime_risk "$requested_risk" "$files_changed" \
-		"$summary_what" "$base_ref" "$_full_loop_pending_diff_target") || return 1
+		"$summary_what" "$comparison_base" "$_full_loop_pending_diff_target") || return 1
 	_resolve_runtime_testing_level "$runtime_risk" "$requested_testing_level" \
 		"$summary_testing" >/dev/null || return 1
 	return 0

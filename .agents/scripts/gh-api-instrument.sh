@@ -46,7 +46,24 @@
 # Legacy log format (TSV, still readable):
 #   <unix_ts>\t<caller_basename>\t<path>\t<auth_mode>\t<api_pool>\t<route_decision>\t<budget_remaining>
 # Version 2 appends these privacy-safe fields after the legacy prefix:
-#   v2\t<event_kind>\t<logical_id>\t<attempt_id>\t<page>\t<retry>\t<outcome>\t<http_status>\t<elapsed_ms>\t<quota_cost>
+#   v2\t<event_kind>\t<logical_id>\t<attempt_id>\t<page>\t<retry>\t<outcome>\t<http_status>\t<elapsed_ms>\t<quota_cost>[\t<auth_reason>]
+# auth_reason (optional, from AIDEVOPS_GH_AUTH_REASON) is the Pulse auth route:
+# app | write | local | account | unclassified | unscoped | not-configured |
+# other-host | absolute-url | explicit-auth | verbose. Empty = not routed.
+# Fields 19-21 are auth_consumer, auth_fingerprint (SHA-256 of host + token),
+# and rate-limit reset epoch. Unknown values stay empty; old rows remain valid.
+# Field 22 is the response's cumulative x-ratelimit-used counter, not call cost.
+# rest_core_attribution reports independent (pool, fingerprint, reset) series.
+# Residuals are upper bounds: unknown costs, other tokens sharing a user quota,
+# other machines and filtered-out callers cannot be distinguished from bypasses.
+# same_login_external_cost independently sums max(used_delta - local_attempt_cost,
+# 0) between response-owned used samples in a credential/reset series. It never
+# reduces residuals or unknown costs. Attribution is an upper bound until matching
+# windows on both devices confirm it; compare digest, reset and used counters.
+# other_devices stays unknown: the local dispatch ledger has device IDs but no
+# credential-digest-to-login mapping; reporting must not fetch one via the API.
+# Minutes own the interval-ending sample; multi-frame samples use command
+# completion under the credential lock, not exact per-response wall-clock time.
 #
 # Override env vars:
 #   AIDEVOPS_GH_API_LOG          — path to the log file (default
@@ -389,8 +406,10 @@ _gh_append_record() {
 	[[ ${#record} -le 4000 ]] || return 0
 	[[ "$GH_API_LOG" == */* ]] && mkdir -p "${GH_API_LOG%/*}" 2>/dev/null || true
 	_gh_log_lock_acquire || return 0
+	if declare -F _shim_timing >/dev/null 2>&1; then _shim_timing log_lock_acquire; fi
 	printf '%s\n' "$record" >>"$GH_API_LOG" 2>/dev/null || true
 	_gh_log_lock_release
+	if declare -F _shim_timing >/dev/null 2>&1; then _shim_timing log_append_release; fi
 	return 0
 }
 
@@ -483,12 +502,20 @@ gh_request_attempt_state_cleanup() {
 _gh_request_attempt_state_record() {
 	local logical_id="$1"
 	local http_status="$2"
+	local outcome="${3:-}"
 	local state_file="${AIDEVOPS_GH_REQUEST_ATTEMPT_STATE_FILE:-}"
 	[[ -n "${_GH_API_REQUEST_LOGICAL_ID:-}" &&
 		"$logical_id" == "$_GH_API_REQUEST_LOGICAL_ID" ]] || return 0
 	[[ "${_GH_API_REQUEST_ATTEMPT_COUNT:-}" =~ ^[0-9]+$ ]] || _GH_API_REQUEST_ATTEMPT_COUNT=0
 	_GH_API_REQUEST_ATTEMPT_COUNT=$((_GH_API_REQUEST_ATTEMPT_COUNT + 1))
-	if [[ "$http_status" =~ ^[45][0-9][0-9]$ ]]; then
+	# Keep the private two-column wire compatible. Non-HTTP execution errors
+	# stop alternate transports too; public telemetry retains the actual status.
+	# A successful HTTP response can still fail gh's local --jq projection;
+	# preserve the existing equivalent-read fallback for that distinct case.
+	if [[ "$outcome" == error && ! "$http_status" =~ ^[1-5][0-9][0-9]$ ]]; then
+		http_status=transport-error
+	fi
+	if [[ "$http_status" =~ ^[45][0-9][0-9]$ || "$http_status" == transport-error ]]; then
 		_GH_API_REQUEST_HTTP_FAILURE=1
 	fi
 	if _gh_request_attempt_state_file_valid "$state_file"; then
@@ -526,7 +553,7 @@ gh_request_has_http_failure() {
 	if [[ "$logical_id" == "${AIDEVOPS_GH_REQUEST_ATTEMPT_STATE_LOGICAL_ID:-}" ]] &&
 		_gh_request_attempt_state_file_valid "$state_file"; then
 		while IFS=$'\t' read -r recorded_logical_id http_status; do
-			if [[ "$recorded_logical_id" == "$logical_id" && "$http_status" =~ ^[45][0-9][0-9]$ ]]; then
+			if [[ "$recorded_logical_id" == "$logical_id" && ( "$http_status" =~ ^[45][0-9][0-9]$ || "$http_status" == transport-error ) ]]; then
 				return 0
 			fi
 		done <"$state_file"
@@ -570,8 +597,15 @@ _gh_append_v2() {
 	local quota_cost="$1"
 	shift
 	local recorded_at="${1:-}"
+	local auth_fingerprint="${2:-}"
+	local reset_epoch="${3:-}"
+	local quota_used="${4:-}"
+	local request_method="${5:-unknown}"
+	local endpoint_class="${6:-unknown}"
+	local endpoint_family="${7:-unknown}"
 	local ts=""
 	local record=""
+	local auth_reason=""
 	if [[ -n "$recorded_at" ]]; then
 		[[ "$recorded_at" =~ ^[1-9][0-9]*$ ]] || return 1
 		ts="$recorded_at"
@@ -593,9 +627,36 @@ _gh_append_v2() {
 	http_status=$(_gh_safe_number "$http_status")
 	elapsed_ms=$(_gh_safe_number "$elapsed_ms")
 	quota_cost=$(_gh_safe_number "$quota_cost")
-	printf -v record '%s\t%s\t%s\t%s\t%s\t%s\t%s\tv2\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+	# The Pulse auth resolver labels its child gh process; other callers leave
+	# the reason empty ("unrouted" in reports).
+	auth_reason=$(_gh_safe_text "${AIDEVOPS_GH_AUTH_REASON:-}" "")
+	local auth_consumer=""
+	auth_consumer=$(_gh_safe_text "${AIDEVOPS_GITHUB_AUTH_CONSUMER:-}" "")
+	# Only accept the digest format produced by _ghqa_auth_fingerprint, never
+	# arbitrary auth text (which might accidentally contain a credential).
+	[[ "$auth_fingerprint" =~ ^[a-f0-9]{64}$ ]] || auth_fingerprint=""
+	reset_epoch=$(_gh_safe_number "$reset_epoch")
+	quota_used=$(_gh_safe_number "$quota_used")
+	# These fields are strict enums, not generic text: reject URLs/argv even if a
+	# caller bypasses the debug filter. Existing v2 columns remain unchanged.
+	case "$request_method" in GET | HEAD | POST | PUT | PATCH | DELETE | OPTIONS) ;; *) request_method=unknown ;; esac
+	case "$endpoint_class" in
+	rate-limit | graphql | search | users | orgs | notifications | installation | other | repos-issues | repos-pulls | repos-actions | repos-commits | repos-git | repos-contents | repos-releases | repos-checks | repos-statuses | repos-other) ;;
+	*) endpoint_class=unknown ;;
+	esac
+	# Static allowlist only: no URL, repository, user, query or arbitrary argv.
+	case "$endpoint_family" in
+	user|rate-limit|graphql|search|users|orgs|notifications|installation|other|repos-other|repos/:o/:r/collaborators/:u/permission) ;;
+	*)
+		if [[ ! "$endpoint_family" =~ ^repos/:o/:r/(issues|pulls|actions|commits|git|contents|releases|check-runs|check-suites|statuses)(/:id)?(/(reviews|comments|commits|files|checks|runs))?$ ]]; then
+			endpoint_family=unknown
+		fi
+		;;
+	esac
+	printf -v record '%s\t%s\t%s\t%s\t%s\t%s\t%s\tv2\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
 		"$ts" "$caller" "$path" "$auth_mode" "$api_pool" "$route_decision" "$budget_remaining" \
-		"$event_kind" "$logical_id" "$attempt_id" "$page" "$retry" "$outcome" "$http_status" "$elapsed_ms" "$quota_cost"
+		"$event_kind" "$logical_id" "$attempt_id" "$page" "$retry" "$outcome" "$http_status" "$elapsed_ms" "$quota_cost" \
+		"$auth_reason" "$auth_consumer" "$auth_fingerprint" "$reset_epoch" "$quota_used" "$request_method" "$endpoint_class" "$endpoint_family"
 	_gh_append_record "$record"
 	return 0
 }
@@ -703,6 +764,13 @@ gh_record_attempt() {
 	local route_decision="$1"
 	shift
 	local budget_remaining="$1"
+	local auth_fingerprint="${2-${AIDEVOPS_GH_AUTH_FINGERPRINT:-}}"
+	local reset_epoch="${3:-}"
+	local recorded_at="${4:-}"
+	local quota_used="${5:-}"
+	local request_method="${6:-unknown}"
+	local endpoint_class="${7:-unknown}"
+	local endpoint_family="${8:-unknown}"
 	[[ -n "$logical_id" ]] || logical_id=$(gh_new_logical_id)
 	[[ -n "$attempt_id" ]] || attempt_id=$(gh_new_attempt_id "$logical_id")
 	[[ -n "$page" ]] || page=1
@@ -710,11 +778,13 @@ gh_record_attempt() {
 	[[ -n "$api_pool" ]] || api_pool=$(_gh_default_pool "$path")
 	[[ -n "$auth_mode" ]] || auth_mode="${AIDEVOPS_GH_AUTH_MODE:-$(_gh_default_auth "$api_pool")}"
 	[[ -n "$route_decision" ]] || route_decision="${AIDEVOPS_GH_ROUTE_DECISION:-${api_pool}-selected}"
-	_gh_request_attempt_state_record "$logical_id" "$http_status" || true
+	# Only the native boundary can attest a transport execution error. Legacy
+	# logical adapters may fail a local projection after a successful request.
+	_gh_request_attempt_state_record "$logical_id" "$http_status" "${AIDEVOPS_GH_NATIVE_EXECUTION_OUTCOME:-}" || true
 	[[ "${AIDEVOPS_GH_API_INSTRUMENT_DISABLE:-0}" == "1" ]] && return 0
 	_gh_append_v2 attempt "$caller" "$path" "$auth_mode" "$api_pool" "$route_decision" \
 		"$budget_remaining" "$logical_id" "$attempt_id" "$page" "$retry" "$outcome" \
-		"$http_status" "$elapsed_ms" "$quota_cost"
+		"$http_status" "$elapsed_ms" "$quota_cost" "$recorded_at" "$auth_fingerprint" "$reset_epoch" "$quota_used" "$request_method" "$endpoint_class" "$endpoint_family"
 	return 0
 }
 
@@ -781,8 +851,20 @@ gh_run_transport_attempt() {
 			return "$capture_rc"
 		fi
 	fi
+	local auth_fingerprint="" host="" executable="${1:-}"
+	if [[ "${executable##*/}" == gh ]] && declare -F _ghqa_auth_fingerprint >/dev/null 2>&1; then
+		host=$(_ghqa_target_host "${@:2}" 2>/dev/null || true)
+		if [[ -n "$host" ]]; then
+			auth_fingerprint=$(_ghqa_auth_fingerprint "$executable" "$host" 2>/dev/null || true)
+		fi
+	fi
 	start_ms=$(_gh_now_ms) || start_ms=""
-	if "$@"; then
+	_GH_TRANSPORT_ERROR_HTTP_STATUS=""
+	local -a transport_command=("$@")
+	if declare -F _gh_transport_capture_errors >/dev/null 2>&1; then
+		transport_command=(_gh_transport_capture_errors "$@")
+	fi
+	if "${transport_command[@]}"; then
 		rc=0
 		if [[ -z "$quota_cost" && -n "$success_quota_cost" ]]; then
 			quota_cost="$success_quota_cost"
@@ -796,9 +878,9 @@ gh_run_transport_attempt() {
 		elapsed_ms=$((end_ms - start_ms))
 	fi
 	gh_record_attempt "$path" "$caller" "$logical_id" "" "$page" "$retry" "$outcome" \
-		"${AIDEVOPS_GH_HTTP_STATUS:-}" "$elapsed_ms" "$quota_cost" \
+		"${AIDEVOPS_GH_HTTP_STATUS:-${_GH_TRANSPORT_ERROR_HTTP_STATUS:-}}" "$elapsed_ms" "$quota_cost" \
 		"${AIDEVOPS_GH_AUTH_MODE:-}" "${AIDEVOPS_GH_API_POOL:-}" "${AIDEVOPS_GH_ROUTE_DECISION:-}" \
-		"${AIDEVOPS_GH_BUDGET_REMAINING:-${_GH_LAST_GRAPHQL_REMAINING:-}}"
+		"${AIDEVOPS_GH_BUDGET_REMAINING:-${_GH_LAST_GRAPHQL_REMAINING:-}}" "$auth_fingerprint"
 	return "$rc"
 }
 
@@ -988,8 +1070,13 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 		gh_record_efficiency_evidence "$@"
 		;;
 	report | aggregate)
+		# An ad-hoc report is not a completed-cycle publication. Keep it away
+		# from the canonical report/sidecar pair unless a target is explicit.
+		if [[ $# -eq 0 ]]; then
+			set -- "${AIDEVOPS_GH_API_LIVE_REPORT:-${GH_API_REPORT%.json}-live.json}"
+		fi
 		gh_aggregate_calls "$@"
-		printf 'Wrote %s\n' "${1:-$GH_API_REPORT}" >&2
+		printf 'Wrote %s\n' "$1" >&2
 		;;
 	trim)
 		gh_trim_log

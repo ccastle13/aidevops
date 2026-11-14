@@ -3,11 +3,42 @@
 
 # Tabby profiles
 
+For live multi-host tmux tabs, use `aidevops tabby sessions new|restore|list|doctor`;
+see [Remote Tabby sessions](../tools/terminal/remote-sessions.md). Session leases
+are separate from profile reconciliation and do not change `tabby status`.
+
 Use `.agents/scripts/tabby-profile-sync.py` to generate aidevops project profiles
 from `repos.json`. When `~/.buzz` exists, setup/update also generates a `Buzz`
 profile rooted there so OpenCode opens the Buzz-scoped session namespace. The
 profile is omitted when Buzz has not created that workspace, and an existing
 profile with the same working directory remains user-owned and unchanged.
+
+`tabby-helper.sh status` reports pending reconciliation without changing the
+configuration. `tabby-helper.sh sync`, including the setup/update path, removes
+only profiles confidently identified as aidevops-generated when their cwd is
+both missing and unregistered, or when a later managed profile duplicates an
+earlier managed profile's normalized cwd. It preserves custom profiles,
+custom/managed same-cwd pairs, existing unregistered profiles, and missing paths
+still registered in `repos.json`. The validated write is atomic and a second
+sync must be a no-op. Sync also self-repairs the narrowly identified legacy
+corruption where generated list entries were appended beneath `profiles: []`.
+Other invalid YAML remains unchanged and fails visibly.
+
+For missing-PyYAML failures, use `aidevops tabby sync`, not repeated status
+checks or another YAML repair. Sync first selects a Python interpreter that can
+import PyYAML; if none is usable, it creates the dedicated environment at
+`~/.aidevops/.agent-workspace/python-env/tabby` and installs pinned
+`PyYAML==6.0.3`, then continues reconciliation. It does not install into system
+Python. `aidevops tabby status` remains read-only and cannot bootstrap the
+dependency. If environment creation or dependency installation fails, sync
+stops before backing up or modifying the active config.
+
+When this symptom persists, inspect the deployed `tabby-helper.sh` and its
+actual sync output before modifying recovery logic. Verify valid YAML and a
+successful subsequent status check; an update summary alone is not proof of
+Tabby recovery. Existing regression coverage lives in
+`.agents/scripts/tests/test-tabby-profile-sync.sh` and
+`tests/test-tabby-profile-sync.py` (bootstrap fix: PR #32328).
 
 OpenCode profiles must not launch with `zsh -i -c opencode`. That shape runs an
 interactive zsh startup while executing a command string, which can make
@@ -65,6 +96,47 @@ Recovery markers live under
 the OpenCode session ID and local directory references, use owner-only
 permissions, and are inert unless Tabby starts the launcher from that exact
 marker directory.
+
+Tabby uses the reported directory both for restoration and as the starting
+directory of any new tab opened from the focused OpenCode tab. Restored
+plain-shell tabs also start there. Setup therefore sources
+`scripts/tabby-recovery-shell-guard.sh` from interactive bash/zsh startup files
+(`setup_tabby_recovery_shell_guard`, run only when Tabby is installed). An
+interactive shell that starts inside a marker moves to the session's project
+directory, or to `$HOME` if the marker is unusable. When the owning OpenCode
+process is gone, the shell prints the `cd <marker> && aidevops opencode
+--tabby-shell` (or `opencode2`) resume command at the first prompt.
+Command-string shells (`-c`), including managed profiles, skip the guard so
+they can still restore the session. Set `AIDEVOPS_TABBY_MARKER_GUARD=0` to opt
+out.
+
+## OpenCode V2 (`opencode2`)
+
+V2 server plugins run in the tty-less background service, so the V2 TUI plugin
+(`plugins/opencode-aidevops/v2-plugin/tui.mjs`) writes the marker instead. When
+the `opencode2` shim starts an interactive TUI inside Tabby, it exports
+`AIDEVOPS_TABBY_V2_RECOVERY=1`. The TUI then records a schema-2 `runtime: "v2"`
+marker for the routed root session and reports it with `OSC 1337`. Switching
+sessions rewrites the marker.
+
+Launching `opencode2` from a marker directory, whether Tabby re-runs the
+profile command or you run the printed resume command in a restored shell tab, resolves the marker
+against the V2 data home and the `session_v2` table, then runs
+`--session <id>` in the session's directory. The shim only opens the project
+directory, without resuming, when:
+
+- the marker's owner TUI is still live (a split or duplicated tab);
+- the caller passed `--session` or `--continue`;
+- the marker belongs to V1.
+
+The V1 launcher likewise opens a V2 marker's directory without resuming it.
+Owner liveness uses `/proc` on Linux and `ps -o lstart=` on macOS.
+
+After a normal TUI exit, the shim reports the project directory back to Tabby.
+When Tabby quits or crashes, the marker remains the tab's saved directory, so
+the next launch restores that session. Set `AIDEVOPS_TABBY_V2_RECOVERY=0` to
+opt out. With V2's own tab strip disabled (`"tabs": {"mode": "off"}` in V2
+`cli.json`), each Tabby tab maps to one session.
 
 For manual one-off profiles that should run OpenCode and then leave a shell open,
 use the same non-interactive login command instead of mixing `-i` and `-c`:

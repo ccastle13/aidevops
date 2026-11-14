@@ -32,6 +32,7 @@ unset AIDEVOPS_GH_QUOTA_COST
 unset AIDEVOPS_GH_QUOTA_COST_ON_SUCCESS
 unset AIDEVOPS_GH_GRAPHQL_COST_FROM_RESPONSE
 unset GH_HOST
+unset AIDEVOPS_GH_EXPLICIT_PAGINATION_DISABLE
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)" || exit
 REPO_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)" || exit
@@ -65,19 +66,31 @@ _fail() {
 TMP=$(mktemp -d 2>/dev/null || mktemp -d -t gh-shim-test)
 trap 'rm -rf "$TMP"' EXIT
 
+# Hermetic HOME (GH#36255): the shim falls back to
+# ~/.aidevops/agents/scripts/<lib> for any library missing beside it and reads
+# governor/cache state under HOME, so a deployed install changed this suite's
+# result. Only the tree under test may be sourced.
+export HOME="$TMP/home"
+mkdir -p "$HOME"
+
 # Stub real gh — writes its argv (one per line) to $STUB_GH_LOG and
 # exits 0. The shim will exec this when forwarding.
 mkdir -p "$TMP/bin"
 cat >"$TMP/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 # Stub gh that logs argv
+if [[ "${1:-}" == api && -n "${STUB_TRANSPORT_RESPONSE_FILE:-}" ]]; then
+	printf '%s\n' "$*" >>"$STUB_GH_CALL_LOG"
+	cat "$STUB_TRANSPORT_RESPONSE_FILE"
+	exit "${STUB_TRANSPORT_RC:-0}"
+fi
 if [[ "$1" == "api" && "$2" == "user" ]]; then
 	printf '%s\n' "${STUB_GH_USER:-managed}"
 	exit 0
 fi
 if [[ "$1" == "api" && "$2" =~ ^/repos/[^/]+/[^/]+/collaborators/[^/]+/permission$ ]]; then
 	[[ "${STUB_GH_PERMISSION_FAIL:-0}" != "1" ]] || exit 44
-	printf '%s\n' "${STUB_GH_PERMISSION:-none}"
+	printf '%s\n' "${STUB_GH_PERMISSION:-write}"
 	exit 0
 fi
 if [[ "$1" == "auth" && "$2" == "token" ]]; then
@@ -87,12 +100,25 @@ fi
 if [[ -n "${STUB_GH_CALL_LOG:-}" ]]; then
 	printf '%s\t%s\n' "${1:-}" "${2:-}" >>"$STUB_GH_CALL_LOG"
 fi
+if [[ "$1" == "pr" && "$2" == "create" && -n "${STUB_PR_CREATE_EXIT_CODE:-}" ]]; then
+	[[ -z "${STUB_PR_CREATE_STDOUT:-}" ]] || printf '%s\n' "$STUB_PR_CREATE_STDOUT"
+	[[ -z "${STUB_PR_CREATE_STDERR:-}" ]] || printf '%s\n' "$STUB_PR_CREATE_STDERR" >&2
+	exit "$STUB_PR_CREATE_EXIT_CODE"
+fi
 if [[ "$1" == "api" && "$2" =~ ^/repos/[^/]+/[^/]+/labels\?per_page=100$ ]]; then
 	[[ "${STUB_MANAGED_LABEL_INVENTORY_FAIL:-0}" != "1" ]] || exit 42
 	managed_labels="${STUB_MANAGED_LABELS-}"
 	if [[ -z "${STUB_MANAGED_LABELS+x}" ]]; then
 		managed_labels=$'origin:worker\norigin:interactive\norigin:worker-takeover\nstatus:in-review\nbug'
 	fi
+	# The explicit REST paginator requests --include and parses the header
+	# block; no Link header means a single page.
+	for arg in "$@"; do
+		if [[ "$arg" == "--include" || "$arg" == "-i" ]]; then
+			printf 'HTTP/2.0 200 OK\r\nX-Ratelimit-Resource: core\r\n\r\n'
+			break
+		fi
+	done
 	printf '%s\n' "$managed_labels"
 	exit 0
 fi
@@ -200,7 +226,7 @@ if [[ "${STUB_REST_READ_FAIL:-0}" == "1" && "$1" == "api" && \
 	"$2" =~ ^/repos/[^/]+/[^/]+/(issues|pulls)(\?|/|$) ]]; then
 	exit "${STUB_REST_READ_EXIT_CODE:-42}"
 fi
-if [[ "$1" == "api" && "$2" =~ ^/repos/[^/]+/[^/]+/pulls\? ]]; then
+if [[ "$1" == "api" && "$2" =~ ^/repos/[^/]+/[^/]+/pulls(\?|$) ]]; then
 	jq_filter=""
 	i=3
 	while [[ $i -le $# ]]; do
@@ -211,7 +237,11 @@ if [[ "$1" == "api" && "$2" =~ ^/repos/[^/]+/[^/]+/pulls\? ]]; then
 		fi
 		i=$((i + 1))
 	done
-	fixture='[{"number":22337,"state":"open","merged_at":null,"html_url":"https://github.com/owner/repo/pull/22337"},{"number":22343,"state":"open","merged_at":null,"html_url":"https://github.com/owner/repo/pull/22343"}]'
+	if [[ -n "${STUB_REST_PULLS_FILE:-}" ]]; then
+		fixture=$(<"$STUB_REST_PULLS_FILE")
+	else
+		fixture='[{"number":22337,"state":"open","merged_at":null,"html_url":"https://github.com/owner/repo/pull/22337"},{"number":22343,"state":"open","merged_at":null,"html_url":"https://github.com/owner/repo/pull/22343"}]'
+	fi
 	if [[ "$2" == *"head=owner%3Afeature%2Fauto-20260502-135611-gh22289"* ]]; then
 		fixture='[{"number":22337,"state":"open","merged_at":null,"html_url":"https://github.com/owner/repo/pull/22337"}]'
 	fi
@@ -267,6 +297,11 @@ if [[ "$1" == "issue" && "$2" == "view" && -n "${STUB_NATIVE_ISSUE_VIEW_JSON:-}"
 	printf '%s\n' "$STUB_NATIVE_ISSUE_VIEW_JSON"
 	exit 0
 fi
+# Safe-body edit cases target a non-worker PR with readable origin labels.
+if [[ "$*" == 'pr view 42 --repo owner/repo --json labels --jq [.labels[].name]' ]]; then
+	printf '%s\n' '[]'
+	exit 0
+fi
 EOF
 chmod +x "$TMP/bin/gh"
 
@@ -294,10 +329,15 @@ cp "$REPO_DIR/.agents/scripts/gh-native-transport-lib.sh" "$TMP/scripts/gh-nativ
 cp "$REPO_DIR/.agents/scripts/gh-api-guards-lib.sh" "$TMP/scripts/gh-api-guards-lib.sh"
 cp "$REPO_DIR/.agents/scripts/managed-label-provisioning-lib.sh" "$TMP/scripts/managed-label-provisioning-lib.sh"
 cp "$REPO_DIR/.agents/scripts/gh-write-policy-lib.sh" "$TMP/scripts/gh-write-policy-lib.sh"
+cp "$REPO_DIR/.agents/scripts/gh-closing-reference-lib.sh" "$TMP/scripts/gh-closing-reference-lib.sh"
 cp "$REPO_DIR/.agents/scripts/gh-api-instrument.sh" "$TMP/scripts/gh-api-instrument.sh"
 cp "$REPO_DIR/.agents/scripts/gh-quota-attribution-lib.sh" "$TMP/scripts/gh-quota-attribution-lib.sh"
+cp "$REPO_DIR/.agents/scripts/gh-rest-pagination-lib.sh" "$TMP/scripts/gh-rest-pagination-lib.sh"
 cp "$REPO_DIR/.agents/scripts/gh-quota-debug-filter.py" "$TMP/scripts/gh-quota-debug-filter.py"
 cp "$REPO_DIR/.agents/scripts/gh_quota_debug_response.py" "$TMP/scripts/gh_quota_debug_response.py"
+cp "$REPO_DIR/.agents/scripts/gh_quota_debug_cache.py" "$TMP/scripts/gh_quota_debug_cache.py"
+cp "$REPO_DIR/.agents/scripts/gh_quota_debug_request.py" "$TMP/scripts/gh_quota_debug_request.py"
+cp "$REPO_DIR/.agents/scripts/gh_native_response.py" "$TMP/scripts/gh_native_response.py"
 cp "$REPO_DIR/.agents/scripts/shared-gh-wrappers-rest-fallback.sh" "$TMP/scripts/shared-gh-wrappers-rest-fallback.sh"
 cp "$REPO_DIR/.agents/scripts/shared-gh-wrappers-rest-read-semantics.sh" "$TMP/scripts/shared-gh-wrappers-rest-read-semantics.sh"
 cp "$REPO_DIR/.agents/scripts/log-issue-helper.sh" "$TMP/scripts/log-issue-helper.sh"
@@ -345,6 +385,10 @@ _reset_log() {
 	unset STUB_MANAGED_LABEL_CREATE_FAIL
 	unset STUB_GH_PERMISSION
 	unset STUB_GH_PERMISSION_FAIL
+	unset STUB_PR_CREATE_EXIT_CODE
+	unset STUB_PR_CREATE_STDOUT
+	unset STUB_PR_CREATE_STDERR
+	unset STUB_REST_PULLS_FILE
 	return 0
 }
 
@@ -391,6 +435,23 @@ _argv_has_pair() {
 	return 1
 }
 
+# The shim sources the closing-reference library without the safe-edit module.
+# An explicit repo must reach the identity metadata lookup on body edits.
+if (
+	source "${REPO_DIR}/.agents/scripts/gh-closing-reference-lib.sh"
+	gh_pr_view() {
+		[[ "$*" == '42 --repo owner/repo --json labels --jq [.labels[].name]' ]] || return 1
+		printf '%s\n' '["origin:worker"]'
+		return 0
+	}
+	_GH_PR_IDENTITY_ORIGIN=edit
+	_gh_validate_pr_closing_keywords 42 --repo owner/repo --body 'For #123'
+); then
+	_pass "standalone PR body validation passes explicit repo to identity lookup"
+else
+	_fail "standalone PR body validation passes explicit repo to identity lookup"
+fi
+
 # --- Focused test modules ---
 
 # shellcheck source=./test-gh-shim-core-cases.sh
@@ -408,6 +469,9 @@ source "${SCRIPT_DIR}/test-gh-shim-quota-cases.sh"
 # shellcheck source=./test-gh-shim-policy-cases.sh
 # shellcheck disable=SC1091  # sub-library resolved at runtime via $SCRIPT_DIR
 source "${SCRIPT_DIR}/test-gh-shim-policy-cases.sh"
+
+# shellcheck source=./test-gh-shim-transport-cases.sh
+source "${SCRIPT_DIR}/test-gh-shim-transport-cases.sh"
 
 # =============================================================================
 # Summary

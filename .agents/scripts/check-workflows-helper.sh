@@ -10,7 +10,10 @@
 #   - issue-sync.yml         (template: issue-sync-caller.yml)
 #   - review-bot-gate.yml    (template: review-bot-gate-caller.yml, GH#20727)
 #   - maintainer-gate.yml    (template: maintainer-gate-caller.yml, GH#21154)
+#   - loc-badge.yml          (template: loc-badge-caller.yml)
 #   - linked-issue-check.yml (template: linked-issue-check-caller.yml, GH#28844)
+#   - release-verify.yml     (template: release-verify-caller.yml)
+#   - issue-triage-gate.yml  (template: issue-triage-gate-caller.yml, GH#36905)
 #
 # Classifies each (repo × workflow) as:
 #
@@ -82,12 +85,15 @@ fi
 # GH#20727: review-bot-gate added.
 # GH#21154: maintainer-gate added (layer-1 defense-in-depth propagation).
 # GH#28844: linked-issue-check added (external contribution visibility).
+# GH#36905: issue-triage-gate added (creation-time external issue trust labels).
 readonly _KNOWN_WORKFLOWS=(
 	"issue-sync.yml:issue-sync-reusable.yml:issue-sync-caller.yml"
 	"review-bot-gate.yml:review-bot-gate-reusable.yml:review-bot-gate-caller.yml"
 	"maintainer-gate.yml:maintainer-gate-reusable.yml:maintainer-gate-caller.yml"
 	"loc-badge.yml:loc-badge-reusable.yml:loc-badge-caller.yml"
 	"linked-issue-check.yml:linked-issue-check-reusable.yml:linked-issue-check-caller.yml"
+	"release-verify.yml:release-verify-reusable.yml:release-verify-caller.yml"
+	"issue-triage-gate.yml:issue-triage-gate-reusable.yml:issue-triage-gate-caller.yml"
 )
 
 # Versioned inventory of framework-owned paths superseded by reusable callers.
@@ -278,17 +284,15 @@ _workflow_reusable_ref_for_slug() {
 _render_template_for_target() {
 	local _template="$1"
 	local _repo="$2"
-	local _reusable_file="$3"
 	local _ref="$4"
-	local _default_repo_escaped _reusable_escaped _repo_repl _ref_repl
+	local _default_repo_escaped _repo_repl _ref_repl
 	_default_repo_escaped=$(_escape_ere "$_DEFAULT_WORKFLOW_REUSABLE_REPO")
-	_reusable_escaped=$(_escape_ere "$_reusable_file")
 	_repo_repl=$(_escape_sed_replacement "$_repo")
 	_ref_repl=$(_escape_sed_replacement "$_ref")
 	local _rendered
 	_rendered=$(sed -E \
-		-e "s|(uses:[[:space:]]*)${_default_repo_escaped}(/\.github/workflows/${_reusable_escaped})@[^[:space:]]+|\1${_repo_repl}\2@${_ref_repl}|" \
-		-e "s|${_default_repo_escaped}(/\.github/workflows/${_reusable_escaped})|${_repo_repl}\1|g" \
+		-e "s|^([[:space:]]*uses:[[:space:]]*)${_default_repo_escaped}(/\.github/workflows/[^@[:space:]]+)@[^[:space:]]+|\1${_repo_repl}\2@${_ref_repl}|" \
+		-e "s|${_default_repo_escaped}(/\.github/workflows/[^[:space:]]+)|${_repo_repl}\1|g" \
 		-e "s|^(      aidevops_ref:).*$|\1 ${_ref_repl}|" \
 		"$_template")
 	if [[ "$_repo" != "$_DEFAULT_WORKFLOW_REUSABLE_REPO" ]] &&
@@ -305,6 +309,13 @@ _render_template_for_target() {
 
 _inject_mirror_read_secret() {
 	local _content="$1"
+	local _secret_blocks _read_tokens
+	_secret_blocks=$(printf '%s\n' "$_content" | grep -cE '^    secrets:( inherit)?$' || true)
+	_read_tokens=$(printf '%s\n' "$_content" | grep -cE '^      AIDEVOPS_READ_TOKEN:' || true)
+	if ((_secret_blocks > 0 && _read_tokens >= _secret_blocks)); then
+		printf '%s\n' "$_content"
+		return 0
+	fi
 	if printf '%s\n' "$_content" | grep -qE '^    secrets: inherit$'; then
 		printf '%s\n' "$_content" | sed -E \
 			's|^    secrets: inherit$|    secrets:\
@@ -320,16 +331,82 @@ _inject_mirror_read_secret() {
 _caller_helper_provenance_matches() {
 	local _wf="$1"
 	local _target_repo="$2"
-	local _target_escaped="$3"
-	local _uses_ref _helper_ref _helper_repo
-	_uses_ref=$(sed -nE "s|^[[:space:]]*uses:[[:space:]]*${_target_escaped}@([^[:space:]]+).*$|\1|p" "$_wf" | head -n 1)
-	_helper_ref=$(sed -nE 's|^      aidevops_ref:[[:space:]]*([^[:space:]]+).*$|\1|p' "$_wf" | head -n 1)
-	_helper_repo=$(sed -nE 's|^      aidevops_repository:[[:space:]]*([^[:space:]]+).*$|\1|p' "$_wf" | head -n 1)
-	[[ -z "$_helper_repo" ]] && _helper_repo="$_DEFAULT_WORKFLOW_REUSABLE_REPO"
-	if [[ -n "$_uses_ref" && "$_helper_ref" == "$_uses_ref" && "$_helper_repo" == "$_target_repo" ]]; then
+	local _target_repo_escaped="$3"
+	local _uses_refs _helper_refs _helper_repos _helper_repo
+	_uses_refs=$(sed -nE \
+		"s|^[[:space:]]*uses:[[:space:]]*${_target_repo_escaped}/\.github/workflows/[^@[:space:]]+@([^[:space:]]+).*$|\1|p" \
+		"$_wf")
+	_helper_refs=$(sed -nE 's|^      aidevops_ref:[[:space:]]*([^[:space:]]+).*$|\1|p' "$_wf")
+	[[ -n "$_uses_refs" && "$_helper_refs" == "$_uses_refs" ]] || return 1
+	_helper_repos=$(sed -nE 's|^      aidevops_repository:[[:space:]]*([^[:space:]]+).*$|\1|p' "$_wf")
+	if [[ "$_target_repo" == "$_DEFAULT_WORKFLOW_REUSABLE_REPO" && -z "$_helper_repos" ]]; then
 		return 0
 	fi
+	[[ -n "$_helper_repos" ]] || return 1
+	while IFS= read -r _helper_repo; do
+		[[ "$_helper_repo" == "$_target_repo" ]] || return 1
+	done <<<"$_helper_repos"
+	[[ "$(printf '%s\n' "$_helper_repos" | wc -l | tr -d ' ')" == "$(printf '%s\n' "$_helper_refs" | wc -l | tr -d ' ')" ]]
+}
+
+# _installed_framework_version — X.Y.Z of the running install (deployed
+# agents/VERSION) or of the repository checkout; empty when unavailable.
+_installed_framework_version() {
+	local _candidate="" _version=""
+	for _candidate in "${SELF_DIR:+$SELF_DIR/../VERSION}" "${REPO_ROOT:+$REPO_ROOT/VERSION}"; do
+		[[ -n "$_candidate" && -r "$_candidate" ]] || continue
+		IFS= read -r _version <"$_candidate" || true
+		if [[ "$_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+			printf '%s\n' "$_version"
+			return 0
+		fi
+	done
+	return 0
+}
+
+# _version_is_older <a> <b> — succeeds when X.Y.Z version a sorts before b.
+_version_is_older() {
+	local _a="$1"
+	local _b="$2"
+	local _a_major _a_minor _a_patch _b_major _b_minor _b_patch
+	IFS=. read -r _a_major _a_minor _a_patch <<<"$_a"
+	IFS=. read -r _b_major _b_minor _b_patch <<<"$_b"
+	if ((10#$_a_major != 10#$_b_major)); then
+		if ((10#$_a_major < 10#$_b_major)); then return 0; fi
+		return 1
+	fi
+	if ((10#$_a_minor != 10#$_b_minor)); then
+		if ((10#$_a_minor < 10#$_b_minor)); then return 0; fi
+		return 1
+	fi
+	if ((10#$_a_patch < 10#$_b_patch)); then return 0; fi
 	return 1
+}
+
+# _pin_lag_note <workflow-file> <workflow-name>
+# CURRENT/CALLER ignores @ref variance by design (pins are an operator
+# choice), so a release-tag pin older than the install is reported here
+# rather than reclassified (GH#34095). Classification and exit status are
+# unchanged; the note names the explicit opt-in bump command.
+_pin_lag_note() {
+	local _wf="$1"
+	local _workflow_name="$2"
+	local _pin="" _installed _line=""
+	local _uses_re='^[[:space:]]*uses:[[:space:]]*[^[:space:]]+/\.github/workflows/[^@[:space:]]+@v([0-9]+\.[0-9]+\.[0-9]+)([[:space:]].*)?$'
+	[[ -r "$_wf" ]] || return 0
+	while IFS= read -r _line || [[ -n "$_line" ]]; do
+		if [[ "$_line" =~ $_uses_re ]]; then
+			_pin="${BASH_REMATCH[1]}"
+			break
+		fi
+	done <"$_wf"
+	[[ -n "$_pin" ]] || return 0
+	_installed=$(_installed_framework_version)
+	[[ -n "$_installed" ]] || return 0
+	_version_is_older "$_pin" "$_installed" || return 0
+	printf 'pinned @v%s; installed v%s; bump: aidevops sync-workflows --workflow %s --force-ref --ref @v%s' \
+		"$_pin" "$_installed" "$_workflow_name" "$_installed"
+	return 0
 }
 
 # ─── Classification ─────────────────────────────────────────────────────────
@@ -337,7 +414,7 @@ _caller_helper_provenance_matches() {
 # _normalize_wf_for_compare <file> <target_escaped>
 # Normalise a workflow file for byte-comparison:
 #   - Replaces the @<ref> suffix on reusable `uses:` lines with @REF so that
-#     `@main` vs `@v3.9.0` doesn't count as drift.
+#     `@main` vs `@v3.9.0` doesn't count as drift; ignores display comments.
 #   - Replaces `branches: [<name>]` with `branches: [BRANCH]` so repos that
 #     default to `develop` aren't flagged as drifted from a main-defaulting template.
 #   - Strips injected `runner:` keys from `with:` blocks (GH#21877) and removes
@@ -361,6 +438,8 @@ _normalize_wf_for_compare() {
 	#         Dropping pending at EOF is correct — there is no legitimate scenario
 	#         where a `with:` followed by no children should survive normalisation.
 	sed -E "s|(${_target_escaped})@[^[:space:]]+|\1@REF|g" "$_file" |
+		sed -E 's|(uses:[[:space:]]*[^[:space:]]+/\.github/workflows/[^@[:space:]]+)@[^[:space:]]+|\1@REF|g' |
+		sed -E 's|^([[:space:]]*uses:[[:space:]]*[^[:space:]]+/\.github/workflows/[^@[:space:]]+@REF)[[:space:]]+#.*$|\1|' |
 		sed -E 's|^([[:space:]]+branches:) \[[^]]+\]$|\1 [BRANCH]|' |
 		sed -E 's|^      aidevops_ref: .+$|      aidevops_ref: REF|' |
 		sed -E '/^      aidevops_repository: /d' |
@@ -388,6 +467,8 @@ _normalize_wf_text_for_compare() {
 	local _target_escaped="$2"
 	printf '%s\n' "$_content" |
 		sed -E "s|(${_target_escaped})@[^[:space:]]+|\1@REF|g" |
+		sed -E 's|(uses:[[:space:]]*[^[:space:]]+/\.github/workflows/[^@[:space:]]+)@[^[:space:]]+|\1@REF|g' |
+		sed -E 's|^([[:space:]]*uses:[[:space:]]*[^[:space:]]+/\.github/workflows/[^@[:space:]]+@REF)[[:space:]]+#.*$|\1|' |
 		sed -E 's|^([[:space:]]+branches:) \[[^]]+\]$|\1 [BRANCH]|' |
 		sed -E 's|^      aidevops_ref: .+$|      aidevops_ref: REF|' |
 		sed -E '/^      aidevops_repository: /d' |
@@ -458,7 +539,7 @@ _classify_workflow() {
 		# repository/ref tuple as the reusable YAML. Missing or mismatched values
 		# are drift so sync-workflows can repair legacy callers safely.
 		if grep -qE '^      aidevops_ref:' "$_canon" &&
-			! _caller_helper_provenance_matches "$_wf" "$_target_repo" "$_target_escaped"; then
+			! _caller_helper_provenance_matches "$_wf" "$_target_repo" "$(_escape_ere "$_target_repo")"; then
 			printf 'DRIFTED/CALLER\n'
 			return 0
 		fi
@@ -723,7 +804,7 @@ _diff_summary() {
 		local _target_escaped _canon_rendered
 		_target_escaped="$(_escape_ere "$_target_repo")/\.github/workflows/$(_escape_ere "$_reusable_file")"
 		if grep -qE '^      aidevops_ref:' "$_canon" &&
-			! _caller_helper_provenance_matches "$_wf" "$_target_repo" "$_target_escaped"; then
+			! _caller_helper_provenance_matches "$_wf" "$_target_repo" "$(_escape_ere "$_target_repo")"; then
 			printf '  helper provenance mismatch: reusable uses and aidevops_repository/aidevops_ref must identify the same target\n'
 		fi
 		_canon_rendered=$(_render_template_for_target \
@@ -874,6 +955,9 @@ _classify_row() {
 	case "$_class" in
 	NEEDS-MIGRATION)
 		_note="legacy full-copy; run: aidevops sync-workflows --apply"
+		;;
+	CURRENT/CALLER)
+		_note=$(_pin_lag_note "$_wf" "${_workflow_file%.yml}")
 		;;
 	esac
 

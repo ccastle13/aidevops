@@ -45,12 +45,70 @@ _DISPATCH_DEDUP_COST_LOADED=1
 #######################################
 
 #######################################
-# Look up the per-tier cost budget from .agents/configs/dispatch-cost-budgets.conf.
+# Bounds for repository budget overrides (t18729). A typo in a repository file
+# can neither disable the breaker nor make it fire on the first attempt.
+#######################################
+_COST_REPO_BUDGET_MIN=100000
+_COST_REPO_BUDGET_MAX=20000000
+
+#######################################
+# Resolve a registered repository's checkout path from repos.json.
+# Args: $1 = repo slug (owner/repo)
+# Stdout: checkout path, or nothing when unregistered/unreadable
+#######################################
+_cost_repo_path_for_slug() {
+	local repo_slug="$1"
+	local repos_file="${AIDEVOPS_REPOS_FILE:-$HOME/.config/aidevops/repos.json}"
+	[[ -n "$repo_slug" && -f "$repos_file" ]] || return 0
+	jq -r --arg slug "$repo_slug" '
+		[.initialized_repos[]?
+		 | select(((.slug // "") | ascii_downcase) == ($slug | ascii_downcase))
+		 | .path // empty][0] // empty
+	' "$repos_file" 2>/dev/null || true
+	return 0
+}
+
+#######################################
+# Print validated repository budget overrides as KEY=VALUE lines (t18729).
+# The repository file is data, never sourced: only exact
+# COST_BUDGET_(SIMPLE|STANDARD|THINKING|DEFAULT)=<digits> lines are accepted,
+# and values are clamped to [_COST_REPO_BUDGET_MIN, _COST_REPO_BUDGET_MAX].
+# Args: $1 = repo slug (owner/repo)
+#######################################
+_cost_repo_budget_overrides() {
+	local repo_slug="$1"
+	local repo_path conf line key value
+	repo_path=$(_cost_repo_path_for_slug "$repo_slug")
+	[[ -n "$repo_path" ]] || return 0
+	repo_path="${repo_path/#\~/$HOME}"
+	conf="${repo_path}/.aidevops/dispatch-cost-budgets.conf"
+	[[ -f "$conf" ]] || return 0
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		line="${line%$'\r'}"
+		[[ "$line" =~ ^(COST_BUDGET_(SIMPLE|STANDARD|THINKING|DEFAULT))=([0-9]{1,9})$ ]] || continue
+		key="${BASH_REMATCH[1]}"
+		value=$((10#${BASH_REMATCH[3]}))
+		if [[ "$value" -lt "$_COST_REPO_BUDGET_MIN" ]]; then
+			value="$_COST_REPO_BUDGET_MIN"
+		elif [[ "$value" -gt "$_COST_REPO_BUDGET_MAX" ]]; then
+			value="$_COST_REPO_BUDGET_MAX"
+		fi
+		printf '%s=%s\n' "$key" "$value"
+	done <"$conf"
+	return 0
+}
+
+#######################################
+# Look up the per-tier cost budget from .agents/configs/dispatch-cost-budgets.conf,
+# overridden by the target repository's committed
+# .aidevops/dispatch-cost-budgets.conf when present (t18729).
 # Args: $1 = tier label or short name (simple|standard|thinking|tier:simple|...)
+#       $2 = (optional) repo slug (owner/repo) for the repository override
 # Stdout: integer token budget
 #######################################
 _get_cost_budget_for_tier() {
 	local tier="$1"
+	local repo_slug="${2:-}"
 	local _conf="${SCRIPT_DIR}/../configs/dispatch-cost-budgets.conf"
 	# Defaults match the documented tier sizing (see dispatch-cost-budgets.conf)
 	local COST_BUDGET_SIMPLE=800000
@@ -62,6 +120,20 @@ _get_cost_budget_for_tier() {
 		source "$_conf"
 	fi
 
+	local _override _key _value
+	if [[ -n "$repo_slug" ]]; then
+		while IFS= read -r _override; do
+			_key="${_override%%=*}"
+			_value="${_override#*=}"
+			case "$_key" in
+			COST_BUDGET_SIMPLE) COST_BUDGET_SIMPLE="$_value" ;;
+			COST_BUDGET_STANDARD) COST_BUDGET_STANDARD="$_value" ;;
+			COST_BUDGET_THINKING) COST_BUDGET_THINKING="$_value" ;;
+			COST_BUDGET_DEFAULT) COST_BUDGET_DEFAULT="$_value" ;;
+			esac
+		done < <(_cost_repo_budget_overrides "$repo_slug")
+	fi
+
 	# Strip "tier:" prefix if present
 	tier="${tier#tier:}"
 
@@ -71,6 +143,127 @@ _get_cost_budget_for_tier() {
 	thinking) printf '%s' "$COST_BUDGET_THINKING" ;;
 	*) printf '%s' "$COST_BUDGET_DEFAULT" ;;
 	esac
+	return 0
+}
+
+# GH#34598: installation-authenticated REST (pulse App routing) reports private
+# org members as CONTRIBUTOR, so association alone dropped every closeout receipt
+# and re-charged delivered work. Resolve ambiguous authors of checkpoint
+# nominations (closeout markers, signed PR reports) through the collaborator
+# permission endpoint; at most 5 distinct logins to bound REST calls.
+# Args: repo slug, slurped comments JSON.
+# Stdout: JSON array of logins with admin/maintain/write permission.
+# Returns 1 on lookup failure (caller fail-open: cannot classify the evidence).
+_COST_TRUSTED_ASSOCIATIONS='["OWNER","MEMBER","COLLABORATOR"]'
+_cost_verified_nominator_logins() {
+	local repo_slug="$1" comments_json="$2"
+	local logins login permission lookup_rc
+	local verified='[]'
+	logins=$(printf '%s' "$comments_json" | jq -r --argjson assoc "$_COST_TRUSTED_ASSOCIATIONS" '
+		[.[][] | select((.author_association // "NONE") as $a | $assoc | index($a) | not)
+		 | select(.body // "" | test("<!-- PARTIAL_PARENT_CLOSEOUT:PR#[0-9]+ -->")
+			or (contains("<!-- aidevops:sig -->") and test("\\bPR #[0-9]+\\b")))
+		 | .user.login // empty] | unique | .[:5][]
+	' 2>/dev/null) || return 1
+	while IFS= read -r login; do
+		[[ "$login" =~ ^[A-Za-z0-9][A-Za-z0-9-]*(\[bot\])?$ ]] || continue
+		permission=""
+		lookup_rc=0
+		#aidevops:trust-boundary GH#34598: only an authenticated write-level
+		# permission verdict promotes an ambiguous association; a confirmed
+		# non-collaborator (404 → none) stays untrusted, uncertainty fails open.
+		# Without the shared lookup a 404 is indistinguishable from an outage,
+		# so the bare fallback treats any failure as untrusted.
+		if declare -F _gh_collaborator_permission_lookup >/dev/null 2>&1; then
+			_gh_collaborator_permission_lookup "$repo_slug" "$login" permission || lookup_rc=$?
+			[[ "$lookup_rc" -eq 0 ]] || return 1
+		else
+			permission=$(gh api "repos/${repo_slug}/collaborators/${login}/permission" \
+				--jq '.permission // ""' 2>/dev/null) || permission=""
+		fi
+		case "$permission" in
+		admin | maintain | write)
+			verified=$(printf '%s' "$verified" | jq -c --arg login "$login" '. + [$login]') || return 1
+			;;
+		esac
+	done <<<"$logins"
+	printf '%s' "$verified"
+	return 0
+}
+
+# GH#34248: GitHub can omit cross-reference events for delivered partial PRs.
+# Closeout markers supply candidates only; verify each PR through REST before
+# treating its actual merge time as a checkpoint. Never reset from prose alone.
+# Args: issue number, repo slug, slurped comments JSON.
+# Stdout: JSON with latest verified merge epoch and verified closeout PRs.
+# Returns 1 on fetch/parse failure.
+_cost_checkpoint_from_closeouts() {
+	local issue_number="$1" repo_slug="$2" comments_json="$3"
+	# Delivered checkpoints start a new spend window, not a lifetime budget.
+	# Reference creation time is not merge time; unrelated PRs cannot reset spend.
+	local timeline_json checkpoint_epoch
+	timeline_json=$(gh api "repos/${repo_slug}/issues/${issue_number}/timeline" --paginate --slurp 2>/dev/null) || return 1
+	checkpoint_epoch=$(printf '%s' "$timeline_json" | jq -r --arg repo "$repo_slug" --arg issue "$issue_number" '
+		[.[][]
+		 | select(.event == "cross-referenced")
+		 | .source.issue
+		 | select(.repository.full_name == $repo)
+		 | select(((.title // "") + "\n" + (.body // ""))
+			| test("(?i)\\b(for|ref|resolves)\\s+#" + $issue + "([^0-9]|$)"))
+		 | .pull_request.merged_at // empty
+		 | fromdateiso8601] | max // 0
+	' 2>/dev/null) || return 1
+
+	# GH#34342: continuation workers often report merged checkpoints only as
+	# "PR #N" prose in their signed comments, with neither timeline events nor a
+	# closeout marker. Those mentions are candidates only (at most the three
+	# highest numbers, to bound REST calls); unlike closeouts, an unreadable or
+	# non-PR mention is skipped rather than failing the whole aggregation.
+	local candidates kind pr_number pr_json merge_epoch trusted_logins
+	local verified_closeouts='[]'
+	trusted_logins=$(_cost_verified_nominator_logins "$repo_slug" "$comments_json") || return 1
+	candidates=$(printf '%s' "$comments_json" | jq -r --argjson logins "$trusted_logins" \
+		--argjson assoc "$_COST_TRUSTED_ASSOCIATIONS" '
+		[.[][] | select(((.author_association // "NONE") as $a | $assoc | index($a) != null)
+			or ((.user.login // "") as $who | $logins | index($who) != null))
+		 | .body // ""] as $trusted
+		| ([$trusted[] | scan("<!-- PARTIAL_PARENT_CLOSEOUT:PR#([0-9]+) -->") | .[0] | tonumber]
+			| unique) as $closeouts
+		| ($closeouts[] | "closeout \(.)"),
+		  ([$trusted[] | select(contains("<!-- aidevops:sig -->"))
+			| select(test("<!-- PARTIAL_PARENT_CLOSEOUT:PR#[0-9]+ -->") | not)
+			| scan("\\bPR #([0-9]+)\\b") | .[0] | tonumber]
+			| unique - $closeouts | reverse | .[:3][] | "report \(.)")
+	' 2>/dev/null) || return 1
+	while read -r kind pr_number; do
+		[[ "$pr_number" =~ ^[0-9]+$ ]] || continue
+		if ! pr_json=$(gh api "repos/${repo_slug}/pulls/${pr_number}" 2>/dev/null); then
+			[[ "$kind" == "report" ]] && continue
+			return 1
+		fi
+		if ! merge_epoch=$(printf '%s' "$pr_json" | jq -r --arg repo "$repo_slug" --arg issue "$issue_number" '
+			select(.base.repo.full_name == $repo)
+			| select(((.title // "") + "\n" + (.body // ""))
+				| test("(?i)\\b(for|ref|resolves)\\s+#" + $issue + "([^0-9]|$)"))
+			| .merged_at // empty | fromdateiso8601
+		' 2>/dev/null); then
+			[[ "$kind" == "report" ]] && continue
+			return 1
+		fi
+		if [[ "$merge_epoch" =~ ^[0-9]+$ ]]; then
+			if [[ "$kind" == "closeout" ]]; then
+				verified_closeouts=$(printf '%s' "$verified_closeouts" | jq -c \
+					--argjson pr "$pr_number" --argjson epoch "$merge_epoch" \
+					'. + [{pr: $pr, epoch: $epoch}]') || return 1
+			fi
+			if [[ "$merge_epoch" -gt "$checkpoint_epoch" ]]; then
+				checkpoint_epoch="$merge_epoch"
+			fi
+		fi
+	done <<<"$candidates"
+	jq -cn --argjson epoch "$checkpoint_epoch" --argjson closeouts "$verified_closeouts" \
+		--argjson logins "$trusted_logins" \
+		'{epoch: $epoch, closeouts: $closeouts, trusted_logins: $logins}' || return 1
 	return 0
 }
 
@@ -92,13 +285,26 @@ _sum_issue_token_spend() {
 	fi
 
 	local comments_json
-	comments_json=$(gh api "repos/${repo_slug}/issues/${issue_number}/comments" --paginate 2>/dev/null) || return 1
+	comments_json=$(gh api "repos/${repo_slug}/issues/${issue_number}/comments" --paginate --slurp 2>/dev/null) || return 1
 	if [[ -z "$comments_json" || "$comments_json" == "null" ]]; then
 		return 1
 	fi
 
+	local checkpoint_data
+	checkpoint_data=$(_cost_checkpoint_from_closeouts "$issue_number" "$repo_slug" \
+		"$comments_json") || return 1
+
+	_cost_spend_from_comments "$comments_json" "$checkpoint_data" || return 1
+	return 0
+}
+
+# Aggregate fetched comments against verified checkpoint data, without API calls.
+# Args: slurped comments JSON, checkpoint JSON. Stdout: spent_tokens|attempt_count.
+# Returns 1 on parse failure or malformed output (caller fail-open).
+_cost_spend_from_comments() {
+	local comments_json="$1" checkpoint_data="$2"
 	# Extract comment bodies, excluding interactive-session signature footers and
-	# comments predating the latest maintainer approval / cost reset marker.
+	# comments predating the latest approval, cost reset marker or merged checkpoint.
 	# Interactive footers are maintainer triage/review activity that should
 	# NOT count toward the per-issue worker cost budget — including them
 	# produces false-positive circuit-breaker trips every time a maintainer
@@ -109,56 +315,84 @@ _sum_issue_token_spend() {
 	# t3077: a signed maintainer approval is also a budget reset boundary. Without
 	# this, approving/removing NMR after a cost trip immediately re-trips on the
 	# same historical worker footers and no new dispatch can occur.
-	local bodies
-	bodies=$(printf '%s' "$comments_json" | jq -r '
+	#
+	# Footer shapes: "spent 30,000 tokens", "spent 4m and 30,000 tokens",
+	# "spent 1h 30m and …", "spent 1d 3h and …", historical "has used N tokens".
+	# The cumulative "N total tokens on this issue." line is intentionally NOT
+	# matched — it is the running aggregate and would double-count.
+	#
+	# GH#34342: footer tokens and time are cumulative for the OpenCode session
+	# (gh-signature-helper-session.sh), and continuation dispatches can resume
+	# that session. A later footer then repeats every earlier footer's spend
+	# ("6m and 89,214" → "6h 5m and 217,569" → "13h 2m and 356,637"). Footers
+	# by the same author whose implied session start (created_at − duration,
+	# widened by the display resolution and posting slack) overlaps and whose
+	# tokens do not decrease are one session: count only the increment. A
+	# pre-window footer of that session is the baseline, never window spend.
+	local spend_data
+	spend_data=$(printf '%s' "$comments_json" | jq -r --argjson checkpoint "$checkpoint_data" '
 		def epoch: try ((.created_at // "") | fromdateiso8601) catch 0;
-		(map(select(
+		# Durations are truncated to their smallest displayed unit
+		# (_format_duration drops minutes once days are shown).
+		def duration:
+			if test("^[0-9]+[dhms]( [0-9]+[dhms])*$") then
+				{secs: ([scan("([0-9]+)([dhms])")
+					| (.[0] | tonumber) * ({"d": 86400, "h": 3600, "m": 60, "s": 1}[.[1]])] | add),
+				 res: (if test("d") then 3600 elif test("[hm]") then 60 else 1 end)}
+			else null end;
+		120 as $slack
+		| [.[][]] as $all
+		| ($all | map(select(
 				((.body // "") | contains("<!-- aidevops-signed-approval -->"))
 				or ((.body // "") | contains("<!-- cost-circuit-breaker:reset"))
-			) | epoch) | max // 0) as $reset_epoch
-		|
-		.[]
-		| select((.body // "") | contains("with the user in an interactive session") | not)
-		| select(($reset_epoch == 0) or (epoch > $reset_epoch))
-		| .body // empty
+			) | epoch) + [$checkpoint.epoch] | max // 0) as $reset_epoch
+		| [$all[]
+			| select((.body // "") | contains("with the user in an interactive session") | not)
+			| epoch as $t
+			| ((.body // "") | test("<!-- PARTIAL_PARENT_CLOSEOUT:PR#[0-9]+ -->")) as $receipt
+			# GH#34510: a trusted receipt posted within posting slack of its
+			# verified merge supplies a cumulative session baseline, never spend.
+			# Delayed copies cannot reliably identify the original session start.
+			| select($receipt == false or (
+				(.author_association == "OWNER" or .author_association == "MEMBER"
+					or .author_association == "COLLABORATOR"
+					# GH#34598: permission-verified author (ambiguous association).
+					or ((.user.login // "") as $who
+						| ($checkpoint.trusted_logins // []) | index($who) != null)) and
+				([(.body // "" | scan("<!-- PARTIAL_PARENT_CLOSEOUT:PR#([0-9]+) -->")
+					| .[0] | tonumber)] as $prs
+				 | any($checkpoint.closeouts[]; .pr as $pr
+					| ($prs | index($pr)) != null and $t >= .epoch and $t <= .epoch + $slack))))
+			| (.user.login // "") as $who
+			| (.body // "")
+			| match("(spent|has used) (?:(.*) and )?([0-9,]+) tokens"; "g")
+			| (.captures[2].string | gsub(","; "")) as $raw
+			| select($raw | test("^[0-9]+$"))
+			| ((.captures[1].string // "") | duration) as $dur
+			| {t: $t, who: $who, tok: ($raw | tonumber),
+			   inwin: ($receipt == false and (($reset_epoch == 0) or ($t > $reset_epoch))),
+			   session: (if $dur != null and $who != "" and $t > 0 then
+				{lo: ($t - $dur.secs - $dur.res - $slack), hi: ($t - $dur.secs + $slack)}
+				else null end)}]
+		| sort_by(.t)
+		| reduce .[] as $f ({chains: [], total: 0, attempts: 0};
+			(if $f.session == null then null else
+				([.chains | to_entries[] | .value as $c
+					| select($c.who == $f.who and $c.last <= $f.tok
+						and $c.lo <= $f.session.hi and $f.session.lo <= $c.hi) | .key]
+				 | last) end) as $idx
+			| (if $idx == null then $f.tok else $f.tok - .chains[$idx].last end) as $inc
+			| (if $f.session == null then .
+				elif $idx == null then .chains += [$f.session + {who: $f.who, last: $f.tok}]
+				else .chains[$idx] = ($f.session + {who: $f.who, last: $f.tok}) end)
+			| if $f.inwin then .total += $inc | .attempts += 1 else . end)
+		| "\(.total)|\(.attempts)"
 	' 2>/dev/null) || return 1
-	if [[ -z "$bodies" ]]; then
-		# No countable comments — zero spend, zero attempts (fail-open via 0|0 not 1)
-		printf '0|0'
-		return 0
+	if [[ ! "$spend_data" =~ ^[0-9]+\|[0-9]+$ ]]; then
+		return 1
 	fi
 
-	# Match signature footer patterns. The footer can take several shapes:
-	#   "spent 30,000 tokens"                  (no time)
-	#   "spent 4m and 30,000 tokens"           (with session time)
-	#   "spent 1h 30m and 30,000 tokens"       (with hours+minutes)
-	#   "spent 2d 3h 15m and 30,000 tokens"    (with days+hours+minutes)
-	#   "has used 30,000 tokens"               (historical wording)
-	#
-	# Strategy: collapse the optional "<time> and " infix so all variants
-	# reduce to "(spent|has used) N tokens", then extract N. The cumulative
-	# "N total tokens on this issue." line is intentionally NOT matched —
-	# it's the running aggregate of prior comments and would double-count
-	# every time a new worker reports its own per-comment spend.
-	local raw_vals
-	raw_vals=$(printf '%s' "$bodies" |
-		sed -E 's/(spent|has used) (.* and )?([0-9,]+ tokens)/\1 \3/g' |
-		grep -oE '(spent|has used) [0-9,]+ tokens' |
-		grep -oE '[0-9,]+' |
-		tr -d ',' || true)
-
-	local total_tokens=0 attempts=0
-	if [[ -n "$raw_vals" ]]; then
-		local v
-		while IFS= read -r v; do
-			[[ -z "$v" ]] && continue
-			[[ "$v" =~ ^[0-9]+$ ]] || continue
-			total_tokens=$((total_tokens + v))
-			attempts=$((attempts + 1))
-		done <<<"$raw_vals"
-	fi
-
-	printf '%s|%s' "$total_tokens" "$attempts"
+	printf '%s' "$spend_data"
 	return 0
 }
 
@@ -238,7 +472,7 @@ _apply_cost_breaker_side_effects() {
 
 	if [[ "$already_commented" != "true" ]]; then
 		gh_issue_comment "$issue_number" --repo "$repo_slug" \
-			--body "<!-- ops:start — workers: skip this comment, it is audit trail not implementation context -->
+			--body "$(aidevops_ops_marker cost-circuit-breaker)"$'\n'"<!-- ops:start — workers: skip this comment, it is audit trail not implementation context -->
 <!-- cost-circuit-breaker:fired tier=${tier} spent=${spent} budget=${budget} -->
 🛑 **Cost circuit breaker fired** (t2007)
 
@@ -354,7 +588,7 @@ _check_cost_budget() {
 	fi
 
 	local budget
-	budget=$(_get_cost_budget_for_tier "$tier")
+	budget=$(_get_cost_budget_for_tier "$tier" "$repo_slug")
 	if [[ -z "$budget" ]] || ! [[ "$budget" =~ ^[0-9]+$ ]]; then
 		return 1
 	fi

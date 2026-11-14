@@ -70,7 +70,10 @@ _pulse_set_rest_core_budget_priority
 [[ "${AIDEVOPS_PULSE_GRAPHQL_BUDGET_CLASS}" == "reserve" ]]
 [[ "${AIDEVOPS_PULSE_REST_CORE_BUDGET_CLASS}" == "normal" ]]
 _pulse_should_defer_budget_priority_stage "dashboard_freshness_check"
-_pulse_should_defer_budget_priority_stage "evaluate_routines"
+if _pulse_should_defer_budget_priority_stage "evaluate_routines"; then
+	printf 'FAIL: local calendar evaluation deferred by API budget\n' >&2
+	exit 1
+fi
 _pulse_should_defer_budget_priority_stage "pr_review_thread_response"
 export AIDEVOPS_SKIP_PULSE_PREFETCH_BUDGET_GATE=1
 if _pulse_should_defer_budget_priority_stage "preflight_prefetch_and_scope"; then
@@ -108,6 +111,7 @@ fi
 [[ "$(_pulse_stage_priority_class "sync_todo_refs_all_repos")" == "deferrable" ]]
 [[ "$(_pulse_stage_priority_class "build_dependency_graph_cache")" == "deferrable" ]]
 [[ "$(_pulse_stage_priority_class "refresh_blocked_status_from_graph")" == "deferrable" ]]
+[[ "$(_pulse_stage_priority_class "worker_bus_relay")" == "deferrable" ]]
 [[ "$(_pulse_stage_priority_class "approval_merge_trigger")" == "progress" ]]
 [[ "$(_pulse_stage_priority_class "deterministic_merge_pass")" == "progress" ]]
 [[ "$(_pulse_stage_priority_class "preflight_early_dispatch")" == "progress" ]]
@@ -137,7 +141,8 @@ if _pulse_should_defer_budget_priority_stage "reap_orphan_workers"; then
 	printf 'FAIL: critical stage deferred in REST reserve mode\n' >&2
 	exit 1
 fi
-grep -q '_pulse_run_budget_priority_stage "stale_blocked_reconcile" _pulse_reconcile_stale_blocked_if_due' "${TEST_SCRIPT_DIR}/../pulse-wrapper.sh"
+grep -q '_pulse_run_budget_priority_stage_with_timeout "stale_blocked_reconcile"' "${TEST_SCRIPT_DIR}/../pulse-wrapper.sh"
+grep -q '^[[:space:]]*_pulse_reconcile_stale_blocked_if_due || true' "${TEST_SCRIPT_DIR}/../pulse-wrapper.sh"
 grep -q '_pulse_run_budget_priority_stage "approval_merge_trigger" _drain_merge_trigger_file_if_present' "${TEST_SCRIPT_DIR}/../pulse-wrapper.sh"
 _pulse_defer_budget_priority_stage "dashboard_freshness_check"
 grep -q 'pulse_rest_core_budget_reserve_mode' "${TMP_DIR}/counters.log"
@@ -170,6 +175,16 @@ export GH_REST_CORE_RESET="$(($(date +%s) + 3600))"
 export GH_REST_CORE_REMAINING=100
 rm -f "${HOME}/.aidevops/cache/pulse-rest-core.json"
 _pulse_set_rest_core_budget_priority
+_pulse_cycle_state_set_blocker none
+_pulse_run_budget_priority_stage dashboard_freshness_check false
+[[ "$_PULSE_CYCLE_BLOCKER_KIND" == "none" ]]
+_pulse_run_budget_priority_stage dispatch_max false
+[[ "$_PULSE_BUDGET_STAGE_DEFERRED" == "1" ]]
+[[ "$_PULSE_CYCLE_BLOCKER_KIND" == "rest-core-quota" ]]
+quota_fingerprint="$_PULSE_CYCLE_BLOCKER_FINGERPRINT"
+_pulse_cycle_state_set_blocker none
+_pulse_run_budget_priority_stage deterministic_merge_pass false
+[[ "$_PULSE_CYCLE_BLOCKER_FINGERPRINT" == "$quota_fingerprint" ]]
 [[ "${AIDEVOPS_PULSE_REST_CORE_BUDGET_CLASS}" == "emergency" ]]
 _pulse_should_defer_budget_priority_stage "deterministic_merge_pass"
 _pulse_should_defer_budget_priority_stage "approval_merge_trigger"
@@ -193,6 +208,10 @@ fi
 unset GH_REST_CORE_UNKNOWN
 export GH_REST_CORE_REMAINING=5000
 rm -f "${HOME}/.aidevops/cache/pulse-rest-core.json"
+_pulse_cycle_state_set_blocker none
+_pulse_run_budget_priority_stage dispatch_max true
+[[ "$_PULSE_BUDGET_STAGE_DEFERRED" == "0" ]]
+[[ "$_PULSE_CYCLE_BLOCKER_KIND" == "none" ]]
 
 unset -f _cb_rate_limit_json
 TIMEOUT_CALL_LOG="${TMP_DIR}/timeout-calls.log"
@@ -215,5 +234,50 @@ if ! grep -q '_gh_with_timeout read gh api rate_limit' "$TIMEOUT_CALL_LOG"; then
 	printf 'FAIL: pulse-wrapper fallback did not call _gh_with_timeout read gh api rate_limit\n' >&2
 	exit 1
 fi
+
+# Equal remaining quota should yield different scheduling decisions depending on
+# reset, with no unused final point and no fabricated allowance after exhaustion.
+[[ "$(gh_budget_window_threshold 1250 4600 1000)" == 1250 ]]
+[[ "$(gh_budget_window_threshold 1250 2800 1000)" == 625 ]]
+[[ "$(gh_budget_window_threshold 1250 1001 1000)" == 0 ]]
+[[ "$(gh_budget_window_threshold 1250 unknown 1000)" == 1250 ]]
+_cb_rate_limit_json() {
+	printf '{"resources":{"graphql":{"remaining":%s,"limit":5000,"reset":%s}}}\n' \
+		"$GH_GRAPHQL_REMAINING" "$GH_GRAPHQL_RESET"
+	return 0
+}
+export GH_GRAPHQL_REMAINING=100
+export GH_GRAPHQL_RESET="$(($(date +%s) + 3600))"
+[[ "$(_pulse_graphql_budget_priority_decision)" == reserve* ]]
+export GH_GRAPHQL_RESET="$(($(date +%s) + 60))"
+[[ "$(_pulse_graphql_budget_priority_decision)" == normal* ]]
+export GH_GRAPHQL_REMAINING=0
+[[ "$(_pulse_graphql_budget_priority_decision)" == reserve* ]]
+export AIDEVOPS_PULSE_REST_CORE_HARD_FLOOR=0
+export AIDEVOPS_PULSE_REST_CORE_IN_FLIGHT_ALLOWANCE=0
+_cb_rest_core_priority_decision_allows progress 'reserve 1 5000 500 500 0 9999999999'
+if _cb_rest_core_priority_decision_allows progress 'emergency 0 5000 500 500 0 9999999999'; then
+	printf 'FAIL: exhausted REST capacity admitted progress\n' >&2
+	exit 1
+fi
+[[ "$(_cb_rest_core_thresholds 1001 1000)" == '0 500 0' ]]
+
+# Scheduled dispatch uses protected headroom, never the hard floor or unknown
+# quota. Local evaluation must still run with both API pools exhausted.
+_cb_rest_core_priority_decision_allows scheduled 'reserve 126 5000 500 500 100 9999999999'
+for snapshot in 'reserve 125 5000 500 500 100 9999999999' 'emergency 0 5000 500 500 0 9999999999' 'unknown ? ? ? 500 0 ?'; do
+	if _cb_rest_core_priority_decision_allows scheduled "$snapshot"; then
+		printf 'FAIL: scheduled dispatch ignored its quota floor\n' >&2
+		exit 1
+	fi
+done
+export GH_REST_CORE_REMAINING=0
+export GH_GRAPHQL_REMAINING=0
+rm -f "${HOME}/.aidevops/cache/pulse-rest-core.json"
+if _pulse_should_defer_budget_priority_stage evaluate_routines; then
+	printf 'FAIL: exhausted quota suppressed calendar evaluation\n' >&2
+	exit 1
+fi
+_pulse_should_defer_budget_priority_stage dashboard_freshness_check
 
 printf 'PASS pulse-graphql-budget-priority\n'

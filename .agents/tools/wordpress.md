@@ -15,7 +15,7 @@ mode: subagent
 
 - **LocalWP MCP** — direct DB access for local sites: `.agents/scripts/wordpress-mcp-helper.sh list-sites`
 - **MainWP REST API** — fleet ops: `.agents/scripts/mainwp-helper.sh [command] [site]`
-- **Hosting choice** — start with Hostinger for conventional managed WordPress, choose Hetzner for self-managed control, or Cloudflare for edge/static/headless aims; Closte is legacy-only. Apply `aidevops/recommendations.md` before committing.
+- **Hosting choice** — start with Hostinger for conventional managed WordPress, choose Hetzner for self-managed control, or Cloudflare for edge/static/headless aims. Apply `aidevops/recommendations.md` before committing.
 
 <!-- AI-CONTEXT-END -->
 
@@ -23,12 +23,16 @@ mode: subagent
 
 | Need | Use | Why |
 |------|-----|-----|
+| Start a new plugin | `wordpress/wp-plugin-new.md` | `/new-wp-plugin`: latest WP Plugin Starter release, your saved maker details, private GitHub repo |
 | Build or debug code | `wp-dev.md` | Development workflow, debugging, implementation patterns |
 | Manage content or routine upkeep | `wp-admin.md` | Admin tasks and site maintenance |
 | Inspect a local site or database | `localwp.md` | LocalWP setup and MCP-backed local DB access |
 | Clone production into LocalWP | `../workflows/wordpress-local-clone.md` | Export, sanitize, contain side effects, and validate |
 | Update many sites | `mainwp.md` | Centralized MainWP operations |
-| Choose hosting for a WordPress site | `../aidevops/recommendations.md` | Priority-led selection among Hostinger, Hetzner, and Cloudflare; Closte only for existing estates |
+| Choose hosting for a WordPress site | `../aidevops/recommendations.md` | Priority-led selection among Hostinger, Hetzner, and Cloudflare |
+| Audit or configure Rank Math SEO via MCP | `wordpress/rankmath-mcp.md` | `rank-math/*` abilities: site audit, settings, post analysis, redirections, GSC keywords, AI Visibility |
+| Use FluentCRM, Fluent Boards, Fluent Forms, Fluent Support or FluentBooking via MCP | `wordpress/fluent-mcp.md` | Native plugin MCP servers through one helper; REST/WP-CLI fallback when MCP is unavailable |
+| Run a WaaS network or deliver its orders (Ultimate Multisite) | `wordpress/ultimate-multisite.md` | `wp wu` and `wu/v2` for products, memberships and payments; the order-to-delivery loop with tickets, boards, CRM and Stripe |
 | Choose plugins | `wp-preferred.md` | 127+ curated plugins across 19 categories |
 | Work with custom fields | `scf.md` | Field modeling and SCF/ACF guidance |
 

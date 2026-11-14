@@ -33,7 +33,7 @@ tools:
 
 Use aidevops' existing browser, crawler, profile, and data-extraction tools to find the cheapest reliable path for a web task, then graduate the result into a reusable artifact.
 
-Auto-browse is not a new browser engine. It is a controller that decides when to use fetch/API, curl-copy, sweet-cookie, Crawl4AI, WaterCrawl, Playwright, agent-browser, dev-browser, Playwriter, chromium-debug-use, Stagehand, browser-use, Skyvern, and profile/proxy tooling.
+Auto-browse is not a new browser engine. It is a controller that decides when to use fetch/API, curl-copy, sweet-cookie, Crawl4AI, WaterCrawl, Playwright (including its official existing-session extension), agent-browser, dev-browser, chromium-debug-use, browser-use, Skyvern, and profile/proxy tooling. Stagehand is not recommended; use it only when the user explicitly asks to try it.
 
 ## Operating Principles
 
@@ -50,10 +50,10 @@ Auto-browse is not a new browser engine. It is a controller that decides when to
 | Public static data | Fetch/API/parser | HTML is dynamic, blocked, or incomplete |
 | Many pages/docs/site audit | WaterCrawl/site-crawler/Crawl4AI | Login or heavy interaction required |
 | Authenticated dashboard export | curl-copy/sweet-cookie/DevTools network | Endpoint cannot be isolated or action sequence required |
-| Known form/navigation flow | Playwright/playwright-cli/agent-browser | Login persistence or extensions needed |
+| Known form/navigation flow | Standalone Playwright (Brave preferred)/playwright-cli/agent-browser | Login persistence or interactive user-browser access needed |
 | Recurring logged-in workflow | dev-browser or persistent Playwright profile | User's live browser is required |
-| Existing user session | chromium-debug-use or Playwriter | Flow must become CI-friendly/repeatable |
-| Unknown/dynamic UI | Stagehand or browser-use CLI 3.0 | Vision-only/canvas/CAPTCHA-heavy path requires Skyvern or Browser Use Cloud |
+| Interactive existing user session | Playwright Extension or chromium-debug-use | User is unavailable or flow must become isolated/repeatable |
+| Unknown/dynamic UI | Playwright with bounded selector discovery | If selectors fail, browser-use CLI 3.0; vision-only/canvas paths may need Skyvern or Browser Use Cloud |
 | Profile/proxy/geo isolation | browser-profiles/proxy-integration | Only after explicit authorization |
 
 ## Artifact Rules

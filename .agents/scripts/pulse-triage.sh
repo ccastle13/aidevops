@@ -95,6 +95,28 @@ _route_terminal_breaker_to_consolidation() {
 		return 1
 	fi
 
+	# Human-owned boundaries (permission, secret, spend, trust) cannot be
+	# resolved by merging comments into a superseding issue, and consolidation
+	# would drop sub-issue links, blockedBy edges and signed approvals. Wait for
+	# the human decision, then terminal-blocker-circuit:retry.
+	if [[ "$breaker_source $breaker_detail" =~ (permission_required|needs_maintainer_permissions|permission_grant_unverified|secret_required|spend_required|trust_boundary|input_required) ]]; then
+		echo "[pulse-wrapper] terminal breaker consolidation skipped: human-owned boundary (${BASH_REMATCH[1]}) for #${issue_number} in ${repo_slug}" >>"$LOGFILE"
+		return 0
+	fi
+
+	# Unlike the comment-count threshold for ordinary triage, a breaker only
+	# needs one real scope comment. An automation-only thread has nothing for
+	# a consolidation child to merge; keep the blocked escalation for review.
+	local comments_json="" substantive_json="" substantive_count=0
+	comments_json=$(gh api "repos/${repo_slug}/issues/${issue_number}/comments" \
+		--paginate --jq '.' 2>/dev/null) || return 1
+	substantive_json=$(_consolidation_filter_substantive_comments "$comments_json") || return 1
+	substantive_count=$(printf '%s' "$substantive_json" | jq -r 'length' 2>/dev/null) || return 1
+	if [[ "$substantive_count" -eq 0 ]]; then
+		echo "[pulse-wrapper] terminal breaker consolidation skipped: no substantive comments for #${issue_number} in ${repo_slug}" >>"$LOGFILE"
+		return 0
+	fi
+
 	echo "[pulse-wrapper] Routing terminal breaker to consolidation: #${issue_number} in ${repo_slug} source=${breaker_source} detail=${breaker_detail:-none}" >>"$LOGFILE"
 	if ! _dispatch_issue_consolidation "$issue_number" "$repo_slug" ""; then
 		echo "[pulse-wrapper] Terminal breaker consolidation failed for #${issue_number} in ${repo_slug} source=${breaker_source}" >>"$LOGFILE"
@@ -116,6 +138,10 @@ _issue_needs_consolidation() {
 	# may have stale labels), fall back to a fresh fetch so the helper
 	# remains self-sufficient.
 	local pre_fetched_json="${3:-}"
+	# Set to 1 only when an in-flight consolidation child owns this parent.
+	# The dispatch scope gate defers implementation on it; other callers
+	# (backfill, re-evaluation) keep the existing "no new child" return.
+	_CONSOLIDATION_CHILD_PENDING=0
 
 	local issue_labels
 	if [[ -n "$pre_fetched_json" ]] \
@@ -129,31 +155,45 @@ _issue_needs_consolidation() {
 	if [[ ",$issue_labels," == *",consolidated,"* ]]; then
 		return 1
 	fi
+	# Labeled issues always retain the ownership-aware cleanup path.
+	local was_already_labeled=false
+	if [[ ",$issue_labels," == *",needs-consolidation,"* ]]; then
+		was_already_labeled=true
+	fi
+
+	# An ordinary issue cannot need consolidation below the substantive-comment
+	# threshold. Read its live timeline first, before the per-candidate child,
+	# ownership and PR lookups. Those gates still run before any consolidation
+	# action, and labeled issues retain the existing cleanup/ownership path.
+	local comments_json="" substantive_json="[]" substantive_count=0
+	comments_json=$(gh api "repos/${repo_slug}/issues/${issue_number}/comments" \
+		--paginate --jq '.' 2>/dev/null) || comments_json="[]"
+	substantive_json=$(_consolidation_filter_substantive_comments "$comments_json") || substantive_json="[]"
+	substantive_count=$(printf '%s' "$substantive_json" | jq -r 'length' 2>/dev/null) || substantive_count=0
+	if [[ "$was_already_labeled" == "false" &&
+		"$substantive_count" -lt "$ISSUE_CONSOLIDATION_COMMENT_THRESHOLD" ]]; then
+		return 1
+	fi
+
 	# t1982: Skip if an open consolidation-task child already references this
 	# parent. Prevents double-dispatch during the race window between the
 	# child being created and _reevaluate_consolidation_labels re-checking.
+	# The child will supersede this parent, so the pending flag also keeps
+	# an implementation worker off the parent until it does (#35605).
 	if _consolidation_child_exists "$issue_number" "$repo_slug"; then
+		_CONSOLIDATION_CHILD_PENDING=1
 		return 1
 	fi
 	# If already labeled, re-evaluate with the current (tighter) filter.
 	# If the issue no longer triggers, auto-clear the label so it becomes
 	# dispatchable without manual intervention. This handles the case where
 	# a filter improvement makes previously-flagged issues pass.
-	local was_already_labeled=false
-	if [[ ",$issue_labels," == *",needs-consolidation,"* ]]; then
-		was_already_labeled=true
-	fi
-	# A fresh interactive claim is stronger evidence of live ownership than a
-	# comment-count heuristic. Clear any stale planning label, but defer on an
-	# ambiguous ownership read so a transient API failure cannot create a child.
-	local interactive_claim_rc=0
-	_consolidation_live_interactive_claim "$issue_number" "$repo_slug" || interactive_claim_rc=$?
-	if [[ "$interactive_claim_rc" -eq 0 ]]; then
-		[[ "$was_already_labeled" != false ]] &&
-			_clear_needs_consolidation_label "$issue_number" "$repo_slug" "live interactive claim exists"
+	# Active headless lifecycle ownership and fresh interactive claims both
+	# override the comment-count heuristic; ambiguous reads fail closed.
+	if _consolidation_classification_defers_for_ownership \
+		"$issue_number" "$repo_slug" "$pre_fetched_json" "$was_already_labeled"; then
 		return 1
 	fi
-	[[ "$interactive_claim_rc" -eq 2 ]] && return 1
 	# t2161: Defence-in-depth — if an open PR already resolves this parent
 	# (closing keyword + #N), the work is in flight. Skip consolidation
 	# regardless of substantive-comment count. This catches the cascade
@@ -173,52 +213,9 @@ _issue_needs_consolidation() {
 	# comments (dispatch claims, kill notices, crash reports, stale recovery,
 	# triage reviews, provenance metadata) are noise — workers generate dozens
 	# of these on issues that fail repeatedly, falsely triggering consolidation.
-	local comments_json
-	comments_json=$(gh api "repos/${repo_slug}/issues/${issue_number}/comments" \
-		--paginate --jq '.' 2>/dev/null) || comments_json="[]"
-
-	local substantive_count=0
-	# Defaults are set at module level (: "${VAR:=value}" block above).
-	# Bare $VAR reference is safe; the module-level block guarantees non-empty.
-	local min_chars="$ISSUE_CONSOLIDATION_COMMENT_MIN_CHARS"
-	substantive_count=$(printf '%s' "$comments_json" | jq -s --argjson min "$min_chars" '
-		add as $comments |
-		# Combine all operational-noise patterns into a single regex for efficiency
-		# (1 test() invocation per comment instead of 15).
-		#
-		# t2144: Added ^<!-- WORKER_SUPERSEDED and ^<!-- stale-recovery-tick
-		# patterns. Real recovery comment bodies start with these HTML comment
-		# markers, then contain "**Stale assignment recovered**" later in the
-		# body. The ^(\\*\\*)?Stale... anchor was therefore a no-op — 528-char
-		# recovery comments passed the filter, and two of them on any stuck
-		# issue falsely tripped the ISSUE_CONSOLIDATION_COMMENT_THRESHOLD=2 gate.
-		(
-			"DISPATCH_CLAIM nonce="
-			+ "|^(<!-- ops:start[^>]*-->\\s*)?Dispatching worker"
-			+ "|^<!-- (nmr-hold|aidevops-signed|ops:start|provenance:start)"
-			+ "|^<!-- WORKER_SUPERSEDED"
-			+ "|^<!-- stale-recovery-tick"
-			+ "|^<!-- cost-circuit-breaker:fired"
-			+ "|^<!-- triage-escalation"
-			+ "|^<!-- review-feedback-"
-			+ "|CLAIM_RELEASED reason="
-			+ "|^(Worker failed:|## Worker Watchdog Kill)"
-			+ "|^(\\*\\*)?Stale assignment recovered"
-			+ "|^## (Triage Review|Completion Summary|Large File Simplification Gate|Issue Consolidation Needed|Issue Consolidation Dispatched|Additional Review Feedback|Cascade Tier Escalation)"
-			+ "|^## Review: Recommendation:"
-			+ "|^This quality-debt issue was auto-generated by"
-			+ "|<!-- MERGE_SUMMARY -->"
-			+ "|^Closing:"
-			+ "|^Worker failed: orphan worktree"
-			+ "|sudo aidevops approve"
-			+ "|^_Automated by"
-		) as $patterns |
-		[$comments[] | select(
-			(.body | length) >= $min
-			and .user.type != "Bot"
-			and (.body | test($patterns) | not)
-		)] | length
-	' 2>/dev/null) || substantive_count=0
+	# Classification and child composition must use one predicate. A duplicated
+	# filter previously let new operational comment shapes count here while a
+	# different set was inlined into the child.
 
 	if [[ "$substantive_count" -ge "$ISSUE_CONSOLIDATION_COMMENT_THRESHOLD" ]]; then
 		return 0
@@ -252,15 +249,52 @@ _issue_needs_consolidation() {
 # Reference pattern: `_issue_targets_large_files` at pulse-dispatch-core.sh:685-757
 # which creates file-size-debt child issues the same way.
 #######################################
+_consolidation_preflight_skip_outcome() {
+	local issue_number="$1" repo_slug="$2"
+	_consolidation_dispatch_preflight_skips "$issue_number" "$repo_slug" || return 1
+	_CONSOLIDATION_DISPATCH_OUTCOME="preflight_skipped"
+	return 0
+}
+
+# GH#36536: with the lock held, skip when an open child already names the
+# parent. The pre-lock check reads GitHub's eventually consistent search index,
+# so a child another runner just created (and whose lock it released) can be
+# missed; this re-check uses a label-filtered list. Releases the lock and flags
+# the parent. Returns 0 when skipped.
+_consolidation_post_lock_dedup_skip() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local self_login="$3"
+
+	local listed_rc=0
+	_consolidation_open_child_listed "$issue_number" "$repo_slug" || listed_rc=$?
+	[[ "$listed_rc" -eq 1 ]] && return 1
+	if [[ "$listed_rc" -ne 0 ]]; then
+		# Listing failed: cannot prove no child exists; yield and retry next cycle.
+		_consolidation_lock_release "$issue_number" "$repo_slug" "$self_login"
+		echo "[pulse-wrapper] Consolidation: post-lock child listing failed for #${issue_number} in ${repo_slug}; released lock, retry next cycle (GH#36536)" >>"$LOGFILE"
+		return 0
+	fi
+	_consolidation_lock_release "$issue_number" "$repo_slug" "$self_login"
+	gh issue edit "$issue_number" --repo "$repo_slug" \
+		--add-label "needs-consolidation" 2>/dev/null || true
+	echo "[pulse-wrapper] Consolidation: dedup skip for #${issue_number} in ${repo_slug}; open consolidation child found after lock acquire (GH#36536)" >>"$LOGFILE"
+	return 0
+}
+
 _dispatch_issue_consolidation() {
 	local issue_number="$1"
 	local repo_slug="$2"
 	local repo_path="$3"
+	# GH#33306: lets _dispatch_dedup_scope_gates tell a pre-flight skip
+	# (no child will exist) apart from a created or in-flight child.
+	_CONSOLIDATION_DISPATCH_OUTCOME=""
 
 	# Re-check immediately before any visible consolidation mutation. This
 	# closes the classification-to-dispatch race when an interactive session
 	# claims the issue between pulse stages; ambiguity must defer safely too.
-	if _consolidation_dispatch_defers_for_interactive_claim "$issue_number" "$repo_slug"; then
+	if _consolidation_dispatch_defers_for_manual_hold "$issue_number" "$repo_slug" ||
+		_consolidation_dispatch_defers_for_active_ownership "$issue_number" "$repo_slug"; then
 		return 0
 	fi
 
@@ -268,16 +302,19 @@ _dispatch_issue_consolidation() {
 	_ensure_consolidation_labels "$repo_slug"
 
 	# Resolve and in-flight-PR checks precede child/lock acquisition.
-	if _consolidation_dispatch_preflight_skips "$issue_number" "$repo_slug"; then
-		return 0
-	fi
-
+	_consolidation_preflight_skip_outcome "$issue_number" "$repo_slug" && return 0
 	# Dedup: child already exists (t2151: lock label also returns 0, blocking
 	# competing runners before they reach the acquire path).
 	if _consolidation_child_exists "$issue_number" "$repo_slug"; then
 		gh issue edit "$issue_number" --repo "$repo_slug" \
 			--add-label "needs-consolidation" 2>/dev/null || true
 		echo "[pulse-wrapper] Consolidation: child already exists for #${issue_number} in ${repo_slug}; flagged parent and returning" >>"$LOGFILE"
+		return 0
+	fi
+	# Ownership can change while preflight and child dedup reads are running.
+	# Recheck immediately before the lock's first issue-level mutation.
+	if _consolidation_dispatch_defers_for_manual_hold "$issue_number" "$repo_slug" ||
+		_consolidation_dispatch_defers_for_active_ownership "$issue_number" "$repo_slug"; then
 		return 0
 	fi
 
@@ -294,6 +331,9 @@ _dispatch_issue_consolidation() {
 	local self_login
 	self_login=$(_consolidation_lock_self_login)
 
+	# GH#36536: re-check for an open child now that the lock is held.
+	_consolidation_post_lock_dedup_skip "$issue_number" "$repo_slug" "$self_login" && return 0
+
 	# Fetch parent metadata.
 	local parent_title parent_body parent_labels
 	parent_title=$(gh issue view "$issue_number" --repo "$repo_slug" \
@@ -303,13 +343,10 @@ _dispatch_issue_consolidation() {
 	parent_labels=$(gh issue view "$issue_number" --repo "$repo_slug" \
 		--json labels --jq '[.labels[].name] | join(",")' 2>/dev/null) || parent_labels=""
 
-	# Fetch substantive comments via the shared filter helper.
-	local substantive_json
+	# Substantive comments (shared filter) and the Contributors cc line.
+	local substantive_json="" authors_csv=""
 	substantive_json=$(_consolidation_substantive_comments "$issue_number" "$repo_slug")
 	[[ -n "$substantive_json" ]] || substantive_json="[]"
-
-	# Build the Contributors cc line (unique, @-prefixed).
-	local authors_csv
 	authors_csv=$(printf '%s' "$substantive_json" | jq -r '
 		[.[] | .login] | unique | map("@" + .) | join(" ")
 	' 2>/dev/null) || authors_csv=""
@@ -319,6 +356,14 @@ _dispatch_issue_consolidation() {
 	child_body=$(_compose_consolidation_child_body \
 		"$issue_number" "$repo_slug" "$parent_title" "$parent_body" \
 		"$substantive_json" "$authors_csv" "$parent_labels")
+
+	# A hold may arrive while metadata/comments are being assembled. Release
+	# only our consolidation lock; never turn the held parent into fresh work.
+	if _consolidation_dispatch_defers_for_manual_hold "$issue_number" "$repo_slug" ||
+		_consolidation_dispatch_defers_for_active_ownership "$issue_number" "$repo_slug"; then
+		_consolidation_lock_release "$issue_number" "$repo_slug" "$self_login"
+		return 0
+	fi
 
 	# File the child issue via a temp body file.
 	local child_num
@@ -335,6 +380,17 @@ _dispatch_issue_consolidation() {
 		return 1
 	fi
 
+	_consolidation_finish_dispatch "$issue_number" "$repo_slug" "$child_num" "$authors_csv" "$self_login"
+	return $?
+}
+
+# Publish a verified child handoff and release our lock as one completion step.
+_consolidation_finish_dispatch() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local child_num="$3"
+	local authors_csv="$4"
+	local self_login="$5"
 	# Flag parent and post the idempotent pointer comment.
 	_post_consolidation_dispatch_comment "$issue_number" "$repo_slug" "$child_num" "$authors_csv"
 	# t2749: Signal to apply_dispatch_max that a consolidation child

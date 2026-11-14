@@ -116,9 +116,42 @@ test_rebase_conflict_neutralizes_cleanly() {
 	return 0
 }
 
+write_fake_gh_api_handler() {
+	local fake_bin="$1"
+	mkdir -p "$fake_bin"
+	cat >"${fake_bin}/gh-api-handler" <<'GH'
+#!/usr/bin/env bash
+set -u
+
+if [[ "${1:-}" == "api" && "${2:-}" == "repos/example/repo" ]]; then
+	printf 'false\n'
+	exit 0
+fi
+
+if [[ "${1:-}" == "api" && "${2:-}" == "/repos/example/repo/pulls?"* ]]; then
+	if [[ -f "${GH_STUB_PR_MARKER:?}" ]]; then
+		printf '[{"number":1,"html_url":"https://github.com/example/repo/pull/1"}]\n'
+	else
+		printf '[]\n'
+	fi
+	exit 0
+fi
+
+if [[ "${1:-}" == "api" && "${2:-}" == */repos/example/repo/issues/1 ]]; then
+	printf 'origin:worker\n'
+	exit 0
+fi
+
+exit 0
+GH
+	chmod +x "${fake_bin}/gh-api-handler"
+	return 0
+}
+
 write_fake_gh() {
 	local fake_bin="$1"
 	mkdir -p "$fake_bin"
+	write_fake_gh_api_handler "$fake_bin"
 	cat >"${fake_bin}/gh" <<'GH'
 #!/usr/bin/env bash
 set -u
@@ -138,9 +171,9 @@ if [[ "${1:-}" == "auth" && "${2:-}" == "status" ]]; then
 	exit 0
 fi
 
-if [[ "${1:-}" == "api" && "${2:-}" == "repos/example/repo" ]]; then
-	printf 'false\n'
-	exit 0
+if [[ "${1:-}" == "api" ]]; then
+	"${GH_STUB_API_HANDLER:?}" "$@"
+	exit $?
 fi
 
 if [[ "${1:-}" == "pr" && "${2:-}" == "list" ]]; then
@@ -317,6 +350,7 @@ run_issue_sync_helper() {
 	local fallback_token="${10:-}"
 	local reject_pr_token="${11:-}"
 	local trusted_git="${12:-}"
+	local target_branch="${13:-main}"
 	local ci_home="${output_file}.home"
 	local runner_temp="${output_file}.runner"
 	mkdir -p "$ci_home" "$runner_temp"
@@ -334,10 +368,11 @@ run_issue_sync_helper() {
 			GH_STUB_HEAD="$head_file" \
 			GH_STUB_TITLE="$title_file" \
 			GH_STUB_BODY="${title_file}.body" \
+			GH_STUB_API_HANDLER="${fake_bin}/gh-api-handler" \
 			GH_STUB_REJECT_PR_TOKEN="$reject_pr_token" \
 			GIT_GUARD_LOG="${output_file}.git-guard" \
 			AIDEVOPS_PLANNING_GIT_BIN="$trusted_git" \
-			bash "$HELPER" publish-todo main "$attempts" \
+			bash "$HELPER" publish-todo "$target_branch" "$attempts" \
 			"chore: sync fixture issue refs to TODO.md [skip ci]" >"$output_file" 2>&1
 	)
 	return $?
@@ -421,6 +456,8 @@ test_protected_branch_uses_one_rebased_pr() {
 		fail "issue-sync PR title preserves merge-loop prevention"
 	elif [[ "$(<"${title_file}.body")" != *"Ref #9001"* ]]; then
 		fail "issue-sync PR body preserves changed-task linkage"
+	elif [[ "$(<"$output_a")" == *"GH006: Protected branch update failed"* ]]; then
+		fail "typed protected-branch result survives captured provider output"
 	elif [[ "$(<"$output_a")" != *"repository-scoped CI privacy and write-policy inventory"* ]]; then
 		fail "GitHub Actions publication declares its scoped CI inventory"
 	elif ! jq -e '.initialized_repos == [{"slug":"example/repo","role":"maintainer"}]' \
@@ -429,10 +466,10 @@ test_protected_branch_uses_one_rebased_pr() {
 	elif [[ "$branch_message" == *"[skip ci]"* ]]; then
 		fail "issue-sync PR branch still runs required checks"
 	elif [[ "$(git -C "$work_a" status --short)" != *"TODO.md"* ||
-	"$(git -C "$work_b" status --short)" != *"TODO.md"* ]]; then
+		"$(git -C "$work_b" status --short)" != *"TODO.md"* ]]; then
 		fail "PR fallback preserves each caller's local TODO projection"
 	else
-		pass "GH006 converges through one rebased deterministic PR"
+		pass "typed protected-branch result routes through one rebased deterministic PR"
 	fi
 	return 0
 }
@@ -903,6 +940,63 @@ test_noop_publishes_nothing() {
 	return 0
 }
 
+test_shallow_publication_target() {
+	local target_branch="$1"
+	local origin_dir="$TMP/target-${target_branch}-origin.git"
+	local seed_dir="$TMP/target-${target_branch}-seed"
+	local work_dir="$TMP/target-${target_branch}-work"
+	local fake_bin="$TMP/target-${target_branch}-bin"
+	local gh_log="$TMP/target-${target_branch}-gh.log"
+	local output_file="$TMP/target-${target_branch}-output.log"
+	local main_before=""
+	local develop_before=""
+	local candidate_before=""
+	local rc=0
+
+	create_origin "$origin_dir" "$seed_dir"
+	git -C "$seed_dir" checkout -b develop >/dev/null 2>&1
+	printf '\nDevelopment branch context.\n' >>"$seed_dir/TODO.md"
+	git -C "$seed_dir" add TODO.md
+	git -C "$seed_dir" commit -m "advance develop" >/dev/null
+	git -C "$seed_dir" push origin develop >/dev/null 2>&1
+	git clone --depth 1 --branch develop "file://${origin_dir}" "$work_dir" >/dev/null 2>&1
+	git_init_repo "$work_dir"
+	write_fake_gh "$fake_bin"
+	: >"$gh_log"
+	printf '\n- [ ] t9004 development-only projection ref:GH#9004\n' >>"$work_dir/TODO.md"
+	main_before=$(git --git-dir="$origin_dir" rev-parse main)
+	develop_before=$(git --git-dir="$origin_dir" rev-parse develop)
+	candidate_before=$(git -C "$work_dir" hash-object TODO.md)
+
+	run_issue_sync_helper "$work_dir" "$fake_bin" "$gh_log" "$TMP/target-${target_branch}-pr.marker" \
+		"$TMP/target-${target_branch}-head" "$TMP/target-${target_branch}-title" "$output_file" 1 \
+		"fixture-token" "" "" "" "$target_branch" || rc=$?
+	if [[ "$target_branch" == "develop" ]]; then
+		if [[ "$rc" -eq 0 ]] && git --git-dir="$origin_dir" show develop:TODO.md | grep -q 't9004 development-only projection'; then
+			pass "shallow develop checkout publishes to develop"
+		else
+			fail "shallow develop checkout publishes to develop"
+		fi
+	else
+		if [[ "$rc" -ne 0 ]] && grep -q 'Cannot find a common ancestor.*refusing TODO.md publication' "$output_file" &&
+			[[ "$(git --git-dir="$origin_dir" rev-parse develop)" == "$develop_before" ]]; then
+			pass "shallow branch mismatch fails closed with an actionable diagnostic"
+		else
+			fail "shallow branch mismatch fails closed with an actionable diagnostic"
+		fi
+	fi
+	if [[ "$(git --git-dir="$origin_dir" rev-parse main)" == "$main_before" &&
+	"$(git -C "$work_dir" rev-parse HEAD)" == "$develop_before" &&
+	"$(git -C "$work_dir" hash-object TODO.md)" == "$candidate_before" && ! -s "$gh_log" ]]; then
+		pass "${target_branch} target preserves main, caller state, and avoids GitHub writes"
+	else
+		fail "${target_branch} target preserves main, caller state, and avoids GitHub writes"
+	fi
+	return 0
+}
+
+test_shallow_publication_target develop
+test_shallow_publication_target main
 test_successful_push
 test_rebase_conflict_neutralizes_cleanly
 test_protected_branch_uses_one_rebased_pr

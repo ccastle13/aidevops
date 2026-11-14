@@ -97,7 +97,8 @@ assert_match_count() {
 
 assert_refill_runtime_contract() {
 	local label="$1"
-	local actual_events="" expected_events="dispatch:skip;routine;stage:auto_approve_maintainer_issues:7;nmr;invalidate:label_maintenance_complete;dispatch:normalize;"
+	# GH#33944: the post-label refill also skips full dependency normalization.
+	local actual_events="" expected_events="dispatch:skip;routine;stage:auto_approve_maintainer_issues:7;nmr;invalidate:label_maintenance_complete;dispatch:skip;"
 	TESTS_RUN=$((TESTS_RUN + 1))
 	actual_events=$(
 		(
@@ -270,7 +271,8 @@ assert_routine_comment_rest_block_contract() {
 assert_label_maintenance_rest_block_contract() {
 	local label="$1"
 	local expected_events="gate:deferrable:label_maintenance_consolidation_reevaluate;reevaluate;gate:deferrable:label_maintenance_consolidation_backfill;"
-	local actual_events=""
+	local actual_events="" test_root=""
+	test_root=$(mktemp -d "${AIDEVOPS_TEMP_DIR:-${HOME}/.aidevops/.agent-workspace/tmp}/pulse-label-order-XXXXXX") || return 1
 	TESTS_RUN=$((TESTS_RUN + 1))
 	actual_events=$(
 		(
@@ -279,6 +281,7 @@ assert_label_maintenance_rest_block_contract() {
 			source "$PREFLIGHT_LIB"
 			REST_EVENTS=""
 			LOGFILE="/dev/null"
+			AIDEVOPS_LABEL_MAINTENANCE_STATE_FILE="$test_root/epochs"
 
 			pulse_rest_core_priority_allows_next() {
 				local priority="$1"
@@ -309,6 +312,7 @@ assert_label_maintenance_rest_block_contract() {
 			printf '%s\n' "$REST_EVENTS"
 		)
 	)
+	rm -rf "$test_root"
 	if [[ "$actual_events" == "$expected_events" ]]; then
 		echo "${TEST_GREEN}PASS${TEST_NC}: $label"
 	else
@@ -320,12 +324,624 @@ assert_label_maintenance_rest_block_contract() {
 	return 0
 }
 
+assert_label_maintenance_stalest_contract() {
+	local label="$1" test_root="" actual_events="" next_order="" fallback_order="" corrupt_order=""
+	local expected_events="gate:deferrable:label_maintenance_simplification_reevaluate;simplification;gate:deferrable:label_maintenance_consolidation_reevaluate;"
+	test_root=$(mktemp -d "${AIDEVOPS_TEMP_DIR:-${HOME}/.aidevops/.agent-workspace/tmp}/pulse-label-order-XXXXXX") || return 1
+	printf 'consolidation 200\nbackfill 300\nsimplification 1\n' >"$test_root/epochs"
+	TESTS_RUN=$((TESTS_RUN + 1))
+	actual_events=$(
+		(
+			unset _PULSE_DISPATCH_PREFLIGHT_LIB_LOADED
+			# shellcheck source=../pulse-dispatch-preflight-lib.sh
+			source "$PREFLIGHT_LIB"
+			AIDEVOPS_LABEL_MAINTENANCE_STATE_FILE="$test_root/epochs"
+			LOGFILE="/dev/null" REST_EVENTS=""
+			pulse_rest_core_priority_allows_next() {
+				local priority="$1" context="$2"
+				REST_EVENTS="${REST_EVENTS}gate:${priority}:${context};"
+				[[ "$context" != "label_maintenance_consolidation_reevaluate" ]]
+			}
+			_reevaluate_consolidation_labels() { REST_EVENTS="${REST_EVENTS}reevaluate;"; return 0; }
+			_backfill_stale_consolidation_labels() { REST_EVENTS="${REST_EVENTS}backfill;"; return 0; }
+			_reevaluate_simplification_labels() { REST_EVENTS="${REST_EVENTS}simplification;"; return 0; }
+			_log_substage_timing() { return 0; }
+			_preflight_label_maintenance
+			printf '%s\n' "$REST_EVENTS"
+		)
+	)
+	next_order=$(
+		unset _PULSE_DISPATCH_PREFLIGHT_LIB_LOADED
+		# shellcheck source=../pulse-dispatch-preflight-lib.sh
+		source "$PREFLIGHT_LIB"
+		AIDEVOPS_LABEL_MAINTENANCE_STATE_FILE="$test_root/epochs"
+		_preflight_label_maintenance_order
+	)
+	fallback_order=$(
+		unset _PULSE_DISPATCH_PREFLIGHT_LIB_LOADED
+		# shellcheck source=../pulse-dispatch-preflight-lib.sh
+		source "$PREFLIGHT_LIB"
+		AIDEVOPS_LABEL_MAINTENANCE_STATE_FILE="$test_root/missing"
+		_preflight_label_maintenance_order
+	)
+	printf 'corrupt content\n' >"$test_root/corrupt"
+	corrupt_order=$(
+		unset _PULSE_DISPATCH_PREFLIGHT_LIB_LOADED
+		# shellcheck source=../pulse-dispatch-preflight-lib.sh
+		source "$PREFLIGHT_LIB"
+		AIDEVOPS_LABEL_MAINTENANCE_STATE_FILE="$test_root/corrupt"
+		_preflight_label_maintenance_order
+	)
+	if [[ "$actual_events" == "$expected_events" ]] &&
+		grep -qE '^simplification [0-9]+$' "$test_root/epochs" &&
+		grep -q '^consolidation 200$' "$test_root/epochs" &&
+		[[ "$next_order" == $'consolidation\nbackfill\nsimplification' ]] &&
+		[[ "$fallback_order" == $'consolidation\nbackfill\nsimplification' ]] &&
+		[[ "$corrupt_order" == "$fallback_order" ]]; then
+		echo "${TEST_GREEN}PASS${TEST_NC}: $label"
+	else
+		TESTS_FAILED=$((TESTS_FAILED + 1))
+		echo "${TEST_RED}FAIL${TEST_NC}: $label (${actual_events:-none})"
+	fi
+	rm -rf "$test_root"
+	return 0
+}
+
+assert_label_maintenance_cycle_budget_contract() {
+	local actual_events="" expected_events="normal:600;limited:195;exhausted:skip;invalid:skip;"
+	TESTS_RUN=$((TESTS_RUN + 1))
+	actual_events=$(
+		(
+			unset _PULSE_DISPATCH_PREFLIGHT_LIB_LOADED
+			# shellcheck source=../pulse-dispatch-preflight-lib.sh
+			source "$PREFLIGHT_LIB"
+			PULSE_START_EPOCH=0 PULSE_STALE_THRESHOLD=1800 PRE_RUN_STAGE_TIMEOUT=600
+			date() { printf '%s\n' "$TEST_EPOCH"; }
+			TEST_EPOCH=0
+			printf 'normal:%s;' "$(_preflight_refill_reserved_timeout 600)"
+			TEST_EPOCH=1000
+			printf 'limited:%s;' "$(_preflight_refill_reserved_timeout 600)"
+			TEST_EPOCH=1195
+			printf 'exhausted:%s;' "$(_preflight_refill_reserved_timeout 600 || printf 'skip')"
+			PULSE_START_EPOCH=invalid
+			printf 'invalid:%s;' "$(_preflight_refill_reserved_timeout 600 || printf 'skip')"
+		)
+	)
+	if [[ "$actual_events" == "$expected_events" ]]; then
+		echo "${TEST_GREEN}PASS${TEST_NC}: label maintenance preserves the post-label refill budget"
+	else
+		TESTS_FAILED=$((TESTS_FAILED + 1))
+		echo "${TEST_RED}FAIL${TEST_NC}: label maintenance preserves the post-label refill budget"
+		echo "  expected events: $expected_events"
+		echo "  actual events: ${actual_events:-none}"
+	fi
+	return 0
+}
+
+# GH#37986: any substage that has not started within the starvation bound
+# promotes one bounded slice ahead of early dispatch, and a deferral reports
+# how far short of the refill reserve the cycle fell.
+assert_label_maintenance_starvation_contract() {
+	local test_root="" actual=""
+	local expected="never:never;doubled_never:no;fresh:no;stale:9000;partial:never;doubled_partial:no;doubled_partial_stale:never;disabled:no;doubled:no;doubled_stale:15000;"
+	expected+="deficit:remaining=605s, required=606s;"
+	expected+="promoted:1:preflight_label_maintenance:180;current:0:;deferred:0:preflight_label_maintenance:180;"
+	expected+="prefetch:0:;prefetch_doubled:1:preflight_label_maintenance:180;stopped:0:;slice:1:preflight_label_maintenance:240;minimum:1:preflight_label_maintenance:180;"
+	test_root=$(mktemp -d "${AIDEVOPS_TEMP_DIR:-${HOME}/.aidevops/.agent-workspace/tmp}/pulse-label-starved-XXXXXX") || return 1
+	TESTS_RUN=$((TESTS_RUN + 1))
+	actual=$(
+		(
+			unset _PULSE_DISPATCH_PREFLIGHT_LIB_LOADED
+			# shellcheck source=../pulse-dispatch-preflight-lib.sh
+			source "$PREFLIGHT_LIB"
+			eval "$(sed -n '/^_run_promoted_label_maintenance_if_starved() {/,/^}/p' "$ENGINE")"
+			unset AIDEVOPS_PULSE_LABEL_MAINTENANCE_STARVATION_S AIDEVOPS_PULSE_LABEL_MAINTENANCE_STARVED_SLICE_S
+			unset PULSE_POST_LABEL_REFILL_MIN_REMAINING_SECONDS _PULSE_ELASTIC_DISPATCH
+			LOGFILE="$test_root/pulse.log" STOP_FLAG="$test_root/stop"
+			AIDEVOPS_LABEL_MAINTENANCE_STATE_FILE="$test_root/epochs"
+			PULSE_START_EPOCH=98805 PULSE_STALE_THRESHOLD=1800 PULSE_LOCK_MAX_AGE_S=1800 PRE_RUN_STAGE_TIMEOUT=600
+			date() { printf '100000\n'; }
+			attempts() {
+				printf 'consolidation 99000\nbackfill 99000\nsimplification %s\n' "$1" >"$test_root/epochs.attempts"
+				return 0
+			}
+			printf 'never:%s;' "$(_preflight_label_maintenance_starved || printf 'no')"
+			printf 'doubled_never:%s;' "$(_preflight_label_maintenance_starved 2 || printf 'no')"
+			attempts 99000
+			printf 'fresh:%s;' "$(_preflight_label_maintenance_starved || printf 'no')"
+			attempts 91000
+			printf 'stale:%s;' "$(_preflight_label_maintenance_starved || printf 'no')"
+			printf 'consolidation 99000\nbackfill 99000\n' >"$test_root/epochs.attempts"
+			printf 'partial:%s;' "$(_preflight_label_maintenance_starved || printf 'no')"
+			# A missing substage must not block the doubled bound: it applies
+			# to the oldest recorded attempt.
+			printf 'doubled_partial:%s;' "$(_preflight_label_maintenance_starved 2 || printf 'no')"
+			printf 'consolidation 85000\nbackfill 99000\n' >"$test_root/epochs.attempts"
+			printf 'doubled_partial_stale:%s;' "$(_preflight_label_maintenance_starved 2 || printf 'no')"
+			attempts 91000
+			printf 'disabled:%s;' "$(AIDEVOPS_PULSE_LABEL_MAINTENANCE_STARVATION_S=0 _preflight_label_maintenance_starved || printf 'no')"
+			printf 'doubled:%s;' "$(_preflight_label_maintenance_starved 2 || printf 'no')"
+			attempts 85000
+			printf 'doubled_stale:%s;' "$(_preflight_label_maintenance_starved 2 || printf 'no')"
+			printf 'deficit:%s;' "$(_preflight_refill_reserved_deficit)"
+
+			TEST_DEFERRED=0 STAGE_CALL=""
+			_pulse_run_budget_priority_stage_with_timeout() {
+				local stage="$1" timeout_seconds="$2"
+				_PULSE_BUDGET_STAGE_DEFERRED="$TEST_DEFERRED"
+				STAGE_CALL="${stage}:${timeout_seconds}"
+				return 0
+			}
+			promotion_probe() {
+				local probe="$1"
+				STAGE_CALL=""
+				_run_promoted_label_maintenance_if_starved
+				printf '%s:%s:%s;' "$probe" "$_PULSE_LABEL_MAINTENANCE_PROMOTED" "$STAGE_CALL"
+				return 0
+			}
+			_PULSE_PREFETCH_RAN=0
+			attempts 91000
+			promotion_probe promoted
+			attempts 99000
+			promotion_probe current
+			attempts 91000
+			TEST_DEFERRED=1
+			promotion_probe deferred
+			TEST_DEFERRED=0 _PULSE_PREFETCH_RAN=1
+			promotion_probe prefetch
+			attempts 85000
+			promotion_probe prefetch_doubled
+			_PULSE_PREFETCH_RAN=0
+			: >"$STOP_FLAG"
+			promotion_probe stopped
+			rm -f "$STOP_FLAG"
+			AIDEVOPS_PULSE_LABEL_MAINTENANCE_STARVED_SLICE_S=240
+			promotion_probe slice
+			AIDEVOPS_PULSE_LABEL_MAINTENANCE_STARVED_SLICE_S=30
+			promotion_probe minimum
+		)
+	)
+	if [[ "$actual" == "$expected" ]] &&
+		grep -q 'stalest substage attempt 9000s ago, bound 7200s x1 — promoting a 180s slice' "$test_root/pulse.log" &&
+		grep -q 'stalest substage attempt 15000s ago, bound 7200s x2' "$test_root/pulse.log"; then
+		echo "${TEST_GREEN}PASS${TEST_NC}: starved label maintenance is promoted once per bound and reports its deficit"
+	else
+		TESTS_FAILED=$((TESTS_FAILED + 1))
+		echo "${TEST_RED}FAIL${TEST_NC}: label maintenance starvation contract"
+		echo "  expected: $expected"
+		echo "  actual:   ${actual:-none}"
+	fi
+	rm -rf "$test_root"
+	return 0
+}
+
+# GH#37986 held-first fixture: a fake clock, one search answer, one current
+# body per issue and one per-repository list answer. Call inside the trace
+# subshell after sourcing.
+# Reads: EVENTS, CLOCK, TEST_SEARCH_RC, TEST_MEASURE_SECONDS, TEST_UNREADABLE
+label_maintenance_held_first_stubs() {
+	date() {
+		local now=0
+		read -r now <"$CLOCK"
+		printf '%s\n' "$now"
+		return 0
+	}
+	gh() {
+		[[ "$*" == "api -X GET search/issues"* ]] || return 1
+		printf 'search;' >>"$EVENTS"
+		[[ "$TEST_SEARCH_RC" -eq 0 ]] || return 1
+		printf '%s\n' '{"slug":"acme/held","number":12}' \
+			'{"slug":"acme/held","number":7}' \
+			'{"slug":"stranger/repo","number":3}'
+		return 0
+	}
+	gh_issue_view() {
+		local num="$1" slug="$3"
+		printf 'view:%s#%s;' "$slug" "$num" >>"$EVENTS"
+		[[ "$num" != "$TEST_UNREADABLE" ]] || return 1
+		printf 'current%s\n' "$num"
+		return 0
+	}
+	gh_issue_list() {
+		local slug="$2"
+		printf 'list:%s;' "$slug" >>"$EVENTS"
+		if [[ "$slug" == "Acme/held" ]]; then
+			printf '%s\n' '[{"number":20,"body":"b20"},{"number":7,"body":"b7"},{"number":12,"body":"b12"}]'
+		else
+			printf '[]\n'
+		fi
+		return 0
+	}
+	_pulse_refresh_repo() { return 0; }
+	_backfill_simplification_auto_dispatch_labels() { printf '0\n'; return 0; }
+	_reevaluate_stale_continuations() { return 1; }
+	_post_simplification_gate_cleared_comment() {
+		printf 'cleared:%s#%s;' "$2" "$1" >>"$EVENTS"
+		return 0
+	}
+	_issue_targets_large_files() {
+		local num="$1" slug="$2" body="$3" rpath="$4" now=0
+		printf 'measure:%s#%s:%s:%s;' "$slug" "$num" "$body" "$rpath" >>"$EVENTS"
+		read -r now <"$CLOCK"
+		printf '%s\n' "$((now + TEST_MEASURE_SECONDS))" >"$CLOCK"
+		[[ "$num" != 7 ]]
+	}
+	_issue_needs_consolidation() {
+		local num="$1"
+		printf 'c%s;' "$num" >>"$EVENTS"
+		[[ "$num" != 7 ]]
+	}
+	return 0
+}
+
+# GH#37986: run the two re-evaluation substages against the fixture and print
+# one "name:rc:events[:cursors]|" record per scenario.
+# Arguments: $1 - test root directory
+label_maintenance_held_first_trace() {
+	local test_root="$1"
+	(
+		unset _PULSE_TRIAGE_EVALUATION_LIB_LOADED
+		# shellcheck source=../pulse-triage-evaluation.sh
+		source "$TRIAGE_EVALUATION"
+		unset _LABEL_MAINTENANCE_DEADLINE _LABEL_CURSOR_SLUG _LABEL_CURSOR_PHASE _LABEL_CURSOR_ISSUE
+		LOGFILE="$test_root/pulse.log" REPOS_JSON="$test_root/repos.json"
+		EVENTS="$test_root/events" CLOCK="$test_root/clock"
+		_LABEL_MAINTENANCE_KEY="simplification"
+		_LABEL_CURSOR_FILE="$test_root/epochs.simplification.cursor"
+		jq -n '{initialized_repos:[{slug:"acme/empty",path:"/e",pulse:true},{slug:"Acme/held",path:"/h",pulse:true}]}' >"$REPOS_JSON"
+		printf '0\n' >"$CLOCK"
+		TEST_SEARCH_RC=0 TEST_MEASURE_SECONDS=0 TEST_UNREADABLE=""
+		label_maintenance_held_first_stubs
+		local rc=0 held_cursor="$test_root/epochs.simplification.held"
+
+		: >"$EVENTS"
+		_reevaluate_simplification_labels || rc=$?
+		printf 'first:%s:%s:%s|' "$rc" "$(<"$EVENTS")" "$(<"$held_cursor")"
+
+		# A previous run stopped at #7: this run starts after it.
+		printf 'Acme/held 7\n' >"$held_cursor"
+		: >"$EVENTS"
+		rc=0
+		_reevaluate_simplification_labels || rc=$?
+		printf 'rotated:%s:%s:%s|' "$rc" "$(<"$EVENTS")" "$(<"$held_cursor")"
+
+		# A failed search proves nothing: the sweep re-checks every hold.
+		TEST_SEARCH_RC=1
+		: >"$EVENTS"
+		rc=0
+		_reevaluate_simplification_labels || rc=$?
+		printf 'fallback:%s:%s|' "$rc" "$(<"$EVENTS")"
+
+		# An issue whose current body cannot be read stays with the sweep.
+		TEST_SEARCH_RC=0 TEST_UNREADABLE=12
+		rm -f "$held_cursor"
+		: >"$EVENTS"
+		rc=0
+		_reevaluate_simplification_labels || rc=$?
+		printf 'unreadable:%s:%s|' "$rc" "$(<"$EVENTS")"
+		TEST_UNREADABLE=""
+
+		# 60s substage: the held-first step yields at 40s, the sweep
+		# re-checks #12 and the deadline defers #20 to the next cycle.
+		TEST_SEARCH_RC=0 TEST_MEASURE_SECONDS=40 _LABEL_MAINTENANCE_DEADLINE=60
+		rm -f "$held_cursor"
+		: >"$EVENTS"
+		rc=0
+		_reevaluate_simplification_labels || rc=$?
+		printf 'share:%s:%s:%s:%s|' "$rc" "$(<"$EVENTS")" "$(<"$held_cursor")" "$(<"$_LABEL_CURSOR_FILE")"
+
+		unset _LABEL_MAINTENANCE_DEADLINE
+		TEST_MEASURE_SECONDS=0 _LABEL_MAINTENANCE_KEY="consolidation"
+		_LABEL_CURSOR_FILE="$test_root/epochs.consolidation.cursor"
+		: >"$EVENTS"
+		rc=0
+		_reevaluate_consolidation_labels || rc=$?
+		printf 'consolidation:%s:%s|' "$rc" "$(<"$EVENTS")"
+	)
+	return 0
+}
+
+# GH#37986: each re-evaluation substage re-checks the issues that carry its
+# label before it sweeps repositories. The search only names candidates: the
+# simplification step measures each issue's current body, and consolidation
+# reads none. The sweep remains the safety net for a failed search or an
+# unreadable issue, skips what the held-first step already re-checked, and
+# keeps a share of the substage's time.
+assert_label_maintenance_held_first_contract() {
+	local test_root="" actual="" expected=""
+	local held7="view:Acme/held#7;measure:Acme/held#7:current7:/h;cleared:Acme/held#7;"
+	local held12="view:Acme/held#12;measure:Acme/held#12:current12:/h;"
+	local sweep="list:acme/empty;list:Acme/held;"
+	local swept7="measure:Acme/held#7:b7:/h;cleared:Acme/held#7;" swept12="measure:Acme/held#12:b12:/h;"
+	local swept20="measure:Acme/held#20:b20:/h;"
+	expected="first:0:search;${held7}${held12}${sweep}${swept20}:Acme/held 12|"
+	expected+="rotated:0:search;${held12}${held7}${sweep}${swept20}:Acme/held 7|"
+	expected+="fallback:0:search;${sweep}${swept7}${swept12}${swept20}|"
+	expected+="unreadable:0:search;${held7}view:Acme/held#12;${sweep}${swept12}${swept20}|"
+	expected+="share:2:search;${held7}${sweep}${swept12}:Acme/held 7:Acme/held 2 20|"
+	expected+="consolidation:0:search;c7;c12;${sweep}c20;|"
+	test_root=$(mktemp -d "${AIDEVOPS_TEMP_DIR:-${HOME}/.aidevops/.agent-workspace/tmp}/pulse-label-held-XXXXXX") || return 1
+	TESTS_RUN=$((TESTS_RUN + 1))
+	actual=$(label_maintenance_held_first_trace "$test_root")
+	if [[ "$actual" == "$expected" ]] &&
+		grep -q 'held-first needs-simplification re-checked 2 issue(s), cleared 1 (GH#37986)' "$test_root/pulse.log" &&
+		grep -q 'held-first needs-simplification re-checked 1 issue(s), cleared 1; time share used' "$test_root/pulse.log" &&
+		grep -q 'partial simplification; resume Acme/held 2 20' "$test_root/pulse.log" &&
+		grep -q 'Consolidation re-evaluation: cleared 1 stale' "$test_root/pulse.log"; then
+		echo "${TEST_GREEN}PASS${TEST_NC}: held issues are re-checked before the repository sweep"
+	else
+		TESTS_FAILED=$((TESTS_FAILED + 1))
+		echo "${TEST_RED}FAIL${TEST_NC}: label maintenance held-first contract"
+		echo "  expected: $expected"
+		echo "  actual:   ${actual:-none}"
+	fi
+	rm -rf "$test_root"
+	return 0
+}
+
+ownership_deadline_trace() {
+	local mode="$1" requested=600 starved=0 rc=0
+	unset _PULSE_DISPATCH_PREFLIGHT_LIB_LOADED
+	# shellcheck source=../pulse-dispatch-preflight-lib.sh
+	source "$PREFLIGHT_LIB"
+	LOGFILE="/dev/null" PULSE_STAGE_DEADLINE_EPOCH=1384
+	AIDEVOPS_PULSE_STAGE_CYCLE_CLAMP=1 AIDEVOPS_PULSE_NORMALIZE_FLOOR_S=60
+	case "$mode" in
+	recovery) starved=1 ;;
+	standalone)
+		unset PULSE_STAGE_DEADLINE_EPOCH
+		starved=1
+		;;
+	async)
+		AIDEVOPS_PULSE_STAGE_CYCLE_CLAMP=0
+		starved=1
+		;;
+	invalid) PULSE_STAGE_DEADLINE_EPOCH=invalid ;;
+	expired) PULSE_STAGE_DEADLINE_EPOCH=999 ;;
+	requested) requested=200 ;;
+	prefetch_exhausted | intake_exhausted) requested=10 ;;
+	esac
+	date() {
+		printf '1000\n'
+		return 0
+	}
+	prefetch_contribution_watch() {
+		[[ "$mode" != prefetch_exhausted ]] || SECONDS=$((SECONDS + requested))
+		return 0
+	}
+	_log_substage_timing() { return 0; }
+	_pulse_blocker_refresh_starved() {
+		[[ "$starved" -eq 1 ]] && return 0
+		return 1
+	}
+	run_stage_with_timeout() {
+		local stage_name="$1" timeout_seconds="$2"
+		case "$stage_name" in
+		reconcile_new_external_issues) printf 'i:%s;' "$timeout_seconds" ;;
+		reconcile_issues_single_pass) printf 'r:%s;' "$timeout_seconds" ;;
+		normalize_active_issue_assignments)
+			printf 'n:%s;' "$timeout_seconds"
+			[[ "$mode" != normalize_deferred ]] || return 124
+			[[ "$mode" != normalize_failed ]] || return 1
+			;;
+		esac
+		# Model each child consuming its complete allocation without sleeps.
+		SECONDS=$((SECONDS + timeout_seconds))
+		return 0
+	}
+	_preflight_ownership_reconcile "$requested" || rc=$?
+	printf 'rc:%s;' "$rc"
+	return 0
+}
+
+assert_ownership_deadline_contract() {
+	local mode actual="" expected=""
+	for mode in clamped recovery standalone async invalid expired requested prefetch_exhausted intake_exhausted normalize_deferred normalize_failed; do
+		TESTS_RUN=$((TESTS_RUN + 1))
+		case "$mode" in
+		clamped | async) expected="i:60;r:256;n:60;rc:0;" ;;
+		recovery) expected="i:60;r:64;n:60;rc:0;" ;;
+		standalone | invalid) expected="i:60;r:380;n:152;rc:0;" ;;
+		expired) expected="rc:124;" ;;
+		requested) expected="i:60;r:72;n:60;rc:0;" ;;
+		prefetch_exhausted) expected="rc:124;" ;;
+		intake_exhausted) expected="i:8;rc:124;" ;;
+		normalize_deferred) expected="i:60;r:256;n:60;rc:124;" ;;
+		normalize_failed) expected="i:60;r:256;n:60;rc:1;" ;;
+		esac
+		# Keep case statements outside command substitution for Bash 3.2.
+		actual=$(ownership_deadline_trace "$mode")
+		if [[ "$actual" == "$expected" ]]; then
+			echo "${TEST_GREEN}PASS${TEST_NC}: ownership deadline budget ${mode}"
+		else
+			TESTS_FAILED=$((TESTS_FAILED + 1))
+			echo "${TEST_RED}FAIL${TEST_NC}: ownership deadline budget ${mode} expected=${expected} actual=${actual}"
+		fi
+	done
+	return 0
+}
+
+assert_stage_cycle_budget_contract() {
+	local test_root="" actual="" expected="reserved:67;nested:67;maximum:60;protected:124;admission:0;unadmittable:600;dispatch:600;released:600;clamp:1;defer:124;optout:1;unset:1;"
+	test_root=$(mktemp -d "${AIDEVOPS_TEMP_DIR:-${HOME}/.aidevops/.agent-workspace/tmp}/pulse-stage-cycle-XXXXXX") || return 1
+	TESTS_RUN=$((TESTS_RUN + 1))
+	actual=$(
+		(
+			LOGFILE="$test_root/stages.log" EVENTS="$test_root/events"
+			PULSE_START_EPOCH=1000 PULSE_STALE_THRESHOLD=1800 PULSE_LOCK_MAX_AGE_S=1800
+			date() { [[ "${1:-}" == '+%s' ]] && printf '%s\n' "$TEST_EPOCH"; }
+			stage_probe() { printf 'run\n' >>"$EVENTS"; return 0; }
+			# A many-repo scan needs 483s + 600s floor + 60s prestage
+			# margin + 90s finalisation, plus the 60s teardown allowance.
+			_PULSE_MAIN_DISPATCH_RESERVE_S=1293 TEST_EPOCH=1440
+			printf 'reserved:%s;' "$(_pulse_stage_cycle_timeout build_dependency_graph_cache 600)"
+			nested_probe() { printf 'nested:%s;' "$(_pulse_stage_cycle_timeout inner 600)"; return 0; }
+			run_stage_with_timeout preflight_cleanup_and_ledger 600 nested_probe || true
+			printf 'maximum:%s;' "$(AIDEVOPS_PULSE_CYCLE_FINALISE_RESERVE_S=1300 _pulse_stage_cycle_timeout prefetch_state 600)"
+			TEST_EPOCH=1500
+			local protected_rc=0
+			run_stage_with_timeout cache_prime 300 stage_probe || protected_rc=$?
+			printf 'protected:%s;' "$protected_rc"
+			[[ ! -f "$EVENTS" ]] || exit 1
+			# The actual round-admission gate still admits a full main census.
+			# shellcheck source=../pulse-dispatch-lib-candidates.sh
+			source "$DISPATCH_CANDIDATES_LIB"
+			_dispatch_enumeration_expected_seconds() { printf '483\n'; return 0; }
+			protected_rc=0
+			_dispatch_cycle_budget_admits_round Dispatch_max before || protected_rc=$?
+			printf 'admission:%s;' "$protected_rc"
+			# GH#37811: 710s left cannot admit even a bounded round (780s), so
+			# the reserve protects nothing and the stage keeps finalisation only.
+			TEST_EPOCH=2000
+			printf 'unadmittable:%s;' "$(_pulse_stage_cycle_timeout dirty_pr_sweep 600)"
+			TEST_EPOCH=1500
+			printf 'dispatch:%s;' "$(_PULSE_MAIN_DISPATCH_RESERVE_S=0 _pulse_stage_cycle_timeout dispatch_candidate_1 600)"
+			_PULSE_MAIN_DISPATCH_RESERVE_S=0
+			printf 'released:%s;' "$(_pulse_stage_cycle_timeout auto_decomposer_scanner 600)"
+			TEST_EPOCH=2500
+			run_stage_with_timeout clamped 600 stage_probe || true
+			[[ "$(<"$EVENTS")" == run ]] && printf 'clamp:1;'
+			TEST_EPOCH=2700
+			local rc=0
+			run_stage_with_timeout deferred 600 stage_probe || rc=$?
+			[[ "$rc" -eq 124 && "$(<"$EVENTS")" == run ]] && printf 'defer:124;'
+			AIDEVOPS_PULSE_STAGE_CYCLE_CLAMP=0
+			run_stage_with_timeout optout 600 stage_probe || true
+			[[ "$(<"$EVENTS")" == $'run\nrun' ]] && printf 'optout:1;'
+			unset AIDEVOPS_PULSE_STAGE_CYCLE_CLAMP PULSE_START_EPOCH
+			run_stage_with_timeout unset 600 stage_probe || true
+			[[ "$(<"$EVENTS")" == $'run\nrun\nrun' ]] && printf 'unset:1;'
+		)
+	)
+	if [[ "$actual" == "$expected" ]] && grep -q 'clamped 600s -> 210s' "$test_root/stages.log" &&
+		grep -q 'Stage deferred: deferred cycle budget exhausted' "$test_root/stages.log" &&
+		grep -q 'Stage dispatch reserve released: dirty_pr_sweep' "$test_root/stages.log" &&
+		! grep -q 'reserve released: cache_prime' "$test_root/stages.log" &&
+		grep -q 'Stage start: optout (timeout 600s)' "$test_root/stages.log"; then
+		echo "${TEST_GREEN}PASS${TEST_NC}: stages clamp, defer and opt out of cycle deadline"
+	else
+		TESTS_FAILED=$((TESTS_FAILED + 1))
+		echo "${TEST_RED}FAIL${TEST_NC}: stages clamp, defer and opt out of cycle deadline (${actual:-none})"
+	fi
+	rm -rf "$test_root"
+	return 0
+}
+
+assert_dispatch_cycle_budget_contract() {
+	local actual="" expected="deferred:1;unclamped:0;margin:1;stage_guard:1;admitted:0;"
+	TESTS_RUN=$((TESTS_RUN + 1))
+	actual=$(
+		(
+			# shellcheck source=../pulse-dispatch-lib-candidates.sh
+			source "$DISPATCH_CANDIDATES_LIB"
+			LOGFILE="/dev/null" PULSE_START_EPOCH=0 PULSE_STALE_THRESHOLD=1800 PULSE_LOCK_MAX_AGE_S=1100
+			date() { printf '500\n'; }
+			local rc=0
+			_dispatch_graphql_budget_allows_next || rc=$?
+			printf 'deferred:%s;' "$rc"
+			PULSE_START_EPOCH=invalid
+			rc=0
+			_dispatch_graphql_budget_allows_next || rc=$?
+			printf 'unclamped:%s;' "$rc"
+			# GH#36603: 630s clears the stage-start floor guard (rc=1 proceeds)
+			# but not admission, which needs floor + 60s margin; 660s admits.
+			PULSE_START_EPOCH=0 PULSE_LOCK_MAX_AGE_S=1220
+			rc=0
+			_dispatch_graphql_budget_allows_next || rc=$?
+			printf 'margin:%s;' "$rc"
+			rc=0
+			_dispatch_cycle_budget_defers_candidate 1 o/r || rc=$?
+			printf 'stage_guard:%s;' "$rc"
+			PULSE_LOCK_MAX_AGE_S=1250
+			rc=0
+			_dispatch_graphql_budget_allows_next || rc=$?
+			printf 'admitted:%s;' "$rc"
+		)
+	)
+	if [[ "$actual" == "$expected" ]]; then
+		echo "${TEST_GREEN}PASS${TEST_NC}: dispatch admits candidates only with floor plus pre-stage margin"
+	else
+		TESTS_FAILED=$((TESTS_FAILED + 1))
+		echo "${TEST_RED}FAIL${TEST_NC}: dispatch budget admission (${actual:-none})"
+	fi
+	return 0
+}
+
+# GH#34000: a prefetch timeout/deferral (124) continues the cycle on cached
+# state; any other prefetch failure still aborts. The prefetch reserve adds
+# the pipeline share to the finalisation reserve and supports opt-out.
+assert_prefetch_degraded_contract() {
+	local actual="" expected="timeout:124;failure:1;reserve:270;optout:90;"
+	TESTS_RUN=$((TESTS_RUN + 1))
+	actual=$(
+		(
+			unset _PULSE_DISPATCH_PREFLIGHT_LIB_LOADED
+			# shellcheck source=../pulse-dispatch-preflight-lib.sh
+			source "$PREFLIGHT_LIB"
+			LOGFILE="/dev/null" PIDFILE="/dev/null" SCOPE_FILE="" PRE_RUN_STAGE_TIMEOUT=600
+			PULSE_RATE_LIMIT_FLAG="${TMPDIR:-/tmp}/gh34000-missing-rate-limit-flag"
+			_PULSE_HEALTH_PREFETCH_ERRORS=0 TEST_PREFETCH_RC=124
+			run_stage_with_timeout() { return "$TEST_PREFETCH_RC"; }
+			local rc=0
+			_preflight_prefetch_and_scope || rc=$?
+			printf 'timeout:%s;' "$rc"
+			TEST_PREFETCH_RC=1 rc=0
+			_preflight_prefetch_and_scope || rc=$?
+			printf 'failure:%s;' "$rc"
+			unset AIDEVOPS_PULSE_CYCLE_FINALISE_RESERVE_S AIDEVOPS_PULSE_PIPELINE_RESERVE_S
+			printf 'reserve:%s;' "$(_preflight_prefetch_reserved_finalise_seconds)"
+			printf 'optout:%s;' "$(AIDEVOPS_PULSE_PIPELINE_RESERVE_S=0 _preflight_prefetch_reserved_finalise_seconds)"
+		)
+	)
+	if [[ "$actual" == "$expected" ]]; then
+		echo "${TEST_GREEN}PASS${TEST_NC}: prefetch timeout continues on cached state; failures still abort"
+	else
+		TESTS_FAILED=$((TESTS_FAILED + 1))
+		echo "${TEST_RED}FAIL${TEST_NC}: prefetch degraded contract (${actual:-none})"
+	fi
+	return 0
+}
+
+assert_interrupted_dispatch_progress_contract() {
+	local actual="" expected='["worker-dispatched"]'
+	TESTS_RUN=$((TESTS_RUN + 1))
+	actual=$(
+		(
+			# shellcheck source=../pulse-logging.sh
+			source "$SCRIPT_DIR/pulse-logging.sh"
+			_PULSE_CYCLE_STATE_INITIALIZED=1 _PULSE_CYCLE_DISPATCH_BEFORE=2
+			_pulse_cycle_state_executor_is_owner() { return 0; }
+			_pulse_capture_dispatch_total() { printf '3\n'; return 0; }
+			_pulse_cycle_state_note_blocker() { return 0; }
+			_pulse_cycle_state_finalize() { printf '%s' "$2"; return 0; }
+			_pulse_cycle_state_write_terminal_if_current() { return 0; }
+			_pulse_cycle_state_finish_if_needed interrupted
+		)
+	)
+	if [[ "$actual" == "$expected" ]]; then
+		echo "${TEST_GREEN}PASS${TEST_NC}: interrupted cycle retains worker dispatch progress"
+	else
+		TESTS_FAILED=$((TESTS_FAILED + 1))
+		echo "${TEST_RED}FAIL${TEST_NC}: interrupted dispatch progress (${actual:-none})"
+	fi
+	return 0
+}
+
 # Resolve paths relative to this test file
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENGINE="$SCRIPT_DIR/pulse-dispatch-engine.sh"
+HOUSEKEEPING="$SCRIPT_DIR/pulse-dispatch-engine-housekeeping.sh"
 CORE="$SCRIPT_DIR/pulse-dispatch-core.sh"
+DISPATCH_LOCKS="$SCRIPT_DIR/pulse-dispatch-locks.sh"
 DISPATCH_LIB="$SCRIPT_DIR/pulse-dispatch-lib.sh"
+DISPATCH_CAPACITY_LIB="$SCRIPT_DIR/pulse-dispatch-lib-capacity.sh"
+DISPATCH_CANDIDATES_LIB="$SCRIPT_DIR/pulse-dispatch-lib-candidates.sh"
 PREFLIGHT_LIB="$SCRIPT_DIR/pulse-dispatch-preflight-lib.sh"
+WRAPPER="$SCRIPT_DIR/pulse-wrapper.sh"
+# The wrapper loads the shared cycle clock before sourcing preflight helpers.
+# Mirror that order for the standalone runtime contracts below.
+# shellcheck source=../pulse-watchdog.sh
+source "$SCRIPT_DIR/pulse-watchdog.sh"
 ROUTINES="$SCRIPT_DIR/pulse-routines.sh"
 TRIAGE_EVALUATION="$SCRIPT_DIR/pulse-triage-evaluation.sh"
 TRIAGE_DISPATCH="$SCRIPT_DIR/pulse-triage-dispatch.sh"
@@ -347,64 +963,72 @@ assert_not_grep \
 	'run_stage_with_timeout "complexity_scan"' \
 	"$ENGINE"
 
-# Assertions 2-6: each stage uses two separate greps (2a/2b pattern) because the
-# dispatch engine wires stages with a backslash line-continuation:
-#   _pulse_run_optional_stage_with_timeout "coderabbit_review" "$stage_timeout" run_daily_codebase_review || true
+# Assertions 3-6: each stage uses two separate greps (3a/3b pattern) because the
+# housekeeping module wires stages with a backslash line-continuation:
+#   _pulse_run_optional_stage_with_timeout "post_merge_scanner" "$stage_timeout" _run_post_merge_review_scanner || incomplete=1
 # Single-line grep -E cannot span the newline, so split into stage-name + function-name.
 
-assert_grep \
-	"2a: coderabbit_review stage call present" \
-	'_pulse_run_optional_stage_with_timeout "coderabbit_review"' \
+assert_not_grep \
+	"2a: retired coderabbit_review stage must NOT be in dispatch engine (GH#35865)" \
+	'coderabbit_review' \
 	"$ENGINE"
-assert_grep \
-	"2b: coderabbit_review function name present" \
+assert_not_grep \
+	"2a: retired coderabbit_review stage must NOT be in housekeeping module (GH#35865)" \
+	'coderabbit_review' \
+	"$HOUSEKEEPING"
+assert_not_grep \
+	"2b: retired daily review function must NOT be in dispatch engine" \
 	'run_daily_codebase_review' \
 	"$ENGINE"
+assert_not_grep \
+	"2b: retired daily review function must NOT be in housekeeping module" \
+	'run_daily_codebase_review' \
+	"$HOUSEKEEPING"
 
 assert_grep \
 	"3a: post_merge_scanner stage call present" \
 	'_pulse_run_optional_stage_with_timeout "post_merge_scanner"' \
-	"$ENGINE"
+	"$HOUSEKEEPING"
 assert_grep \
 	"3b: post_merge_scanner function name present" \
 	'_run_post_merge_review_scanner' \
-	"$ENGINE"
+	"$HOUSEKEEPING"
 
 assert_grep \
 	"3c: pr_review_thread_response stage call present" \
 	'_pulse_run_optional_stage_with_timeout "pr_review_thread_response"' \
-	"$ENGINE"
+	"$HOUSEKEEPING"
 assert_grep \
 	"3d: pr_review_thread_response function name present" \
 	'_run_pr_review_thread_response_scanner' \
-	"$ENGINE"
+	"$HOUSEKEEPING"
 
 assert_grep \
 	"4a: auto_decomposer_scanner stage call present" \
 	'_pulse_run_optional_stage_with_timeout "auto_decomposer_scanner"' \
-	"$ENGINE"
+	"$HOUSEKEEPING"
 assert_grep \
 	"4b: auto_decomposer_scanner function name present" \
 	'_run_auto_decomposer_scanner' \
-	"$ENGINE"
+	"$HOUSEKEEPING"
 
 assert_grep \
 	"5a: dedup_cleanup stage call present" \
 	'_pulse_run_optional_stage_with_timeout "dedup_cleanup"' \
-	"$ENGINE"
+	"$HOUSEKEEPING"
 assert_grep \
 	"5b: dedup_cleanup function name present" \
 	'run_simplification_dedup_cleanup' \
-	"$ENGINE"
+	"$HOUSEKEEPING"
 
 assert_grep \
 	"6a: fast_fail_prune_expired stage call present" \
 	'_pulse_run_optional_stage_with_timeout "fast_fail_prune_expired"' \
-	"$ENGINE"
+	"$HOUSEKEEPING"
 assert_grep \
 	"6b: fast_fail_prune_expired function name present" \
 	'fast_fail_prune_expired' \
-	"$ENGINE"
+	"$HOUSEKEEPING"
 
 # --- The shared-budget wrapper must NOT exist ---
 
@@ -442,9 +1066,9 @@ assert_grep \
 	'^_preflight_label_maintenance\(\)' \
 	"$PREFLIGHT_LIB"
 assert_match_count \
-	"9c2: every label-maintenance substage has a fresh REST launch gate" \
-	'^[[:space:]]*_preflight_rest_core_allows_next "label_maintenance_' \
-	3 \
+	"9c2: every label-maintenance iteration checks REST before the substage" \
+	'^[[:space:]]*_preflight_rest_core_allows_next "\$context" \|\| return 0' \
+	1 \
 	"$PREFLIGHT_LIB"
 assert_grep \
 	"9d: post-label refill has a dedicated helper" \
@@ -455,9 +1079,19 @@ assert_grep \
 	'^_preflight_trusted_nmr_reconcile\(\)' \
 	"$PREFLIGHT_LIB"
 assert_order \
-	"9e: capacity completes before the initial fill" \
-	'^[[:space:]]*run_stage_with_timeout "preflight_capacity"' \
+	"9e: local host capacity completes before the initial fill" \
+	'^[[:space:]]*run_stage_with_timeout "preflight_initial_capacity"' \
 	'^[[:space:]]*_pulse_run_budget_priority_stage "preflight_early_dispatch"' \
+	"$ENGINE"
+assert_order \
+	"9e2: initial fill precedes remote cleanup/reaping" \
+	'^[[:space:]]*_pulse_run_budget_priority_stage "preflight_early_dispatch"' \
+	'^[[:space:]]*run_stage_with_timeout "preflight_cleanup_and_ledger"' \
+	"$ENGINE"
+assert_order \
+	"9e3: full allocation completes after the initial fill" \
+	'^[[:space:]]*_pulse_run_budget_priority_stage "preflight_early_dispatch"' \
+	'^[[:space:]]*run_stage_with_timeout "preflight_capacity"' \
 	"$ENGINE"
 assert_order \
 	"9f: initial fill precedes label maintenance" \
@@ -498,13 +1132,37 @@ assert_match_count \
 	1 \
 	"$PREFLIGHT_LIB"
 assert_refill_runtime_contract \
-	"9l: trusted NMR reconciliation completes before the normalized refill"
+	"9l: trusted NMR reconciliation completes before the same-cycle refill"
 assert_refill_wall_clock_budget_contract \
 	"9l1: refill skips with telemetry when remaining cycle budget is insufficient"
 assert_routine_comment_rest_block_contract \
 	"9l2: blocked REST evidence suppresses the routine-comment API scan"
 assert_label_maintenance_rest_block_contract \
 	"9l3: blocked REST evidence stops label maintenance before the next API substage"
+assert_label_maintenance_stalest_contract \
+	"9l4: stalest simplification runs first and a refused REST gate stops the stage"
+assert_label_maintenance_cycle_budget_contract
+assert_label_maintenance_starvation_contract
+assert_label_maintenance_held_first_contract
+assert_order \
+	"9l5: GH#37986 starved label maintenance is promoted after the prefetch promotion" \
+	'_run_promoted_prefetch_if_starved "\$_pflt_timeout"' \
+	'^[[:space:]]*_run_promoted_label_maintenance_if_starved \|\| true' \
+	"$ENGINE"
+assert_order \
+	"9l6: GH#37986 starved label maintenance is promoted ahead of early dispatch" \
+	'^[[:space:]]*_run_promoted_label_maintenance_if_starved \|\| true' \
+	'^[[:space:]]*_pulse_run_budget_priority_stage "preflight_early_dispatch"' \
+	"$ENGINE"
+assert_grep \
+	"9l7: GH#37986 a promoted cycle skips the normal label-maintenance slot" \
+	'_PULSE_LABEL_MAINTENANCE_PROMOTED:-0\}" == "1"' \
+	"$ENGINE"
+assert_match_count \
+	"9l8: GH#37986 refill-reserve deferrals report remaining and required seconds" \
+	'deferred: insufficient wall-clock budget for post-label refill \(\$\(_preflight_refill_reserved_deficit\)\)' \
+	2 \
+	"$ENGINE"
 assert_order \
 	"9m: routine-comment REST gate precedes its API scan" \
 	'_preflight_rest_core_allows_next "routine_comment_responses"' \
@@ -548,44 +1206,120 @@ assert_grep \
 assert_grep \
 	"10a: dispatch stage adapter preserves benign block rc" \
 	'_dispatch_stage_rc_adapter' \
-	"$DISPATCH_LIB"
+	"$DISPATCH_CAPACITY_LIB"
 assert_grep \
 	"10b: interactive review hold is recognized as a benign block" \
 	'interactive_review_hold' \
-	"$DISPATCH_LIB"
+	"$DISPATCH_CAPACITY_LIB"
 assert_grep \
 	"10b1: PR targets are recognized as benign dispatch blocks" \
 	'pr_target_not_dispatchable' \
-	"$DISPATCH_LIB"
+	"$DISPATCH_CAPACITY_LIB"
 assert_grep \
 	"10b1b: Renovate Dependency Dashboard is recognized as a benign dispatch block" \
 	'renovate_dependency_dashboard' \
-	"$DISPATCH_LIB"
+	"$DISPATCH_CAPACITY_LIB"
 assert_grep \
 	"10b2: benign blocks are logged distinctly, not as pre-launch failures" \
 	'blocked:\$\{failure_reason\} benign dispatch block' \
-	"$DISPATCH_LIB"
+	"$DISPATCH_CANDIDATES_LIB"
 assert_grep \
 	"10b3: active claim dedup returns benign rc=3 to suppress Stage failed" \
 	'_dedup_layer6_assignee_and_stale.*&& return 3' \
-	"$CORE"
+	"$DISPATCH_LOCKS"
 assert_grep \
 	"10b4: refill skips candidates blocked by active claim in current cycle" \
 	'skip:already_assigned blocked:' \
-	"$DISPATCH_LIB"
+	"$DISPATCH_CANDIDATES_LIB"
 
 assert_grep \
 	"10c: dispatch stage adapter reports rc-file write failures" \
 	'Failed to write dispatch rc to' \
-	"$DISPATCH_LIB"
+	"$DISPATCH_CAPACITY_LIB"
 assert_grep \
 	"10d: dispatch stage adapter propagates raw rc after rc-file write failure" \
 	'return "\$raw_rc"' \
-	"$DISPATCH_LIB"
+	"$DISPATCH_CAPACITY_LIB"
 assert_not_grep \
 	"10e: benign block reasons are not counted as candidate failure reasons" \
 	'dedup_active_claim \| cost_budget_exceeded' \
-	"$DISPATCH_LIB"
+	"$DISPATCH_CAPACITY_LIB"
+assert_grep \
+	"10f: NMR gate entry is recorded before the potentially slow gate" \
+	'_ds_stage_start.*nmr_gate' \
+	"$CORE"
+assert_order \
+	"10g: NMR stage entry precedes gate execution" \
+	'_ds_stage_start.*nmr_gate' \
+	'^[[:space:]]*if _check_nmr_approval_gate' \
+	"$CORE"
+
+# --- GH#34000: preflight timeouts must not starve the deterministic pipeline ---
+
+assert_grep \
+	"11a: prefetch timeout marks the cycle degraded instead of aborting" \
+	'_PULSE_PREFETCH_DEGRADED=1' \
+	"$ENGINE"
+assert_grep \
+	"11b: prefetch runs with the deterministic-pipeline reserve" \
+	'AIDEVOPS_PULSE_CYCLE_FINALISE_RESERVE_S="\$\(_preflight_prefetch_reserved_finalise_seconds\)"' \
+	"$ENGINE"
+assert_order \
+	"11c: hourly stale_queued_runs runs before the long merge pass" \
+	'_pulse_run_optional_stage_with_timeout "stale_queued_runs"' \
+	'_pulse_run_budget_priority_stage_with_timeout "deterministic_merge_pass"' \
+	"$WRAPPER"
+assert_order \
+	"11d: Dependabot alert monitor runs before the long merge pass" \
+	'_pulse_run_optional_stage_with_timeout "dependabot_alert_monitor"' \
+	'_pulse_run_budget_priority_stage_with_timeout "deterministic_merge_pass"' \
+	"$WRAPPER"
+assert_order \
+	"11e: orphan reaping still opens the deterministic pipeline" \
+	'run_stage_with_timeout "reap_orphan_workers"' \
+	'_pulse_run_optional_stage_with_timeout "stale_queued_runs"' \
+	"$WRAPPER"
+assert_not_grep \
+	"11e2: t18911 worker bus relay is not a budgeted pipeline stage" \
+	'_stage_with_timeout "worker_bus_relay"' \
+	"$WRAPPER"
+assert_order \
+	"11e3: t18911 worker bus relay starts with the cycle-start async launches" \
+	'^_preflight_start_async_cleanups\(\) \{' \
+	'^[[:space:]]+_preflight_start_worker_bus_relay \|\| true' \
+	"$PREFLIGHT_LIB"
+assert_grep \
+	"11e4: t18911 worker bus relay uses the detached launcher with the relay command" \
+	'"worker-bus-relay" relay \|\| true' \
+	"$PREFLIGHT_LIB"
+assert_order \
+	"11e5: t18911 busy-lock ticks start the relay before the routines-only gate" \
+	'_preflight_start_worker_bus_relay \|\| true' \
+	'AIDEVOPS_PULSE_BUSY_ROUTINES:-1\}" == "1" \]\] \|\| return 0' \
+	"$WRAPPER"
+assert_grep \
+	"11f: degraded prefetch skips only the STATE_FILE-reading LLM supervisor" \
+	'_PULSE_PREFETCH_DEGRADED:-0\}" == "1"' \
+	"$WRAPPER"
+assert_prefetch_degraded_contract
+assert_order \
+	"11g: GH#37854 starved prefetch is promoted ahead of early dispatch" \
+	'_run_promoted_prefetch_if_starved "\$_pflt_timeout"' \
+	'_pulse_run_budget_priority_stage "preflight_early_dispatch"' \
+	"$ENGINE"
+assert_grep \
+	"11g2: GH#37854 promotion is gated on the snapshot starvation bound" \
+	'_preflight_prefetch_starved \|\| return 0' \
+	"$ENGINE"
+assert_grep \
+	"11h: GH#37854 end-of-preflight prefetch skips a cycle that already ran it" \
+	'_PULSE_PREFETCH_RAN:-0\}" != "1"' \
+	"$ENGINE"
+
+assert_ownership_deadline_contract
+assert_stage_cycle_budget_contract
+assert_dispatch_cycle_budget_contract
+assert_interrupted_dispatch_progress_contract
 
 # --- Summary ---
 

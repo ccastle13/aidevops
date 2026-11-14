@@ -359,6 +359,10 @@ _config_env_map() {
 	orchestration.provider_account_slot_multiplier) echo "PULSE_PROVIDER_ACCOUNT_SLOT_MULTIPLIER" ;;
 	orchestration.triage_known_contributors) echo "AIDEVOPS_TRIAGE_KNOWN_CONTRIBUTORS" ;;
 	orchestration.triage_refresh_interval_seconds) echo "AIDEVOPS_TRIAGE_REFRESH_INTERVAL_SECONDS" ;;
+	keywords.monthly_budget_usd) echo "AIDEVOPS_KEYWORDS_MONTHLY_BUDGET_USD" ;;
+	keywords.hub_slug) echo "AIDEVOPS_KEYWORDS_HUB_SLUG" ;;
+	keywords.hub_path) echo "AIDEVOPS_KEYWORDS_HUB_PATH" ;;
+	keywords.dataforseo_estimate_usd) echo "AIDEVOPS_KEYWORDS_DATAFORSEO_ESTIMATE_USD" ;;
 	*) echo "" ;;
 	esac
 	return 0
@@ -708,6 +712,17 @@ _cmd_set_get_default_type() {
 	return 0
 }
 
+# Print the JSON Schema "type" declared for a dotpath (e.g. "integer" or
+# "number"), or nothing when the schema is unavailable or omits the key.
+_cmd_set_schema_type() {
+	local dotpath="$1"
+	[[ -r "$JSONC_SCHEMA" ]] || return 0
+	jq -r --arg p "$dotpath" \
+		'getpath(($p | split(".") | map(["properties", .]) | add) + ["type"]) // empty | strings' \
+		"$JSONC_SCHEMA" 2>/dev/null || true
+	return 0
+}
+
 # Validate that $value is compatible with $default_type (boolean/number/string).
 # Returns 0 if valid, 1 if not.
 _cmd_set_validate_value_type() {
@@ -727,8 +742,16 @@ _cmd_set_validate_value_type() {
 		fi
 		;;
 	number)
-		if ! [[ "$value" =~ ^[0-9]+$ ]]; then
-			echo "[ERROR] Config '$dotpath' expects a number, got: $value" >&2
+		# GH#33581: jq reports every default as "number", so the schema decides
+		# whether decimals are allowed. Integer keys, or keys whose schema type
+		# is unknown, stay integer-only.
+		if [[ "$(_cmd_set_schema_type "$dotpath")" == "number" ]]; then
+			if ! [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+				echo "[ERROR] Config '$dotpath' expects a number, got: $value" >&2
+				return 1
+			fi
+		elif ! [[ "$value" =~ ^[0-9]+$ ]]; then
+			echo "[ERROR] Config '$dotpath' expects an integer, got: $value" >&2
 			return 1
 		fi
 		;;

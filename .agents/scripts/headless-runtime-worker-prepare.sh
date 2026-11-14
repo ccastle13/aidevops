@@ -22,6 +22,14 @@
 # Include guard
 [[ -n "${_HEADLESS_RUNTIME_WORKER_PREPARE_LIB_LOADED:-}" ]] && return 0
 _HEADLESS_RUNTIME_WORKER_PREPARE_LIB_LOADED=1
+# shellcheck source=./project-node-runtime.sh
+source "${BASH_SOURCE[0]%/*}/project-node-runtime.sh"
+# GH#33993: shared systemd user-manager probe for detached worker isolation.
+# shellcheck source=./pulse-dispatch-worker-systemd.sh
+source "${BASH_SOURCE[0]%/*}/pulse-dispatch-worker-systemd.sh"
+# Shared transient-scope launcher, also used by detached routines (GH#35760).
+# shellcheck source=./systemd-scope-launch.sh
+source "${BASH_SOURCE[0]%/*}/systemd-scope-launch.sh"
 : "${_HRW_ROLE_WORKER:=worker}"
 _HRW_PR_REPAIR_OWNERSHIP_LINKED_ISSUE="linked-issue"
 
@@ -44,8 +52,28 @@ _hrw_permission_pending_path() {
 _hrw_mark_runtime_launch_started() {
 	local session_key="$1"
 	local runtime="$2"
+	# This records intent before spawn, not proof that a runtime session exists.
 	_WORKER_RUNTIME_LAUNCH_STARTED=1
 	print_info "[lifecycle] pre_runtime_launch session=${session_key} runtime=${runtime} pid=$$"
+	return 0
+}
+
+# A spawn intent (or a persisted continuation ID) cannot consume an approval.
+# The result session ID comes from this invocation's output; activity snapshots
+# survive isolated OpenCode DB finalization and cover failed invocations too.
+_hrw_runtime_launch_confirmed() {
+	local activity_count="0"
+	[[ "${_WORKER_RUNTIME_LAUNCH_STARTED:-0}" == 1 ]] || return 1
+	[[ -n "${_run_metric_session_id:-}" ]] && return 0
+	# Isolated runs must not borrow shared-DB activity from other workers when
+	# isolation failed before spawn: require this attempt's live DB or snapshot.
+	if [[ "${AIDEVOPS_HEADLESS_AUTH_ISOLATION:-1}" == "1" &&
+		"${_WORKER_ATTEMPT_ACTIVITY_START_MS:-}" != "${_WORKER_START_EPOCH_MS:-0}" &&
+		! -f "${_WORKER_ISOLATED_DB_PATH:-}" ]]; then
+		return 1
+	fi
+	activity_count=$(_hrff_worker_session_count)
+	[[ "$activity_count" =~ ^[0-9]+$ && "$activity_count" -gt 0 ]] || return 1
 	return 0
 }
 
@@ -60,6 +88,19 @@ _hrw_ownership_log() {
 	*) return 1 ;;
 	esac
 	return 0
+}
+
+_hrw_verify_checkpoint_target() {
+	local ownership_helper="$1"
+	shift
+	local -a checkpoint_args=("$@")
+	# Keep legacy calls unchanged; transferred checkpoints carry the original
+	# author separately from the replacement issue owner.
+	if [[ -n "${AIDEVOPS_PR_CHECKPOINT_AUTHOR:-}" ]]; then
+		checkpoint_args+=("$AIDEVOPS_PR_CHECKPOINT_AUTHOR")
+	fi
+	"$ownership_helper" verify-pr-checkpoint-target "${checkpoint_args[@]}"
+	return $?
 }
 
 #######################################
@@ -102,6 +143,11 @@ _hrw_verify_dispatch_ownership() {
 		local target_rc=0
 		if [[ -n "$repair_linked_issue" ]]; then
 			local expected_assignee="${AIDEVOPS_PR_REPAIR_ISSUE_ASSIGNEE:-}"
+			if [[ ! "${AIDEVOPS_PR_CHECKPOINT_ADMISSION_MODE:-}" =~ ^(automatic|revision)$ ||
+				-z "${AIDEVOPS_DISPATCH_LEASE_TOKEN:-}" || -z "${AIDEVOPS_PR_CHECKPOINT_SESSION:-}" ]]; then
+				_hrw_ownership_log error "incomplete claimed checkpoint admission contract"
+				return 1
+			fi
 			if [[ -n "$repair_ownership_mode" ]]; then
 				_hrw_ownership_log error "conflicting PR checkpoint ownership mode issue=${issue_number} pr=${repair_pr_number} mode=${repair_ownership_mode}"
 				return 1
@@ -114,7 +160,7 @@ _hrw_verify_dispatch_ownership() {
 				_hrw_ownership_log error "incomplete PR checkpoint assignee contract issue=${issue_number} expected=${expected_assignee:-missing} worker=${WORKER_GITHUB_LOGIN:-missing}"
 				return 1
 			fi
-			target_output=$("$ownership_helper" verify-pr-checkpoint-target \
+			target_output=$(_hrw_verify_checkpoint_target "$ownership_helper" \
 				"$repair_pr_number" "$repo_slug" "$expected_head_sha" "$expected_head_ref" \
 				"$repair_linked_issue" "$expected_assignee" 2>&1) || target_rc=$?
 			if [[ "$target_rc" -ne 0 ]]; then
@@ -261,7 +307,8 @@ _hrw_prepare_role_context() {
 		unset WORKER_ISSUE_NUMBER WORKER_REPO_SLUG WORKER_WORKTREE_PATH \
 			WORKER_GITHUB_LOGIN WORKER_SESSION_KEY AIDEVOPS_WORKER_GITHUB_LOGIN \
 			DISPATCH_REPO_SLUG AIDEVOPS_DISPATCH_LEASE_TOKEN \
-			AIDEVOPS_DISPATCH_LEASE_DEVICE AIDEVOPS_ATTEMPT_ID \
+			AIDEVOPS_PR_CHECKPOINT_SESSION AIDEVOPS_PR_CHECKPOINT_AUTHOR AIDEVOPS_PR_CHECKPOINT_ADMISSION_MODE \
+			AIDEVOPS_DISPATCH_LEASE_DEVICE AIDEVOPS_DISPATCH_LEASE_SESSION AIDEVOPS_ATTEMPT_ID \
 			AIDEVOPS_PARENT_WORKER_ID AIDEVOPS_ROOT_WORKER_ID AIDEVOPS_WORKER_ID \
 			AIDEVOPS_PERMISSION_GRANT_FILE AIDEVOPS_PERMISSION_REQUEST_ID \
 			AIDEVOPS_WORKTREE_OWNER_PID AIDEVOPS_WORKTREE_OWNER_SESSION \
@@ -299,6 +346,29 @@ _hrw_prepare_permission_grant_path() {
 	[[ -n "${AIDEVOPS_PERMISSION_REQUEST_ID:-}" && -n "$issue_number" && -n "$repo_slug" ]] || return 0
 	permission_grant_slug=$(printf '%s' "$repo_slug" | tr '/:' '__')
 	export AIDEVOPS_PERMISSION_GRANT_FILE="${HOME}/.aidevops/permission-grants/${permission_grant_slug}/${issue_number}.json"
+	return 0
+}
+
+# Select the project-required Node for this worker and publish it for tool
+# shells. OpenCode tool shells do not inherit this process PATH; the plugin
+# shell.env hook re-applies the selection from AIDEVOPS_PROJECT_NODE_BIN
+# (GH#33290). _project_node_bin rc 0 with no output means the active node
+# already satisfies; rc 1 is a fatal environment failure.
+_hrw_prepare_project_node() {
+	local work_dir="$1"
+	local node_bin="" node_rc=0 selected_node=""
+	node_bin=$(_project_node_bin "$work_dir" ".") || node_rc=$?
+	if [[ "$node_rc" -eq 1 ]]; then
+		_WORKER_PRELAUNCH_FAILURE_REASON="project_node_environment_failure"
+		return 1
+	fi
+	[[ -n "$node_bin" ]] && export PATH="${node_bin}:$PATH"
+	[[ "$node_rc" -eq 0 ]] && selected_node=$(command -v node 2>/dev/null || true)
+	if [[ "$selected_node" == /* ]]; then
+		export AIDEVOPS_PROJECT_NODE_BIN="${selected_node%/*}"
+	else
+		unset AIDEVOPS_PROJECT_NODE_BIN 2>/dev/null || true
+	fi
 	return 0
 }
 
@@ -368,6 +438,7 @@ _cmd_run_prepare() {
 		WORKER_TARGET_BRANCH=$(git -C "$work_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
 		export WORKER_TARGET_BRANCH
 		_hrw_claim_worker_worktree "$session_key" "$work_dir" || return 1
+		_hrw_prepare_project_node "$work_dir" || return 1
 	else
 		unset _WORKER_WORKTREE_PATH WORKER_TARGET_BRANCH 2>/dev/null || true
 	fi
@@ -380,12 +451,19 @@ _cmd_run_prepare() {
 				_WORKER_PRELAUNCH_FAILURE_REASON="worker_ledger_ready_failed"
 				return 1
 			fi
+			# GH#34901: the claim's lease session (issue-N for manual dispatch)
+			# may differ from the runtime session; the ledger keeps session_key.
 			if ! "${SCRIPT_DIR}/dispatch-claim-helper.sh" transition ready "$WORKER_ISSUE_NUMBER" \
-				"$DISPATCH_REPO_SLUG" "$AIDEVOPS_DISPATCH_LEASE_TOKEN" "$session_key" \
+				"$DISPATCH_REPO_SLUG" "$AIDEVOPS_DISPATCH_LEASE_TOKEN" "${AIDEVOPS_DISPATCH_LEASE_SESSION:-$session_key}" \
 				"${AIDEVOPS_DISPATCH_READY_LEASE_TTL:-7200}" 2>/dev/null; then
 				_WORKER_PRELAUNCH_FAILURE_REASON="worker_claim_ready_transition_failed"
 				return 1
 			fi
+			# GH#36646: checkpoint-only, non-fatal; ordinary workers are a no-op.
+			# shellcheck source=./terminal-lease-recovery.sh
+			source "${SCRIPT_DIR}/terminal-lease-recovery.sh"
+			_terminal_lease_record_ready "$WORKER_ISSUE_NUMBER" "$DISPATCH_REPO_SLUG" \
+				"${AIDEVOPS_DISPATCH_LEASE_SESSION:-$session_key}"
 		fi
 	fi
 	return 0
@@ -417,8 +495,11 @@ _cmd_run_prepare_retry() {
 		return 0
 	fi
 
+	# GH#36698: model_unavailable was backed off for this model only, so the
+	# exact-tier reselection below picks the next same-tier candidate.
 	if [[ "$_run_failure_reason" != "access_denied" && "$_run_failure_reason" != "auth_error" && "$_run_failure_reason" != "rate_limit" && \
-		"$_run_failure_reason" != "provider_error" && "$_run_failure_reason" != "startup_no_model_activity" ]]; then
+		"$_run_failure_reason" != "provider_error" && "$_run_failure_reason" != "model_unavailable" && \
+		"$_run_failure_reason" != "startup_no_model_activity" ]]; then
 		_cmd_run_finish "$session_key" "$_HRW_STATUS_FAIL"
 		return "$attempt_exit"
 	fi
@@ -434,21 +515,99 @@ _cmd_run_prepare_retry() {
 	return 0
 }
 
+#######################################
+# Launch a detached worker in its own systemd user scope (GH#33993).
+# A plain background subshell stays in the caller's cgroup, so a pulse unit
+# with KillMode=control-group kills manually dispatched and CI-repair workers
+# when it stops or hits TimeoutStartSec. The shared launcher never starts a
+# second copy: an early exit is reported through the caller's readiness check
+# with systemd-run's error preserved in the worker log.
+# Args: $1 = session key, $2 = log file, $3.. = worker command
+# Output: worker PID
+# Returns: 0 always once launched; isolation evidence is logged
+#######################################
+_hrw_detach_systemd_scope() {
+	local session_key="$1"
+	local log_file="$2"
+	shift 2
+	local scope_name="" launch_result="" worker_pid="" isolation=""
+	scope_name="aidevops-worker-$(printf '%s' "$session_key" | tr -c 'A-Za-z0-9_.-' '-')-$$-${RANDOM:-0}"
+	launch_result=$(systemd_scope_launch "$scope_name" "aidevops worker ${session_key}" "$log_file" "$@")
+	worker_pid="${launch_result%% *}"
+	isolation="${launch_result#* }"
+	if [[ "$isolation" == "systemd_scope" ]]; then
+		print_info "[lifecycle] worker_detached session=${session_key} pid=${worker_pid} isolation=systemd_scope unit=${scope_name}.scope" >&2
+	else
+		print_warning "[lifecycle] worker_detach_unconfirmed session=${session_key} pid=${worker_pid} unit=${scope_name}.scope log=${log_file}" >&2
+	fi
+	printf '%s\n' "$worker_pid"
+	return 0
+}
+
+#######################################
+# Create the detached worker log in the managed per-user temp root (GH#34556).
+# The root is AIDEVOPS_TEMP_DIR as set by aidevops_init_temp_workspace, so
+# AIDEVOPS_WORKSPACE_DIR is the caller-approved override. There is no host /tmp
+# fallback. Logs stay flat in the root so system-cleanup.sh ages each file.
+# mktemp creates the file exclusively with mode 600: a planted symlink is never
+# followed and repeated attempts for one session key never truncate each other.
+# Pulse-side callers (revised checkpoint dispatch, PR review launch) are not
+# managed session entry points, so an unset root is initialised here from the
+# same contract. An explicitly set but unusable root still fails closed.
+# Args: $1 = session key
+# Output: absolute log path
+# Returns: 0 created, 1 unusable root (caller must not spawn)
+#######################################
+_hrw_create_detached_log() {
+	local session_key="$1"
+	local root="${AIDEVOPS_TEMP_DIR:-}"
+	local safe_key="" log_file=""
+	if [[ -z "$root" ]]; then
+		if ! declare -F aidevops_init_temp_workspace >/dev/null 2>&1; then
+			# shellcheck source=./shared-temp-workspace.sh
+			source "${BASH_SOURCE[0]%/*}/shared-temp-workspace.sh" || return 1
+		fi
+		aidevops_init_temp_workspace || return 1
+		root="${AIDEVOPS_TEMP_DIR:-}"
+	fi
+	if [[ "$root" != /* || -L "$root" || ! -d "$root" || ! -O "$root" || ! -w "$root" ]]; then
+		print_error "Detached worker log root is unusable: ${root:-<unset>} (must be an owned, writable, non-symlink directory; set AIDEVOPS_WORKSPACE_DIR to an approved location)"
+		return 1
+	fi
+	# Session keys are caller-supplied; keep the name inside the root.
+	safe_key=$(printf '%s' "$session_key" | tr -c 'A-Za-z0-9_.-' '-')
+	safe_key="${safe_key:0:96}"
+	log_file=$(mktemp "${root}/worker-${safe_key}.log.XXXXXX") || {
+		print_error "Could not create detached worker log in ${root}"
+		return 1
+	}
+	printf '%s\n' "$log_file"
+	return 0
+}
+
 _detach_worker() {
 	local session_key="$1"
 	shift
-	local log_file="/tmp/worker-${session_key}.log"
-	print_info "Detaching worker (log: $log_file)"
-	(
-		exec </dev/null >"$log_file" 2>&1
-		local -a filtered_args=()
-		for arg in "$@"; do
-			[[ "$arg" == "--detach" ]] && continue
-			filtered_args+=("$arg")
-		done
-		"$0" run "${filtered_args[@]}"
-	) &
-	local child_pid=$!
+	local log_file=""
+	local arg="" child_pid=""
+	local -a run_command=("$0" run)
+	for arg in "$@"; do
+		[[ "$arg" == "--detach" ]] && continue
+		run_command+=("$arg")
+	done
+	log_file=$(_hrw_create_detached_log "$session_key") || return 1
+	# Contract line: dispatch-single-issue-tracking.sh reads the runtime log
+	# path from it. Plain printf keeps the path byte-exact (no echo -e).
+	printf '[INFO] Detaching worker (log: %s)\n' "$log_file" >&2
+	if _dlw_systemd_user_service_available; then
+		child_pid=$(_hrw_detach_systemd_scope "$session_key" "$log_file" "${run_command[@]}")
+	elif command -v setsid >/dev/null 2>&1; then
+		setsid "${run_command[@]}" </dev/null >>"$log_file" 2>&1 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- &
+		child_pid=$!
+	else
+		"${run_command[@]}" </dev/null >>"$log_file" 2>&1 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- &
+		child_pid=$!
+	fi
 	print_info "Dispatched PID: $child_pid"
 	return 0
 }

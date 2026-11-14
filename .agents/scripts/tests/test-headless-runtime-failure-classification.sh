@@ -76,6 +76,26 @@ check_classification() {
 
 echo "${TEST_BLUE}=== headless runtime failure classification tests ===${TEST_NC}"
 
+# Record only positively classified zero-activity failures, not general failures.
+_HRFF_RUNNER_HEALTH_HELPER_OVERRIDE="$FIXTURE_DIR/health-helper"
+export _HRFF_RUNNER_HEALTH_HELPER_OVERRIDE
+# shellcheck disable=SC2016 # Variables are expanded by the fixture at runtime.
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "$*" >>"$FIXTURE_HEALTH_LOG"' >"$_HRFF_RUNNER_HEALTH_HELPER_OVERRIDE"
+chmod +x "$_HRFF_RUNNER_HEALTH_HELPER_OVERRIDE"
+export FIXTURE_HEALTH_LOG="$FIXTURE_DIR/health.log"
+_hrff_record_runner_health_failure issue-123 crash_during_startup
+_hrff_record_runner_health_failure issue-123 worker_noop_zero_output
+_hrff_record_runner_health_failure issue-123 crash_during_execution
+assert_eq "only zero-activity startup outcomes recorded" "2" "$(wc -l <"$FIXTURE_HEALTH_LOG" | tr -d ' ')"
+# GH#37597: a fresh dispatch's signing failure keeps the trip-at-1 signal; a
+# continuation after an attempt with activity is recorded audit-only.
+: >"$FIXTURE_HEALTH_LOG"
+_HRW_PRIOR_ATTEMPT_ACTIVITY=0 _hrff_record_runner_health_failure issue-123 worker_signing_unavailable
+_HRW_PRIOR_ATTEMPT_ACTIVITY=1 _hrff_record_runner_health_failure issue-123 worker_signing_unavailable
+assert_eq "signing outcome attribution follows prior attempt activity" \
+	"worker_signing_unavailable|worker_signing_unavailable_after_activity" \
+	"$(cut -d' ' -f2 "$FIXTURE_HEALTH_LOG" | paste -sd'|' -)"
+
 check_classification \
 	"openai_rate_limit" \
 	'{"provider":"openai","error":{"type":"rate_limit","message":"Too many requests"},"status":429}' \
@@ -271,6 +291,26 @@ _hrff_write_external_outcome "pr-review-thread-response-owner-repo-1" "worker_no
 assert_eq "external outcome rejects destination symlink" "1" "$OUTCOME_WRITE_RC"
 assert_eq "external outcome symlink target remains unchanged" "unchanged" "$(<"$OUTCOME_TARGET")"
 unset _WORKER_EXTERNAL_OUTCOME_FILE _WORKER_EXTERNAL_OUTCOME_ID
+
+# t18608: worker-side first failure flags enrichment_needed (allow-listed reasons only)
+FF_STATE="$HOME/.aidevops/.agent-workspace/supervisor/fast-fail-counter.json"
+escalate_issue_tier() { return 0; }
+print_info() { return 0; }
+DISPATCH_REPO_SLUG="owner/repo"
+_report_failure_to_fast_fail "issue-owner-repo-901" "worker_noop_zero_output" "" >/dev/null 2>&1
+assert_eq "first noop failure sets enrichment_needed" "true" \
+	"$(jq -r '.["owner/repo/901"].enrichment_needed // "unset"' "$FF_STATE")"
+_report_failure_to_fast_fail "issue-owner-repo-902" "worker_post_pr_handoff_unverified" "" >/dev/null 2>&1
+assert_eq "post-PR handoff failure does not set enrichment_needed" "unset" \
+	"$(jq -r '.["owner/repo/902"].enrichment_needed // "unset"' "$FF_STATE")"
+jq '.["owner/repo/901"] |= (.enrichment_needed = false | .enrichment_done = true)' "$FF_STATE" >"$FF_STATE.new" && mv "$FF_STATE.new" "$FF_STATE"
+_fast_fail_write_state "$FF_STATE" "$(dirname "$FF_STATE")" "owner/repo/901" 1 "$(date +%s)" worker_failed 0 600 "" true
+assert_eq "enrichment_done entry is never re-flagged" "false" \
+	"$(jq -r '.["owner/repo/901"].enrichment_needed' "$FF_STATE")"
+_report_failure_to_fast_fail "issue-owner-repo-902" "worker_failed" "" >/dev/null 2>&1
+assert_eq "second failure (count 2) does not set enrichment_needed" "unset" \
+	"$(jq -r '.["owner/repo/902"].enrichment_needed // "unset"' "$FF_STATE")"
+unset DISPATCH_REPO_SLUG
 
 echo
 echo "${TEST_BLUE}=== Summary ===${TEST_NC}"

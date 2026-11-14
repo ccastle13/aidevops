@@ -89,6 +89,7 @@ print_result() {
 #   ruleset_review_malformed_response — REST reviews payload is not page arrays
 #   ruleset_review_malformed_element — a REST reviews page contains a non-object
 #   ruleset_review_fetch_error — REST reviews endpoint fails
+#   ruleset_review_local_deferral — local admission rejects the REST read
 #   rulesets_private_plan_unavailable — exact feature-unavailable 403 resolves
 #      to an empty repository-ruleset context set
 #   rulesets_generic_forbidden — generic 403 remains an API failure
@@ -99,9 +100,11 @@ setup_test_env() {
 	export PATH="${TEST_ROOT}/bin:${PATH}"
 	export LOGFILE="${TEST_ROOT}/pulse.log"
 	export GH_CALL_LOG="${TEST_ROOT}/gh-calls.log"
+	export GH_ROUTE_LOG="${TEST_ROOT}/gh-routes.log"
 	export MOCK_GH_MODE="all_pass"
 	: >"$LOGFILE"
 	: >"$GH_CALL_LOG"
+	: >"$GH_ROUTE_LOG"
 
 	cat >"${TEST_ROOT}/bin/gh" <<'EOF'
 #!/usr/bin/env bash
@@ -109,6 +112,7 @@ setup_test_env() {
 # Records every top-level invocation and returns canned REST responses for
 # branch-protection required-context verification.
 printf '%s\n' "$*" >>"${GH_CALL_LOG}"
+printf '%s|%s\n' "${AIDEVOPS_GH_ROUTE_DECISION:-}" "$*" >>"${GH_ROUTE_LOG}"
 
 apply_jq() {
 	local json="$1"
@@ -133,7 +137,10 @@ apply_jq() {
 if [[ "$1" == "api" && "$2" == repos/* && "$*" == *"/rulesets/"* ]]; then
 	branch_identity='"id":101,"target":"branch","enforcement":"active"'
 	case "${MOCK_GH_MODE:-all_pass}" in
-	ruleset_review_only_missing | ruleset_review_only_approved | ruleset_review_latest_changes_requested | ruleset_review_paginated_approved | ruleset_review_author_only | ruleset_review_malformed_response | ruleset_review_malformed_element | ruleset_review_fetch_error)
+	classic404_union)
+		apply_jq "{${branch_identity},\"conditions\":{\"ref_name\":{\"include\":[\"refs/heads/main\"]}},\"rules\":[{\"type\":\"required_status_checks\",\"parameters\":{\"required_status_checks\":[{\"context\":\"required-c\"}]}}]}" "$@"
+		;;
+	ruleset_review_only_missing | ruleset_review_only_approved | ruleset_review_latest_changes_requested | ruleset_review_paginated_approved | ruleset_review_author_only | ruleset_review_malformed_response | ruleset_review_malformed_element | ruleset_review_fetch_error | ruleset_review_local_deferral)
 		apply_jq "{${branch_identity},\"conditions\":{\"ref_name\":{\"include\":[\"refs/heads/main\"]}},\"rules\":[{\"type\":\"pull_request\",\"parameters\":{\"required_approving_review_count\":1,\"dismiss_stale_reviews_on_push\":false,\"require_last_push_approval\":false}}]}" "$@"
 		;;
 	ruleset_review_stale_head_dismiss | ruleset_review_current_head_dismissed)
@@ -163,6 +170,9 @@ fi
 
 if [[ "$1" == "api" && "$2" == repos/* && "$*" == *"/rulesets"* ]]; then
 	case "${MOCK_GH_MODE:-all_pass}" in
+	classic404_union)
+		apply_jq '[{"id":101,"enforcement":"active","target":"branch"}]' "$@"
+		;;
 	rulesets_private_plan_unavailable)
 		printf '%s\n' 'gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)' >&2
 		exit 1
@@ -171,7 +181,7 @@ if [[ "$1" == "api" && "$2" == repos/* && "$*" == *"/rulesets"* ]]; then
 		printf '%s\n' 'gh: HTTP 403: Resource not accessible by integration' >&2
 		exit 1
 		;;
-	ruleset_review_only_missing | ruleset_review_only_approved | ruleset_mixed_review_status | ruleset_review_zero | ruleset_review_malformed_optional | ruleset_review_latest_changes_requested | ruleset_review_paginated_approved | ruleset_review_author_only | ruleset_review_malformed_response | ruleset_review_malformed_element | ruleset_review_fetch_error | ruleset_review_stale_head_dismiss | ruleset_review_current_head_last_push | ruleset_review_current_head_dismissed | ruleset_review_unknown_freshness)
+	ruleset_review_only_missing | ruleset_review_only_approved | ruleset_mixed_review_status | ruleset_review_zero | ruleset_review_malformed_optional | ruleset_review_latest_changes_requested | ruleset_review_paginated_approved | ruleset_review_author_only | ruleset_review_malformed_response | ruleset_review_malformed_element | ruleset_review_fetch_error | ruleset_review_local_deferral | ruleset_review_stale_head_dismiss | ruleset_review_current_head_last_push | ruleset_review_current_head_dismissed | ruleset_review_unknown_freshness)
 		apply_jq '[{"id":101,"enforcement":"active","target":"branch"}]' "$@"
 		;;
 	*)
@@ -202,7 +212,7 @@ if [[ "$1" == "api" && "$2" == repos/*/pulls/*/reviews* ]]; then
 		printf '%s\n' '[[{"id":6,"state":"APPROVED","commit_id":"abc123def456789000000000000000000000abcd","submitted_at":"2026-06-03T00:00:00Z","user":{"login":"reviewer"}},{"id":7,"state":"DISMISSED","commit_id":"abc123def456789000000000000000000000abcd","submitted_at":"2026-06-04T00:00:00Z","user":{"login":"reviewer"}}]]'
 		;;
 	ruleset_review_author_only)
-		printf '%s\n' '[[{"id":1,"state":"APPROVED","submitted_at":"2026-06-01T00:00:00Z","user":{"login":"author"}}]]'
+		printf '%s\n' '[[{"id":1,"state":"APPROVED","body":"PRIVATE-REVIEW-BODY","submitted_at":"2026-06-01T00:00:00Z","user":{"login":"author"}}]]'
 		;;
 	ruleset_review_malformed_response)
 		printf '%s\n' '{"reviews":[]}'
@@ -213,6 +223,10 @@ if [[ "$1" == "api" && "$2" == repos/*/pulls/*/reviews* ]]; then
 	ruleset_review_fetch_error)
 		printf 'gh: mock reviews endpoint error\n' >&2
 		exit 1
+		;;
+	ruleset_review_local_deferral)
+		printf '%s\n' '[gh-transport] error_kind=github-api-read-deferred attempted=false deferred_by=local_admission route=pulse-ruleset-reviews-rest' >&2
+		exit 75
 		;;
 	*)
 		printf '%s\n' '[[]]'
@@ -229,6 +243,27 @@ fi
 
 if [[ "$1" == "api" && "$*" == *"protection/required_status_checks"* ]]; then
 	case "${MOCK_GH_MODE:-all_pass}" in
+	classic404_*)
+		if [[ "${MOCK_CLASSIC_PRIVATE_PLAN:-false}" == true ]]; then
+			printf '%s\n' 'gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)' >&2
+		elif [[ "${MOCK_CLASSIC_BODY_ONLY:-false}" == true ]]; then
+			# GH#36866: transport dropped stderr; only the JSON body remains.
+			printf '%s\n' '{"message":"Branch not protected","status":"404"}'
+		elif [[ "${MOCK_CLASSIC_REAL_404:-false}" == true ]]; then
+			# GH#37026: native gh shape — JSON body on stdout, status on stderr.
+			printf '%s' '{"message":"Branch not protected","documentation_url":"https://docs.github.com/rest","status":"404"}'
+			printf '%s\n' 'gh: Branch not protected (HTTP 404)' >&2
+		elif [[ "${MOCK_CLASSIC_UNCLASSIFIED:-false}" == true ]]; then
+			# GH#37026: a transport layer failed without any 404 marker.
+			printf '%s\n' 'gh: mock transport failure' >&2
+		elif [[ "${MOCK_CLASSIC_DEFERRED:-false}" == true ]]; then
+			printf '%s\n' '[gh-transport] error_kind=github-api-read-deferred attempted=false deferred_by=local_admission retry_at=unknown reason="mock"' >&2
+			exit 75
+		else
+			printf '%s\n' 'gh: HTTP 404: Not Found' >&2
+		fi
+		exit 1
+		;;
 	empty_required | empty_required_pending_fallback | empty_required_stale_maintainer_gate_fallback | empty_required_current_pending_maintainer_gate_fallback)
 		apply_jq '{"contexts":[]}' "$@"
 		exit 0
@@ -244,6 +279,22 @@ if [[ "$1" == "api" && "$*" == *"protection/required_status_checks"* ]]; then
 	esac
 fi
 
+if [[ "$1" == "api" && "$2" == repos/*/branches/main ]]; then
+	case "${MOCK_GH_MODE:-all_pass}" in
+	classic404_unprotected) apply_jq '{"protected":false}' "$@" ;;
+	classic404_unknown) apply_jq '{"protected":true}' "$@" ;;
+	classic404_malformed) apply_jq '{"protected":true,"protection":{"required_status_checks":{"contexts":"required-a"}}}' "$@" ;;
+	classic404_false_contexts) apply_jq '{"protected":true,"protection":{"required_status_checks":{"contexts":false,"checks":[]}}}' "$@" ;;
+	classic404_false_checks) apply_jq '{"protected":true,"protection":{"required_status_checks":{"contexts":[],"checks":false}}}' "$@" ;;
+	classic404_checks_only) apply_jq '{"protected":true,"protection":{"required_status_checks":{"checks":[{"context":"required-b"}]}}}' "$@" ;;
+	classic404_unavailable)
+		printf '%s\n' 'gh: HTTP 503: Service Unavailable' >&2
+		exit 1 ;;
+	classic404_*) apply_jq '{"protected":true,"protection":{"required_status_checks":{"contexts":["required-a"],"checks":[{"context":"required-b","app_id":1}]}}}' "$@" ;;
+	esac
+	exit 0
+fi
+
 if [[ "$1" == "pr" && "$2" == "view" && "$*" == *"headRefOid"* ]]; then
 	apply_jq '{"headRefOid":"abc123def456789000000000000000000000abcd"}' "$@"
 	exit 0
@@ -252,7 +303,7 @@ fi
 if [[ "$1" == "api" && "$*" == *"/check-runs"* ]]; then
 	local_json=""
 	case "${MOCK_GH_MODE:-all_pass}" in
-	all_pass | empty_required)
+	all_pass | empty_required | classic404_pass)
 		local_json='{"check_runs":[
 			{"name":"required-a","conclusion":"success","status":"completed"},
 			{"name":"required-b","conclusion":"success","status":"completed"},
@@ -265,7 +316,7 @@ if [[ "$1" == "api" && "$*" == *"/check-runs"* ]]; then
 			{"name":"Complexity Analysis","conclusion":"success","status":"completed"}
 		]}'
 		;;
-	one_fail)
+	one_fail | classic404_fail)
 		local_json='{"check_runs":[
 			{"name":"required-a","conclusion":"success","status":"completed"},
 			{"name":"required-b","conclusion":"failure","status":"completed"}
@@ -283,7 +334,7 @@ if [[ "$1" == "api" && "$*" == *"/check-runs"* ]]; then
 			{"name":"required-b","conclusion":"action_required","status":"completed"}
 		]}'
 		;;
-	pending_only)
+	pending_only | classic404_pending)
 		local_json='{"check_runs":[
 			{"name":"required-a","conclusion":null,"status":"in_progress"},
 			{"name":"required-b","conclusion":"success","status":"completed"}
@@ -800,6 +851,13 @@ test_ruleset_review_only_missing_blocks_merge() {
 	assert_ruleset_review_gate_returns 1 "ruleset-only missing approval → merge blocked (GH#24577)"
 	assert_log_contains "0/1 ruleset-required approval" \
 		"ruleset-only missing approval: skip reason logged"
+	assert_log_contains "diagnostic transport=success pages=1 reviews=0 state_changing=0 expected_head_state_changing=0 payload_bytes=4" \
+		"ruleset-only missing approval: privacy-safe response shape logged"
+	if grep -Fq -- "pulse-ruleset-reviews-rest|api repos/marcusquinn/aidevops/pulls/19023/reviews?per_page=100 --paginate --slurp" "$GH_ROUTE_LOG"; then
+		print_result "ruleset review fetch has stable REST route attribution" 0
+	else
+		print_result "ruleset review fetch has stable REST route attribution" 1 "Expected pulse-ruleset-reviews-rest attribution"
+	fi
 	return 0
 }
 
@@ -891,6 +949,11 @@ test_ruleset_author_approval_does_not_count() {
 	: >"$LOGFILE"
 	export MOCK_GH_MODE="ruleset_review_author_only"
 	assert_ruleset_review_gate_returns 1 "PR author approval does not satisfy ruleset"
+	if grep -Fq -- "PRIVATE-REVIEW-BODY" "$LOGFILE"; then
+		print_result "ruleset review diagnostics omit review bodies" 1 "Private fixture body leaked into diagnostics"
+	else
+		print_result "ruleset review diagnostics omit review bodies" 0
+	fi
 	return 0
 }
 
@@ -921,6 +984,24 @@ test_ruleset_review_fetch_error_fails_closed() {
 	assert_ruleset_review_gate_returns 1 "REST review fetch error fails closed"
 	assert_log_contains "review fetch failed" \
 		"REST review fetch error: failure logged"
+	return 0
+}
+
+test_ruleset_review_local_deferral_propagates_diagnostic() {
+	: >"$GH_CALL_LOG"
+	: >"$LOGFILE"
+	export MOCK_GH_MODE="ruleset_review_local_deferral"
+	local actual_rc=0 diagnostics=""
+	diagnostics=$(_check_ruleset_required_reviews_passing "marcusquinn/aidevops" "19023" "author" "abc123def456789000000000000000000000abcd" 2>&1) || actual_rc=$?
+	if [[ "$actual_rc" -ne 1 ]]; then
+		print_result "ruleset review local deferral fails closed" 1 "Expected rc=1, got rc=${actual_rc}"
+	elif [[ "$diagnostics" != *"error_kind=github-api-read-deferred attempted=false deferred_by=local_admission"* ]]; then
+		print_result "ruleset review local deferral propagates admission diagnostic" 1 "Missing authoritative local-deferral diagnostic"
+	else
+		print_result "ruleset review local deferral propagates admission diagnostic" 0
+	fi
+	assert_log_contains "transport=failed" \
+		"ruleset review local deferral records failed transport without raw response"
 	return 0
 }
 
@@ -983,6 +1064,161 @@ test_rulesets_generic_forbidden_fails_closed() {
 	return 0
 }
 
+test_classic_settings_404_branch_evidence() {
+	local mode="" contexts="" rc=0 expected="" expected_rc=0 first="" second=""
+	for mode in pass pending fail union checks_only unprotected unknown malformed false_contexts false_checks unavailable; do
+		export MOCK_GH_MODE="classic404_${mode}"
+		rc=0
+		contexts=$(_required_contexts_for_default_branch "owner/repo") || rc=$?
+		expected_rc=0
+		case "$mode" in
+		pass | pending | fail) expected=$'required-a\nrequired-b' ;;
+		union) expected=$'required-a\nrequired-b\nrequired-c' ;;
+		checks_only) expected="required-b" ;;
+		unprotected) expected="" ;;
+		*) expected=""; expected_rc=1 ;;
+		esac
+		if [[ "$contexts" == "$expected" && "$rc" -eq "$expected_rc" ]]; then
+			print_result "classic settings 404: ${mode} preserves branch evidence" 0
+		else
+			print_result "classic settings 404: ${mode} preserves branch evidence" 1 "rc=${rc} contexts=${contexts}"
+		fi
+	done
+	export MOCK_GH_MODE="classic404_pass"
+	assert_passing_check_returns 0 "protected branch with settings 404 and passing checks allows merge"
+	export MOCK_GH_MODE="classic404_pending"
+	assert_passing_check_returns 1 "protected branch with settings 404 and pending checks blocks merge"
+	export MOCK_GH_MODE="classic404_fail"
+	assert_passing_check_returns 1 "protected branch with settings 404 and failing checks blocks merge"
+
+	mkdir -p "${TEST_ROOT}/contexts-cache"
+	export AIDEVOPS_PULSE_REQUIRED_CONTEXTS_CACHE_DIR="${TEST_ROOT}/contexts-cache"
+	for mode in unknown malformed false_contexts false_checks unavailable; do
+		export MOCK_GH_MODE="classic404_${mode}"
+		rc=0
+		contexts=$(_required_contexts_for_default_branch "owner/repo") || rc=$?
+		if [[ "$rc" -eq 1 && ! -f "${AIDEVOPS_PULSE_REQUIRED_CONTEXTS_CACHE_DIR}/owner_repo.rc" ]]; then
+			print_result "${mode} classic requirements are not cached as empty success" 0
+		else
+			print_result "${mode} classic requirements are not cached as empty success" 1
+		fi
+	done
+	export MOCK_GH_MODE="classic404_pass"
+	first=$(_required_contexts_for_default_branch "owner/repo")
+	export MOCK_GH_MODE="classic404_unavailable"
+	second=$(_required_contexts_for_default_branch "owner/repo")
+	if [[ "$first" == $'required-a\nrequired-b' && "$second" == "$first" ]]; then
+		print_result "cached fallback retains nonempty protected-branch requirements" 0
+	else
+		print_result "cached fallback retains nonempty protected-branch requirements" 1
+	fi
+	unset AIDEVOPS_PULSE_REQUIRED_CONTEXTS_CACHE_DIR
+	export MOCK_CLASSIC_PRIVATE_PLAN=true
+	for mode in pass unprotected unknown; do
+		export MOCK_GH_MODE="classic404_${mode}"
+		rc=0
+		contexts=$(_required_contexts_for_default_branch "owner/repo") || rc=$?
+		if [[ "$mode" == pass && "$rc" -eq 0 && "$contexts" == $'required-a\nrequired-b' ]] ||
+			[[ "$mode" == unprotected && "$rc" -eq 0 && -z "$contexts" ]] ||
+			[[ "$mode" == unknown && "$rc" -eq 1 && -z "$contexts" ]]; then
+			print_result "private-plan settings 403 preserves ${mode} branch evidence" 0
+		else
+			print_result "private-plan settings 403 preserves ${mode} branch evidence" 1
+		fi
+	done
+	unset MOCK_CLASSIC_PRIVATE_PLAN
+	export MOCK_CLASSIC_BODY_ONLY=true
+	for mode in pass unprotected; do
+		export MOCK_GH_MODE="classic404_${mode}"
+		rc=0
+		contexts=$(_required_contexts_for_default_branch "owner/repo") || rc=$?
+		if [[ "$mode" == pass && "$rc" -eq 0 && "$contexts" == $'required-a\nrequired-b' ]] ||
+			[[ "$mode" == unprotected && "$rc" -eq 0 && -z "$contexts" ]]; then
+			print_result "body-only 404 (stderr dropped) classified for ${mode} (GH#36866)" 0
+		else
+			print_result "body-only 404 (stderr dropped) classified for ${mode} (GH#36866)" 1
+		fi
+	done
+	unset MOCK_CLASSIC_BODY_ONLY
+	return 0
+}
+
+# GH#37026: run _required_contexts_for_default_branch twice through the real
+# _gh_with_timeout transport (cooldown preflight, capture, replay, cooldown
+# recording) instead of the bare-command fallback in _pmrc_gh_read. A second
+# call exposes any cooldown or admission state recorded by the first.
+_required_contexts_via_real_transport_twice() {
+	local flag="$1"
+	local mode="$2"
+	(
+		export HOME="${TEST_ROOT}/transport-home"
+		mkdir -p "$HOME"
+		export "${flag}=true"
+		export MOCK_GH_MODE="$mode"
+		# The boot/recovery read ramp depends on host uptime; keep it
+		# deterministic. Cooldown preflight and recording stay active.
+		export AIDEVOPS_GH_READ_RAMP_ENABLED=0
+		unset AIDEVOPS_PULSE_REQUIRED_CONTEXTS_CACHE_DIR
+		# shellcheck source=../shared-constants.sh
+		source "${SCRIPT_DIR}/../shared-constants.sh"
+		# shellcheck source=../shared-gh-wrappers.sh
+		source "${SCRIPT_DIR}/../shared-gh-wrappers.sh"
+		declare -F _gh_with_timeout >/dev/null 2>&1 || exit 3
+		local call="" rc=0 contexts=""
+		for call in 1 2; do
+			rc=0
+			contexts=$(_required_contexts_for_default_branch "owner/repo" 2>/dev/null) || rc=$?
+			printf 'call%s rc=%s contexts=%s;' "$call" "$rc" "$(printf '%s' "$contexts" | tr '\n' ',')"
+		done
+	)
+	return $?
+}
+
+test_classic_settings_failure_through_real_transport() {
+	local flag="" mode="" expected_call="" actual="" protection_reads=0
+	for flag in MOCK_CLASSIC_REAL_404 MOCK_CLASSIC_UNCLASSIFIED; do
+		for mode in pass unprotected unknown; do
+			: >"$LOGFILE"
+			: >"$GH_CALL_LOG"
+			case "$mode" in
+			pass) expected_call="rc=0 contexts=required-a,required-b" ;;
+			unprotected) expected_call="rc=0 contexts=" ;;
+			*) expected_call="rc=1 contexts=" ;;
+			esac
+			actual=$(_required_contexts_via_real_transport_twice "$flag" "classic404_${mode}") || actual="subshell-failed rc=$?"
+			protection_reads=$(grep -c 'protection/required_status_checks' "$GH_CALL_LOG" || true)
+			if [[ "$actual" == "call1 ${expected_call};call2 ${expected_call};" && "$protection_reads" -eq 2 ]]; then
+				print_result "real transport ${flag#MOCK_CLASSIC_} ${mode}: classic failure resolves via branch metadata twice (GH#37026)" 0
+			else
+				print_result "real transport ${flag#MOCK_CLASSIC_} ${mode}: classic failure resolves via branch metadata twice (GH#37026)" 1 \
+					"got '${actual}' protection_reads=${protection_reads}"
+			fi
+		done
+	done
+	: >"$LOGFILE"
+	_required_contexts_via_real_transport_twice MOCK_CLASSIC_UNCLASSIFIED classic404_unprotected >/dev/null || true
+	assert_log_contains "branch metadata resolved classic requirements (GH#37026)" \
+		"unclassified classic failure records branch-metadata recovery"
+	if grep -q "branch protection API failed" "$LOGFILE"; then
+		print_result "recovered classic failure is not logged as API failure" 1
+	else
+		print_result "recovered classic failure is not logged as API failure" 0
+	fi
+
+	: >"$LOGFILE"
+	: >"$GH_CALL_LOG"
+	actual=$(_required_contexts_via_real_transport_twice MOCK_CLASSIC_DEFERRED classic404_pass) || actual="subshell-failed"
+	if [[ "$actual" == "call1 rc=1 contexts=;call2 rc=1 contexts=;" ]] &&
+		! grep -q 'branches/main$' "$GH_CALL_LOG" &&
+		grep -q "branch protection read deferred locally" "$LOGFILE" &&
+		! grep -q "branch protection API failed" "$LOGFILE"; then
+		print_result "local deferral fails closed as a deferral without extra reads (GH#37026)" 0
+	else
+		print_result "local deferral fails closed as a deferral without extra reads (GH#37026)" 1 "got '${actual}'"
+	fi
+	return 0
+}
+
 test_gh_api_error_fails_closed() {
 	# gh exits 1 → the function MUST return 1 (fail-closed). A bubbling
 	# gh error must never auto-merge when --admin would bypass branch
@@ -1035,12 +1271,15 @@ main() {
 	test_ruleset_malformed_reviews_fail_closed
 	test_ruleset_malformed_review_element_fails_closed
 	test_ruleset_review_fetch_error_fails_closed
+	test_ruleset_review_local_deferral_propagates_diagnostic
 	test_ruleset_mixed_review_status_preserves_both_gates
 	test_ruleset_review_zero_does_not_require_approval
 	test_ruleset_review_malformed_optional_fails_closed
 	test_rulesets_empty_list_resolves_empty
 	test_rulesets_private_plan_unavailable_resolves_empty
 	test_rulesets_generic_forbidden_fails_closed
+	test_classic_settings_404_branch_evidence
+	test_classic_settings_failure_through_real_transport
 	test_gh_api_error_fails_closed
 	test_required_checks_gh_reads_are_timeout_wrapped
 	test_empty_required_stale_maintainer_gate_fallback_allows_merge

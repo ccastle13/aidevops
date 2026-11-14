@@ -20,8 +20,8 @@ tools:
 
 | Intent | Resource |
 |--------|----------|
-| **Manage/configure** Cloudflare resources (DNS, WAF, DDoS, R2, Workers, zones, rules) | `.agents/tools/mcp/cloudflare-code-mode.md` — Code Mode MCP (2,500+ endpoints, live OpenAPI) |
-| **Build/develop** on the Cloudflare platform (Workers, Pages, D1, KV, Durable Objects, AI) | [`cloudflare-platform-skill.md`](cloudflare-platform-skill.md) — patterns, gotchas, decision trees, SDK usage |
+| **Manage/configure** Cloudflare resources (DNS, WAF, DDoS, R2, Workers, zones, rules) | `.agents/tools/api/cloudflare-cf-cli.md` — `cf` CLI (full API, JSON output, `cf cli search`) when installed; otherwise `.agents/tools/mcp/cloudflare-code-mode.md` — Code Mode MCP |
+| **Build/develop** on the Cloudflare platform (Workers, Pages, D1, KV, Durable Objects, AI) | [`cloudflare-platform-skill.md`](cloudflare-platform-skill.md) — patterns, gotchas, decision trees, SDK usage; project commands (`cf init/dev/deploy/migrate`) in `.agents/tools/api/cloudflare-cf-cli.md` |
 | **Auth/token setup** for API access | This file (below) |
 
 <!-- AI-CONTEXT-START -->
@@ -30,16 +30,20 @@ tools:
 
 - **Hosting role**: Prefer for edge/serverless/static/headless workloads and global delivery/security; conventional PHP/MySQL WordPress normally uses Cloudflare in front of a Hostinger or Hetzner origin
 - **Provider selection**: Apply `aidevops/recommendations.md` before treating Cloudflare as the hosting platform rather than the edge layer
+- **Optional GitHub ingress**: [Webhook onboarding](../../reference/github-webhook-onboarding.md) — Tunnel is distinct from Access/Zero Trust login; GitHub needs a public HMAC-validated route, not an SSO challenge. Polling remains the default
 - **Auth**: API Tokens only (NEVER Global API Keys)
 - **Token creation**: Dashboard > My Profile > API Tokens > Create Token
 - **Permissions**: Zone:Read, DNS:Read, DNS:Edit (scope to specific zones)
+- **Cache guidance**: [Cloudflare + LiteSpeed cache notes](hostinger.md#cloudflare-cache-rules-that-skip-every-visitor-with-a-cookie)
 - **Config**: `configs/cloudflare-dns-config.json`
 - **Account ID**: Dashboard > Right sidebar > 32-char hex
 - **Zone ID**: Domain overview > Right sidebar > 32-char hex
 - **API test**: `curl -X GET "https://api.cloudflare.com/client/v4/zones" -H "Authorization: Bearer TOKEN"`
 - **Security**: IP filtering, expiration dates, minimal permissions
 - **Rotation**: Every 6-12 months or after team changes
+- **cf CLI**: `.agents/tools/api/cloudflare-cf-cli.md` (open beta; reads `CLOUDFLARE_API_TOKEN`)
 - **Code Mode MCP**: `.agents/tools/mcp/cloudflare-code-mode.md` (operations via 2,500+ endpoints)
+- **Crawler policy default**: Prefer allowing crawlers unless the user or site policy explicitly requires blocking; preserve search discovery by keeping mixed-purpose crawlers allowed
 
 <!-- AI-CONTEXT-END -->
 
@@ -60,7 +64,7 @@ tools:
 ### 1. Create Token
 
 1. Dashboard > My Profile > API Tokens > Create Token > Custom token
-2. **Name**: `AI-Assistant-DevOps-[AccountName]`
+2. **Name**: `aidevops-<account>-<purpose>` (e.g. `aidevops-acme-dns`); store it as `CLOUDFLARE_<ACCOUNT>_API_TOKEN` with `--provider cloudflare --account cloudflare-<account> --purpose "<purpose>"`. Naming: `tools/credentials/credential-inventory.md` "Naming new credentials"
 3. **Permissions**:
 
 ```text
@@ -74,6 +78,12 @@ Zone Settings:Read - Read zone settings (optional)
 4. **Zone Resources**: Include > Specific zones > [Select your domains]
 5. **IP Filtering** (recommended): Include > [Your home/office IP]
 6. **Expiration**: Set to 1 year maximum
+
+### Cache Rules and purge permissions
+
+- **Cache Rules API**: A token without rules permissions receives “request is not authorized” on `zones/<zone>/rulesets` when configuring the `http_request_cache_settings` phase. Grant **Zone → Cache Rules: Read** and **Zone → Cache Rules: Edit**, scoped to the required zone.
+- **Cache purge API**: Grant **Zone → Cache Purge** to purge and **Zone → Zone: Read** so the caller can find the zone. Scope the token to the relevant zone.
+- For Cloudflare Free edge TTL limits, safe development HTML caching, shared-zone purge scope and Smart Tiered Cache, see the [Hostinger LiteSpeed cache notes](hostinger.md#cloudflare-cache-rules-that-skip-every-visitor-with-a-cookie).
 
 ### 2. Collect IDs
 
@@ -119,7 +129,7 @@ Edit the config:
 
 ## Security Best Practices
 
-- **Separate tokens** per Cloudflare account with descriptive names
+- **Separate tokens** per Cloudflare account, named `CLOUDFLARE_<ACCOUNT>_API_TOKEN` with the account recorded; declare a default only explicitly (`aidevops secret default cloudflare NAME`)
 - **Minimum permissions** scoped to specific zones (not all zones)
 - **IP restrictions** and **expiration dates** always set
 - **Never commit** tokens to git; use env vars for CI/CD
@@ -151,6 +161,71 @@ Success returns `"success": true` with your zone list.
 ```
 
 Use cases: automated DNS for dev environments, dynamic subdomains for feature branches, SSL automation, traffic routing for A/B testing, security rule management for dev APIs.
+
+## AI Crawler Policy
+
+Cloudflare exposes the zone-level AI crawler control through Bot Management:
+
+- Read: `GET /zones/{zone_id}/bot_management`
+- Update: `PUT /zones/{zone_id}/bot_management`
+- Field: `ai_bots_protection`
+- Values: `disabled` (allow), `block`, or `only_on_ad_pages`
+- Token permissions: `Bot Management Read` for audits and `Bot Management Write` for changes
+
+Default to `disabled` so AI training crawlers and mixed-purpose crawlers used for
+search indexing remain allowed. Only select a blocking value when the user or an
+explicit site policy requires it. Do not infer crawler policy from Bot Fight Mode,
+robots.txt, or the legacy zone-settings API; read Bot Management directly.
+
+For a portfolio audit, enumerate every accessible zone with pagination, exclude
+non-active zones from mutation, read each active zone's Bot Management object, and
+compare `ai_bots_protection` with `disabled`. Update only non-compliant active zones,
+then re-read every active zone and report totals for compliant, changed, skipped,
+and failed zones. Never report success from the update response alone.
+
+Cloudflare may show a migration-specific dashboard preference for mixed-purpose
+crawlers separately from the older “Block AI bots” selector. The public Bot
+Management schema is the authoritative automation contract; do not guess an
+undocumented field from dashboard wording. If the public API does not expose the
+separate migration preference, inspect an authorized dashboard network request or
+use Cloudflare Code Mode OpenAPI search, then document the verified field before
+automating it.
+
+## Email Routing on a Subdomain
+
+Use this when the apex MX belongs to another provider (Google Workspace, M365) and
+only a subdomain such as `marketing.<domain>` should forward through Cloudflare.
+Dashboard onboarding covers the apex only and proposes replacing the apex MX, so
+subdomain enablement is API-only:
+
+- Preview: `GET /zones/{zone_id}/email/routing/dns?subdomain=<sub>.<domain>`
+- Enable: `POST /zones/{zone_id}/email/routing/dns` with `{"name": "<sub>.<domain>"}`
+- Token permissions (observed): `Zone Settings Write`, `Email Routing Rules Write`,
+  `DNS Write`, and `Account Email Routing Addresses Write`. Without Zone Settings
+  Write the settings/DNS endpoints return code `10000`.
+
+**Apex side effect (not shown in the preview):** besides the subdomain MX and SPF,
+enablement can also create an apex `TXT "v=spf1 include:_spf.mx.cloudflare.net ~all"`
+when the apex had no SPF, plus a locked apex `cf2024-1._domainkey` DKIM record. That
+SPF omits the existing provider, so its outbound mail moves from SPF `none` to
+`softfail`. Cloudflare documents the same apex behaviour for normal onboarding in
+[Domain configuration](https://developers.cloudflare.com/email-service/configuration/domains/index.md).
+
+1. Export the zone's DNS records before enabling.
+2. Enable, then export again and diff. Never trust the preview or the POST response alone.
+3. If an apex SPF appeared and the apex had none, replace it with the real sending
+   provider's SPF (for example `v=spf1 include:_spf.google.com ~all`) or delete it;
+   unlock it first under Email Routing > Settings if it is locked. If the apex already
+   had SPF, Cloudflare does not add another; leave it unchanged.
+4. Keep the `cf2024-1._domainkey` record; its selector does not conflict with
+   provider DKIM selectors.
+5. Check the subdomain's routing status (`ready`), not the zone's. Zone-level
+   `misconfigured` (`mx.foreign`) is expected while the apex MX stays foreign.
+
+Disabling Email Routing later deletes every record Cloudflare associates with it,
+including unlocked records you edited. Destination-address verification links sit
+behind a Cloudflare challenge and fail in headless browsers; ask a human to open
+them in a normal browser.
 
 ## If a Token Is Compromised
 

@@ -132,6 +132,44 @@ _should_setup_noninteractive_complexity_scan() {
 	return 1
 }
 
+# The profile README's input-activity rows are measured only by the
+# per-minute sampler that setup_screen_time_snapshot installs: on Linux it is
+# the screen-time row (no OS store), on macOS the "Input activity (Mac)" row
+# (GH#37496). Installs that publish a profile README but never got the
+# snapshot scheduler would otherwise stay "unavailable" forever under the
+# generic regenerate-if-installed gate (GH#36709).
+_should_setup_noninteractive_screen_time() {
+	if _should_setup_noninteractive_scheduler \
+		"Screen time" \
+		"sh.aidevops.screen-time-snapshot" \
+		"aidevops: screen-time-snapshot" \
+		"aidevops-screen-time-snapshot"; then
+		return 0
+	fi
+
+	# An installed sampler must be refreshed even when the snapshot scheduler
+	# is missing or failed to load; otherwise it keeps a stale definition
+	# (GH#37588: the Background ProcessType starved the macOS sampler).
+	if _should_setup_noninteractive_scheduler \
+		"Screen activity sampler" \
+		"sh.aidevops.screen-activity-sampler" \
+		"aidevops: screen-activity-sampler" \
+		"aidevops-screen-activity-sampler"; then
+		return 0
+	fi
+
+	# Profile-README-dependency escape hatch (all platforms; see above).
+	if _should_setup_noninteractive_scheduler \
+		"Profile README" \
+		"sh.aidevops.profile-readme-update" \
+		"aidevops: profile-readme-update" \
+		"aidevops-profile-readme-update"; then
+		return 0
+	fi
+
+	return 1
+}
+
 # Pulse-merge-routine is a REQUIRED dependency of the supervisor pulse — it
 # is the merge-side of pulse, running merge_ready_prs_all_repos() on a fast
 # 120s cadence so green PRs land within ~3 min of CI completion instead of
@@ -282,17 +320,30 @@ verified_install() {
 	fi
 }
 
+# shellcheck source=./_opencode_config_paths.sh
+source "${BASH_SOURCE[0]%/*}/_opencode_config_paths.sh"
+
 # Find OpenCode config file (checks multiple possible locations)
 # Returns: path to config file, or empty string if not found
+# Ambient OPENCODE_CONFIG / OPENCODE_CONFIG_DIR are honoured only when they
+# are user-owned; every caller writes to the result (GH#33046).
 find_opencode_config() {
+	local ambient_config="" ambient_config_dir=""
+	ambient_config=$(opencode_config_ambient_write_path "${OPENCODE_CONFIG:-}")
+	ambient_config_dir=$(opencode_config_ambient_write_path "${OPENCODE_CONFIG_DIR:-}")
 	local candidates=(
+		"$ambient_config"
+		"${ambient_config_dir:+${ambient_config_dir}/opencode.json}"
+		"$(opencode_config_user_opt_in_path)"
+		"${XDG_CONFIG_HOME:+${XDG_CONFIG_HOME}/opencode/opencode.json}"
 		"$HOME/.config/opencode/opencode.json"                     # XDG standard (Linux, some macOS)
 		"$HOME/.opencode/opencode.json"                            # Alternative location
 		"$HOME/Library/Application Support/opencode/opencode.json" # macOS standard
 	)
 	for candidate in "${candidates[@]}"; do
+		[[ -n "$candidate" ]] || continue
 		if [[ -f "$candidate" ]]; then
-			echo "$candidate"
+			printf '%s\n' "$candidate"
 			return 0
 		fi
 	done

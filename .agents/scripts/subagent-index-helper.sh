@@ -35,7 +35,7 @@ CAPABILITY_INDEX_FILE="${AGENTS_DIR}/agent-source-capabilities.toon"
 
 # Directories to scan for subagents (relative to AGENTS_DIR)
 # Covers all tiers: shared, custom, draft; plugins are appended separately
-SUBAGENT_DIRS="aidevops content public-relations seo tools services workflows memory custom draft"
+SUBAGENT_DIRS="aidevops business content marketing-sales public-relations seo tools services workflows memory custom draft"
 
 generate_plugin_agents_block() {
 	local agents_dir="$1"
@@ -85,8 +85,9 @@ generate_subagents_block() {
 	fi
 
 	# Single find + awk pipeline: no shell loops, no per-file reads
+	# Use byte ordering regardless of the caller's locale to avoid index churn.
 	# shellcheck disable=SC2086
-	find $search_dirs -name "*.md" -type f 2>/dev/null | sort | awk -v agents_dir="$agents_dir" '
+	find $search_dirs -name "*.md" -type f 2>/dev/null | LC_ALL=C sort | awk -v agents_dir="$agents_dir" '
     BEGIN { count = 0 }
     {
         # Extract filename without .md

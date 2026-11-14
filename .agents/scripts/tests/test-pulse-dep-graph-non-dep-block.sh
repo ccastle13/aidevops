@@ -60,10 +60,10 @@ source "$HOLD_MARKER_LIB"
 printf '\n== Body defer marker detection ==\n'
 
 assert_eq 'defer until phrase' 'true' "$(issue_body_has_defer_marker 'Defer until Phase 1-6 are working end-to-end @alexey')"
-assert_eq 'do not dispatch' 'true' "$(issue_body_has_defer_marker 'Please do not dispatch this yet.')"
-assert_eq 'do-not-dispatch' 'true' "$(issue_body_has_defer_marker 'Tagged do-not-dispatch until owner reviews.')"
-assert_eq 'on-hold hyphenated' 'true' "$(issue_body_has_defer_marker 'This task is on-hold.')"
-assert_eq 'on hold spaced' 'true' "$(issue_body_has_defer_marker 'This task is on hold.')"
+assert_eq 'do not dispatch' 'true' "$(issue_body_has_defer_marker 'Do not dispatch this yet.')"
+assert_eq 'do-not-dispatch' 'true' "$(issue_body_has_defer_marker '- do-not-dispatch until owner reviews.')"
+assert_eq 'on-hold hyphenated' 'true' "$(issue_body_has_defer_marker 'On-hold until review.')"
+assert_eq 'on hold spaced' 'true' "$(issue_body_has_defer_marker '> On hold pending review.')"
 assert_eq 'ON HOLD uppercase' 'true' "$(issue_body_has_defer_marker 'ON HOLD: waiting for legal.')"
 assert_eq 'HUMAN_UNBLOCK_REQD' 'true' "$(issue_body_has_defer_marker 'HUMAN_UNBLOCK_REQUIRED — see comment thread.')"
 assert_eq 'hold for trailing' 'true' "$(issue_body_has_defer_marker 'hold for Q2 release cycle')"
@@ -76,6 +76,9 @@ assert_eq 'blocked-by only' 'false' "$(issue_body_has_defer_marker 'blocked-by:t
 assert_eq 'word defer in prose' 'false' "$(issue_body_has_defer_marker 'We should not defer this; ship it now.')"
 assert_eq 'dispatch without prefix' 'false' "$(issue_body_has_defer_marker 'Dispatch the worker once ready.')"
 assert_eq 'hold without for' 'false' "$(issue_body_has_defer_marker 'please hold this comment until later')"
+assert_eq 'mid-sentence hold for' 'false' "$(issue_body_has_defer_marker 'Other rows belong to other parts; neither is a hold for this part.')"
+assert_eq 'mid-sentence on hold' 'false' "$(issue_body_has_defer_marker 'This task may be on hold for review.')"
+assert_eq 'hold inside fence' 'false' "$(issue_body_has_defer_marker $'```\nOn hold\n```')"
 
 ###############################################################################
 # Part 2: non-dep BLOCKED comment marker detection (pure regex)
@@ -155,11 +158,15 @@ cat >"$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${GH_STUB_CALLS:-/dev/null}"
 # Canned response is whatever lives in $GH_STUB_COMMENTS.
-# If unset or file missing, return empty so the helper fail-opens.
+# If unset or file missing, return the real --paginate --slurp shape for an
+# issue with no comments. GH_STUB_FAIL simulates an API outage.
+if [[ -n "${GH_STUB_FAIL:-}" ]]; then
+	exit 1
+fi
 if [[ "${GH_STUB_COMMENTS:-}" && -f "${GH_STUB_COMMENTS}" ]]; then
 	cat "${GH_STUB_COMMENTS}"
 else
-	printf ''
+	printf '[[]]\n'
 fi
 STUB
 chmod +x "$STUB_DIR/gh"
@@ -184,6 +191,12 @@ assert_eq 'body defer flag triggers defer' 'body-defer' "$got"
 unset GH_STUB_COMMENTS
 got=$(_should_defer_auto_unblock 'owner/repo' '123' 'false' || echo "__no_defer__")
 assert_eq 'clean body and empty comments → unblock' '__no_defer__' "$got"
+
+# Scenario 2b (GH#37200): an unreadable comment history cannot prove the
+# absence of a terminal-blocker hold, so the refresh defers instead of
+# silently relabelling the issue available.
+got=$(GH_STUB_FAIL=1 _should_defer_auto_unblock 'owner/repo' '123' 'false' || echo "__no_defer__")
+assert_eq 'comment fetch failure defers unblock' 'comments-unavailable' "$got"
 
 # Scenario 3: body defer flag false, comment contains **BLOCKED** → defer
 export GH_STUB_COMMENTS="$STUB_DIR/blocked-comment.json"
@@ -236,6 +249,16 @@ jq -cn --arg body 'CLAIM_RELEASED reason=worker_complete runner=maintainer ts=20
 	'[{author_association:"OWNER",body:$body}]' >"$GH_STUB_COMMENTS"
 got=$(_should_defer_auto_unblock 'owner/repo' '123' 'false' || echo "__no_defer__")
 assert_eq 'trusted non-blocked claim release does not defer' '__no_defer__' "$got"
+
+jq -cn '[{author_association:"OWNER",body:"DISPATCH_CLAIM nonce=first"},
+    {author_association:"OWNER",body:"CLAIM_RELEASED reason=blocked runner=maintainer "}]
+    + [range(12) | {author_association:"OWNER",body:"DISPATCH_LEASE nonce=noise"}]' >"$GH_STUB_COMMENTS"
+got=$(_should_defer_auto_unblock 'owner/repo' '123' 'false' || echo "__no_defer__")
+assert_eq 'blocked release survives more than ten lease comments' 'comment-marker' "$got"
+jq '. + [{author_association:"OWNER",body:"DISPATCH_CLAIM nonce=next"}]' "$GH_STUB_COMMENTS" >"$STUB_DIR/new-claim.json"
+export GH_STUB_COMMENTS="$STUB_DIR/new-claim.json"
+got=$(_should_defer_auto_unblock 'owner/repo' '123' 'false' || echo "__no_defer__")
+assert_eq 'new dispatch supersedes previous blocked attempt' '__no_defer__' "$got"
 
 printf '\n'
 printf 'Results: %d passed, %d failed\n' "$pass_count" "$fail_count"

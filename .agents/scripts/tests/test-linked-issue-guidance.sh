@@ -56,11 +56,15 @@ assert_contains ".github/workflows/linked-issue-check-reusable.yml" 'throw error
 assert_contains ".github/workflows/linked-issue-check-reusable.yml" 'const hasTaskPrefix = .*t\\d.*GH#\\d' "linked issue recognizes both tNNN and GH#NNN prefixes"
 assert_contains ".github/workflows/linked-issue-check-reusable.yml" "const trustedRoles = \\['OWNER', 'MEMBER', 'COLLABORATOR'\\]" "linked issue preserves trusted author controls"
 assert_contains ".github/workflows/linked-issue-check-reusable.yml" "pr.user.type === 'Bot'" "linked issue preserves bot control"
-assert_contains ".github/workflows/linked-issue-check-reusable.yml" 'if \(trustedRoles\.includes\(pr\.author_association\)\)' "linked issue exempts trusted repository authors"
+assert_contains ".github/workflows/linked-issue-check-reusable.yml" 'let authorIsTrusted = trustedRoles\.includes\(pr\.author_association\)' "linked issue preserves trusted association exemption"
+assert_contains ".github/workflows/linked-issue-check-reusable.yml" "\['CONTRIBUTOR', 'NONE'\]\.includes\(pr\.author_association\)" "linked issue verifies ambiguous payload associations"
+assert_contains ".github/workflows/linked-issue-check-reusable.yml" 'GET /repos/\{owner\}/\{repo\}/collaborators/\{username\}/permission' "linked issue uses authenticated permission metadata"
+assert_contains ".github/workflows/linked-issue-check-reusable.yml" "\['admin', 'maintain', 'write'\]\.includes" "linked issue permission fallback requires write authority"
+assert_contains ".github/workflows/linked-issue-check-reusable.yml" 'if \(authorIsTrusted\)' "linked issue exempts verified trusted repository authors"
 assert_contains ".github/workflows/linked-issue-check-reusable.yml" 'github\.rest\.issues\.get' "linked issue verifies referenced issue through GitHub metadata"
 assert_contains ".github/workflows/linked-issue-check-reusable.yml" 'if \(!issue\.pull_request\)' "linked issue rejects pull request numbers as issue references"
 assert_contains ".github/workflows/linked-issue-check-reusable.yml" 'body\.matchAll\(issueRefPattern\)' "linked issue validates every candidate reference"
-assert_contains ".github/workflows/linked-issue-check-reusable.yml" '#aidevops:trust-boundary GH#17671/GH#28567' "linked issue trust check carries boundary marker"
+assert_contains ".github/workflows/linked-issue-check-reusable.yml" '#aidevops:trust-boundary GH#17671/GH#28567/GH#24546' "linked issue trust check carries boundary marker"
 assert_not_contains ".github/workflows/linked-issue-check-reusable.yml" 'if \(/\^\(t\\d' "untrusted linked issue path has no title-only exemption"
 
 assert_contains ".github/workflows/pr-triage-gate.yml" "const trustedRoles = \\['OWNER', 'MEMBER'\\]" "PR triage preserves owner and member trust controls"
@@ -77,13 +81,95 @@ assert_contains ".github/workflows/bounty-spam-auto-close.yml" "author_associati
 assert_contains ".github/workflows/bounty-spam-auto-close.yml" '#aidevops:trust-boundary GH#17671/GH#28567' "bounty detector trust check carries boundary marker"
 assert_not_contains ".github/workflows/bounty-spam-auto-close.yml" 'PR_TITLE|task ID prefix|\^t\[0-9\]|\^GH#\[0-9\]' "bounty detector gives tNNN and GH#NNN titles no trust"
 
+# Match the active input and both branches, not a comparison elsewhere or in a comment.
+assert_contains ".github/workflows/review-bot-gate.yml" \
+	"^[[:space:]]+aidevops_ref: \\$\{\{ \(github\.event\.pull_request\.head\.repo\.full_name == github\.repository && github\.event\.pull_request\.head\.sha\) \|\| 'main' \}\}[[:space:]]*$" \
+	"same-repository PRs select the head SHA and fork PRs select main (t18881)"
 assert_contains ".github/workflows/review-bot-gate-reusable.yml" 'classify-infra-rate-limit' "review gate classifies API exhaustion from immutable trust evidence"
 assert_contains ".github/workflows/review-bot-gate-reusable.yml" 'RESULT.*PASS_ADVISORY' "trusted advisory default defers unavailable review API"
-assert_contains ".github/workflows/review-bot-gate-reusable.yml" 'SKIP\|PASS_ADVISORY\|PASS_RATE_LIMITED' "external authors cannot use advisory review outcomes"
+assert_contains ".github/workflows/review-bot-gate-reusable.yml" 'SKIP overridden: external-contributor PRs cannot use the skip label' "external authors cannot use the skip-label outcome"
+assert_not_contains ".github/workflows/review-bot-gate-reusable.yml" 'REVIEW_GATE_COMPLETION_BEHAVIOR=strict' "external authors are not forced to wait on review bots (GH#36931)"
 assert_contains ".github/workflows/review-bot-gate-reusable.yml" 'Unexpected review helper result' "malformed review helper output fails closed"
 assert_contains ".github/workflows/review-bot-gate-reusable.yml" "result != 'INFRA_RATE_LIMITED'" "review gate avoids follow-up API label lookup during exhaustion"
 assert_contains ".github/workflows/review-bot-gate-reusable.yml" 'skipping immediate status retry' "review gate avoids retry loop during exhaustion"
 assert_contains ".github/workflows/review-bot-gate-reusable.yml" 'infrastructure wait — GitHub API quota exhausted' "review status reports infrastructure wait truthfully"
 assert_not_contains ".github/workflows/review-bot-gate-reusable.yml" 'sleep 5 && gh api' "review gate removed blind status retry"
+
+# Execute the actual github-script body: string guards alone cannot prove that
+# permission errors or below-write responses preserve the issue requirement.
+node - "$REPO_ROOT" <<'NODE'
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const workflow = fs.readFileSync(`${process.argv[2]}/.github/workflows/linked-issue-check-reusable.yml`, 'utf8');
+const script = workflow.split('          script: |\n')[1];
+assert.ok(script, 'github-script body exists');
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+const run = new AsyncFunction('github', 'context', 'core', 'console', script);
+const trustedReason = 'Trusted repository author — external policy not applicable';
+const taskReason = 'Trusted task-ID prefix — issue linkage via task system';
+const missingReason = 'No linked issue — add Closes/Fixes/Resolves/For #NNN to PR body';
+let cases = 0;
+
+async function check({association = 'CONTRIBUTOR', permission = 'none', error = false,
+  title = 'Routine update', body = '', bot = false, fork = false,
+  state = 'failure', reason = missingReason, lookup = true}) {
+  const statuses = [];
+  const warnings = [];
+  let lookups = 0;
+  const github = {
+    request: async (route, params) => {
+      lookups++;
+      assert.equal(route, 'GET /repos/{owner}/{repo}/collaborators/{username}/permission');
+      assert.deepEqual(params, {owner: 'base', repo: 'repo', username: 'author'});
+      if (error) throw new Error('permission lookup unavailable');
+      return {data: {permission}};
+    },
+    rest: {
+      repos: {createCommitStatus: async status => statuses.push(status)},
+      issues: {get: async params => {
+        assert.equal(params.issue_number, 123);
+        return {data: {number: 123}};
+      }}
+    }
+  };
+  await run(github, {repo: {owner: 'base', repo: 'repo'}, payload: {pull_request: {
+    author_association: association, title, body,
+    user: {login: 'author', type: bot ? 'Bot' : 'User'},
+    head: {sha: 'head', repo: {full_name: fork ? 'fork/repo' : 'base/repo'}},
+    base: {repo: {full_name: 'base/repo'}}
+  }}}, {warning: message => warnings.push(message)}, {log() {}});
+  assert.equal(lookups, lookup ? 1 : 0);
+  assert.equal(statuses.length, 1);
+  assert.equal(statuses[0].state, state);
+  assert.equal(statuses[0].description, reason);
+  if (error) assert.ok(warnings.some(message => message.includes('preserving linked-issue policy')));
+  cases++;
+}
+
+(async () => {
+  for (const association of ['CONTRIBUTOR', 'NONE']) {
+    for (const permission of ['admin', 'maintain', 'write']) {
+      for (const title of ['Routine update', 't123: update', 'GH#123: update']) {
+        await check({association, permission, title, state: 'success',
+          reason: title === 'Routine update' ? trustedReason : taskReason});
+      }
+    }
+    for (const permission of ['read', 'triage', 'none', undefined, 'unexpected']) {
+      await check({association, permission, title: 't123: update'});
+    }
+    await check({association, error: true});
+    await check({association, error: true, body: 'Resolves #123',
+      state: 'success', reason: 'Linked issue found — #123'});
+  }
+  for (const association of ['OWNER', 'MEMBER', 'COLLABORATOR']) {
+    await check({association, lookup: false, state: 'success', reason: trustedReason});
+    await check({association, title: 'GH#123: update', lookup: false, state: 'success', reason: taskReason});
+  }
+  await check({association: 'FIRST_TIME_CONTRIBUTOR', permission: 'admin', lookup: false});
+  await check({bot: true, lookup: false, state: 'success', reason: 'Bot PR — exempt from linked-issue requirement'});
+  await check({bot: true, fork: true, lookup: false, state: 'success', reason: 'External bot PR — skipped'});
+  console.log(`PASS: linked issue JavaScript behavior (${cases} cases)`);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+NODE
 
 exit 0

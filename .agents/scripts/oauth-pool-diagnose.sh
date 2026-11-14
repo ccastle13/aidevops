@@ -40,6 +40,21 @@ fi
 # Help
 # ---------------------------------------------------------------------------
 
+# Never invoke pool_ops, curl, or live diagnostics from the offline command.
+cmd_probe_rotation() {
+	local provider="${1:-}"
+	if [[ "$provider" != "anthropic" || "$#" -ne 1 ]]; then
+		print_error "Usage: aidevops model-accounts-pool probe-rotation anthropic (offline)"
+		return 1
+	fi
+	if ! command -v node >/dev/null 2>&1; then
+		print_error "Offline probe requires Node.js 18+ with VM modules support"
+		return 1
+	fi
+	env -u NODE_OPTIONS -u NODE_PATH node "${SCRIPT_DIR}/oauth-pool-rotation-probe.mjs" "$provider" || return 1
+	return 0
+}
+
 cmd_help() {
 	cat >&2 <<'HELP'
 oauth-pool-helper.sh — Manage OAuth pool accounts from the shell
@@ -51,6 +66,7 @@ Commands:
   add [anthropic|openai|cursor|google]            Add an account (OAuth; OpenAI defaults to device flow)
   check [anthropic|openai|cursor|google|all]      Health check: token expiry + live validity
   diagnose [anthropic]                            Full pipeline diagnostics (pool, plugin, CCH, runtime)
+  probe-rotation anthropic                       Offline simulated rotation (no accounts/network/restart)
   list [anthropic|openai|cursor|google|all]       List accounts with per-account status
   status [anthropic|openai|cursor|google|all]     Pool aggregate stats (counts, availability)
   refresh [anthropic|openai|google] [email|all]   Refresh expired tokens without re-auth (uses refresh_token)
@@ -134,11 +150,22 @@ _diag_check_pool() {
 		return 1
 	fi
 	local perms
-	perms=$(_file_perms "$POOL_FILE")
+	local permission_check="Pool file permissions"
+	# Load the owning library explicitly. Use its failure-preserving primitive:
+	# _file_perms substitutes "000" on failure, not an observed file mode.
+	# shellcheck source=./portable-stat.sh
+	source "${SCRIPT_DIR}/portable-stat.sh"
+	# Both GNU and BSD stat accept -L to inspect the file that jq will read.
+	if ! perms=$(_stat_batch '%a' -L "$POOL_FILE" 2>/dev/null) ||
+		[[ ! "$perms" =~ ^[0-7]{1,4}$ ]]; then
+		_diag_print "$permission_check" "FAIL" "Unable to inspect file mode (expected 600)"
+		return 1
+	fi
+	printf -v perms '%03o' "$((8#$perms))"
 	if [[ "$perms" != "600" ]]; then
-		_diag_print "Pool file permissions" "WARN" "$perms (expected 600)"
+		_diag_print "$permission_check" "WARN" "$perms (expected 600)"
 	else
-		_diag_print "Pool file permissions" "PASS" "600"
+		_diag_print "$permission_check" "PASS" "600"
 	fi
 	local count
 	count=$(jq '[.anthropic // [] | length] | add' "$POOL_FILE" 2>/dev/null || echo "0")

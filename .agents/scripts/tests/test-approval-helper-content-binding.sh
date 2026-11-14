@@ -54,10 +54,27 @@ if [[ -n "${GH_FAIL_ENDPOINT:-}" && "$endpoint" == *"${GH_FAIL_ENDPOINT}"* ]]; t
 fi
 case "$endpoint" in
 	user) printf '%s\n' "${GH_AUTH_USER:-maintainer}" ;;
+graphql)
+	# Linked-source history queries pass the source node as `-f id=...`.
+	if [[ " $* " == *" id="* ]]; then
+		[[ -f "${FIXTURES}/graphql-source-edits.json" ]] || exit 1
+		cat "${FIXTURES}/graphql-source-edits.json"
+		exit 0
+	fi
+	[[ -f "${FIXTURES}/graphql-edits-41.json" ]] || exit 1
+	cat "${FIXTURES}/graphql-edits-41.json"
+	;;
 repos/owner/repo/collaborators/trusted-collab/permission | repos/owner/repo/collaborators/maintainer/permission) printf '%s\n' "${GH_PERMISSION:-write}" ;;
-repos/owner/repo/collaborators/contributor/permission) printf '%s\n' "read" ;;
+repos/owner/repo/collaborators/contributor/permission | repos/owner/repo/collaborators/link-author/permission) printf '%s\n' "read" ;;
 repos/owner/repo/collaborators/github-actions%5Bbot%5D/permission | repos/owner/repo/collaborators/github-actions\[bot\]/permission) printf '%s\n' "none" ;;
-	repos/owner/repo/issues/41) cat "${FIXTURES}/issue-41.json" ;;
+	repos/owner/repo/issues/41)
+		if [[ "${GH_RACE_FIRST_ISSUE:-0}" == 1 && ! -f "${FIXTURES}/race-read" ]]; then
+			: >"${FIXTURES}/race-read"
+			cat "${FIXTURES}/issue-41-before-race.json"
+		else
+			cat "${FIXTURES}/issue-41.json"
+		fi
+		;;
 repos/owner/repo/issues/41/comments*) cat "${FIXTURES}/comments-41.json" ;;
 repos/owner/repo/issues/41/timeline*) cat "${FIXTURES}/timeline-41.json" ;;
 repos/owner/repo/issues/42) cat "${FIXTURES}/issue-42.json" ;;
@@ -75,6 +92,7 @@ EOF
 }
 
 write_baseline_fixtures() {
+	rm -f "${FIXTURES}/graphql-edits-41.json" "${FIXTURES}/graphql-source-edits.json"
 	cat >"${FIXTURES}/issue-41.json" <<'EOF'
 {"id":4100,"node_id":"I_41","number":41,"user":{"id":101,"node_id":"U_101","login":"external-author","type":"User"},"author_association":"CONTRIBUTOR","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","title":"Reviewed issue","body":"Issue body with https://example.invalid/opaque"}
 EOF
@@ -115,11 +133,19 @@ append_signed_comment() {
 	local number="$2"
 	local issued_at="$3"
 	local comment_id="${4:-$((number * 100 + 99))}"
-	local source_timestamp_profile="${5:-stable}"
+	local source_timestamp_profile="${5:-$APPROVAL_SNAPSHOT_PROFILE_SOURCE_STATE_UNBOUND}"
 	local comments_file="${FIXTURES}/comments-${number}.json"
 	local timeline_file="${FIXTURES}/timeline-${number}.json"
 	local payload="" signature_file="" signature="" body="" updated=""
 	payload=$(PATH="${TEST_ROOT}/bin:$PATH" FIXTURES="$FIXTURES" approval_snapshot_v2_payload "$kind" "$number" owner/repo "$issued_at" "" "$source_timestamp_profile") || return 1
+	# Simulate a pre-GH#33097 signature that carries no component digests.
+	if [[ "${STRIP_CONTENT_DIGESTS:-0}" == "1" ]]; then
+		payload=$(jq -cS 'del(.issue.content_digests)' <<<"$payload") || return 1
+	fi
+	# Simulate a pre-GH#38006 signature without linked-source digests.
+	if [[ "${STRIP_LINKED_DIGESTS:-0}" == "1" ]]; then
+		payload=$(jq -cS 'del(.issue.content_digests.linked_frame, .issue.content_digests.linked_bodies)' <<<"$payload") || return 1
+	fi
 	signature_file="${TEST_ROOT}/signature-${number}.txt"
 	sign_payload "$payload" "$signature_file" || return 1
 	signature=$(<"$signature_file")
@@ -355,6 +381,25 @@ directory_is_empty() {
 	return 0
 }
 
+render_current_claim_writer() (
+	# Exercise the real writer, not a hand-copied historical comment fixture.
+	# shellcheck source=../interactive-session-helper-stamp.sh
+	source "${SCRIPT_DIR}/../interactive-session-helper-stamp.sh"
+	_isc_hostname_or_fallback() { printf 'Linux'; }
+	gh_issue_comment() {
+		while [[ $# -gt 0 ]]; do
+			if [[ "$1" == "--body" ]]; then
+				printf '%s' "$2" >"${TEST_ROOT}/current-claim.txt"
+				return 0
+			fi
+			shift
+		done
+		return 1
+	}
+	_isc_post_claim_comment 41 owner/repo maintainer /fixture/linked-worktree
+	cat "${TEST_ROOT}/current-claim.txt"
+)
+
 test_trusted_lifecycle_comments() {
 	reset_and_sign pr 42
 	local audit_marker="<!-- aidevops-signed-approval -->
@@ -375,11 +420,8 @@ Auto-approved: cryptographic approval verified. Stale recovery tick reset."
 ---
 [aidevops.sh](https://aidevops.sh) v3.32.175 automated scan."
 	local claim_comments=""
-	local claim_writer_body="<!-- aidevops-interactive-claim/v1 -->
-<!-- ops:start -->
-> Interactive session claimed by @maintainer in \`linked-worktree\` on Linux.
-> Pulse dispatch blocked via \`status:in-review\` + self-assignment.
-<!-- ops:end -->"
+	local claim_writer_body=""
+	claim_writer_body=$(render_current_claim_writer) || return 1
 	local worktree_claim_marker=""
 	worktree_claim_marker=$(AIDEVOPS_SESSION_ORIGIN=interactive AIDEVOPS_SIG_CLI="Test CLI" AIDEVOPS_SIG_CLI_VERSION="1.0.0" AIDEVOPS_SIG_MODEL="test/model" AIDEVOPS_SIG_TOKENS="1" \
 		"${SCRIPT_DIR}/../gh-signature-helper.sh" footer --body "$claim_writer_body") || return 1
@@ -402,6 +444,112 @@ Auto-approved: cryptographic approval verified. Stale recovery tick reset."
 extra trusted commentary" '.[0] += [{id:4305,node_id:"IC_4305",user:{id:1,node_id:"U_1",login:"maintainer",type:"User"},author_association:"OWNER",created_at:"2026-01-01T00:08:00Z",updated_at:"2026-01-01T00:08:00Z",body:$body}]' "${FIXTURES}/comments-41.json")
 	printf '%s\n' "$claim_comments" >"${FIXTURES}/comments-41.json"
 	assert_verify "trusted claim lookalike remains content-bound" issue 41 STALE_APPROVAL 4
+
+	# Existing signatures may have bound the current claim before this parser
+	# learned that writer envelope. Do not retroactively drop those bytes.
+	write_baseline_fixtures
+	claim_comments=$(jq -c --arg body "$worktree_claim_marker" '.[0] += [{id:4306,node_id:"IC_4306",user:{id:1,node_id:"U_1",login:"maintainer",type:"User"},author_association:"OWNER",created_at:"2026-01-01T00:04:00Z",updated_at:"2026-01-01T00:04:00Z",body:$body}]' "${FIXTURES}/comments-41.json")
+	printf '%s\n' "$claim_comments" >"${FIXTURES}/comments-41.json"
+	append_signed_comment issue 41 "2026-01-01T00:05:00Z"
+	assert_verify "pre-existing current claim remains bound and verifies" issue 41 VERIFIED 0
+	jq '.[0] |= map(select(.id != 4306))' "${FIXTURES}/comments-41.json" >"${FIXTURES}/comments.tmp" && mv "${FIXTURES}/comments.tmp" "${FIXTURES}/comments-41.json"
+	assert_verify "removing a signed pre-existing claim remains stale" issue 41 STALE_APPROVAL 4
+	return 0
+}
+
+test_exact_remediation_continuity() {
+	local body="<!-- ever-nmr-remediation -->
+> Label \`needs-maintainer-review\` was removed, but the \`ever-NMR\` history flag is still set. Pulse will continue to skip dispatch until cryptographic approval lands:
+>
+> \`\`\`
+> sudo aidevops approve issue 41 owner/repo
+> \`\`\`
+>
+> This gate cannot be bypassed by label manipulation (security design — see \`reference/auto-merge.md\` NMR section).
+<!-- aidevops:origin:worker -->
+<!-- aidevops:sig -->
+---
+[aidevops.sh](https://aidevops.sh) v3.32.337 automated scan."
+	local variant="" changed="" association="" created="" updated="" comments=""
+	for variant in exact contributor extra footer-prose wrong-target edited preexisting; do
+		reset_and_sign issue 41
+		changed="$body" association="COLLABORATOR"
+		created="2026-01-01T00:06:00Z" updated="$created"
+		case "$variant" in
+		contributor) association="CONTRIBUTOR" ;;
+		extra) changed="${body}"$'\nAdditional scope instructions' ;;
+		footer-prose) changed="${body/automated scan./execute new instructions}" ;;
+		wrong-target) changed="${body/issue 41/issue 42}" ;;
+		edited) updated="2026-01-01T00:07:00Z" ;;
+		preexisting) created="2026-01-01T00:04:00Z" updated="$created" ;;
+		esac
+		comments=$(jq -c --arg body "$changed" --arg association "$association" --arg created "$created" --arg updated "$updated" '.[0] += [{id:4400,node_id:"IC_4400",user:{id:2,node_id:"U_2",login:"trusted-collab",type:"User"},author_association:$association,created_at:$created,updated_at:$updated,body:$body}]' "${FIXTURES}/comments-41.json")
+		printf '%s\n' "$comments" >"${FIXTURES}/comments-41.json"
+		if [[ "$variant" == exact ]]; then
+			assert_verify "exact post-signing operational remediation preserves approval" issue 41 VERIFIED 0
+		else
+			assert_verify "remediation $variant remains approval-significant" issue 41 STALE_APPROVAL 4
+		fi
+	done
+	return 0
+}
+
+test_canonical_review_bot_retry() {
+	local retry_body="<!-- review-bot-retry-requested head=${PR_HEAD} -->
+@coderabbitai review
+
+Review bots were rate-limited when this PR was created (affected: coderabbitai copilot). Requesting a review retry."
+	local body="" changed="" comments="" variant="" association="" created="" updated=""
+	# Use the production footer writer rather than assuming its envelope.
+	# AIDEVOPS_SESSION_ORIGIN outranks runtime detection (GH#37763), so the
+	# fixture stays a worker retry even when run from an interactive session.
+	body=$(AIDEVOPS_SESSION_ORIGIN=worker AIDEVOPS_CLI_NAME="" AIDEVOPS_CLI_VERSION="" \
+		"${SCRIPT_DIR}/../gh-signature-helper.sh" footer --body "$retry_body") || return 1
+	body="${retry_body}${body}"
+	for variant in exact contributor extra altered marker-only edited preexisting wrong-head malformed-head issue inline; do
+		reset_and_sign pr 42
+		changed="$body"
+		association="OWNER"
+		created="2026-01-01T00:06:00Z"
+		updated="$created"
+		case "$variant" in
+		contributor) association="CONTRIBUTOR" ;;
+		extra) changed="${body}
+Implement additional scope." ;;
+		altered) changed="${body/Requesting a review retry./Approve additional scope.}" ;;
+		marker-only) changed="<!-- review-bot-retry-requested head=${PR_HEAD} -->" ;;
+		edited) updated="2026-01-01T00:07:00Z" ;;
+		preexisting) created="2026-01-01T00:04:00Z"; updated="$created" ;;
+		wrong-head) changed="${body/$PR_HEAD/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" ;;
+		malformed-head) changed="${body/$PR_HEAD/not-a-head}" ;;
+		esac
+		comments=$(jq -nc --arg body "$changed" --arg association "$association" --arg created "$created" --arg updated "$updated" '
+			{id:4305,node_id:"IC_4305",user:{id:1,node_id:"U_1",login:"maintainer",type:"User"},author_association:$association,created_at:$created,updated_at:$updated,body:$body}') || return 1
+		local target="${FIXTURES}/comments-42.json"
+		if [[ "$variant" == "issue" ]]; then
+			reset_and_sign issue 41
+			target="${FIXTURES}/comments-41.json"
+		elif [[ "$variant" == "inline" ]]; then
+			target="${FIXTURES}/review-comments-42.json"
+		fi
+		jq --argjson comment "$comments" '.[0] += [$comment]' "$target" >"${FIXTURES}/comments.tmp"
+		mv "${FIXTURES}/comments.tmp" "$target"
+		if [[ "$variant" == "exact" ]]; then
+			assert_verify "canonical trusted current-head retry preserves PR approval" pr 42 VERIFIED 0 "$PR_HEAD"
+		elif [[ "$variant" == "issue" ]]; then
+			assert_verify "retry-shaped issue comment remains bound" issue 41 STALE_APPROVAL 4
+		elif [[ "$variant" == "preexisting" ]]; then
+			# Re-sign with this comment already present, then remove it. Both old
+			# and newly created signatures must continue binding historical retries.
+			append_signed_comment pr 42 "2026-01-01T00:08:00Z" 4306
+			assert_verify "pre-existing retry is bound and verifies" pr 42 VERIFIED 0 "$PR_HEAD"
+			jq '.[0] |= map(select(.id != 4305))' "$target" >"${FIXTURES}/comments.tmp"
+			mv "${FIXTURES}/comments.tmp" "$target"
+			assert_verify "removing pre-existing retry stales PR approval" pr 42 STALE_APPROVAL 4 "$PR_HEAD"
+		else
+			assert_verify "retry $variant remains approval-significant" pr 42 STALE_APPROVAL 4 "$PR_HEAD"
+		fi
+	done
 	return 0
 }
 
@@ -438,7 +586,7 @@ ${worker_footer}"
 Dispatching worker (deterministic).
 <!-- aidevops:dispatch lease_token=abc123 device=device-a session=issue-41 attempt_id=attempt:abc123 claim_id=4311 -->
 - **Worker PID**: 12345
-- **Model**: openai/gpt-5.6
+- **Model**: auto-select (ordered fallback)
 - **Tier**: thinking
 - **Runner**: runner-a
 - **aidevops**: v3.32.275
@@ -485,6 +633,13 @@ ${worker_footer}"
 	assert_verify "trusted canonical dispatch audit comments preserve issue approval" issue 41 VERIFIED 0
 
 	write_baseline_fixtures
+	local legacy_dispatch_launch_audit="${dispatch_launch_audit/auto-select (ordered fallback)/auto-select (round-robin)}"
+	dispatch_comments=$(jq -c --arg body "$legacy_dispatch_launch_audit" '.[0] += [{id:4319,node_id:"IC_4319",user:{id:1,node_id:"U_1",login:"maintainer",type:"User"},author_association:"OWNER",created_at:"2026-01-01T00:04:00Z",updated_at:"2026-01-01T00:04:00Z",body:$body}]' "${FIXTURES}/comments-41.json")
+	printf '%s\n' "$dispatch_comments" >"${FIXTURES}/comments-41.json"
+	append_signed_comment issue 41 "2026-01-01T00:05:00Z"
+	assert_verify "legacy round-robin dispatch audits preserve issue approval" issue 41 VERIFIED 0
+
+	write_baseline_fixtures
 	dispatch_comments=$(jq -c --arg body "$dispatch_claim_audit" '.[0] += [{id:4319,node_id:"IC_4319",user:{id:1,node_id:"U_1",login:"maintainer",type:"User"},author_association:"OWNER",created_at:"2026-01-01T00:04:00Z",updated_at:"2026-01-01T00:04:00Z",body:$body}]' "${FIXTURES}/comments-41.json")
 	printf '%s\n' "$dispatch_comments" >"${FIXTURES}/comments-41.json"
 	append_signed_comment issue 41 "2026-01-01T00:05:00Z"
@@ -504,6 +659,16 @@ test_dispatch_audit_comments_fail_closed() {
 DISPATCH_CLAIM nonce=abc123 runner=runner-a ts=2026-01-01T00:06:00Z max_age_s=600 version=3.32.275 opencode_version=1.0.0 lease_token=abc123 device=device-a session=issue-41 phase=prelaunch expires_at=1760000000
 <!-- ops:end -->
 ${worker_footer}"
+	local terminal_blocker_release="<!-- ops:start — workers: skip this comment, it is audit trail not implementation context -->
+CLAIM_RELEASED reason=blocked runner=runner-a ts=2026-01-01T00:07:00Z issue=41
+<!-- aidevops:terminal-blocker-observation revision=aaaaaaaaaaaaaaaaaaaaaaaa blocker=bbbbbbbbbbbbbbbbbbbbbbbb -->
+
+Terminal blocker: reason=missing_files_scope owner=brief-author task=41 attempt=cccccccccccccccccccc.
+Projected state: status:blocked.
+Next action: Add a canonical ### Files Scope (or legacy ## Files Scope) section listing the permitted paths in the issue body.
+Raw evidence remains in protected worker telemetry.
+<!-- ops:end -->
+${worker_footer}"
 	local dispatch_comments=""
 	reset_and_sign issue 41
 	dispatch_comments=$(jq -c --arg body "$dispatch_claim_audit" '.[0] += [{id:4315,node_id:"IC_4315",user:{id:105,node_id:"U_105",login:"external-author",type:"User"},author_association:"CONTRIBUTOR",created_at:"2026-01-01T00:08:00Z",updated_at:"2026-01-01T00:08:00Z",body:$body}]' "${FIXTURES}/comments-41.json")
@@ -511,10 +676,28 @@ ${worker_footer}"
 	assert_verify "external canonical dispatch audit lookalike remains content-bound" issue 41 STALE_APPROVAL 4
 
 	reset_and_sign issue 41
-	dispatch_comments=$(jq -c --arg body "${dispatch_claim_audit}
+	dispatch_comments=$(jq -c --arg body "$terminal_blocker_release" '.[0] += [{id:4316,node_id:"IC_4316",user:{id:1,node_id:"U_1",login:"maintainer",type:"User"},author_association:"OWNER",created_at:"2026-01-01T00:08:00Z",updated_at:"2026-01-01T00:08:00Z",body:$body}]' "${FIXTURES}/comments-41.json")
+	printf '%s\n' "$dispatch_comments" >"${FIXTURES}/comments-41.json"
+	assert_verify "trusted canonical terminal-blocker release preserves approval" issue 41 VERIFIED 0
+
+	# GH#33332: input_required releases are canonical writer output too.
+	local input_release="${terminal_blocker_release/reason=missing_files_scope owner=brief-author/reason=input_required owner=maintainer}"
+	input_release="${input_release/Next action: Add a canonical ### Files Scope (or legacy ## Files Scope) section listing the permitted paths in the issue body./Next action: Supply the specific input named in the protected dossier in the issue brief; a brief or dependency change re-arms dispatch. The recovery supervisor first decides anything AI can resolve within delegated authority.}"
+	reset_and_sign issue 41
+	dispatch_comments=$(jq -c --arg body "$input_release" '.[0] += [{id:4316,node_id:"IC_4316",user:{id:1,node_id:"U_1",login:"maintainer",type:"User"},author_association:"OWNER",created_at:"2026-01-01T00:08:00Z",updated_at:"2026-01-01T00:08:00Z",body:$body}]' "${FIXTURES}/comments-41.json")
+	printf '%s\n' "$dispatch_comments" >"${FIXTURES}/comments-41.json"
+	assert_verify "trusted canonical input_required release preserves approval" issue 41 VERIFIED 0
+
+	reset_and_sign issue 41
+	dispatch_comments=$(jq -c --arg body "${input_release/owner=maintainer/owner=human}" '.[0] += [{id:4316,node_id:"IC_4316",user:{id:1,node_id:"U_1",login:"maintainer",type:"User"},author_association:"OWNER",created_at:"2026-01-01T00:08:00Z",updated_at:"2026-01-01T00:08:00Z",body:$body}]' "${FIXTURES}/comments-41.json")
+	printf '%s\n' "$dispatch_comments" >"${FIXTURES}/comments-41.json"
+	assert_verify "input_required release with unlisted owner remains content-bound" issue 41 STALE_APPROVAL 4
+
+	reset_and_sign issue 41
+	dispatch_comments=$(jq -c --arg body "${terminal_blocker_release}
 extra trusted commentary" '.[0] += [{id:4316,node_id:"IC_4316",user:{id:1,node_id:"U_1",login:"maintainer",type:"User"},author_association:"OWNER",created_at:"2026-01-01T00:08:00Z",updated_at:"2026-01-01T00:08:00Z",body:$body}]' "${FIXTURES}/comments-41.json")
 	printf '%s\n' "$dispatch_comments" >"${FIXTURES}/comments-41.json"
-	assert_verify "trusted dispatch audit with extra prose remains content-bound" issue 41 STALE_APPROVAL 4
+	assert_verify "terminal-blocker release with extra prose remains content-bound" issue 41 STALE_APPROVAL 4
 
 	reset_and_sign issue 41
 	dispatch_comments=$(jq -c --arg body "${dispatch_claim_audit/DISPATCH_CLAIM/DISPATCH_UNKNOWN}" '.[0] += [{id:4317,node_id:"IC_4317",user:{id:1,node_id:"U_1",login:"maintainer",type:"User"},author_association:"OWNER",created_at:"2026-01-01T00:08:00Z",updated_at:"2026-01-01T00:08:00Z",body:$body}]' "${FIXTURES}/comments-41.json")
@@ -555,16 +738,70 @@ test_post_approval_linked_references() {
 write_locked_issue_fixture() {
 	local include_tier="${1:-true}"
 	local initial_status="${2:-}"
+	local extra_label="${3:-}"
 	write_baseline_fixtures
-	jq --arg include_tier "$include_tier" --arg initial_status "$initial_status" '.locked = true | .active_lock_reason = "resolved" | .labels = ([{id:6,node_id:"L_6",name:"external-contributor"},{id:7,node_id:"L_7",name:"origin:interactive"},{id:8,node_id:"L_8",name:"review:approve"}] + if $include_tier == "true" then [{id:9,node_id:"L_9",name:"tier:standard"}] else [] end + if $initial_status != "" then [{id:10,node_id:"L_10",name:("status:" + $initial_status)}] else [] end) | .assignees = []' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+	[[ -z "${LINKED_SOURCE_BODY:-}" ]] || set_linked_source_body 41 "$LINKED_SOURCE_BODY"
+	jq --arg include_tier "$include_tier" --arg initial_status "$initial_status" --arg extra_label "$extra_label" '.locked = true | .active_lock_reason = "resolved" | .labels = ([{id:6,node_id:"L_6",name:"external-contributor"},{id:7,node_id:"L_7",name:"origin:interactive"},{id:8,node_id:"L_8",name:"review:approve"}] + if $include_tier == "true" then [{id:9,node_id:"L_9",name:"tier:standard"}] else [] end + if $initial_status != "" then [{id:10,node_id:"L_10",name:("status:" + $initial_status)}] else [] end + if $extra_label != "" then [{id:13,node_id:"L_13",name:$extra_label}] else [] end) | .assignees = []' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
 	jq '.[0] += [{id:418,node_id:"EV_418",event:"locked",created_at:"2026-01-01T00:04:00Z",actor:{id:1,node_id:"U_1",login:"maintainer",type:"User"}}]' "${FIXTURES}/timeline-41.json" >"${FIXTURES}/timeline.tmp" && mv "${FIXTURES}/timeline.tmp" "${FIXTURES}/timeline-41.json"
-	append_signed_comment issue 41 "2026-01-01T00:05:00Z" 4199
+	append_signed_comment issue 41 "2026-01-01T00:05:00Z" 4199 "${SIGNED_SOURCE_PROFILE:-$APPROVAL_SNAPSHOT_PROFILE_SOURCE_STATE_UNBOUND}"
 	return 0
 }
 
 append_issue_timeline_event() {
 	local event_json="$1"
 	jq --argjson event "$event_json" '.[0] += [$event]' "${FIXTURES}/timeline-41.json" >"${FIXTURES}/timeline.tmp" && mv "${FIXTURES}/timeline.tmp" "${FIXTURES}/timeline-41.json"
+	return 0
+}
+
+render_self_hosting_writer() (
+	local implementation="" _SELF_HOSTING_TARGET_LABEL="tier:thinking"
+	implementation=$(awk '/^_sht_apply_label_and_comment\(\) \{/,/^}$/ { print }' "${SCRIPT_DIR}/../pre-dispatch-validator-helper.sh")
+	eval "$implementation"
+	_sht_replace_tier_labels() { return 0; }
+	_log() { return 0; }
+	gh_issue_comment() {
+		while [[ $# -gt 0 ]]; do
+			if [[ "$1" == --body ]]; then
+				printf '%s' "$2" >"${TEST_ROOT}/self-hosting-body.txt"
+				return 0
+			fi
+			shift
+		done
+		return 1
+	}
+	_sht_apply_label_and_comment 41 owner/repo pulse-dispatch- '<!-- self-hosting-tier-override -->' tier:standard
+	cat "${TEST_ROOT}/self-hosting-body.txt"
+	printf '\n<!-- aidevops:origin:worker -->\n<!-- aidevops:sig -->\n---\n[aidevops.sh](https://aidevops.sh) v3.32.337 automated scan.'
+)
+
+test_signed_tier_self_hosting_continuity() {
+	local body="" variant="" actor="" association="" comments="" changed="" created=""
+	body=$(render_self_hosting_writer) || return 1
+	for variant in exact missing wrong-actor contributor edited prose early; do
+		write_locked_issue_fixture
+		jq '.labels |= map(if .name == "tier:standard" then .name = "tier:thinking" else . end)' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+		append_issue_timeline_event '{"id":4501,"event":"unlabeled","created_at":"2026-01-01T00:06:00Z","actor":{"id":1,"login":"maintainer","type":"User"},"label":{"name":"tier:standard"}}'
+		append_issue_timeline_event '{"id":4502,"event":"labeled","created_at":"2026-01-01T00:06:01Z","actor":{"id":1,"login":"maintainer","type":"User"},"label":{"name":"tier:thinking"}}'
+		actor="maintainer" association="OWNER" changed="$body" created="2026-01-01T00:06:02Z"
+		case "$variant" in
+		wrong-actor) actor="trusted-collab" ;;
+		contributor) association="CONTRIBUTOR" ;;
+		prose) changed="${body}"$'\nNew scope' ;;
+		early) created="2026-01-01T00:04:00Z" ;;
+		esac
+		if [[ "$variant" != missing ]]; then
+			comments=$(jq -c --arg body "$changed" --arg actor "$actor" --arg association "$association" --arg created "$created" '.[0] += [{id:4503,node_id:"IC_4503",user:{id:1,node_id:"U_1",login:$actor,type:"User"},author_association:$association,created_at:$created,updated_at:"2026-01-01T00:06:02Z",body:$body}]' "${FIXTURES}/comments-41.json")
+			printf '%s\n' "$comments" >"${FIXTURES}/comments-41.json"
+		fi
+		if [[ "$variant" == edited ]]; then
+			jq '.[0][-1].updated_at = "2026-01-01T00:07:00Z"' "${FIXTURES}/comments-41.json" >"${FIXTURES}/comments.tmp" && mv "${FIXTURES}/comments.tmp" "${FIXTURES}/comments-41.json"
+		fi
+		if [[ "$variant" == exact ]]; then
+			assert_verify "signed tier escalation with real writer audit preserves approval" issue 41 VERIFIED 0
+		else
+			assert_verify "signed tier escalation with $variant audit remains stale" issue 41 STALE_APPROVAL 4
+		fi
+	done
 	return 0
 }
 
@@ -633,6 +870,106 @@ test_locked_issue_tier_backfill_continuity() {
 	jq '.labels |= map(select(.name != "tier:standard"))' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
 	append_issue_timeline_event '{"id":4213,"node_id":"EV_4213","event":"unlabeled","created_at":"2026-01-01T00:06:00Z","actor":{"id":1,"login":"maintainer","type":"User"},"label":{"name":"tier:standard"}}'
 	assert_verify "trusted tier removal remains stale" issue 41 STALE_APPROVAL 4
+
+	# The fix-the-fixer detector labels newly auto-dispatched issues right after
+	# approval; that observability classification must not stale the approval.
+	write_locked_issue_fixture
+	jq '.labels += [{id:12,node_id:"L_12",name:"fix-the-fixer"}]' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+	append_issue_timeline_event '{"id":4214,"node_id":"EV_4214","event":"labeled","created_at":"2026-01-01T00:06:00Z","actor":{"id":1,"login":"maintainer","type":"User"},"label":{"name":"fix-the-fixer"}}'
+	assert_verify "trusted fix-the-fixer classification preserves locked issue approval" issue 41 VERIFIED 0
+
+	write_locked_issue_fixture
+	jq '.labels += [{id:12,node_id:"L_12",name:"fix-the-fixer"}]' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+	append_issue_timeline_event '{"id":4215,"node_id":"EV_4215","event":"labeled","created_at":"2026-01-01T00:06:00Z","actor":{"id":2,"login":"contributor","type":"User"},"label":{"name":"fix-the-fixer"}}'
+	assert_verify "untrusted fix-the-fixer classification remains stale" issue 41 STALE_APPROVAL 4
+
+	# GH#37993: persistent is add-only after signing. It marks a long-lived
+	# non-task record and only restricts automation.
+	write_locked_issue_fixture
+	jq '.labels += [{id:14,node_id:"L_14",name:"persistent"}]' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+	append_issue_timeline_event '{"id":4216,"node_id":"EV_4216","event":"labeled","created_at":"2026-01-01T00:06:00Z","actor":{"id":1,"login":"maintainer","type":"User"},"label":{"name":"persistent"}}'
+	assert_verify "trusted persistent addition preserves locked issue approval" issue 41 VERIFIED 0
+
+	write_locked_issue_fixture
+	jq '.labels += [{id:14,node_id:"L_14",name:"persistent"}]' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+	append_issue_timeline_event '{"id":4217,"node_id":"EV_4217","event":"labeled","created_at":"2026-01-01T00:06:00Z","actor":{"id":2,"login":"contributor","type":"User"},"label":{"name":"persistent"}}'
+	assert_verify "untrusted persistent addition remains stale" issue 41 STALE_APPROVAL 4
+
+	write_locked_issue_fixture
+	jq '.labels += [{id:14,node_id:"L_14",name:"persistent"}]' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+	assert_verify "persistent addition without a visible event remains stale" issue 41 STALE_APPROVAL 4
+
+	write_locked_issue_fixture true "" persistent
+	jq '.labels |= map(select(.name != "persistent"))' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+	append_issue_timeline_event '{"id":4218,"node_id":"EV_4218","event":"unlabeled","created_at":"2026-01-01T00:06:00Z","actor":{"id":1,"login":"maintainer","type":"User"},"label":{"name":"persistent"}}'
+	assert_verify "trusted persistent removal remains stale" issue 41 STALE_APPROVAL 4
+	return 0
+}
+
+# GH#37762: signed permission requests add, and signed grants/withdrawals
+# remove, the needs-maintainer-permissions hold. That dispatch hold is not
+# scope-bearing, so authorized toggles must not stale a prior issue approval.
+test_locked_issue_permission_hold_continuity() {
+	local hold="needs-maintainer-permissions"
+	write_locked_issue_fixture true "" "$hold"
+	jq --arg hold "$hold" '.labels |= map(select(.name != $hold))' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+	append_issue_timeline_event '{"id":4221,"node_id":"EV_4221","event":"unlabeled","created_at":"2026-01-01T00:06:00Z","actor":{"id":1,"login":"maintainer","type":"User"},"label":{"name":"needs-maintainer-permissions"}}'
+	assert_verify "trusted permission-hold removal preserves locked issue approval" issue 41 VERIFIED 0
+
+	write_locked_issue_fixture
+	jq --arg hold "$hold" '.labels += [{id:13,node_id:"L_13",name:$hold}]' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+	append_issue_timeline_event '{"id":4222,"node_id":"EV_4222","event":"labeled","created_at":"2026-01-01T00:06:00Z","actor":{"id":1,"login":"maintainer","type":"User"},"label":{"name":"needs-maintainer-permissions"}}'
+	assert_verify "trusted permission-hold request preserves locked issue approval" issue 41 VERIFIED 0
+
+	write_locked_issue_fixture true "" "$hold"
+	jq --arg hold "$hold" '.labels |= map(select(.name != $hold))' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+	append_issue_timeline_event '{"id":4223,"node_id":"EV_4223","event":"unlabeled","created_at":"2026-01-01T00:06:00Z","actor":{"id":2,"login":"contributor","type":"User"},"label":{"name":"needs-maintainer-permissions"}}'
+	assert_verify "untrusted permission-hold removal remains stale" issue 41 STALE_APPROVAL 4
+
+	# A timeline that omits the hold removal (visibility lag or truncation) must
+	# not verify on the strength of another visible authorized mutation.
+	write_locked_issue_fixture true "" "$hold"
+	jq --arg hold "$hold" '.labels |= map(select(.name != $hold)) | .assignees = [{id:1,node_id:"U_1",login:"maintainer",type:"User"}]' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+	append_issue_timeline_event '{"id":4224,"node_id":"EV_4224","event":"assigned","created_at":"2026-01-01T00:06:00Z","actor":{"id":1,"login":"maintainer","type":"User"},"assignee":{"id":1,"login":"maintainer","type":"User"}}'
+	assert_verify "hidden permission-hold removal remains stale" issue 41 STALE_APPROVAL 4
+	return 0
+}
+
+test_locked_issue_label_replay() {
+	local label="" output="" rc=0
+	for label in needs-maintainer-review status:available; do
+		write_locked_issue_fixture true "" "$label"
+		jq --arg label "$label" '.labels |= map(select(.name != $label)) | .assignees = [{id:1,node_id:"U_1",login:"maintainer",type:"User"}]' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+		append_issue_timeline_event '{"id":4225,"event":"assigned","created_at":"2026-01-01T00:06:00Z","actor":{"id":1,"login":"maintainer","type":"User"},"assignee":{"id":1,"login":"maintainer","type":"User"}}'
+		assert_verify "hidden ${label} removal remains stale after retry" issue 41 STALE_APPROVAL 4
+	done
+
+	write_locked_issue_fixture
+	jq '.assignees = [{id:1,node_id:"U_1",login:"maintainer",type:"User"}]' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+	cp "${FIXTURES}/issue-41.json" "${FIXTURES}/issue-41-before-race.json"
+	jq '.labels += [{id:10,node_id:"L_10",name:"status:queued"}]' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+	append_issue_timeline_event '{"id":4226,"event":"assigned","created_at":"2026-01-01T00:06:00Z","actor":{"id":1,"login":"maintainer","type":"User"},"assignee":{"id":1,"login":"maintainer","type":"User"}}'
+	append_issue_timeline_event '{"id":4227,"event":"labeled","created_at":"2026-01-01T00:06:01Z","actor":{"id":1,"login":"maintainer","type":"User"},"label":{"name":"status:queued"}}'
+	rm -f "${FIXTURES}/race-read"
+	output=$(GH_RACE_FIRST_ISSUE=1 run_verify issue 41) || rc=$?
+	if [[ "$output" == VERIFIED && "$rc" -eq 0 ]]; then
+		print_result "snapshot timeline race verifies after fresh read" 0
+	else
+		print_result "snapshot timeline race verifies after fresh read" 1 "expected=VERIFIED/0, actual=${output}/${rc}"
+	fi
+	return 0
+}
+
+run_locked_issue_continuity_tests() {
+	test_locked_issue_continuity
+	test_unanchored_lock_signature
+	test_locked_issue_trusted_comment_continuity
+	test_locked_issue_trusted_content_edits
+	test_locked_issue_linked_source_edits
+	test_locked_issue_tier_backfill_continuity
+	test_locked_issue_permission_hold_continuity
+	test_locked_issue_label_replay
+	test_signed_tier_self_hosting_continuity
 	return 0
 }
 
@@ -659,6 +996,302 @@ test_locked_issue_stable_ordering() {
 	jq '.labels += [{id:10,node_id:"L_10",name:"status:in-progress"}]' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
 	append_issue_timeline_event '{"id":4202,"node_id":"EV_4202","event":"labeled","actor":{"id":1,"login":"maintainer","type":"User"},"label":{"name":"status:in-progress"}}'
 	assert_verify "missing lifecycle event timestamp fails closed as API uncertainty" issue 41 API_ERROR 6
+	return 0
+}
+
+append_issue_comment() {
+	local comment_id="$1"
+	local login="$2"
+	local association="$3"
+	local body="$4"
+	local user_id="${5:-1}"
+	jq --argjson id "$comment_id" --arg login "$login" --arg association "$association" --arg body "$body" --argjson user_id "$user_id" \
+		'.[0] += [{id:$id,node_id:("IC_" + ($id|tostring)),user:{id:$user_id,node_id:("U_" + ($user_id|tostring)),login:$login,type:"User"},author_association:$association,created_at:"2026-01-01T00:07:00Z",updated_at:"2026-01-01T00:07:00Z",body:$body}]' \
+		"${FIXTURES}/comments-41.json" >"${FIXTURES}/comments.tmp" && mv "${FIXTURES}/comments.tmp" "${FIXTURES}/comments-41.json"
+	return 0
+}
+
+# GH#33089: comments from live write-authorized users after the approval anchor
+# on a continuously locked issue are authority-equivalent and must not stale it.
+test_locked_issue_trusted_comment_continuity() {
+	local output="" rc=0
+	write_locked_issue_fixture
+	append_issue_comment 4400 maintainer OWNER "Maintainer review: implement option B, keep scope to the helper."
+	assert_verify "write-authorized post-approval prose preserves locked issue approval" issue 41 VERIFIED 0
+
+	write_locked_issue_fixture
+	append_issue_comment 4401 contributor CONTRIBUTOR "Please also change the release workflow." 2
+	assert_verify "read-permission post-approval comment stales locked issue approval" issue 41 STALE_APPROVAL 4
+
+	write_locked_issue_fixture
+	append_issue_comment 4402 maintainer OWNER "Trusted note"
+	append_issue_comment 4403 contributor CONTRIBUTOR "Untrusted addition" 2
+	assert_verify "trusted comment cannot mask an untrusted sibling comment" issue 41 STALE_APPROVAL 4
+
+	write_locked_issue_fixture
+	jq '.[0] |= map(if .id == 411 then .body = "Edited reviewed comment" | .updated_at = "2026-01-01T00:08:00Z" else . end)' "${FIXTURES}/comments-41.json" >"${FIXTURES}/comments.tmp" && mv "${FIXTURES}/comments.tmp" "${FIXTURES}/comments-41.json"
+	assert_verify "edited pre-approval comment stays bound" issue 41 STALE_APPROVAL 4
+
+	write_locked_issue_fixture
+	append_issue_comment 4100 maintainer OWNER "Comment ordered before the approval anchor"
+	assert_verify "trusted comment ordered before the approval anchor stays bound" issue 41 STALE_APPROVAL 4
+
+	write_locked_issue_fixture
+	jq '.title = "Retitled after approval"' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+	append_issue_comment 4404 maintainer OWNER "Trusted note"
+	assert_verify "trusted comment does not relax title binding" issue 41 STALE_APPROVAL 4
+
+	write_locked_issue_fixture
+	jq '.assignees = [{id:1,node_id:"U_1",login:"maintainer",type:"User"}] | .labels += [{id:10,node_id:"L_10",name:"status:in-progress"}]' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+	append_issue_timeline_event '{"id":4405,"node_id":"EV_4405","event":"assigned","created_at":"2026-01-01T00:06:00Z","actor":{"id":1,"login":"maintainer","type":"User"},"assignee":{"id":1,"login":"maintainer","type":"User"}}'
+	append_issue_timeline_event '{"id":4406,"node_id":"EV_4406","event":"labeled","created_at":"2026-01-01T00:06:01Z","actor":{"id":1,"login":"maintainer","type":"User"},"label":{"name":"status:in-progress"}}'
+	append_issue_comment 4407 maintainer OWNER "Starting implementation."
+	assert_verify "trusted comment plus authorized lifecycle transition verifies" issue 41 VERIFIED 0
+
+	write_locked_issue_fixture
+	append_issue_comment 4408 maintainer OWNER "Trusted note"
+	rm -f "${FIXTURES}/gh-fail-count"
+	output=$(GH_FAIL_ENDPOINT="collaborators/maintainer/permission" run_verify issue 41) || rc=$?
+	rm -f "${FIXTURES}/gh-fail-count"
+	if [[ "$output" == "API_ERROR" && "$rc" -eq 6 ]]; then
+		print_result "trusted comment permission uncertainty fails closed" 0
+	else
+		print_result "trusted comment permission uncertainty fails closed" 1 "expected=API_ERROR/6, actual=${output}/${rc}"
+	fi
+
+	# Continuity requires the approval lock; unlocked issues stay exact-bound.
+	reset_and_sign issue 41
+	append_issue_comment 4409 maintainer OWNER "Trusted note on an unlocked issue"
+	assert_verify "trusted comment on an unlocked issue remains stale" issue 41 STALE_APPROVAL 4
+	return 0
+}
+
+write_body_edit_history() {
+	local editor_json="$1"
+	local has_next="${2:-false}"
+	jq -nc --argjson editor "$editor_json" --argjson has_next "$has_next" '
+		{data:{repository:{issue:{userContentEdits:{pageInfo:{hasNextPage:$has_next},nodes:[
+			{editedAt:"2026-01-01T00:08:00Z",editor:$editor},
+			{editedAt:"2026-01-01T00:00:30Z",editor:{__typename:"User",login:"contributor"}}
+		]}}}}}' >"${FIXTURES}/graphql-edits-41.json"
+	return 0
+}
+
+edit_issue_41() {
+	local filter="$1"
+	jq "$filter" "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+	return 0
+}
+
+# GH#33097: write-authorized title/body edits after the approval anchor on a
+# continuously locked issue do not stale approvals that carry component digests.
+test_locked_issue_trusted_content_edits() {
+	local maintainer_editor='{"__typename":"User","login":"maintainer"}'
+	write_locked_issue_fixture
+	edit_issue_41 '.body += "\n\n### Files Scope\n\n- src/helper.sh"'
+	write_body_edit_history "$maintainer_editor"
+	assert_verify "trusted post-approval body edit preserves locked issue approval" issue 41 VERIFIED 0
+
+	write_locked_issue_fixture
+	edit_issue_41 '.body += "\n\nUntrusted scope"'
+	write_body_edit_history '{"__typename":"User","login":"contributor"}'
+	assert_verify "untrusted post-approval body editor stales locked issue approval" issue 41 STALE_APPROVAL 4
+
+	write_locked_issue_fixture
+	edit_issue_41 '.body += "\n\nGhost scope"'
+	write_body_edit_history '{"__typename":"User","login":"ghost"}'
+	assert_verify "ghost body editor fails closed" issue 41 API_ERROR 6
+
+	write_locked_issue_fixture
+	edit_issue_41 '.body += "\n\nDeleted editor"'
+	write_body_edit_history 'null'
+	assert_verify "missing body editor fails closed" issue 41 API_ERROR 6
+
+	write_locked_issue_fixture
+	edit_issue_41 '.body += "\n\nNo history"'
+	assert_verify "missing body edit history fails closed" issue 41 API_ERROR 6
+
+	write_locked_issue_fixture
+	edit_issue_41 '.body += "\n\nPaged history"'
+	write_body_edit_history "$maintainer_editor" true
+	assert_verify "paginated body edit history fails closed" issue 41 API_ERROR 6
+
+	write_locked_issue_fixture
+	edit_issue_41 '.body += "\n\nTrusted scope"'
+	write_body_edit_history "$maintainer_editor"
+	append_issue_comment 4410 contributor CONTRIBUTOR "Untrusted addition" 2
+	assert_verify "trusted body edit cannot mask an untrusted comment" issue 41 STALE_APPROVAL 4
+
+	write_baseline_fixtures
+	edit_issue_41 '.locked = true | .active_lock_reason = "resolved"'
+	jq '.[0] += [{id:418,node_id:"EV_418",event:"locked",created_at:"2026-01-01T00:04:00Z",actor:{id:1,node_id:"U_1",login:"maintainer",type:"User"}}]' "${FIXTURES}/timeline-41.json" >"${FIXTURES}/timeline.tmp" && mv "${FIXTURES}/timeline.tmp" "${FIXTURES}/timeline-41.json"
+	STRIP_CONTENT_DIGESTS=1 append_signed_comment issue 41 "2026-01-01T00:05:00Z" 4199
+	edit_issue_41 '.body += "\n\nLegacy payload scope"'
+	write_body_edit_history "$maintainer_editor"
+	assert_verify "legacy payload without component digests stays body-bound" issue 41 STALE_APPROVAL 4
+
+	reset_and_sign issue 41
+	edit_issue_41 '.body += "\n\nUnlocked scope"'
+	write_body_edit_history "$maintainer_editor"
+	assert_verify "trusted body edit on an unlocked issue remains stale" issue 41 STALE_APPROVAL 4
+
+	write_locked_issue_fixture
+	edit_issue_41 '.title = "Retitled by maintainer"'
+	append_issue_timeline_event '{"id":4420,"node_id":"EV_4420","event":"renamed","created_at":"2026-01-01T00:08:00Z","actor":{"id":1,"login":"maintainer","type":"User"},"rename":{"from":"Reviewed issue","to":"Retitled by maintainer"}}'
+	assert_verify "trusted post-approval rename preserves locked issue approval" issue 41 VERIFIED 0
+
+	write_locked_issue_fixture
+	edit_issue_41 '.title = "Retitled by contributor"'
+	append_issue_timeline_event '{"id":4421,"node_id":"EV_4421","event":"renamed","created_at":"2026-01-01T00:08:00Z","actor":{"id":2,"login":"contributor","type":"User"},"rename":{"from":"Reviewed issue","to":"Retitled by contributor"}}'
+	assert_verify "untrusted post-approval rename stales locked issue approval" issue 41 STALE_APPROVAL 4
+
+	# A body edit by a trusted editor cannot carry an untrusted rename with it.
+	write_locked_issue_fixture
+	edit_issue_41 '.title = "Retitled by contributor" | .body += "\n\nTrusted scope"'
+	write_body_edit_history "$maintainer_editor"
+	append_issue_timeline_event '{"id":4422,"node_id":"EV_4422","event":"renamed","created_at":"2026-01-01T00:08:00Z","actor":{"id":2,"login":"contributor","type":"User"},"rename":{"from":"Reviewed issue","to":"Retitled by contributor"}}'
+	assert_verify "trusted body edit cannot mask an untrusted rename" issue 41 STALE_APPROVAL 4
+	return 0
+}
+
+LINKED_BLOCK_START="<!-- This is an auto-generated comment: release notes by coderabbit.ai -->"
+LINKED_BLOCK_END="<!-- end of auto-generated comment: release notes by coderabbit.ai -->"
+
+set_linked_source_body() {
+	local number="$1"
+	local body="$2"
+	jq --arg body "$body" '.[0][0].source.issue.body = $body' "${FIXTURES}/timeline-${number}.json" >"${FIXTURES}/timeline.tmp" && mv "${FIXTURES}/timeline.tmp" "${FIXTURES}/timeline-${number}.json"
+	return $?
+}
+
+linked_block_body() {
+	local prefix="$1"
+	local summary="$2"
+	printf '%s\n%s\n%s\n%s' "$prefix" "$LINKED_BLOCK_START" "$summary" "$LINKED_BLOCK_END"
+	return 0
+}
+
+# Args: JSON array of {editedAt, login, type, diff}; optional hasNextPage.
+write_source_edit_history() {
+	local revisions_json="$1"
+	local has_next="${2:-false}"
+	jq -nc --argjson revisions "$revisions_json" --argjson has_next "$has_next" '
+		{data:{node:{__typename:"Issue",id:"I_9001",userContentEdits:{pageInfo:{hasNextPage:$has_next},nodes:(
+			$revisions | reverse | map({editedAt, diff, editor:(if .login == null then null else {__typename:.type, login} end)}))}}}}' >"${FIXTURES}/graphql-source-edits.json"
+	return 0
+}
+
+# Revision JSON: original source body before the 00:05 signature, then edits.
+source_revisions() {
+	local signed_body="$1"
+	shift
+	local revisions='[]'
+	revisions=$(jq -nc --arg body "$signed_body" '[{editedAt:"2026-01-01T00:00:30Z",login:"link-author",type:"User",diff:$body}]')
+	while [[ $# -ge 3 ]]; do
+		revisions=$(jq -c --arg at "$1" --arg editor "$2" --arg body "$3" '
+			. + [{editedAt:$at, login:($editor | split(":")[1]), type:($editor | split(":")[0]), diff:$body}]' <<<"$revisions")
+		shift 3
+	done
+	printf '%s\n' "$revisions"
+	return 0
+}
+
+# GH#38006: authorized and review-bot edits to a content-bound external linked
+# source body must not stale a continuously locked issue approval.
+test_locked_issue_linked_source_edits() {
+	local signed="" repaired="" refreshed="" revisions=""
+	signed=$(linked_block_body "Linked body" "Summary at signing")
+	repaired=$(linked_block_body "Linked body
+
+Repair notes by the maintainer" "Summary at signing")
+	refreshed=$(linked_block_body "Linked body
+
+Repair notes by the maintainer" "Summary after the repair commit")
+
+	LINKED_SOURCE_BODY="$signed" write_locked_issue_fixture
+	set_linked_source_body 41 "$repaired"
+	write_source_edit_history "$(source_revisions "$signed" 2026-01-01T00:08:00Z User:maintainer "$repaired")"
+	assert_verify "maintainer linked-source body edit preserves locked issue approval" issue 41 VERIFIED 0
+
+	LINKED_SOURCE_BODY="$signed" write_locked_issue_fixture
+	set_linked_source_body 41 "$(linked_block_body "Linked body" "Summary after the repair commit")"
+	write_source_edit_history "$(source_revisions "$signed" 2026-01-01T00:09:00Z Bot:coderabbitai "$(linked_block_body "Linked body" "Summary after the repair commit")")"
+	assert_verify "CodeRabbit block-only linked-source edit preserves locked issue approval" issue 41 VERIFIED 0
+
+	# GH#37991 replay shape: maintainer repair notes, then a CodeRabbit refresh,
+	# against a payload signed before linked-source digests existed.
+	revisions=$(source_revisions "$signed" 2026-01-01T00:08:00Z User:maintainer "$repaired" 2026-01-01T00:09:00Z Bot:coderabbitai "$refreshed")
+	LINKED_SOURCE_BODY="$signed" STRIP_LINKED_DIGESTS=1 write_locked_issue_fixture
+	set_linked_source_body 41 "$refreshed"
+	write_source_edit_history "$revisions"
+	assert_verify "pre-GH#38006 payload verifies maintainer plus CodeRabbit linked-source edits" issue 41 VERIFIED 0
+
+	LINKED_SOURCE_BODY="$signed" write_locked_issue_fixture
+	set_linked_source_body 41 "$refreshed"
+	write_source_edit_history "$revisions"
+	assert_verify "maintainer plus CodeRabbit linked-source edits preserve locked issue approval" issue 41 VERIFIED 0
+
+	LINKED_SOURCE_BODY="$signed" write_locked_issue_fixture
+	set_linked_source_body 41 "$repaired"
+	write_source_edit_history "$(source_revisions "$signed" 2026-01-01T00:08:00Z User:link-author "$repaired")"
+	assert_verify "external author linked-source body edit stales locked issue approval" issue 41 STALE_APPROVAL 4
+
+	LINKED_SOURCE_BODY="$signed" write_locked_issue_fixture
+	set_linked_source_body 41 "$repaired"
+	write_source_edit_history "$(source_revisions "$signed" 2026-01-01T00:08:00Z Bot:coderabbitai "$repaired")"
+	assert_verify "CodeRabbit edit outside its block stales locked issue approval" issue 41 STALE_APPROVAL 4
+
+	LINKED_SOURCE_BODY="$signed" write_locked_issue_fixture
+	set_linked_source_body 41 "$(linked_block_body "Linked body" "Unlisted bot summary")"
+	write_source_edit_history "$(source_revisions "$signed" 2026-01-01T00:08:00Z Bot:other-review-bot "$(linked_block_body "Linked body" "Unlisted bot summary")")"
+	assert_verify "unlisted bot linked-source edit stales locked issue approval" issue 41 STALE_APPROVAL 4
+
+	LINKED_SOURCE_BODY="$signed" write_locked_issue_fixture
+	set_linked_source_body 41 "$repaired"
+	assert_verify "linked-source GraphQL uncertainty fails closed" issue 41 API_ERROR 6
+
+	LINKED_SOURCE_BODY="$signed" write_locked_issue_fixture
+	set_linked_source_body 41 "$repaired"
+	write_source_edit_history "$(source_revisions "$signed" 2026-01-01T00:08:00Z User:maintainer "$repaired")" true
+	assert_verify "paginated linked-source history fails closed" issue 41 API_ERROR 6
+
+	LINKED_SOURCE_BODY="$signed" write_locked_issue_fixture
+	set_linked_source_body 41 "$repaired"
+	write_source_edit_history "$(source_revisions "$signed" 2026-01-01T00:08:00Z User:ghost "$repaired")"
+	assert_verify "ghost linked-source editor fails closed" issue 41 API_ERROR 6
+
+	LINKED_SOURCE_BODY="$signed" write_locked_issue_fixture
+	set_linked_source_body 41 "$repaired"
+	write_source_edit_history "$(source_revisions "$signed" 2026-01-01T00:08:00Z User:maintainer "an unexplained revision")"
+	assert_verify "history that does not explain the current body fails closed" issue 41 API_ERROR 6
+
+	LINKED_SOURCE_BODY="$signed" write_locked_issue_fixture
+	set_linked_source_body 41 "$repaired"
+	write_source_edit_history "$(source_revisions "$signed" 2026-01-01T00:08:00Z User:maintainer "$repaired")"
+	append_issue_comment 4430 contributor CONTRIBUTOR "Untrusted addition" 2
+	assert_verify "authorized linked-source edit cannot mask an untrusted comment" issue 41 STALE_APPROVAL 4
+
+	LINKED_SOURCE_BODY="$signed" write_locked_issue_fixture
+	set_linked_source 41 '.title = "Retitled linked scope"'
+	set_linked_source_body 41 "$repaired"
+	write_source_edit_history "$(source_revisions "$signed" 2026-01-01T00:08:00Z User:maintainer "$repaired")"
+	assert_verify "linked-source title stays bound" issue 41 STALE_APPROVAL 4
+
+	write_baseline_fixtures
+	set_linked_source_body 41 "$signed"
+	append_signed_comment issue 41 "2026-01-01T00:05:00Z"
+	set_linked_source_body 41 "$repaired"
+	write_source_edit_history "$(source_revisions "$signed" 2026-01-01T00:08:00Z User:maintainer "$repaired")"
+	assert_verify "maintainer linked-source edit on an unlocked issue remains stale" issue 41 STALE_APPROVAL 4
+
+	# Older profiles keep exact-match linked-body behaviour.
+	local profile=""
+	for profile in "$APPROVAL_SNAPSHOT_PROFILE_TRUSTED_SOURCES" "$APPROVAL_SNAPSHOT_PROFILE_STABLE"; do
+		LINKED_SOURCE_BODY="$signed" SIGNED_SOURCE_PROFILE="$profile" STRIP_LINKED_DIGESTS=1 write_locked_issue_fixture
+		set_linked_source_body 41 "$repaired"
+		write_source_edit_history "$(source_revisions "$signed" 2026-01-01T00:08:00Z User:maintainer "$repaired")"
+		assert_verify "${profile} profile linked-source body edit stays stale" issue 41 STALE_APPROVAL 4
+	done
 	return 0
 }
 
@@ -745,6 +1378,52 @@ test_locked_issue_continuity() {
 	return 0
 }
 
+verify_issue_reason() {
+	local number="$1"
+	HOME="$TEST_HOME" PATH="${TEST_ROOT}/bin:$PATH" FIXTURES="$FIXTURES" \
+		AIDEVOPS_APPROVAL_PUB="${TEST_ROOT}/approval.pub" \
+		"$APPROVAL_HELPER" verify issue "$number" owner/repo 2>&1 >/dev/null | sed -n 's/^APPROVAL_REASON: //p' | tail -n 1
+	return 0
+}
+
+# GH#34554: GitHub stopped returning lifecycle events for a saturated issue, so
+# REST reported locked=true while the newest visible lock event was an unlock.
+# Such a signature can never prove continuity and must say so explicitly.
+test_unanchored_lock_signature() {
+	local reason=""
+	write_baseline_fixtures
+	jq '.locked = true | .active_lock_reason = "resolved" | .labels = [{id:7,node_id:"L_7",name:"origin:interactive"}] | .assignees = []' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+	append_issue_timeline_event '{"id":4180,"node_id":"EV_4180","event":"locked","created_at":"2026-01-01T00:03:00Z","actor":{"id":1,"node_id":"U_1","login":"maintainer","type":"User"}}'
+	append_issue_timeline_event '{"id":4181,"node_id":"EV_4181","event":"unlocked","created_at":"2026-01-01T00:03:30Z","actor":{"id":1,"node_id":"U_1","login":"maintainer","type":"User"}}'
+	append_signed_comment issue 41 "2026-01-01T00:05:00Z" 4199
+	if jq -e '.issue.lifecycle.locked == true and .issue.lifecycle.lock_anchor == null' "${TEST_ROOT}/payload-41.json" >/dev/null 2>&1; then
+		print_result "saturated timeline fixture produces an unanchored locked payload" 0
+	else
+		print_result "saturated timeline fixture produces an unanchored locked payload" 1
+	fi
+	# Post-approval handoff with no visible timeline events (truncated stream).
+	jq '.assignees = [{id:1,node_id:"U_1",login:"maintainer",type:"User"}] | .labels += [{id:10,node_id:"L_10",name:"auto-dispatch"},{id:11,node_id:"L_11",name:"status:available"}]' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+	assert_verify "unanchored locked signature fails closed after lifecycle handoff" issue 41 STALE_APPROVAL 4
+	reason=$(verify_issue_reason 41)
+	if [[ "$reason" == "unanchored-lock-signature" ]]; then
+		print_result "unanchored locked signature reports a distinct reason" 0
+	else
+		print_result "unanchored locked signature reports a distinct reason" 1 "reason=${reason}"
+	fi
+
+	# An anchored signature with unrelated drift keeps the generic reason.
+	write_locked_issue_fixture
+	jq '.labels += [{id:12,node_id:"L_12",name:"security"}]' "${FIXTURES}/issue-41.json" >"${FIXTURES}/issue.tmp" && mv "${FIXTURES}/issue.tmp" "${FIXTURES}/issue-41.json"
+	append_issue_timeline_event '{"id":4182,"node_id":"EV_4182","event":"labeled","created_at":"2026-01-01T00:06:00Z","actor":{"id":1,"login":"maintainer","type":"User"},"label":{"name":"security"}}'
+	reason=$(verify_issue_reason 41)
+	if [[ "$reason" == "stale-or-unproven-continuity" ]]; then
+		print_result "anchored continuity failure keeps the generic reason" 0
+	else
+		print_result "anchored continuity failure keeps the generic reason" 1 "reason=${reason}"
+	fi
+	return 0
+}
+
 test_linked_source_timestamp_profiles() {
 	write_baseline_fixtures
 	append_signed_comment pr 42 "2026-01-01T00:05:00Z" 4298 legacy
@@ -760,6 +1439,81 @@ test_linked_source_timestamp_profiles() {
 	jq '.[0][0].source.issue.updated_at = "2026-01-01T00:07:00Z"' "${FIXTURES}/timeline-42.json" >"${FIXTURES}/timeline.tmp" && mv "${FIXTURES}/timeline.tmp" "${FIXTURES}/timeline-42.json"
 	assert_verify "linked-source timestamp drift does not stale PR approval" pr 42 VERIFIED 0 "$PR_HEAD"
 	return 0
+}
+
+set_linked_source() {
+	local number="$1"
+	local filter="$2"
+	jq ".[0][0].source.issue |= (${filter})" "${FIXTURES}/timeline-${number}.json" >"${FIXTURES}/timeline.tmp" && mv "${FIXTURES}/timeline.tmp" "${FIXTURES}/timeline-${number}.json"
+	return $?
+}
+
+rewrite_linked_source_content() {
+	local number="$1"
+	set_linked_source "$number" '.title = "Dashboard refreshed" | .body = "refreshed body" | .state = "closed" | .updated_at = "2026-01-01T00:07:00Z"'
+	return $?
+}
+
+# GH#32455: supervisor dashboards authored by write-trusted accounts rewrite
+# themselves every pulse; they must not stale approvals they merely link to.
+test_trusted_linked_source_profiles() {
+	local association=""
+	for association in OWNER MEMBER COLLABORATOR; do
+		write_baseline_fixtures
+		set_linked_source 42 ".author_association = \"${association}\""
+		append_signed_comment pr 42 "2026-01-01T00:05:00Z"
+		rewrite_linked_source_content 42
+		assert_verify "trusted ${association} linked-source rewrite keeps PR approval" pr 42 VERIFIED 0 "$PR_HEAD"
+	done
+
+	write_baseline_fixtures
+	set_linked_source 41 '.author_association = "COLLABORATOR"'
+	append_signed_comment issue 41 "2026-01-01T00:05:00Z"
+	rewrite_linked_source_content 41
+	assert_verify "trusted linked-source rewrite keeps issue approval" issue 41 VERIFIED 0
+
+	write_baseline_fixtures
+	set_linked_source 42 '.author_association = "CONTRIBUTOR"'
+	append_signed_comment pr 42 "2026-01-01T00:05:00Z"
+	rewrite_linked_source_content 42
+	assert_verify "untrusted linked-source rewrite stales PR approval" pr 42 STALE_APPROVAL 4 "$PR_HEAD"
+
+	write_baseline_fixtures
+	set_linked_source 42 '.author_association = "OWNER" | .repository.full_name = "other/repo"'
+	append_signed_comment pr 42 "2026-01-01T00:05:00Z"
+	rewrite_linked_source_content 42
+	assert_verify "cross-repository linked-source rewrite stales PR approval" pr 42 STALE_APPROVAL 4 "$PR_HEAD"
+
+	write_baseline_fixtures
+	set_linked_source 42 '.author_association = "OWNER"'
+	append_signed_comment pr 42 "2026-01-01T00:05:00Z"
+	set_linked_source 42 '.author_association = "CONTRIBUTOR"'
+	assert_verify "linked-source association drift stales PR approval" pr 42 STALE_APPROVAL 4 "$PR_HEAD"
+
+	# GH#34266: closing/reopening a linked external source carries no scope.
+	write_baseline_fixtures
+	set_linked_source 41 '.author_association = "NONE" | .state = "open"'
+	append_signed_comment issue 41 "2026-01-01T00:05:00Z"
+	set_linked_source 41 '.state = "closed"'
+	assert_verify "maintainer closing a linked external source keeps issue approval" issue 41 VERIFIED 0
+	set_linked_source 41 '.body = "external author rewrote the linked body"'
+	assert_verify "external linked-source body edit still stales issue approval" issue 41 STALE_APPROVAL 4
+
+	write_baseline_fixtures
+	set_linked_source 42 '.author_association = "NONE" | .state = "open"'
+	append_signed_comment pr 42 "2026-01-01T00:05:00Z" 4298 "$APPROVAL_SNAPSHOT_PROFILE_TRUSTED_SOURCES"
+	assert_verify "pre-GH#34266 trusted-sources approval remains verifiable" pr 42 VERIFIED 0 "$PR_HEAD"
+	set_linked_source 42 '.state = "closed"'
+	assert_verify "pre-GH#34266 approval still binds linked-source state" pr 42 STALE_APPROVAL 4 "$PR_HEAD"
+
+	write_baseline_fixtures
+	set_linked_source 42 '.author_association = "OWNER"'
+	append_signed_comment pr 42 "2026-01-01T00:05:00Z" 4297 "$APPROVAL_SNAPSHOT_PROFILE_STABLE"
+	assert_verify "pre-GH#32455 stable-profile approval remains verifiable" pr 42 VERIFIED 0 "$PR_HEAD"
+	rewrite_linked_source_content 42
+	assert_verify "pre-GH#32455 stable-profile content drift remains stale" pr 42 STALE_APPROVAL 4 "$PR_HEAD"
+	reset_and_sign pr 42
+	return $?
 }
 
 main() {
@@ -782,6 +1536,7 @@ main() {
 	reset_and_sign pr 42
 	assert_verify "unchanged PR V2 snapshot verifies exact head" pr 42 VERIFIED 0 "$PR_HEAD"
 	test_linked_source_timestamp_profiles
+	test_trusted_linked_source_profiles
 	local original_digest="" repeated_payload="" repeated_digest=""
 	original_digest=$(jq -r '.snapshot_sha256' "${TEST_ROOT}/payload-42.json")
 	repeated_payload=$(PATH="${TEST_ROOT}/bin:$PATH" FIXTURES="$FIXTURES" approval_snapshot_v2_payload pr 42 owner/repo "2026-01-01T00:06:00Z")
@@ -794,11 +1549,12 @@ main() {
 	append_signed_comment pr 42 "2026-01-01T00:06:00Z" 4300
 	assert_verify "repeat approval verifies against the newest exact snapshot" pr 42 VERIFIED 0 "$PR_HEAD"
 	test_trusted_lifecycle_comments
+	test_exact_remediation_continuity
+	test_canonical_review_bot_retry
 	test_trusted_dispatch_audit_comments
 	test_dispatch_audit_comments_fail_closed
 	test_post_approval_linked_references
-	test_locked_issue_continuity
-	test_locked_issue_tier_backfill_continuity
+	run_locked_issue_continuity_tests
 
 	reset_and_sign pr 42
 	local marker_drift="<!-- aidevops-signed-approval --> unsigned external drift"

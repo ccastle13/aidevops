@@ -15,8 +15,13 @@ export PATH="/usr/bin:/bin:/usr/sbin:/sbin:${PATH}"
 # Fixture repositories are intentionally isolated under TMP. Use native Git so
 # the production canonical-worktree shim does not classify them as service
 # mirrors during local verification.
+export TEST_NATIVE_GIT
+TEST_NATIVE_GIT=$(command -p -v git) || {
+	printf '%s\n' 'Native Git is unavailable on the system PATH' >&2
+	exit 1
+}
 git() {
-	/usr/bin/git "$@"
+	"$TEST_NATIVE_GIT" "$@"
 	return $?
 }
 
@@ -82,6 +87,7 @@ fixture_scripts="${TMP}/scripts"
 mkdir -p "$fixture_scripts"
 cp "$SCRIPTS_DIR/pulse-wrapper-cycle.sh" "$fixture_scripts/pulse-wrapper-cycle.sh"
 cp "$SCRIPTS_DIR/planning-publisher.sh" "$fixture_scripts/planning-publisher.sh"
+cp "$SCRIPTS_DIR/pulse-todo-publication.sh" "$fixture_scripts/pulse-todo-publication.sh"
 cp "$SCRIPTS_DIR/pulse-todo-sync-workspace.sh" "$fixture_scripts/pulse-todo-sync-workspace.sh"
 cat >"${fixture_scripts}/issue-sync-helper.sh" <<'FIXTURE'
 #!/usr/bin/env bash
@@ -100,7 +106,12 @@ done
 [[ -n "$repo" && -n "$root" ]] || exit 3
 printf '%s|%s|%s\n' "$command_name" "$repo" "$root" >>"$CALL_LOG"
 if [[ "$command_name" == "pull" ]]; then
-	printf '%s\n' "synced:${repo}" >>"${root}/TODO.md"
+	if [[ "$repo" == "owner/repo-handoff" ]]; then
+		grep -Fq 'ref:GH#301' "${root}/TODO.md" || \
+			printf '%s\n' '- [x] t301 completed ref:GH#301 pr:#77' >>"${root}/TODO.md"
+	else
+		printf '%s\n' "synced:${repo}" >>"${root}/TODO.md"
+	fi
 fi
 if [[ "$command_name" == "pull" && -n "${ADVANCE_REMOTE_ON_PULL:-}" && ! -e "${ADVANCE_REMOTE_MARKER:-}" ]]; then
 	writer="${ADVANCE_REMOTE_WRITER:-}"
@@ -123,7 +134,8 @@ export WRAPPER_LOGFILE="${TMP}/pulse.log"
 export LOGFILE="$WRAPPER_LOGFILE"
 export SCRIPT_DIR="$fixture_scripts"
 export AIDEVOPS_TEMP_DIR="${TMP}/automation"
-export AIDEVOPS_PLANNING_VALIDATOR=/usr/bin/true
+export AIDEVOPS_PLANNING_VALIDATOR
+AIDEVOPS_PLANNING_VALIDATOR=$(type -P true) || fail "true executable is unavailable"
 export GIT_AUTHOR_NAME=Test
 export GIT_AUTHOR_EMAIL=test@example.com
 export GIT_COMMITTER_NAME=Test
@@ -134,6 +146,15 @@ source "$fixture_scripts/pulse-wrapper-cycle.sh"
 # the same module inside the isolated sync scope when it is not already loaded.
 # shellcheck source=/dev/null
 source "$fixture_scripts/planning-publisher.sh"
+# Normal unprotected publication has no existing Pulse handoff. Keep this
+# fixture entirely offline even though production checks for a pending PR.
+gh() {
+	if [[ "$1 $2" == "pr list" ]]; then
+		printf '%s\n' '[]'
+		return 0
+	fi
+	return 1
+}
 
 # Workspace creation must clone only the remote default branch tip.
 _ptsw_create_workspace "file://${remote_a}" || fail "shallow workspace clone failed"
@@ -195,6 +216,94 @@ sync_todo_refs_for_repo owner/repo-b "$repo_b"
 [[ $(canonical_snapshot "$repo_a") == "$snapshot_a" ]] || fail "repo B invocation changed repo A"
 [[ $(canonical_snapshot "$repo_b") == "$snapshot_b" ]] || fail "repo B canonical checkout changed"
 git --git-dir="$remote_b" show main:TODO.md | grep -q '^synced:owner/repo-b$' || fail "repo B remote was not synced"
+
+# A protected default refuses direct publication once. A deterministic branch
+# and reviewable PR survive workspace cleanup; later cycles wait for merge.
+repo_handoff="${TMP}/repo-handoff"
+remote_handoff="${TMP}/remote-handoff.git"
+setup_sync_repo "$repo_handoff" "$remote_handoff"
+original_gh_definition=$(declare -f gh)
+original_push_definition=$(declare -f _planning_publish_push)
+export TEST_PROTECTED_PR_BODY="${TMP}/protected-pr-body"
+export TEST_PROTECTED_PUSHES="${TMP}/protected-pushes"
+export TEST_PROTECTED_PR_BRANCH="${TMP}/protected-pr-branch"
+gh() {
+	if [[ "$1 $2" == "pr list" ]]; then
+		if [[ -f "$TEST_PROTECTED_PR_BODY" ]]; then
+			jq -n --rawfile body "$TEST_PROTECTED_PR_BODY" --rawfile head "$TEST_PROTECTED_PR_BRANCH" \
+			'[ {url:"https://github.com/owner/repo-handoff/pull/1",state:"OPEN",body:$body,headRefName:($head | rtrimstr("\n"))} ]'
+		else
+			printf '%s\n' '[]'
+		fi
+		return 0
+	fi
+	if [[ "$1 $2" == "repo view" ]]; then
+		printf '%s\n' 'WRITE'
+		return 0
+	fi
+	return 1
+}
+gh_create_pr() {
+	local body_file="" previous="" head_branch="" title=""
+	while [[ $# -gt 0 ]]; do
+		case "$previous" in
+		--body-file) body_file="$1" ;;
+		--head) head_branch="$1" ;;
+		--title) title="$1" ;;
+		esac
+		previous="$1"; shift
+	done
+	[[ -n "$body_file" && -f "$body_file" && -n "$head_branch" && "$title" != *'[skip ci]'* ]] || return 1
+	cp "$body_file" "$TEST_PROTECTED_PR_BODY"
+	printf '%s\n' "$head_branch" >"$TEST_PROTECTED_PR_BRANCH"
+	printf '%s\n' 'https://github.com/owner/repo-handoff/pull/1'
+}
+_planning_publish_push() {
+	local workspace="$1" remote="$2" branch="$3" expected="$4" candidate="$5"
+	if [[ "$branch" == "main" ]]; then
+		printf '%s\n' rejected >>"$TEST_PROTECTED_PUSHES"
+		PLANNING_PUBLISH_RESULT="protected_branch_publication_deferred"
+		return 4
+	fi
+	git -C "$workspace" push -q --force-with-lease="refs/heads/${branch}:${expected}" \
+		"$remote" "${candidate}:refs/heads/${branch}"
+}
+protected_rc=0
+sync_todo_refs_for_repo owner/repo-handoff "$repo_handoff" || protected_rc=$?
+[[ "$protected_rc" -eq 4 && -f "$TEST_PROTECTED_PR_BODY" ]] || fail "protected publication did not create a pending PR"
+[[ $(wc -l <"$TEST_PROTECTED_PUSHES") -eq 1 ]] || fail "protected default push was retried"
+if git --git-dir="$remote_handoff" show main:TODO.md | grep -q 'ref:GH#301'; then
+	fail "unmerged TODO projection reached default"
+fi
+protected_rc=0
+sync_todo_refs_for_repo owner/repo-handoff "$repo_handoff" >/dev/null || protected_rc=$?
+[[ "$protected_rc" -eq 4 && $(wc -l <"$TEST_PROTECTED_PUSHES") -eq 1 ]] ||
+	fail "pending PR allowed another protected-default push"
+grep -q 'status=protected_branch_pr_pending repo=owner/repo-handoff pr=' "$WRAPPER_LOGFILE" ||
+	fail "pending protected PR URL was not logged"
+protected_branch=$(git --git-dir="$remote_handoff" for-each-ref --format='%(refname:short)' 'refs/heads/aidevops/pulse-todo-*')
+[[ -n "$protected_branch" ]] || fail "protected handoff branch did not survive workspace cleanup"
+protected_merge="${TMP}/protected-merge"
+"$TEST_NATIVE_GIT" clone --quiet "$remote_handoff" "$protected_merge"
+"$TEST_NATIVE_GIT" -C "$protected_merge" config user.email test@example.com
+"$TEST_NATIVE_GIT" -C "$protected_merge" config user.name Test
+printf '%s\n' 'unrelated upstream advance' >"${protected_merge}/README.md"
+"$TEST_NATIVE_GIT" -C "$protected_merge" add README.md
+"$TEST_NATIVE_GIT" -C "$protected_merge" commit --quiet -m advance-unrelated
+"$TEST_NATIVE_GIT" -C "$protected_merge" push --quiet origin main
+protected_rc=0
+sync_todo_refs_for_repo owner/repo-handoff "$repo_handoff" >/dev/null || protected_rc=$?
+[[ "$protected_rc" -eq 4 && $(wc -l <"$TEST_PROTECTED_PUSHES") -eq 1 ]] ||
+	fail "default-branch advance created a duplicate handoff"
+"$TEST_NATIVE_GIT" -C "$protected_merge" fetch --quiet origin "$protected_branch"
+"$TEST_NATIVE_GIT" -C "$protected_merge" merge --quiet --no-edit "origin/${protected_branch}" || fail "protected PR fixture could not merge"
+"$TEST_NATIVE_GIT" -C "$protected_merge" push --quiet origin main
+sync_todo_refs_for_repo owner/repo-handoff "$repo_handoff" >/dev/null || fail "post-merge TODO sync did not converge"
+git --git-dir="$remote_handoff" show main:TODO.md | grep -q 'ref:GH#301' || fail "merged PR did not publish TODO state"
+[[ $(wc -l <"$TEST_PROTECTED_PUSHES") -eq 1 ]] || fail "post-merge cycle retried protected push"
+eval "$original_gh_definition"
+eval "$original_push_definition"
+unset -f gh_create_pr
 if only_todo_sync_workspace >/dev/null 2>&1; then
 	fail "successful reconciliation left an automation workspace behind"
 fi
@@ -209,7 +318,7 @@ git() {
 		printf 'credential %s rejected; detail=%0600d\n' "$TEST_CLONE_TOKEN" 0 >&2
 		return 128
 	fi
-	/usr/bin/git "$@"
+	"$TEST_NATIVE_GIT" "$@"
 	return $?
 }
 clone_failure_rc=0
@@ -228,7 +337,7 @@ fi
 [[ $(trap -p EXIT) == "$parent_exit_trap_before" ]] || fail "sync scope replaced the caller EXIT trap"
 [[ $(trap -p TERM) == "$parent_term_trap_before" ]] || fail "sync scope replaced the caller TERM trap"
 
-[[ $(wc -l <"$CALL_LOG" | tr -d ' ') -eq 8 ]] || fail "pulse did not make four bound calls per repository"
+[[ $(wc -l <"$CALL_LOG" | tr -d ' ') -eq 24 ]] || fail "pulse did not make four bound calls per invocation"
 if grep -Fq "|${repo_a}" "$CALL_LOG" || grep -Fq "|${repo_b}" "$CALL_LOG"; then
 	fail "registered canonical root was passed to a mutating issue-sync command"
 fi
@@ -246,7 +355,7 @@ printf '%s\n' 'human canonical dirt C' >>"$repo_c/TODO.md"
 snapshot_c=$(canonical_snapshot "$repo_c")
 remote_c_before=$(git --git-dir="$remote_c" rev-parse main)
 publication_rc=0
-AIDEVOPS_PLANNING_BEFORE_PUSH_HOOK=/usr/bin/false \
+AIDEVOPS_PLANNING_BEFORE_PUSH_HOOK="$(type -P false)" \
 	sync_todo_refs_for_repo owner/repo-c "$repo_c" || publication_rc=$?
 [[ "$publication_rc" -eq 1 ]] || fail "publication failure was swallowed"
 [[ $(canonical_snapshot "$repo_c") == "$snapshot_c" ]] || fail "failed publication changed canonical checkout"
@@ -271,7 +380,7 @@ if [[ "${3:-}" == "push" ]]; then
 	printf '%s\n' 'remote: - Changes must be made through a pull request.' >&2
 	exit 1
 fi
-exec /usr/bin/git "$@"
+exec "$TEST_NATIVE_GIT" "$@"
 FIXTURE
 chmod +x "$protected_git"
 protected_refresh_repo_definition=$(declare -f _pulse_refresh_repo)
@@ -329,9 +438,9 @@ fi
 [[ -e "$ADVANCE_REMOTE_MARKER" ]] || fail "stale snapshot fixture did not advance the remote"
 git --git-dir="$remote_snapshot_retry" show main:TODO.md | grep -q '^synced:owner/repo-snapshot-retry$' || \
 	fail "refreshed snapshot was not synced"
-grep -q 'status=retryable_refresh stage=snapshot repo=owner/repo-snapshot-retry' "$WRAPPER_LOGFILE" || \
+grep -q 'status=snapshot_mismatch stage=snapshot repo=owner/repo-snapshot-retry.*class=remote_advanced.*wake=fresh_workspace_at_remote_tip.*retry=recreate' "$WRAPPER_LOGFILE" || \
 	fail "stale snapshot refresh evidence was not logged"
-grep -q 'status=retrying repo=owner/repo-snapshot-retry attempt=2 reason=retryable_snapshot' "$WRAPPER_LOGFILE" || \
+grep -q 'status=retrying repo=owner/repo-snapshot-retry attempt=2 reason=remote_advanced' "$WRAPPER_LOGFILE" || \
 	fail "stale snapshot retry evidence was not logged"
 grep -q 'TODO ref sync batch completed scheduled=1 failures=0' "$WRAPPER_LOGFILE" || \
 	fail "recovered snapshot retry failed the sync batch"
@@ -339,6 +448,47 @@ if only_todo_sync_workspace >/dev/null 2>&1; then
 	fail "stale snapshot retry left an automation workspace behind"
 fi
 unset ADVANCE_REMOTE_ON_PULL ADVANCE_REMOTE_MARKER ADVANCE_REMOTE_WRITER
+
+# A clone whose fetched tracking ref cannot match the authoritative remote HEAD
+# would reproduce the same mismatch after recreation. Preserve the typed wake
+# condition and do not spend the remote-advance retry on unchanged work.
+repo_snapshot_unchanged="${TMP}/repo-snapshot-unchanged"
+remote_snapshot_unchanged="${TMP}/remote-snapshot-unchanged.git"
+setup_sync_repo "$repo_snapshot_unchanged" "$remote_snapshot_unchanged"
+original_git_definition=$(declare -f git)
+refresh_repo_definition=$(declare -f _pulse_refresh_repo)
+git() {
+	local arg=""
+	for arg in "$@"; do
+		if [[ "$arg" == "ls-remote" ]]; then
+			printf 'ref:\trefs/heads/main\tHEAD\n'
+			printf '1111111111111111111111111111111111111111\tHEAD\n'
+			return 0
+		fi
+	done
+	"$TEST_NATIVE_GIT" "$@"
+	return $?
+}
+_pulse_refresh_repo() {
+	local repo_path="$1"
+	: "$repo_path"
+	return 0
+}
+snapshot_unchanged_rc=0
+_pulse_sync_todo_repo_bounded owner/repo-snapshot-unchanged \
+	"$repo_snapshot_unchanged" 30 1 || snapshot_unchanged_rc=$?
+eval "$original_git_definition"
+eval "$refresh_repo_definition"
+[[ "$snapshot_unchanged_rc" -eq 24 ]] || \
+	fail "unchanged post-clone mismatch lost its stale-tracking classification"
+grep -q 'status=snapshot_mismatch stage=snapshot repo=owner/repo-snapshot-unchanged.*class=stale_tracking_ref.*wake=tracking_ref_matches_authoritative_tip.*retry=none' \
+	"$WRAPPER_LOGFILE" || fail "unchanged post-clone mismatch omitted its wake condition"
+if grep -q 'status=retrying repo=owner/repo-snapshot-unchanged' "$WRAPPER_LOGFILE"; then
+	fail "unchanged post-clone mismatch consumed a useless recreation retry"
+fi
+if only_todo_sync_workspace >/dev/null 2>&1; then
+	fail "unchanged post-clone mismatch left an automation workspace behind"
+fi
 
 # Cleanup failure is observable without replacing the reconciliation result.
 # Use a retryable-conflict result (2) so a cleanup helper failure cannot be
@@ -473,5 +623,160 @@ grep -q 'stale cleanup outcome=removed reason=dead-owner workspace=pulse-todo-sy
 eval "$run_issue_sync_stage_definition"
 unset PULSE_TODO_SYNC_WORKSPACE_GRACE_SECS PULSE_TODO_SYNC_MAX_RECOVERIES_PER_RUN \
 	AIDEVOPS_TODO_SYNC_TRASH_ROOT SYNC_BLOCK_MARKER SYNC_BLOCK_RELEASE
+
+# GH#34511: unattended GitHub HTTPS Git authentication uses only the gh
+# credential principal; inherited helpers never receive get/store/erase.
+# Hermetic by construction (reference/testing.md "Credential-helper
+# isolation"): every config source is a fixture and credential requests run
+# outside any repository, so a regression reaches only the fake helper, never
+# a real OS credential store or GUI prompt.
+auth_root="${TMP}/github-auth"
+auth_no_repo="${auth_root}/no-repo"
+mkdir -p "${auth_root}/bin" "$auth_no_repo"
+export TEST_INHERITED_LOG="${auth_root}/inherited.log"
+export TEST_GH_LOG="${auth_root}/gh.log"
+cat >"${auth_root}/inherited-helper" <<'HELPER'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-}" >>"$TEST_INHERITED_LOG"
+cat >/dev/null
+printf 'username=inherited\npassword=inherited-synthetic\n'
+HELPER
+cat >"${auth_root}/bin/gh" <<'GH'
+#!/usr/bin/env bash
+[[ "${1:-} ${2:-}" == "auth git-credential" ]] || exit 1
+printf '%s\n' "${3:-}" >>"$TEST_GH_LOG"
+cat >/dev/null
+[[ "${3:-}" == "get" && -z "${TEST_GH_NO_TOKEN:-}" ]] || exit 0
+printf 'username=x-access-token\npassword=managed-synthetic\n'
+GH
+chmod +x "${auth_root}/inherited-helper" "${auth_root}/bin/gh"
+repo_auth="${TMP}/repo-auth"
+remote_auth="${TMP}/remote-auth.git"
+setup_sync_repo "$repo_auth" "$remote_auth"
+"$TEST_NATIVE_GIT" -C "$repo_auth" remote set-url origin git@github.com:owner/repo-auth.git
+auth_global="${auth_root}/global.gitconfig"
+"$TEST_NATIVE_GIT" config --file "$auth_global" credential.helper "${auth_root}/inherited-helper"
+"$TEST_NATIVE_GIT" config --file "$auth_global" credential.https://github.com.helper "${auth_root}/inherited-helper"
+"$TEST_NATIVE_GIT" config --file "$auth_global" "url.file://${remote_auth}.insteadOf" \
+	https://github.com/owner/repo-auth.git
+auth_previous_path="$PATH"
+unset GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_ASKPASS SSH_ASKPASS
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_GLOBAL="$auth_global"
+export PATH="${auth_root}/bin:${PATH}"
+
+# Hermeticity preflight: abort before any credential request if a helper
+# outside the fixture is visible (for example a developer checkout's local
+# credential.helper=osxkeychain).
+auth_visible_helpers=$(cd "$auth_no_repo" && GIT_CEILING_DIRECTORIES="$auth_root" \
+	"$TEST_NATIVE_GIT" config --get-regexp '^credential\..*helper$' || true)
+while read -r auth_helper_key auth_helper_value; do
+	[[ -n "$auth_helper_key" ]] || continue
+	[[ "$auth_helper_value" == "${auth_root}/"* ]] ||
+		fail "non-fixture credential helper visible to auth test: ${auth_helper_key}"
+done <<<"$auth_visible_helpers"
+# The fixture remote must resolve locally so no request leaves the host.
+[[ $("$TEST_NATIVE_GIT" config --get "url.file://${remote_auth}.insteadOf") == \
+	https://github.com/owner/repo-auth.git ]] || fail "auth fixture global config is not in effect"
+
+_test_github_credential_roundtrip() {
+	local remote_url="$1"
+	local credential=""
+	# A prompt-capable context is a regression; record it and refuse.
+	if [[ "${GIT_TERMINAL_PROMPT:-}" != "0" || -n "${GIT_ASKPASS:-}" || -n "${SSH_ASKPASS:-}" ]]; then
+		printf '%s\n' prompt-capable >>"$TEST_INHERITED_LOG"
+		return 1
+	fi
+	credential=$(cd "$auth_no_repo" && GIT_CEILING_DIRECTORIES="$auth_root" GIT_TERMINAL_PROMPT=0 \
+		"$TEST_NATIVE_GIT" credential fill <<<"$(printf 'protocol=https\nhost=github.com\npath=%s\n' \
+			"${remote_url#https://github.com/}")") || return 1
+	(cd "$auth_no_repo" && GIT_CEILING_DIRECTORIES="$auth_root" GIT_TERMINAL_PROMPT=0 \
+		"$TEST_NATIVE_GIT" credential approve <<<"${credential}") || return 1
+	return 0
+}
+auth_original_git_definition=$(declare -f git)
+# Fixture remotes are local, so emulate the credential exchange real HTTPS
+# would perform for each GitHub network command, then run it via insteadOf.
+git() {
+	local arg="" prev="" subcommand="" repo_dir="" target=""
+	for arg in "$@"; do
+		if [[ "$prev" == "-C" ]]; then
+			repo_dir="$arg"
+		elif [[ -z "$subcommand" && "$arg" != -* ]]; then
+			subcommand="$arg"
+		fi
+		[[ "$arg" == https://github.com/* ]] && target="$arg"
+		prev="$arg"
+	done
+	case "$subcommand" in
+	clone | fetch | ls-remote | push)
+		if [[ -z "$target" && -n "$repo_dir" ]]; then
+			target=$("$TEST_NATIVE_GIT" -C "$repo_dir" remote get-url origin 2>/dev/null || true)
+		fi
+		if [[ "$target" == https://github.com/* ]]; then
+			_test_github_credential_roundtrip "$target" || return 128
+		fi
+		;;
+	esac
+	"$TEST_NATIVE_GIT" "$@"
+	return $?
+}
+
+: >"$TEST_INHERITED_LOG"
+: >"$TEST_GH_LOG"
+auth_rc=0
+GIT_ASKPASS=/bin/echo SSH_ASKPASS=/bin/echo \
+	sync_todo_refs_for_repo owner/repo-auth "$repo_auth" || auth_rc=$?
+[[ "$auth_rc" -eq 0 ]] || fail "SSH-registered GitHub repo did not sync through the gh helper (rc=${auth_rc})"
+[[ ! -s "$TEST_INHERITED_LOG" ]] ||
+	fail "inherited credential helper or prompt path was used: $(tr '\n' ' ' <"$TEST_INHERITED_LOG")"
+if ! grep -qx get "$TEST_GH_LOG" || ! grep -qx store "$TEST_GH_LOG"; then
+	fail "gh credential helper did not serve get/store for TODO sync"
+fi
+git --git-dir="$remote_auth" show main:TODO.md | grep -q '^synced:owner/repo-auth$' ||
+	fail "gh-authenticated TODO sync did not publish"
+[[ -z "${GIT_CONFIG_COUNT:-}" && -z "${GIT_TERMINAL_PROMPT:-}" ]] ||
+	fail "TODO-sync auth context leaked into the caller"
+
+# Canonical refresh reads use the same isolation.
+: >"$TEST_INHERITED_LOG"
+: >"$TEST_GH_LOG"
+auth_ls_remote=$(_pulse_unattended_git ls-remote https://github.com/owner/repo-auth.git refs/heads/main) ||
+	fail "isolated canonical ls-remote failed"
+[[ "$auth_ls_remote" == *refs/heads/main* ]] || fail "isolated canonical ls-remote returned no default ref"
+if [[ -s "$TEST_INHERITED_LOG" ]] || ! grep -qx get "$TEST_GH_LOG"; then
+	fail "canonical refresh ls-remote did not use only the gh helper"
+fi
+
+# Missing managed credentials fail once with redacted, actionable guidance.
+: >"$TEST_INHERITED_LOG"
+auth_missing_rc=0
+auth_missing_output=$(TEST_GH_NO_TOKEN=1 \
+	sync_todo_refs_for_repo owner/repo-auth "$repo_auth" 2>&1) || auth_missing_rc=$?
+[[ "$auth_missing_rc" -eq 1 ]] || fail "missing gh credential was not a retryable failure"
+[[ ! -s "$TEST_INHERITED_LOG" ]] || fail "missing gh credential fell back to an inherited helper"
+[[ "$auth_missing_output" == *"reason=github_auth_unavailable action=run_gh_auth_status"* ]] ||
+	fail "missing gh credential omitted actionable guidance: ${auth_missing_output}"
+[[ "$auth_missing_output" != *synthetic* ]] || fail "auth failure diagnostic exposed a credential"
+if only_todo_sync_workspace >/dev/null 2>&1; then
+	fail "auth failure left an automation workspace behind"
+fi
+
+# Isolation is host-scoped: other hosts keep their configured helpers.
+: >"$TEST_INHERITED_LOG"
+: >"$TEST_GH_LOG"
+(
+	_ptsw_isolate_github_git_auth || exit 1
+	cd "$auth_no_repo" || exit 1
+	GIT_CEILING_DIRECTORIES="$auth_root" "$TEST_NATIVE_GIT" credential fill \
+		<<<"$(printf 'protocol=https\nhost=example.invalid\npath=o/r.git\n')" >/dev/null
+) || fail "non-GitHub credential lookup failed under isolation"
+if ! grep -qx get "$TEST_INHERITED_LOG" || [[ -s "$TEST_GH_LOG" ]]; then
+	fail "GitHub isolation changed a non-GitHub host's helper"
+fi
+
+eval "$auth_original_git_definition"
+unset -f _test_github_credential_roundtrip
+unset GIT_CONFIG_NOSYSTEM GIT_CONFIG_SYSTEM GIT_CONFIG_GLOBAL TEST_INHERITED_LOG TEST_GH_LOG
+export PATH="$auth_previous_path"
 
 printf 'PASS: issue sync automation-workspace contract\n'

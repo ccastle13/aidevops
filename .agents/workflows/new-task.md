@@ -7,7 +7,7 @@ mode: subagent
 <!-- SPDX-License-Identifier: MIT -->
 <!-- SPDX-FileCopyrightText: 2025-2026 Marcus Quinn -->
 
-Allocate a new task ID using `claim-task-id.sh` (distributed lock via GitHub/GitLab issue creation) and add it to TODO.md. For unclear requirements, use `/define` first.
+Allocate a new task ID using `claim-task-id.sh` (Git compare-and-swap counter allocation) and add it to TODO.md. Forge issue IDs are mappings, not task identity. For unclear requirements, use `/define` first.
 
 <user_input>
 $ARGUMENTS
@@ -30,6 +30,12 @@ output=$(~/.aidevops/agents/scripts/planning-commit-helper.sh next-id --title "$
 output=$(~/.aidevops/agents/scripts/claim-task-id.sh --title "$TASK_TITLE" --repo-path "$(git rev-parse --show-toplevel)" "${PARENT_ISSUE_ARGS[@]}")
 ```
 
+`--repo-path` may identify a canonical checkout. The allocator keeps that source
+checkout read-only and performs online counter discovery/CAS in a disposable
+bare Git context under `AIDEVOPS_TEMP_DIR`; source config, TODO state, and
+pre-push hooks still come from the requested repository. Treat exit 4 with
+`counter_branch_discovery_failed` as a setup failure—do not silently use `main`.
+
 ```bash
 # Parse output
 while IFS= read -r line; do
@@ -51,7 +57,7 @@ Allocated: {task_id} (ref:{task_ref})
 Task: "{title}"
 
 Options:
-1. Add to TODO.md with brief (recommended — dispatches after planning publication)
+1. Add to TODO.md with brief (recommended — dispatches once the issue is filed)
 2. Add to TODO.md with brief AND claim for this session (prevents pulse pickup)
 3. Customize estimate, tags, and dependencies
 4. Just show the ID (don't add to TODO.md)
@@ -74,10 +80,13 @@ fi
 
 **Worker-ready issue body detection (t2417):** Before writing a full brief, check if the linked issue already has a worker-ready body (contains 4+ of: `## Task`, `## Why`, `## How`, `## Acceptance`, `## What`, `## Session Origin`, `## Files to modify`). Use `brief-readiness-helper.sh check <issue-number> <slug>` to detect. If the body is worker-ready:
 
-- **Headless mode:** skip the full brief and write a stub linking to the issue (`brief-readiness-helper.sh stub <task-id> <issue> <slug>`). Default behaviour.
-- **Interactive mode:** offer the user a choice: (1) skip brief, point to issue (recommended), (2) stub brief linking to issue, (3) full brief anyway.
+- **Both modes:** reuse the body with `brief-readiness-helper.sh stub <task-id> <issue> <slug> [repo-path]`. The legacy command name now writes a complete captured brief with observation provenance, not a forge-only pointer. A capture failure must not be reported as success.
+- Existing briefs remain untouched. Reconcile changes explicitly rather than overwriting local decisions; old pointer stubs require a reviewed backfill.
 
-This prevents redundant brief files when the issue body already carries all the context a worker needs.
+This avoids separately authored competing briefs without losing the only copy when
+the forge disappears. Commit the brief, dependencies, progress and evidence before
+publication/acknowledgement. See `reference/forge-portability.md` for coverage and
+lag semantics; body capture does not archive comments or establish fresh authority.
 
 Every task MUST have a brief at `todo/tasks/{task_id}-brief.md`. Use `~/.aidevops/agents/templates/brief-template.md`, formatted per `workflows/brief.md`. Required sections:
 
@@ -112,7 +121,8 @@ After the brief is worker-ready, consider an optional implementation-seeded draf
 
 - Seed only when current-session discovery produced high-confidence file paths, line ranges, and implementation patterns verified against current `HEAD`.
 - Keep issue-only when the implementation is uncertain, depends on design judgment, or would anchor workers to stale assumptions.
-- If seeded, create the PR as draft, link it back to the issue/brief, mark unrun checks as `UNVERIFIED`, and record the draft PR number/status in the brief's **Seeded Draft PR** section.
+- Also seed when the issue needs companion files (fixtures, notes, scaffolding) before a worker can start; they travel on the seed, not the default branch.
+- If seeded, open it with `seed-pr-helper.sh open <issue> --notes <file>` from a linked worktree (mark unrun checks `UNVERIFIED` in the notes) and record the draft PR number/status in the brief's **Seeded Draft PR** section. Mechanics: `workflows/brief.md` "Seed mechanics".
 - If skipped, record the rationale in the same section so later workers know whether the absence of a seed was intentional.
 
 ### Step 3.5: Classify and Decompose (t1408.2)
@@ -170,11 +180,13 @@ if [[ -n "${task_ref:-}" && "${task_ref:-}" != "none" && "${task_ref:-}" != "off
 fi
 ```
 
-Online local creation leaves the issue `publication:pending` and omits positive
-dispatch labels until the exact default-branch TODO/ref/brief snapshot lands.
-Planning-PR and failed-publication outcomes remain blocked and must never be
-reported as queued. A closed-unmerged planning PR remains pending; retry
-publication idempotently without creating a new issue.
+Issue-first (GH#34232): the issue body is composed from the brief, so a
+worker-ready `#auto-dispatch` issue is queued at creation; the TODO row and
+brief you commit are repository backups and need not merge first. Pulse seeds a
+missing backup row after `AIDEVOPS_ORPHAN_SEED_GRACE_HOURS`. Only `--batch`
+(template-stub bodies) or an explicit `--publication-state pending` creates the
+`publication:pending` hold, which clears when the completed brief reaches the
+default branch. Contract: `reference/planning-publication-lifecycle.md`.
 
 `#{origin}`: `#interactive` (user present) or `#worker` (headless). Detect via `detect_session_origin` from `shared-constants.sh`. Maps to `origin:interactive` / `origin:worker` GitHub labels on issue sync.
 
@@ -294,7 +306,10 @@ Tasks without a complete How section will fail tier:simple dispatch.
 - Each title still gets its own GitHub issue (separate API call per title).
 - The `.task-counter` branch is updated per allocation — that is unavoidable.
 - The planning files (`TODO.md`, `todo/tasks/*.md`) use a **single** publication: direct commit+push when allowed, or one planning-only PR when branch protection requires PRs.
-- `--labels` applies the same label set to all tasks in the batch.
+- Run batch from a linked worktree (or pass `--repo-path <linked-worktree>`); it refuses a canonical checkout before claiming any ID.
+- `--labels` applies the same label set to all tasks in the batch; `no-auto-dispatch` there tags TODO lines `#no-auto-dispatch` instead of `#auto-dispatch`.
+- If an issue cannot be created, the summary keeps the claimed ID (`ref none`) and prints its exact recovery commands; do not re-run the batch.
+- Batch issues keep the `publication:pending` hold (their bodies are template stubs) until the completed briefs reach the default branch; this is the issue-first exception.
 - `--no-issue` skips GitHub issue creation (useful for offline / bulk planning).
 
 ```text

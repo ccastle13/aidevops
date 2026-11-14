@@ -55,6 +55,7 @@ unset _claim_counter_lib_dir
 # allocation layer. A protected-branch rejection is policy, not contention, so
 # callers must not reconcile and attempt the same forbidden push again.
 CAS_PROTECTED_BRANCH_RC="${CAS_PROTECTED_BRANCH_RC:-4}"
+TASK_COUNTER_SETUP_STATUS="${TASK_COUNTER_SETUP_STATUS:-setup_error}"
 
 # Format a numeric sequence as a canonical legacy task identity.
 # Args: $1 numeric sequence.
@@ -151,6 +152,147 @@ _append_claim_audit_log() {
 }
 
 # =============================================================================
+# Guard-compatible Git execution context
+# =============================================================================
+# The repository supplied through --repo-path remains the source of task state
+# (TODO.md, project config, and hooks). Online counter discovery and CAS need a
+# mutable Git object database, so canonical checkouts use an owned disposable
+# bare repository under the approved aidevops temp root. Linked worktrees and
+# unmanaged repositories keep using their existing Git context.
+CAS_SOURCE_REPO_PATH="${CAS_SOURCE_REPO_PATH:-}"
+CAS_GIT_CONTEXT_PATH="${CAS_GIT_CONTEXT_PATH:-}"
+_CLAIM_COUNTER_CONTEXT_ROOT="${_CLAIM_COUNTER_CONTEXT_ROOT:-}"
+
+_counter_git() {
+	if [[ -n "${CAS_GIT_CONTEXT_PATH:-}" ]]; then
+		git -C "$CAS_GIT_CONTEXT_PATH" "$@"
+	else
+		git "$@"
+	fi
+	return $?
+}
+
+_counter_context_is_isolated() {
+	[[ -n "${_CLAIM_COUNTER_CONTEXT_ROOT:-}" && \
+		"${CAS_GIT_CONTEXT_PATH:-}" == "${_CLAIM_COUNTER_CONTEXT_ROOT}/repository.git" ]] || return 1
+	return 0
+}
+
+_counter_source_git() {
+	if [[ -n "${CAS_SOURCE_REPO_PATH:-}" ]]; then
+		git -C "$CAS_SOURCE_REPO_PATH" "$@"
+	else
+		git "$@"
+	fi
+	return $?
+}
+
+_claim_counter_context_error() {
+	local detail="$1"
+	local message="$2"
+	log_error "COUNTER_GIT_CONTEXT_ERROR: ${message}"
+	_task_counter_status "$TASK_COUNTER_SETUP_STATUS" "$detail"
+	return "$CAS_PROTECTED_BRANCH_RC"
+}
+
+_claim_counter_cleanup_git_context() {
+	local context_root="${_CLAIM_COUNTER_CONTEXT_ROOT:-}"
+	local temp_root="${AIDEVOPS_TEMP_DIR:-${HOME:-}/.aidevops/.agent-workspace/tmp}"
+	local resolved_parent=""
+	local resolved_temp=""
+	local context_name=""
+
+	[[ -n "$context_root" && -n "$temp_root" ]] || return 0
+	context_name="${context_root##*/}"
+	[[ "$context_name" =~ ^claim-task-id-git\.[A-Za-z0-9]+$ ]] || return 0
+	resolved_parent=$(cd "${context_root%/*}" 2>/dev/null && pwd -P) || return 0
+	resolved_temp=$(cd "$temp_root" 2>/dev/null && pwd -P) || return 0
+	[[ "$resolved_parent" == "$resolved_temp" ]] || return 0
+	rm -rf -- "$context_root" 2>/dev/null || true
+	_CLAIM_COUNTER_CONTEXT_ROOT=""
+	CAS_GIT_CONTEXT_PATH="${CAS_SOURCE_REPO_PATH:-}"
+	return 0
+}
+
+_claim_counter_prepare_git_context() {
+	local repo_path="$1"
+	local policy_helper="${SCRIPT_DIR}/canonical-write-policy-helper.py"
+	local classification=""
+	local temp_root="${AIDEVOPS_TEMP_DIR:-${HOME:-}/.aidevops/.agent-workspace/tmp}"
+	local context_root=""
+	local remote_url=""
+	local user_name=""
+	local user_email=""
+
+	CAS_SOURCE_REPO_PATH="$repo_path"
+	CAS_GIT_CONTEXT_PATH="$repo_path"
+	_CLAIM_COUNTER_CONTEXT_ROOT=""
+	[[ "${OFFLINE_MODE:-}" != "true" ]] || return 0
+
+	[[ -f "$policy_helper" ]] || {
+		_claim_counter_context_error "counter_git_context_policy_missing" \
+			"canonical write policy helper is unavailable"
+		return "$CAS_PROTECTED_BRANCH_RC"
+	}
+	classification=$(python3 "$policy_helper" classify --cwd "$repo_path" \
+		--field classification 2>/dev/null) || {
+		_claim_counter_context_error "counter_git_context_classification_failed" \
+			"unable to classify the supplied repository path"
+		return "$CAS_PROTECTED_BRANCH_RC"
+	}
+	[[ "$classification" == "canonical" ]] || return 0
+
+	[[ -n "$temp_root" && "$temp_root" == /* ]] || {
+		_claim_counter_context_error "counter_git_context_temp_root_failed" \
+			"approved temporary root is unavailable"
+		return "$CAS_PROTECTED_BRANCH_RC"
+	}
+	mkdir -p "$temp_root" || {
+		_claim_counter_context_error "counter_git_context_temp_root_failed" \
+			"unable to create the approved temporary root"
+		return "$CAS_PROTECTED_BRANCH_RC"
+	}
+	chmod 700 "$temp_root" 2>/dev/null || true
+	context_root=$(mktemp -d "${temp_root%/}/claim-task-id-git.XXXXXX") || {
+		_claim_counter_context_error "counter_git_context_create_failed" \
+			"unable to create isolated Git context"
+		return "$CAS_PROTECTED_BRANCH_RC"
+	}
+	_CLAIM_COUNTER_CONTEXT_ROOT="$context_root"
+	CAS_GIT_CONTEXT_PATH="${context_root}/repository.git"
+
+	git -C "$context_root" init --bare --quiet repository.git || {
+		_claim_counter_context_error "counter_git_context_init_failed" \
+			"unable to initialize isolated Git context"
+		return "$CAS_PROTECTED_BRANCH_RC"
+	}
+	remote_url=$(git -C "$repo_path" remote get-url "$REMOTE_NAME" 2>/dev/null) || {
+		_claim_counter_context_error "counter_git_context_remote_failed" \
+			"unable to resolve remote ${REMOTE_NAME}"
+		return "$CAS_PROTECTED_BRANCH_RC"
+	}
+	_counter_git remote add "$REMOTE_NAME" "$remote_url" || {
+		_claim_counter_context_error "counter_git_context_remote_failed" \
+			"unable to configure remote ${REMOTE_NAME}"
+		return "$CAS_PROTECTED_BRANCH_RC"
+	}
+	user_name=$(git -C "$repo_path" config user.name 2>/dev/null || true)
+	user_email=$(git -C "$repo_path" config user.email 2>/dev/null || true)
+	_counter_git config user.name "${user_name:-aidevops}" || {
+		_claim_counter_context_error "counter_git_context_identity_failed" \
+			"unable to configure isolated Git author name"
+		return "$CAS_PROTECTED_BRANCH_RC"
+	}
+	_counter_git config user.email "${user_email:-aidevops@local}" || {
+		_claim_counter_context_error "counter_git_context_identity_failed" \
+			"unable to configure isolated Git author email"
+		return "$CAS_PROTECTED_BRANCH_RC"
+	}
+	log_info "Using isolated Git context for canonical counter discovery and CAS"
+	return 0
+}
+
+# =============================================================================
 # HTTPS timeout + SSH fallback for CAS git operations (GH#21904)
 # =============================================================================
 # The CAS path (`git fetch`/`git push` against the counter branch) hangs
@@ -217,10 +359,15 @@ _derive_ssh_url_from_https() {
 _run_git_with_ssh_fallback() {
 	local timeout_s="$1"
 	shift
+	local context_path="${CAS_GIT_CONTEXT_PATH:-}"
 	# First attempt — pass through unchanged. Quote "$@" so subcommand args
 	# survive whitespace, glob chars, etc.
 	local rc=0
-	timeout_sec "$timeout_s" git "$@" || rc=$?
+	if [[ -n "$context_path" ]]; then
+		timeout_sec "$timeout_s" git -C "$context_path" "$@" || rc=$?
+	else
+		timeout_sec "$timeout_s" git "$@" || rc=$?
+	fi
 	if [[ $rc -eq 0 ]]; then
 		return $rc
 	fi
@@ -236,7 +383,7 @@ _run_git_with_ssh_fallback() {
 	fi
 
 	local current_url
-	current_url=$(git remote get-url "${REMOTE_NAME:-origin}" 2>/dev/null) || {
+	current_url=$(_counter_git remote get-url "${REMOTE_NAME:-origin}" 2>/dev/null) || {
 		if [[ $rc -eq 124 ]]; then
 			log_warn "git timed out after ${timeout_s}s (could not resolve ${REMOTE_NAME:-origin} URL — no fallback)"
 		else
@@ -263,7 +410,13 @@ _run_git_with_ssh_fallback() {
 		log_warn "git failed with rc=${rc} on HTTPS — retrying via SSH (${ssh_url})"
 	fi
 	rc=0
-	timeout_sec "$timeout_s" git -c "url.${ssh_url}.insteadOf=${current_url}" "$@" || rc=$?
+	if [[ -n "$context_path" ]]; then
+		timeout_sec "$timeout_s" git -C "$context_path" \
+			-c "url.${ssh_url}.insteadOf=${current_url}" "$@" || rc=$?
+	else
+		timeout_sec "$timeout_s" git \
+			-c "url.${ssh_url}.insteadOf=${current_url}" "$@" || rc=$?
+	fi
 	if [[ $rc -eq 0 ]]; then
 		log_info "SSH fallback succeeded — HTTPS push hang transparent to caller (GH#21904)"
 	elif [[ $rc -eq 124 ]]; then
@@ -289,9 +442,10 @@ _cas_run_pre_push_hook() {
 	local remote_url=""
 	local hook_path=""
 	local hook_rc=0
+	local object_dir=""
 
 	started_at=$(date +%s)
-	remote_url=$(git remote get-url "$REMOTE_NAME" 2>/dev/null) || {
+	remote_url=$(_counter_git remote get-url "$REMOTE_NAME" 2>/dev/null) || {
 		finished_at=$(date +%s)
 		elapsed=$((finished_at - started_at))
 		log_error "CAS remote configuration validation failed after ${elapsed}s for remote ${REMOTE_NAME}"
@@ -301,28 +455,245 @@ _cas_run_pre_push_hook() {
 	elapsed=$((finished_at - started_at))
 	log_info "CAS remote configuration validated in ${elapsed}s"
 
-	hook_path=$(git rev-parse --git-path hooks/pre-push 2>/dev/null) || {
+	hook_path=$(_counter_source_git rev-parse --path-format=absolute --git-path hooks/pre-push 2>/dev/null) || {
 		log_error "Could not resolve the pre-push hook path"
 		return 1
 	}
 	[[ -x "$hook_path" ]] || return 0
+	if _counter_context_is_isolated; then
+		object_dir=$(_counter_git rev-parse --path-format=absolute --git-path objects) || return 1
+	fi
 
 	started_at=$(date +%s)
-	timeout_sec "${CAS_HOOK_TIMEOUT_S:-300}" "$hook_path" "$REMOTE_NAME" "$remote_url" \
-		<<<"${local_sha} ${local_sha} ${remote_ref} ${remote_sha}" >/dev/null || hook_rc=$?
+	(
+		cd "${CAS_SOURCE_REPO_PATH:-${REPO_PATH:-$PWD}}" || exit 1
+		# Keep source refs/config/worktree semantics, but make the plumbing-only
+		# counter commit and its parent visible to read-only hook scanners.
+		if [[ -n "$object_dir" ]]; then
+			export GIT_ALTERNATE_OBJECT_DIRECTORIES="${object_dir}${GIT_ALTERNATE_OBJECT_DIRECTORIES:+:${GIT_ALTERNATE_OBJECT_DIRECTORIES}}"
+		fi
+		timeout_sec "${CAS_HOOK_TIMEOUT_S:-300}" "$hook_path" "$REMOTE_NAME" "$remote_url" \
+			<<<"${local_sha} ${local_sha} ${remote_ref} ${remote_sha}" >/dev/null
+	) || hook_rc=$?
 	finished_at=$(date +%s)
 	elapsed=$((finished_at - started_at))
 
 	if [[ $hook_rc -eq 124 ]]; then
-		log_error "Pre-push hook timed out after ${elapsed}s (limit=${CAS_HOOK_TIMEOUT_S:-300}s); remote push was not attempted"
+		log_error "Pre-push hook ${hook_path##*/} timed out after ${elapsed}s (limit=${CAS_HOOK_TIMEOUT_S:-300}s); remote push was not attempted"
 		return 1
 	fi
 	if [[ $hook_rc -ne 0 ]]; then
-		log_error "Pre-push hook failed after ${elapsed}s with rc=${hook_rc}; remote push was not attempted"
+		log_error "Pre-push hook ${hook_path##*/} failed after ${elapsed}s with rc=${hook_rc}; remote push was not attempted"
 		return 1
 	fi
 
 	log_info "Pre-push hook completed in ${elapsed}s (limit=${CAS_HOOK_TIMEOUT_S:-300}s)"
+	return 0
+}
+
+# Resolve the remote's actual default branch via its HEAD symref, without
+# assuming "main". Args: none (uses REMOTE_NAME / CAS_GIT_CONTEXT_PATH).
+# Stdout: the branch name (e.g. "develop") on success.
+# Returns: 0 on success, 1 when the remote HEAD symref cannot be resolved.
+_counter_detect_remote_default_branch() {
+	local output=""
+	local branch=""
+
+	output=$(_run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
+		ls-remote --symref "$REMOTE_NAME" HEAD 2>/dev/null) || return 1
+	branch=$(printf '%s\n' "$output" | awk '/^ref:/{print $2}' | sed 's#^refs/heads/##')
+	[[ -n "$branch" ]] || return 1
+	printf '%s\n' "$branch"
+	return 0
+}
+
+# Align DEFAULT_BRANCH (and, when also unset, COUNTER_BRANCH) with the
+# remote's actual default branch instead of the historical "main" literal
+# (GH#33152). Only runs when .aidevops.json did not set "default_branch" —
+# an explicit config value always wins. Fail-open: on detection failure the
+# "main" fallback already assigned at variable declaration is kept, and the
+# existing protected-branch / stale-branch diagnostics still apply downstream.
+_claim_apply_detected_default_branch() {
+	local detected=""
+
+	[[ "${OFFLINE_MODE:-false}" == "false" ]] || return 0
+	[[ "${_DEFAULT_BRANCH_SET:-false}" == "false" ]] || return 0
+
+	detected=$(_counter_detect_remote_default_branch) || {
+		log_warn "Unable to detect ${REMOTE_NAME} default branch (ls-remote failed); DEFAULT_BRANCH remains ${DEFAULT_BRANCH:-main}"
+		return 0
+	}
+	[[ -n "$detected" ]] || return 0
+
+	if [[ "$detected" != "$DEFAULT_BRANCH" ]]; then
+		log_info "Default branch detected from ${REMOTE_NAME}: ${detected}"
+	fi
+	DEFAULT_BRANCH="$detected"
+
+	# COUNTER_BRANCH still carries its literal "main" declaration default —
+	# only realign it when nothing (CLI, config, or a prior implicit-branch
+	# selection) has already chosen a value.
+	if [[ "${_COUNTER_BRANCH_SET:-false}" == "false" && "$COUNTER_BRANCH" == "main" ]]; then
+		COUNTER_BRANCH="$detected"
+	fi
+	return 0
+}
+
+# Never sync an obsolete default-branch pin. Validate before building a commit.
+_counter_validate_sync_target() {
+	local target_branch="$1" default_branch="$2" target_counter="$3"
+	if [[ "$target_branch" == "$default_branch" ]]; then
+		local COUNTER_BRANCH="$target_branch" _COUNTER_BRANCH_SET=true
+		_cas_validate_explicit_counter_branch "${REMOTE_NAME}/${target_branch}" "$target_counter" || return $?
+	fi
+	return 0
+}
+
+# Explicit, audited fast-forward catch-up for a counter branch (GH#33152 gap
+# 4): sets it to max(its own counter, the default branch's counter, the
+# TODO.md seed) instead of resolve_implicit_counter_branch's silent refusal
+# when it is behind. Never rewrites history — the new commit's parent is the
+# branch's current tip, so the push is fast-forward-only.
+# Args: $1 repo_path, $2 target counter branch, $3 default branch.
+# Stdout: "COUNTER_BRANCH_SYNCED branch=<branch> value=<N>" on success/no-op.
+# Returns: 0 on success or already-current no-op, 1 on hard failure,
+#          CAS_PROTECTED_BRANCH_RC when the target branch rejects direct pushes.
+sync_counter_branch() {
+	local repo_path="$1"
+	local target_branch="$2"
+	local default_branch="${3:-main}"
+	local depth_args=()
+	local target_counter="0"
+	local default_counter="0"
+	local todo_seed="0"
+	local sync_target=""
+
+	_counter_context_is_isolated && depth_args=(--depth=1 --no-tags)
+
+	if ! _run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
+		fetch -q "${depth_args[@]}" "$REMOTE_NAME" \
+		"+refs/heads/${target_branch}:refs/remotes/${REMOTE_NAME}/${target_branch}" >/dev/null; then
+		log_error "COUNTER_BRANCH_SYNC_ERROR: unable to fetch ${REMOTE_NAME}/${target_branch}"
+		return 1
+	fi
+	if ! _run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
+		fetch -q "${depth_args[@]}" "$REMOTE_NAME" \
+		"+refs/heads/${default_branch}:refs/remotes/${REMOTE_NAME}/${default_branch}" >/dev/null; then
+		log_error "COUNTER_BRANCH_SYNC_ERROR: unable to fetch ${REMOTE_NAME}/${default_branch}"
+		return 1
+	fi
+
+	target_counter=$(_counter_git show "${REMOTE_NAME}/${target_branch}:${COUNTER_FILE}" 2>/dev/null | tr -d '[:space:]' || true)
+	[[ "$target_counter" =~ ^[0-9]+$ ]] || target_counter="0"
+	default_counter=$(_counter_git show "${REMOTE_NAME}/${default_branch}:${COUNTER_FILE}" 2>/dev/null | tr -d '[:space:]' || true)
+	[[ "$default_counter" =~ ^[0-9]+$ ]] || default_counter="0"
+	todo_seed=$(_compute_counter_seed "$repo_path")
+
+	_counter_validate_sync_target "$target_branch" "$default_branch" "$target_counter" || return $?
+	sync_target="$target_counter"
+	((10#$default_counter > 10#$sync_target)) && sync_target="$default_counter"
+	((10#$todo_seed > 10#$sync_target)) && sync_target="$todo_seed"
+
+	if [[ "$sync_target" == "$target_counter" ]]; then
+		log_info "COUNTER_BRANCH_SYNC_NOOP: ${REMOTE_NAME}/${target_branch} already at or above max(default=${default_counter}, todo=${todo_seed})"
+		printf 'COUNTER_BRANCH_SYNCED branch=%s value=%s\n' "$target_branch" "$target_counter"
+		return 0
+	fi
+
+	local blob_sha="" existing_tree="" tree_sha="" parent_sha="" commit_sha=""
+	blob_sha=$(echo "$sync_target" | _counter_git hash-object -w --stdin 2>/dev/null) || {
+		log_error "COUNTER_BRANCH_SYNC_ERROR: failed to create blob"
+		return 1
+	}
+	existing_tree=$(_counter_git ls-tree "${REMOTE_NAME}/${target_branch}" 2>/dev/null || true)
+	if grep -q "${COUNTER_FILE}$" <<<"$existing_tree"; then
+		tree_sha=$(echo "$existing_tree" | sed "s|[0-9a-f]\{40,64\}	${COUNTER_FILE}$|${blob_sha}	${COUNTER_FILE}|" | _counter_git mktree 2>/dev/null) || {
+			log_error "COUNTER_BRANCH_SYNC_ERROR: failed to build replacement tree"
+			return 1
+		}
+	else
+		tree_sha=$(
+			{
+				echo "$existing_tree"
+				printf '100644 blob %s\t%s\n' "$blob_sha" "$COUNTER_FILE"
+			} | _counter_git mktree 2>/dev/null
+		) || {
+			log_error "COUNTER_BRANCH_SYNC_ERROR: failed to build tree"
+			return 1
+		}
+	fi
+	parent_sha=$(_counter_git rev-parse "${REMOTE_NAME}/${target_branch}" 2>/dev/null) || {
+		log_error "COUNTER_BRANCH_SYNC_ERROR: failed to resolve ${REMOTE_NAME}/${target_branch}"
+		return 1
+	}
+	commit_sha=$(_counter_git commit-tree "$tree_sha" -p "$parent_sha" \
+		-m "chore: sync-counter-branch ${target_branch} -> ${sync_target} (max of default=${default_counter}, todo=${todo_seed}, prior=${target_counter})" 2>/dev/null) || {
+		log_error "COUNTER_BRANCH_SYNC_ERROR: failed to create commit"
+		return 1
+	}
+
+	local push_err_file="" push_rc=0 stderr_text=""
+	push_err_file=$(mktemp "${AIDEVOPS_TEMP_DIR:-${HOME:-}/.aidevops/.agent-workspace/tmp}/sync-counter-push.XXXXXX" 2>/dev/null) || push_err_file=""
+	if [[ -n "$push_err_file" ]]; then
+		_run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
+			push "$REMOTE_NAME" "${commit_sha}:refs/heads/${target_branch}" >/dev/null 2>"$push_err_file" || push_rc=$?
+		stderr_text=$(cat "$push_err_file" 2>/dev/null || true)
+		rm -f "$push_err_file" 2>/dev/null || true
+	else
+		_run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
+			push "$REMOTE_NAME" "${commit_sha}:refs/heads/${target_branch}" >/dev/null || push_rc=$?
+	fi
+
+	if [[ $push_rc -ne 0 ]]; then
+		if [[ "$stderr_text" == *"Changes must be made through a pull request"* ]]; then
+			log_error "PROTECTED_COUNTER_BRANCH: ${REMOTE_NAME}/${target_branch} rejects direct sync pushes"
+			return "$CAS_PROTECTED_BRANCH_RC"
+		fi
+		log_error "COUNTER_BRANCH_SYNC_ERROR: push failed (rc=${push_rc}); ${stderr_text}"
+		return 1
+	fi
+
+	_run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
+		fetch -q "$REMOTE_NAME" "$target_branch" >/dev/null 2>&1 || true
+	log_info "COUNTER_BRANCH_SYNCED: ${REMOTE_NAME}/${target_branch} fast-forwarded to ${sync_target}"
+	printf 'COUNTER_BRANCH_SYNCED branch=%s value=%s\n' "$target_branch" "$sync_target"
+	return 0
+}
+
+# GH#33527: a repository that has never allocated task IDs has no counter on
+# its default branch. Bootstrapping there pushes commits straight to the
+# default branch (and can ship .task-counter in release artifacts), so target
+# the dedicated branch instead unless the caller opted in. A fetch failure
+# leaves the selection unchanged; bootstrap_remote_counter still refuses an
+# implicit default-branch bootstrap.
+# Args: $1 dedicated candidate branch name.
+_counter_redirect_missing_default_counter() {
+	local candidate="$1"
+	local default_branch="${DEFAULT_BRANCH:-main}"
+	local default_counter=""
+	local depth_args=()
+
+	if [[ "${AIDEVOPS_COUNTER_BOOTSTRAP_DEFAULT_BRANCH:-0}" == "1" ]]; then
+		log_info "Dedicated counter branch ${candidate} not present; using ${default_branch} (AIDEVOPS_COUNTER_BOOTSTRAP_DEFAULT_BRANCH=1)"
+		return 0
+	fi
+	_counter_context_is_isolated && depth_args=(--depth=1)
+	if ! _run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
+		fetch -q "${depth_args[@]}" --no-tags "$REMOTE_NAME" \
+		"+refs/heads/${default_branch}:refs/remotes/${REMOTE_NAME}/${default_branch}" >/dev/null; then
+		log_info "Dedicated counter branch ${candidate} not present; using ${default_branch}"
+		return 0
+	fi
+	default_counter=$(_counter_git show "${REMOTE_NAME}/${default_branch}:${COUNTER_FILE}" 2>/dev/null | tr -d '[:space:]' || true)
+	if [[ "$default_counter" =~ ^[0-9]+$ ]]; then
+		log_info "Dedicated counter branch ${candidate} not present; using ${default_branch}"
+		return 0
+	fi
+
+	COUNTER_BRANCH="$candidate"
+	_COUNTER_BOOTSTRAP_DEDICATED=true
+	log_info "COUNTER_BOOTSTRAP_TARGET: ${REMOTE_NAME}/${default_branch} has no ${COUNTER_FILE}; allocation will create the dedicated branch ${candidate} and leave ${default_branch} untouched (GH#33527)"
+	log_info "To keep the counter on ${default_branch} instead, set .aidevops.json counter_branch or AIDEVOPS_COUNTER_BOOTSTRAP_DEFAULT_BRANCH=1"
 	return 0
 }
 
@@ -336,28 +707,52 @@ resolve_implicit_counter_branch() {
 	local candidate_counter=""
 	local default_counter="0"
 	local todo_seed="0"
+	local fetch_rc=0
+	local probe_rc=0
+	local depth_args=()
 
 	[[ "${_COUNTER_BRANCH_SET:-false}" == "false" ]] || return 0
 	[[ "${OFFLINE_MODE:-false}" == "false" ]] || return 0
 	[[ "$COUNTER_BRANCH" == "${DEFAULT_BRANCH:-main}" ]] || return 0
 	[[ -n "$candidate" && "$candidate" != "$COUNTER_BRANCH" ]] || return 0
-	cd "$repo_path" || return 1
-
-	if ! _run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
-		fetch -q "$REMOTE_NAME" "$candidate" >/dev/null; then
+	# Limit depth to the isolated bare context: a shallow file in the shared
+	# object store truncates history for the canonical checkout and all worktrees.
+	# The explicit refspec retains the remote-tracking ref used below.
+	_counter_context_is_isolated && depth_args=(--depth=1)
+	_run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
+		fetch -q "${depth_args[@]}" --no-tags "$REMOTE_NAME" \
+		"+refs/heads/${candidate}:refs/remotes/${REMOTE_NAME}/${candidate}" >/dev/null || fetch_rc=$?
+	if [[ $fetch_rc -ne 0 ]]; then
+		_run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
+			ls-remote --exit-code --heads "$REMOTE_NAME" "refs/heads/${candidate}" \
+			>/dev/null || probe_rc=$?
+		if [[ $probe_rc -eq 2 ]]; then
+			_counter_redirect_missing_default_counter "$candidate"
+			return 0
+		fi
+		log_error "COUNTER_BRANCH_DISCOVERY_ERROR: unable to fetch or classify ${REMOTE_NAME}/${candidate} (fetch_rc=${fetch_rc}, probe_rc=${probe_rc}, CAS_HTTPS_TIMEOUT_S=${CAS_HTTPS_TIMEOUT_S:-30})"
+		_task_counter_status "$TASK_COUNTER_SETUP_STATUS" "counter_branch_discovery_failed"
+		return "$CAS_PROTECTED_BRANCH_RC"
+	fi
+	candidate_counter=$(_counter_git show "${REMOTE_NAME}/${candidate}:${COUNTER_FILE}" 2>/dev/null | tr -d '[:space:]' || true)
+	if ! [[ "$candidate_counter" =~ ^[0-9]+$ ]]; then
+		log_warn "Dedicated counter branch ${REMOTE_NAME}/${candidate} has an invalid or missing ${COUNTER_FILE}; refusing implicit migration"
 		return 0
 	fi
-	candidate_counter=$(git show "${REMOTE_NAME}/${candidate}:${COUNTER_FILE}" 2>/dev/null | tr -d '[:space:]' || true)
-	[[ "$candidate_counter" =~ ^[0-9]+$ ]] || return 0
 
-	_run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
-		fetch -q "$REMOTE_NAME" "${DEFAULT_BRANCH:-main}" >/dev/null || true
-	default_counter=$(git show "${REMOTE_NAME}/${DEFAULT_BRANCH:-main}:${COUNTER_FILE}" 2>/dev/null | tr -d '[:space:]' || true)
+	if ! _run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
+		fetch -q "${depth_args[@]}" --no-tags "$REMOTE_NAME" \
+		"+refs/heads/${DEFAULT_BRANCH:-main}:refs/remotes/${REMOTE_NAME}/${DEFAULT_BRANCH:-main}" >/dev/null; then
+		log_error "COUNTER_BRANCH_DISCOVERY_ERROR: unable to validate ${candidate} against ${REMOTE_NAME}/${DEFAULT_BRANCH:-main}; CAS_HTTPS_TIMEOUT_S=${CAS_HTTPS_TIMEOUT_S:-30}"
+		_task_counter_status "$TASK_COUNTER_SETUP_STATUS" "counter_branch_discovery_failed"
+		return "$CAS_PROTECTED_BRANCH_RC"
+	fi
+	default_counter=$(_counter_git show "${REMOTE_NAME}/${DEFAULT_BRANCH:-main}:${COUNTER_FILE}" 2>/dev/null | tr -d '[:space:]' || true)
 	[[ "$default_counter" =~ ^[0-9]+$ ]] || default_counter="0"
 	todo_seed=$(_compute_counter_seed "$repo_path")
 
 	if ((10#$candidate_counter < 10#$default_counter || 10#$candidate_counter < 10#$todo_seed)); then
-		log_warn "Dedicated counter branch ${REMOTE_NAME}/${candidate} is behind canonical task state; refusing implicit migration"
+		log_warn "COUNTER_BRANCH_STALE: dedicated counter branch ${REMOTE_NAME}/${candidate} is behind canonical task state; refusing implicit migration"
 		return 0
 	fi
 
@@ -375,7 +770,11 @@ _cas_extract_github_slug() {
 	local remote_url=""
 	local slug=""
 
-	remote_url=$(git -C "$repo_path" config --get "remote.${REMOTE_NAME}.url" 2>/dev/null || true)
+	if [[ -n "${CAS_SOURCE_REPO_PATH:-}" ]]; then
+		remote_url=$(git -C "$repo_path" config --get "remote.${REMOTE_NAME}.url" 2>/dev/null || true)
+	else
+		remote_url=$(git config --get "remote.${REMOTE_NAME}.url" 2>/dev/null || true)
+	fi
 	[[ -n "$remote_url" ]] || return 1
 	remote_url="${remote_url%.git}"
 
@@ -449,7 +848,7 @@ preflight_counter_branch_policy() {
 		log_error "PROTECTED_COUNTER_BRANCH: ${REMOTE_NAME}/${COUNTER_BRANCH} requires pull-request updates"
 		log_error "Task ID allocation stopped before reading or advancing ${COUNTER_FILE}."
 		_cas_log_counter_branch_remediation
-		_task_counter_status "setup_error" "protected_counter_branch"
+		_task_counter_status "$TASK_COUNTER_SETUP_STATUS" "protected_counter_branch"
 		return 1
 	fi
 
@@ -479,15 +878,15 @@ _cas_push_rejection_is_protected_branch() {
 # transport, authentication, hook, and provider-policy failures are hard errors.
 _cas_push_rejection_is_non_fast_forward() {
 	local push_stderr="$1"
-	printf '%s\n' "$push_stderr" | grep -Eiq \
-		'non-fast-forward|\(fetch first\)|stale info|remote ref updated since checkout'
+	grep -Eiq \
+		'non-fast-forward|\(fetch first\)|stale info|remote ref updated since checkout' <<<"$push_stderr"
 	return $?
 }
 
 _cas_push_rejection_is_auth_failure() {
 	local push_stderr="$1"
-	printf '%s\n' "$push_stderr" | grep -Eiq \
-		'authentication failed|could not read Username|permission denied \(publickey\)|http[^[:space:]]* 40[13]|repository not found'
+	grep -Eiq \
+		'authentication failed|could not read Username|permission denied \(publickey\)|http[^[:space:]]* 40[13]|repository not found' <<<"$push_stderr"
 	return $?
 }
 
@@ -514,12 +913,25 @@ _task_counter_status() {
 	return 0
 }
 
+# Fetch the counter branch with transport timeouts. In the isolated bare context
+# use --depth=1 --no-tags so large repos do not transfer full history; never
+# add depth otherwise (a shallow file would truncate the shared object store).
+# Any leading arguments are passed through as git global options (e.g. -c k=v).
+_cas_fetch_counter_branch() {
+	local -a git_opts=("$@")
+	local -a depth_args=()
+
+	_counter_context_is_isolated && depth_args=(--depth=1 --no-tags)
+	_run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
+		${git_opts[@]+"${git_opts[@]}"} \
+		fetch -q ${depth_args[@]+"${depth_args[@]}"} "$REMOTE_NAME" "$COUNTER_BRANCH" >/dev/null
+}
+
 _cas_fetch_counter_branch_for_reconcile() {
 	local repo_path="$1"
 
 	cd "$repo_path" || return 1
-	_run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
-		fetch -q "$REMOTE_NAME" "$COUNTER_BRANCH" >/dev/null || {
+	_cas_fetch_counter_branch || {
 		log_error "UNRECOVERABLE_COUNTER_DESYNC: cannot fetch ${REMOTE_NAME}/${COUNTER_BRANCH} for reconciliation"
 		_task_counter_status "unrecoverable_desync" "fetch_failed"
 		return 1
@@ -530,7 +942,7 @@ _cas_fetch_counter_branch_for_reconcile() {
 _cas_resolve_counter_ref_for_reconcile() {
 	local counter_ref="$1"
 
-	git rev-parse "$counter_ref" 2>/dev/null || {
+	_counter_git rev-parse "$counter_ref" 2>/dev/null || {
 		log_error "UNRECOVERABLE_COUNTER_DESYNC: cannot resolve ${counter_ref} after fetch"
 		_task_counter_status "unrecoverable_desync" "resolve_failed"
 		return 1
@@ -543,7 +955,7 @@ _cas_read_counter_file_from_ref() {
 	local repo_path="$2"
 	local counter_value=""
 
-	counter_value=$(git show "${ref_sha}:${COUNTER_FILE}" 2>/dev/null | tr -d '[:space:]' || true)
+	counter_value=$(_counter_git show "${ref_sha}:${COUNTER_FILE}" 2>/dev/null | tr -d '[:space:]' || true)
 	if [[ -z "$counter_value" ]] || ! [[ "$counter_value" =~ ^[0-9]+$ ]]; then
 		counter_value=$(_compute_counter_seed "$repo_path")
 	fi
@@ -555,12 +967,16 @@ _cas_read_default_counter_for_reconcile() {
 	local default_branch="$1"
 	local default_counter="0"
 	local default_ref=""
+	local depth_args=()
 
 	if [[ -n "$default_branch" && "$default_branch" != "$COUNTER_BRANCH" ]]; then
+		# Only the tip's counter file is read. Never shallow a shared object store:
+		# its shallow boundary would also affect the checkout and other worktrees.
+		_counter_context_is_isolated && depth_args=(--depth=1)
 		_run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
-			fetch -q "$REMOTE_NAME" "$default_branch" >/dev/null || true
+			fetch -q "${depth_args[@]}" "$REMOTE_NAME" "$default_branch" >/dev/null || true
 		default_ref="${REMOTE_NAME}/${default_branch}"
-		default_counter=$(git show "${default_ref}:${COUNTER_FILE}" 2>/dev/null | tr -d '[:space:]' || true)
+		default_counter=$(_counter_git show "${default_ref}:${COUNTER_FILE}" 2>/dev/null | tr -d '[:space:]' || true)
 		if [[ -z "$default_counter" ]] || ! [[ "$default_counter" =~ ^[0-9]+$ ]]; then
 			default_counter="0"
 		fi
@@ -569,14 +985,54 @@ _cas_read_default_counter_for_reconcile() {
 	return 0
 }
 
+# Seed (highest TODO.md task ID + 1) from a git ref's TODO.md. Echoes 0 when
+# the ref or file is unavailable (GH#33157).
+_cas_todo_seed_from_ref() {
+	local ref="$1"
+	local todo_content=""
+	local highest="0"
+
+	todo_content=$(_counter_git show "${ref}:TODO.md" 2>/dev/null || true)
+	if [[ -n "$todo_content" ]]; then
+		highest=$(get_highest_task_id "$todo_content")
+		if [[ "$highest" =~ ^[0-9]+$ ]] && ((10#$highest > 0)); then
+			printf '%s\n' "$((10#$highest + 1))"
+			return 0
+		fi
+	fi
+	printf '0\n'
+	return 0
+}
+
+# Highest TODO.md-derived seed across the remote counter branch and default
+# branch tips. Never reads the local working tree (GH#33157).
+_cas_todo_seed_from_remote_refs() {
+	local default_branch="${1:-}"
+	local best="0"
+	local candidate=""
+	local refs=("${REMOTE_NAME}/${COUNTER_BRANCH}")
+	local ref
+
+	[[ -n "$default_branch" ]] && refs+=("${REMOTE_NAME}/${default_branch}")
+	for ref in "${refs[@]}"; do
+		candidate=$(_cas_todo_seed_from_ref "$ref")
+		((10#$candidate > 10#$best)) && best="$candidate"
+	done
+	printf '%s\n' "$best"
+	return 0
+}
+
 _cas_reconciled_counter_value() {
 	local repo_path="$1"
 	local branch_counter="$2"
 	local default_counter="$3"
+	local default_branch="${4:-}"
 	local todo_seed=""
 	local reconciled_counter="$branch_counter"
 
-	todo_seed=$(_compute_counter_seed "$repo_path")
+	# GH#33157: seed from remote refs only; the local working tree may be a
+	# stale mirror that misses recently published IDs.
+	todo_seed=$(_cas_todo_seed_from_remote_refs "$default_branch")
 	((10#$default_counter > 10#$reconciled_counter)) && reconciled_counter="$default_counter"
 	((10#$todo_seed > 10#$reconciled_counter)) && reconciled_counter="$todo_seed"
 	printf '%s\n' "$reconciled_counter"
@@ -588,18 +1044,18 @@ _cas_build_reconciled_counter_tree() {
 	local reconciled_counter="$2"
 	local blob_sha existing_tree tree_sha
 
-	blob_sha=$(printf '%s\n' "$reconciled_counter" | git hash-object -w --stdin 2>/dev/null) || {
+	blob_sha=$(printf '%s\n' "$reconciled_counter" | _counter_git hash-object -w --stdin 2>/dev/null) || {
 		log_error "UNRECOVERABLE_COUNTER_DESYNC: failed to create reconciled counter blob"
 		_task_counter_status "unrecoverable_desync" "blob_failed"
 		return 1
 	}
-	existing_tree=$(git ls-tree "$pinned_sha") || {
+	existing_tree=$(_counter_git ls-tree "$pinned_sha") || {
 		log_error "UNRECOVERABLE_COUNTER_DESYNC: failed to inspect reconciled counter tree"
 		_task_counter_status "unrecoverable_desync" "tree_read_failed"
 		return 1
 	}
-	if printf '%s\n' "$existing_tree" | grep -q "${COUNTER_FILE}$"; then
-		tree_sha=$(printf '%s\n' "$existing_tree" | sed "s|[0-9a-f]\{40,64\}	${COUNTER_FILE}$|${blob_sha}	${COUNTER_FILE}|" | git mktree) || {
+	if grep -q "${COUNTER_FILE}$" <<<"$existing_tree"; then
+		tree_sha=$(printf '%s\n' "$existing_tree" | sed "s|[0-9a-f]\{40,64\}	${COUNTER_FILE}$|${blob_sha}	${COUNTER_FILE}|" | _counter_git mktree) || {
 			log_error "UNRECOVERABLE_COUNTER_DESYNC: failed to replace reconciled counter tree entry"
 			_task_counter_status "unrecoverable_desync" "tree_replace_failed"
 			return 1
@@ -609,7 +1065,7 @@ _cas_build_reconciled_counter_tree() {
 			{
 				[[ -n "$existing_tree" ]] && printf '%s\n' "$existing_tree"
 				printf '100644 blob %s\t%s\n' "$blob_sha" "$COUNTER_FILE"
-			} | git mktree
+			} | _counter_git mktree
 		) || {
 			log_error "UNRECOVERABLE_COUNTER_DESYNC: failed to add reconciled counter tree entry"
 			_task_counter_status "unrecoverable_desync" "tree_add_failed"
@@ -626,7 +1082,7 @@ _cas_create_reconciliation_commit() {
 	local branch_counter="$3"
 	local reconciled_counter="$4"
 
-	git commit-tree "$tree_sha" -p "$pinned_sha" -m "chore: reconcile task counter (${branch_counter}->${reconciled_counter})" 2>/dev/null || {
+	_counter_git commit-tree "$tree_sha" -p "$pinned_sha" -m "chore: reconcile task counter (${branch_counter}->${reconciled_counter})" 2>/dev/null || {
 		log_error "UNRECOVERABLE_COUNTER_DESYNC: failed to create reconciliation commit"
 		_task_counter_status "unrecoverable_desync" "commit_failed"
 		return 1
@@ -660,7 +1116,7 @@ _cas_push_reconciliation_commit() {
 		fi
 		log_warn "Counter reconciliation push raced with another allocator; retrying allocation from refreshed branch"
 		_task_counter_status "recovered_contention" "reconcile_raced"
-		_run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" fetch -q "$REMOTE_NAME" "$COUNTER_BRANCH" >/dev/null || true
+		_cas_fetch_counter_branch || true
 		return 2
 	fi
 	return 0
@@ -696,11 +1152,14 @@ _cas_reconcile_counter_branch() {
 	local branch_counter=""
 	branch_counter=$(_cas_read_counter_file_from_ref "$pinned_sha" "$repo_path")
 
+	# Reconciliation must not silently repair an explicitly stale selection.
+	_cas_validate_explicit_counter_branch "$pinned_sha" "$branch_counter" || return $?
+
 	local default_counter="0"
 	default_counter=$(_cas_read_default_counter_for_reconcile "$default_branch")
 
 	local reconciled_counter=""
-	reconciled_counter=$(_cas_reconciled_counter_value "$repo_path" "$branch_counter" "$default_counter")
+	reconciled_counter=$(_cas_reconciled_counter_value "$repo_path" "$branch_counter" "$default_counter" "$default_branch")
 
 	if [[ "$reconciled_counter" == "$branch_counter" ]]; then
 		_task_counter_status "recovered_contention" "refetched"
@@ -715,7 +1174,7 @@ _cas_reconcile_counter_branch() {
 	_cas_push_reconciliation_commit "$commit_sha" || return $?
 
 	_task_counter_status "recovered_contention" "counter=${reconciled_counter}"
-	_run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" fetch -q "$REMOTE_NAME" "$COUNTER_BRANCH" >/dev/null || true
+	_cas_fetch_counter_branch || true
 	return 0
 }
 
@@ -870,13 +1329,32 @@ _compute_counter_seed() {
 # Bootstrap .task-counter on <remote>/<counter_branch> when it is missing.
 # Seeds from TODO.md highest task ID (or 1 for fresh repos).
 # Uses the same git plumbing as allocate_counter_cas to stay branch-safe.
+# GH#33527: an implicitly selected default branch is never bootstrapped
+# without opt-in; a missing dedicated branch is created as an orphan commit
+# that contains only the counter file.
 # Returns 0 on success (counter now exists on remote), 1 on failure.
 bootstrap_remote_counter() {
 	local repo_path="$1"
 
-	cd "$repo_path" || return 1
+	if [[ "$COUNTER_BRANCH" == "${DEFAULT_BRANCH:-main}" && "${_COUNTER_BRANCH_SET:-false}" != "true" &&
+		"${AIDEVOPS_COUNTER_BOOTSTRAP_DEFAULT_BRANCH:-0}" != "1" ]]; then
+		log_error "BOOTSTRAP_COUNTER_REFUSED: ${COUNTER_FILE} is missing on ${REMOTE_NAME}/${COUNTER_BRANCH} (the default branch); refusing an unrequested push there (GH#33527)"
+		log_error "Recovery: rerun once ${REMOTE_NAME} is reachable to bootstrap the dedicated task-id-counter branch, or opt in via .aidevops.json counter_branch / AIDEVOPS_COUNTER_BOOTSTRAP_DEFAULT_BRANCH=1"
+		return 1
+	fi
 
-	log_info "BOOTSTRAP_COUNTER: .task-counter missing on ${REMOTE_NAME}/${COUNTER_BRANCH} — bootstrapping"
+	local parent_sha=""
+	parent_sha=$(_counter_git rev-parse "${REMOTE_NAME}/${COUNTER_BRANCH}" 2>/dev/null) || parent_sha=""
+	if [[ -z "$parent_sha" && "${_COUNTER_BOOTSTRAP_DEDICATED:-false}" != "true" ]]; then
+		log_warn "BOOTSTRAP_COUNTER: failed to resolve ${REMOTE_NAME}/${COUNTER_BRANCH}"
+		return 1
+	fi
+
+	if [[ -n "$parent_sha" ]]; then
+		log_info "BOOTSTRAP_COUNTER: .task-counter missing on ${REMOTE_NAME}/${COUNTER_BRANCH} — bootstrapping"
+	else
+		log_info "BOOTSTRAP_COUNTER: creating dedicated counter branch ${REMOTE_NAME}/${COUNTER_BRANCH} (orphan commit containing only ${COUNTER_FILE})"
+	fi
 
 	local seed
 	seed=$(_compute_counter_seed "$repo_path")
@@ -884,19 +1362,24 @@ bootstrap_remote_counter() {
 
 	# Create a blob with the seed value
 	local blob_sha
-	blob_sha=$(echo "$seed" | git hash-object -w --stdin 2>/dev/null) || {
+	blob_sha=$(echo "$seed" | _counter_git hash-object -w --stdin 2>/dev/null) || {
 		log_warn "BOOTSTRAP_COUNTER: failed to create blob"
 		return 1
 	}
 
 	# Check whether .task-counter already exists in the remote tree
-	local existing_tree
-	existing_tree=$(git ls-tree "${REMOTE_NAME}/${COUNTER_BRANCH}" 2>/dev/null || true)
+	local existing_tree=""
+	[[ -z "$parent_sha" ]] || existing_tree=$(_counter_git ls-tree "$parent_sha" 2>/dev/null || true)
 
 	local tree_sha
-	if echo "$existing_tree" | grep -q "${COUNTER_FILE}$"; then
+	if [[ -z "$parent_sha" ]]; then
+		tree_sha=$(printf '100644 blob %s\t%s\n' "$blob_sha" "$COUNTER_FILE" | _counter_git mktree 2>/dev/null) || {
+			log_warn "BOOTSTRAP_COUNTER: failed to create tree (orphan)"
+			return 1
+		}
+	elif grep -q "${COUNTER_FILE}$" <<<"$existing_tree"; then
 		# Replace existing (invalid) entry
-		tree_sha=$(echo "$existing_tree" | sed "s|[0-9a-f]\{40,64\}	${COUNTER_FILE}$|${blob_sha}	${COUNTER_FILE}|" | git mktree 2>/dev/null) || {
+		tree_sha=$(echo "$existing_tree" | sed "s|[0-9a-f]\{40,64\}	${COUNTER_FILE}$|${blob_sha}	${COUNTER_FILE}|" | _counter_git mktree 2>/dev/null) || {
 			log_warn "BOOTSTRAP_COUNTER: failed to create tree (replace)"
 			return 1
 		}
@@ -906,24 +1389,23 @@ bootstrap_remote_counter() {
 			{
 				echo "$existing_tree"
 				printf '100644 blob %s\t%s\n' "$blob_sha" "$COUNTER_FILE"
-			} | git mktree 2>/dev/null
+			} | _counter_git mktree 2>/dev/null
 		) || {
 			log_warn "BOOTSTRAP_COUNTER: failed to create tree (add)"
 			return 1
 		}
 	fi
 
-	local parent_sha
-	parent_sha=$(git rev-parse "${REMOTE_NAME}/${COUNTER_BRANCH}" 2>/dev/null) || {
-		log_warn "BOOTSTRAP_COUNTER: failed to resolve ${REMOTE_NAME}/${COUNTER_BRANCH}"
-		return 1
-	}
-
-	local commit_sha
-	commit_sha=$(git commit-tree "$tree_sha" -p "$parent_sha" -m "chore: bootstrap .task-counter (seed=${seed})" 2>/dev/null) || {
+	local commit_sha="" commit_rc=0
+	if [[ -n "$parent_sha" ]]; then
+		commit_sha=$(_counter_git commit-tree "$tree_sha" -p "$parent_sha" -m "chore: bootstrap .task-counter (seed=${seed})" 2>/dev/null) || commit_rc=$?
+	else
+		commit_sha=$(_counter_git commit-tree "$tree_sha" -m "chore: bootstrap .task-counter (seed=${seed})" 2>/dev/null) || commit_rc=$?
+	fi
+	if [[ $commit_rc -ne 0 || -z "$commit_sha" ]]; then
 		log_warn "BOOTSTRAP_COUNTER: failed to create commit"
 		return 1
-	}
+	fi
 
 	# GH#21904: wrap with timeout + SSH fallback for credential-helper hangs.
 	if ! _run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
@@ -946,18 +1428,19 @@ bootstrap_remote_counter() {
 # Read .task-counter from <remote>/<counter_branch> (fetches first)
 read_remote_counter() {
 	local repo_path="$1"
-
-	cd "$repo_path" || return 1
+	local depth_args=()
+	[[ -n "$repo_path" ]] || return 1
 
 	# GH#21904: wrap with timeout + SSH fallback for credential-helper hangs.
+	_counter_context_is_isolated && depth_args=(--depth=1)
 	if ! _run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
-		fetch "$REMOTE_NAME" "$COUNTER_BRANCH" 2>/dev/null; then
-		log_warn "Failed to fetch ${REMOTE_NAME}/${COUNTER_BRANCH}"
+		fetch "${depth_args[@]}" "$REMOTE_NAME" "$COUNTER_BRANCH" 2>/dev/null; then
+		log_warn "Failed to fetch ${REMOTE_NAME}/${COUNTER_BRANCH}; CAS_HTTPS_TIMEOUT_S=${CAS_HTTPS_TIMEOUT_S:-30}"
 		return 1
 	fi
 
 	local counter_value
-	counter_value=$(git show "${REMOTE_NAME}/${COUNTER_BRANCH}:${COUNTER_FILE}" 2>/dev/null | tr -d '[:space:]')
+	counter_value=$(_counter_git show "${REMOTE_NAME}/${COUNTER_BRANCH}:${COUNTER_FILE}" 2>/dev/null | tr -d '[:space:]')
 
 	if [[ -z "$counter_value" ]] || ! [[ "$counter_value" =~ ^[0-9]+$ ]]; then
 		log_warn "Invalid or missing ${COUNTER_FILE} on ${REMOTE_NAME}/${COUNTER_BRANCH}"
@@ -1003,8 +1486,7 @@ read_local_counter() {
 # Echoes "pinned_sha counter_value" on success. Returns 1 on failure.
 _cas_fetch_and_pin() {
 	local repo_path="$1"
-
-	cd "$repo_path" || return 1
+	[[ -n "$repo_path" ]] || return 1
 
 	# GH#20137: set git-native HTTP timeouts to prevent indefinite hangs.
 	# http.lowSpeedLimit=1000 + http.lowSpeedTime=CAS_GIT_CMD_TIMEOUT_S
@@ -1017,33 +1499,33 @@ _cas_fetch_and_pin() {
 	# GH#21904: wrap with `timeout_sec` + SSH fallback to defeat credential-helper
 	# hangs that fire BEFORE bytes flow (osxkeychain etc.) and so bypass
 	# http.lowSpeedTime.
-	if ! _run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
-		-c http.lowSpeedLimit=1000 -c http.lowSpeedTime="$CAS_GIT_CMD_TIMEOUT_S" \
-		fetch -q "$REMOTE_NAME" "$COUNTER_BRANCH" >/dev/null; then
+	if ! _cas_fetch_counter_branch \
+		-c http.lowSpeedLimit=1000 -c http.lowSpeedTime="$CAS_GIT_CMD_TIMEOUT_S"; then
 		log_warn "Failed to fetch ${REMOTE_NAME}/${COUNTER_BRANCH}"
 	fi
 
-	local pinned_sha
-	pinned_sha=$(git rev-parse "${REMOTE_NAME}/${COUNTER_BRANCH}" 2>/dev/null) || {
+	local pinned_sha=""
+	pinned_sha=$(_counter_git rev-parse "${REMOTE_NAME}/${COUNTER_BRANCH}" 2>/dev/null) || pinned_sha=""
+	# GH#33527: a redirected dedicated branch does not exist until bootstrap.
+	if [[ -z "$pinned_sha" && "${_COUNTER_BOOTSTRAP_DEDICATED:-false}" != "true" ]]; then
 		log_warn "Failed to resolve ${REMOTE_NAME}/${COUNTER_BRANCH}"
 		return 1
-	}
+	fi
 
-	local current_value
-	current_value=$(git show "${pinned_sha}:${COUNTER_FILE}" 2>/dev/null | tr -d '[:space:]')
+	local current_value=""
+	[[ -z "$pinned_sha" ]] || current_value=$(_counter_git show "${pinned_sha}:${COUNTER_FILE}" 2>/dev/null | tr -d '[:space:]')
 
 	if [[ -z "$current_value" ]] || ! [[ "$current_value" =~ ^[0-9]+$ ]]; then
 		log_info "Counter missing/invalid — attempting auto-bootstrap (GH#6569)"
 		local bootstrap_result
 		bootstrap_result=$(bootstrap_remote_counter "$repo_path") || true
-		_run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
-			-c http.lowSpeedLimit=1000 -c http.lowSpeedTime="$CAS_GIT_CMD_TIMEOUT_S" \
-			fetch -q "$REMOTE_NAME" "$COUNTER_BRANCH" >/dev/null || true
-		pinned_sha=$(git rev-parse "${REMOTE_NAME}/${COUNTER_BRANCH}" 2>/dev/null) || {
+		_cas_fetch_counter_branch \
+			-c http.lowSpeedLimit=1000 -c http.lowSpeedTime="$CAS_GIT_CMD_TIMEOUT_S" || true
+		pinned_sha=$(_counter_git rev-parse "${REMOTE_NAME}/${COUNTER_BRANCH}" 2>/dev/null) || {
 			log_error "BOOTSTRAP_COUNTER_FAILED: cannot resolve ref after bootstrap"
 			return 1
 		}
-		current_value=$(git show "${pinned_sha}:${COUNTER_FILE}" 2>/dev/null | tr -d '[:space:]')
+		current_value=$(_counter_git show "${pinned_sha}:${COUNTER_FILE}" 2>/dev/null | tr -d '[:space:]')
 		if [[ -z "$current_value" ]] || ! [[ "$current_value" =~ ^[0-9]+$ ]]; then
 			log_error "BOOTSTRAP_COUNTER_FAILED: counter unavailable after bootstrap attempt"
 			return 1
@@ -1066,19 +1548,19 @@ _cas_build_and_push() {
 	local commit_msg="$3"
 
 	local blob_sha
-	blob_sha=$(echo "$new_counter" | git hash-object -w --stdin 2>/dev/null) || {
+	blob_sha=$(echo "$new_counter" | _counter_git hash-object -w --stdin 2>/dev/null) || {
 		log_warn "Failed to create blob"
 		return 1
 	}
 
 	local tree_sha
-	tree_sha=$(git ls-tree "${pinned_sha}" | sed "s|[0-9a-f]\{40,64\}	${COUNTER_FILE}$|${blob_sha}	${COUNTER_FILE}|" | git mktree 2>/dev/null) || {
+	tree_sha=$(_counter_git ls-tree "${pinned_sha}" | sed "s|[0-9a-f]\{40,64\}	${COUNTER_FILE}$|${blob_sha}	${COUNTER_FILE}|" | _counter_git mktree 2>/dev/null) || {
 		log_warn "Failed to create tree"
 		return 1
 	}
 
 	local commit_sha
-	commit_sha=$(git commit-tree "$tree_sha" -p "$pinned_sha" -m "$commit_msg" 2>/dev/null) || {
+	commit_sha=$(_counter_git commit-tree "$tree_sha" -p "$pinned_sha" -m "$commit_msg" 2>/dev/null) || {
 		log_warn "Failed to create commit"
 		return 1
 	}
@@ -1102,7 +1584,10 @@ _cas_build_and_push() {
 	local push_stderr=""
 	local push_err_file=""
 	if ! _cas_run_pre_push_hook "$commit_sha" "$pinned_sha"; then
-		return 1
+		# Hook rejection is a setup failure, not counter drift. Preserve the
+		# existing non-reconcilable exit contract through allocation callers.
+		_task_counter_status "$TASK_COUNTER_SETUP_STATUS" "pre_push_hook_failed"
+		return "$CAS_PROTECTED_BRANCH_RC"
 	fi
 	push_err_file=$(mktemp "${TMPDIR:-/tmp}/claim-task-id-push.XXXXXX" 2>/dev/null) || push_err_file=""
 	if [[ -n "$push_err_file" ]]; then
@@ -1131,24 +1616,136 @@ _cas_build_and_push() {
 		fi
 		if _cas_push_rejection_is_non_fast_forward "$push_stderr"; then
 			log_warn "Push failed (conflict — another session claimed an ID)"
-			_run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
-				-c http.lowSpeedLimit=1000 -c http.lowSpeedTime="$CAS_GIT_CMD_TIMEOUT_S" \
-				fetch -q "$REMOTE_NAME" "$COUNTER_BRANCH" >/dev/null || true
+			_cas_fetch_counter_branch \
+				-c http.lowSpeedLimit=1000 -c http.lowSpeedTime="$CAS_GIT_CMD_TIMEOUT_S" || true
 			return 2
 		fi
 		log_error "Push failed with rc=${push_rc} before the CAS update; failure is not a retriable conflict"
 		return 1
 	fi
 
-	_run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
-		-c http.lowSpeedLimit=1000 -c http.lowSpeedTime="$CAS_GIT_CMD_TIMEOUT_S" \
-		fetch -q "$REMOTE_NAME" "$COUNTER_BRANCH" >/dev/null || true
+	_cas_fetch_counter_branch \
+		-c http.lowSpeedLimit=1000 -c http.lowSpeedTime="$CAS_GIT_CMD_TIMEOUT_S" || true
 	return 0
 }
 
 # =============================================================================
 # Allocation Functions
 # =============================================================================
+
+# Validate explicit selections against freshly fetched canonical task state.
+# Run on every CAS attempt, using the pinned selected tip even if another
+# process updates its remote-tracking ref. Counters store the NEXT free ID.
+_cas_validate_explicit_counter_branch() {
+	local pinned_sha="$1"
+	local current_value="$2"
+	local dedicated="${AIDEVOPS_DEDICATED_COUNTER_BRANCH:-task-id-counter}"
+	local default_branch="${DEFAULT_BRANCH:-main}"
+	local branch="" ref="" value="" todo_seed="0"
+	local leading_value="$current_value" leading_branch="$COUNTER_BRANCH"
+	local fetch_rc=0 probe_rc=0
+	local depth_args=()
+
+	[[ "${_COUNTER_BRANCH_SET:-false}" == "true" ]] || return 0
+	_counter_context_is_isolated && depth_args=(--depth=1)
+	for branch in "$default_branch" "$dedicated"; do
+		[[ -n "$branch" ]] || continue
+		ref="$pinned_sha"
+		if [[ "$branch" != "$COUNTER_BRANCH" ]]; then
+			fetch_rc=0
+			_run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
+				fetch -q "${depth_args[@]}" --no-tags "$REMOTE_NAME" \
+				"+refs/heads/${branch}:refs/remotes/${REMOTE_NAME}/${branch}" >/dev/null || fetch_rc=$?
+			if [[ $fetch_rc -ne 0 ]]; then
+				probe_rc=0
+				_run_git_with_ssh_fallback "${CAS_HTTPS_TIMEOUT_S:-30}" \
+					ls-remote --exit-code --heads "$REMOTE_NAME" "refs/heads/${branch}" >/dev/null || probe_rc=$?
+				# Only the dedicated branch is optional. Never trust cached refs
+				# after an indeterminate fetch or a failed default-branch read.
+				if [[ "$branch" != "$default_branch" && $probe_rc -eq 2 ]]; then
+					continue
+				fi
+				log_error "COUNTER_BRANCH_DISCOVERY_ERROR: unable to validate explicit ${COUNTER_BRANCH} against ${REMOTE_NAME}/${branch}"
+				_task_counter_status "$TASK_COUNTER_SETUP_STATUS" "explicit_counter_branch_discovery_failed"
+				return "$CAS_PROTECTED_BRANCH_RC"
+			fi
+			ref="${REMOTE_NAME}/${branch}"
+		fi
+		value=$(_counter_git show "${ref}:${COUNTER_FILE}" 2>/dev/null | tr -d '[:space:]' || true)
+		if [[ "$branch" == "$dedicated" && "$value" =~ ^[0-9]+$ ]] && ((10#$value > 10#$leading_value)); then
+			leading_value="$value"
+			leading_branch="$branch"
+		fi
+		if [[ "$branch" == "$default_branch" ]]; then
+			todo_seed=$(_cas_todo_seed_from_ref "$ref")
+		fi
+	done
+	if ((10#$current_value < 10#$leading_value || 10#$current_value < 10#$todo_seed)); then
+		log_error "COUNTER_BRANCH_STALE: explicit ${REMOTE_NAME}/${COUNTER_BRANCH} counter=${current_value}, leading branch=${leading_branch} counter=${leading_value}, default TODO seed=${todo_seed}; switch --counter-branch to the leading dedicated branch or use --repair-counter-branch to repair the config first; --sync-counter-branch against a default-branch pin pushes directly to that branch and is refused while stale"
+		_task_counter_status "$TASK_COUNTER_SETUP_STATUS" "counter_branch_stale"
+		return "$CAS_PROTECTED_BRANCH_RC"
+	fi
+	return 0
+}
+
+# GH#34856: opt-in, idempotent repair of an obsolete local default-branch pin.
+# Reuse discovery and explicit freshness validation; neither path allocates IDs.
+repair_counter_branch_config() {
+	local repo_path="$1"
+	local config_file="${repo_path}/.aidevops.json"
+	local candidate="" current="" value="" selected=""
+	local _COUNTER_BRANCH_SET=false
+	local COUNTER_BRANCH="${DEFAULT_BRANCH:-main}"
+
+	command -v python3 >/dev/null 2>&1 || { log_error "Config repair requires python3"; return 1; }
+	current=$(jq -er '.counter_branch | select(type == "string")' "$config_file") || return 1
+	if [[ "$current" != "$DEFAULT_BRANCH" ]]; then
+		log_info "COUNTER_BRANCH_REPAIR_NOOP: config is not pinned to the default branch"
+		return 0
+	fi
+	resolve_implicit_counter_branch "$repo_path" || return $?
+	candidate="$COUNTER_BRANCH"
+	selected=$(_counter_git show "${REMOTE_NAME}/${DEFAULT_BRANCH}:${COUNTER_FILE}" 2>/dev/null | tr -d '[:space:]' || true)
+	value=$(_counter_git show "${REMOTE_NAME}/${candidate}:${COUNTER_FILE}" 2>/dev/null | tr -d '[:space:]' || true)
+	if [[ "$candidate" == "$DEFAULT_BRANCH" || ! "$selected" =~ ^[0-9]+$ || ! "$value" =~ ^[0-9]+$ ]]; then
+		log_info "COUNTER_BRANCH_REPAIR_NOOP: no validated leading dedicated counter"
+		return 0
+	fi
+	if ((10#$value <= 10#$selected)); then
+		log_info "COUNTER_BRANCH_REPAIR_NOOP: default-branch pin is up to date"
+		return 0
+	fi
+	_COUNTER_BRANCH_SET=true
+	_cas_validate_explicit_counter_branch "${REMOTE_NAME}/${candidate}" "$value" || return $?
+	# Keep the same inode, mode and owner. Lock and recheck the expected pin before
+	# writing, refusing symlinks and concurrent config changes rather than clobbering.
+	python3 - "$config_file" "$current" "$candidate" <<'PY' || return 1
+import fcntl
+import json
+import os
+import stat
+import sys
+
+path, expected, target = sys.argv[1:]
+fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+with os.fdopen(fd, "r+", encoding="utf-8") as config:
+    if not stat.S_ISREG(os.fstat(config.fileno()).st_mode):
+        raise SystemExit("Config repair requires a regular file")
+    fcntl.flock(config, fcntl.LOCK_EX)
+    data = json.load(config)
+    if data.get("counter_branch") != expected:
+        raise SystemExit("Config changed during repair; retry discovery")
+    data["counter_branch"] = target
+    updated = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    config.seek(0)
+    config.write(updated)
+    config.truncate()
+    config.flush()
+    os.fsync(config.fileno())
+PY
+	log_info "COUNTER_BRANCH_CONFIG_REPAIRED: counter_branch ${current} -> ${candidate}; no counter push or allocation"
+	return 0
+}
 
 # Atomic CAS allocation: fetch → read → increment → commit → push
 # Returns 0 on success, 1 on hard error, 2 on retriable conflict, and
@@ -1157,14 +1754,14 @@ allocate_counter_cas() {
 	local repo_path="$1"
 	local count="$2"
 
-	cd "$repo_path" || return 1
-
 	# Step 1: Fetch + pin (atomic snapshot of counter + parent SHA)
 	local pin_result
 	pin_result=$(_cas_fetch_and_pin "$repo_path") || return 1
 	local pinned_sha current_value
 	pinned_sha="${pin_result%% *}"
 	current_value="${pin_result##* }"
+
+	_cas_validate_explicit_counter_branch "$pinned_sha" "$current_value" || return $?
 
 	local first_id="$current_value"
 	local last_id=$((current_value + count - 1))

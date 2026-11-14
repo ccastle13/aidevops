@@ -64,6 +64,7 @@ source "${SCRIPT_DIR}/task-identity-lib.sh"
 
 LOOP_MODE=false
 TASK_DESC=""
+EXPLICIT_ISSUE=""
 CHECK_COMMAND=""
 VERIFY_OP=""
 TARGET_FILE=""
@@ -78,6 +79,11 @@ while [[ $# -gt 0 ]]; do
 	--task)
 		TASK_DESC="$2"
 		shift 2
+		;;
+	--issue)
+		shift
+		EXPLICIT_ISSUE="${1:-}"
+		[[ $# -eq 0 ]] || shift
 		;;
 	--file)
 		TARGET_FILE="$2"
@@ -437,6 +443,7 @@ _create_loop_task_worktree() {
 	_LOOP_WT_BEHIND=""
 	_LOOP_WT_COLLISION=""
 	_LOOP_WT_ACTION=""
+	_LOOP_WT_REFUSAL=""
 	_LOOP_WT_RC=1
 	[[ -x "$helper" ]] || return 1
 
@@ -456,7 +463,13 @@ _create_loop_task_worktree() {
 	_LOOP_WT_COLLISION=$(_loop_worktree_output_value "$output" WORKTREE_COLLISION)
 	_LOOP_WT_ACTION=$(_loop_worktree_output_value "$output" ACTION_REQUIRED)
 	if [[ "$_LOOP_WT_RC" -ne 0 ]]; then
-		printf '%s\n' "$output" | awk '!/^[A-Z_]+=/'
+		local diagnostics=""
+		diagnostics=$(printf '%s\n' "$output" | awk '!/^[A-Z_]+=/')
+		printf '%s\n' "$diagnostics"
+		# GH#36370: keep the helper's own refusal line for the no-collision path.
+		_LOOP_WT_REFUSAL=$(printf '%s\n' "$diagnostics" | grep -iE 'refused|error|failed' | tail -n 1 | cut -c1-300) || _LOOP_WT_REFUSAL=""
+		[[ -n "$_LOOP_WT_REFUSAL" ]] ||
+			_LOOP_WT_REFUSAL=$(printf '%s\n' "$diagnostics" | grep -v '^[[:space:]]*$' | tail -n 1 | cut -c1-300) || _LOOP_WT_REFUSAL=""
 		return 1
 	fi
 	return 0
@@ -464,8 +477,14 @@ _create_loop_task_worktree() {
 
 _print_loop_worktree_failure_next_step() {
 	local action="$1"
+	local refusal="${2:-}"
 	if [[ "$action" == "refresh_target" ]]; then
 		echo "NEXT_STEP: Restore remote access, refresh the target branch, and retry without changing local task branches."
+		return 0
+	fi
+	if [[ "$action" == "inspect_creation_refusal" ]]; then
+		echo "NEXT_STEP: No branch collision was reported; worktree creation itself was refused. Resolve the refusal, then retry the continuation command and confirm it reports no refusal."
+		[[ -z "$refusal" ]] || echo "REFUSAL: $refusal"
 		return 0
 	fi
 	echo "NEXT_STEP: Inspect the reported branch collision, then choose an explicit continuation or a new branch."
@@ -498,19 +517,23 @@ _handle_loop_mode_on_protected() {
 	local _wt_branch_name=""
 	local _wt_task_desc="${TASK_DESC:-}"
 	local _wt_issue_num=""
-	if [[ -n "$_wt_task_desc" ]]; then
+	if [[ "${EXPLICIT_ISSUE:-}" =~ ^[1-9][0-9]*$ ]]; then
+		# Explicit --issue wins over task-text parsing (GH#34956)
+		_wt_issue_num="$EXPLICIT_ISSUE"
+	elif [[ -n "$_wt_task_desc" ]]; then
 		# Extract issue number if present (e.g., "Implement issue #17642")
 		_wt_issue_num=$(printf '%s' "$_wt_task_desc" | grep -oE '#[0-9]+|issue[/ ]*([0-9]+)' | grep -oE '[0-9]+' | head -1) || _wt_issue_num=""
-		if [[ -n "$_wt_issue_num" ]]; then
-			# Slugify the task title for the branch name
-			local _wt_slug=""
-			_wt_slug=$(printf '%s' "$_wt_task_desc" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//' | cut -c1-40) || _wt_slug="task"
-			_wt_branch_name="bugfix/gh${_wt_issue_num}-${_wt_slug}"
-		fi
 	fi
-	# Fallback: timestamp-based branch name
+	if [[ -n "$_wt_issue_num" ]]; then
+		# Slugify the task title for the branch name
+		local _wt_slug=""
+		_wt_slug=$(printf '%s' "$_wt_task_desc" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//' | cut -c1-40) || _wt_slug="task"
+		[[ -n "$_wt_slug" ]] || _wt_slug="task"
+		_wt_branch_name="bugfix/gh${_wt_issue_num}-${_wt_slug}"
+	fi
+	# Fallback: timestamp-based branch name; PID suffix avoids same-second collisions
 	if [[ -z "$_wt_branch_name" ]]; then
-		_wt_branch_name="feature/auto-$(date +%Y%m%d-%H%M%S)"
+		_wt_branch_name="feature/auto-$(date +%Y%m%d-%H%M%S)-$$"
 	fi
 
 	_create_loop_task_worktree "$_wt_branch_name" "$_wt_issue_num" || true
@@ -546,15 +569,25 @@ _handle_loop_mode_on_protected() {
 	else
 		# Worktree creation failed — fall back to signalling exit 2
 		echo -e "${RED}LOOP-AUTO${NC}: Failed to auto-create worktree '$_wt_branch_name'"
+		# GH#36370: a failure without WORKTREE_COLLISION is a creation refusal,
+		# not a known branch collision. `unreported` (not `none`) because the
+		# helper may have stopped before checking for one.
+		if [[ -z "$_wt_collision" ]]; then
+			_wt_collision="unreported"
+			[[ -n "$_wt_failure_action" ]] || _wt_failure_action="inspect_creation_refusal"
+		fi
 		echo "LOOP_DECISION=worktree"
 		echo "WORKTREE_BRANCH=${_wt_actual_branch:-$_wt_branch_name}"
 		[[ -z "$_wt_path" ]] || echo "WORKTREE_PATH=$_wt_path"
-		echo "WORKTREE_COLLISION=${_wt_collision:-creation_failed}"
+		echo "WORKTREE_COLLISION=${_wt_collision}"
 		[[ -z "$_wt_target" ]] || echo "WORKTREE_TARGET=$_wt_target"
 		[[ -z "$_wt_ahead" ]] || echo "WORKTREE_AHEAD=$_wt_ahead"
 		[[ -z "$_wt_behind" ]] || echo "WORKTREE_BEHIND=$_wt_behind"
 		echo "ACTION_REQUIRED=${_wt_failure_action:-inspect_existing_task_branch}"
-		_print_loop_worktree_failure_next_step "$_wt_failure_action"
+		# Preserve the branch as an explicit continuation target. Never delete it:
+		# another process may have added commits since worktree creation failed.
+		printf 'CONTINUATION_COMMAND: worktree-helper.sh add %q\n' "${_wt_actual_branch:-$_wt_branch_name}"
+		_print_loop_worktree_failure_next_step "$_wt_failure_action" "$_LOOP_WT_REFUSAL"
 		exit 2 # Special exit code for "create worktree"
 	fi
 }
@@ -784,6 +817,12 @@ worktree_owner_session="${OPENCODE_SESSION_ID:-${CLAUDE_SESSION_ID:-}}"
 
 if declare -f claim_worktree_ownership >/dev/null 2>&1; then
 	if ! claim_worktree_ownership "$worktree_path" "$current_branch" --owner-pid "$worktree_owner_pid" --session "$worktree_owner_session"; then
+		if [[ "${WORKTREE_CLAIM_STATUS:-unavailable}" != "conflict" ]]; then
+			echo -e "${RED}BLOCKED${NC}: linked worktree ownership could not be verified"
+			echo "WORKTREE_OWNERSHIP_UNAVAILABLE=true"
+			echo "ACTION_REQUIRED=retry_worktree_ownership_verification"
+			exit 2
+		fi
 		owner_info=$(check_worktree_owner "$worktree_path" 2>/dev/null || true)
 		owner_pid="unknown"
 		owner_session=""
@@ -825,6 +864,14 @@ if [[ "$_shallow_clone_check" == "true" ]]; then
 	echo -e "${YELLOW}  commit-and-pr will attempt auto-unshallow before rebase.${NC}"
 	echo -e "${YELLOW}  To fix now: git fetch --unshallow origin${NC}"
 	echo -e "${YELLOW}  See .agents/reference/git-hygiene.md for details.${NC}"
+fi
+
+# GH#34199: report JavaScript verification-tool readiness once per session
+# entry into this worktree. Read-only and cached: never lints, installs or
+# provisions, and a missing helper (older deployment) is a silent no-op.
+if [[ -x "$SCRIPT_DIR/worktree-js-readiness-helper.sh" ]]; then
+	"$SCRIPT_DIR/worktree-js-readiness-helper.sh" entry "$worktree_path" \
+		"${worktree_owner_session:-pid-${worktree_owner_pid}}" 2>/dev/null || true
 fi
 
 # go for it — linked worktree is the correct working context

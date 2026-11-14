@@ -175,6 +175,9 @@ else
 	echo "${TEST_RED}FAIL${TEST_NC}: 5b. Hard-kill check must precede CPU check (hard_kill=$hard_kill_line, cpu=$cpu_check_line)"
 fi
 
+# Classification-only cap probes do not defer a kill. Compare the actual
+# network deferral site when asserting provider-failure precedence.
+network_check_line=$(grep -n '_monitor_defer_stall "network_active"' "${SCRIPT_DIR}/worker-activity-watchdog.sh" | head -1 | cut -d: -f1)
 provider_check_line=$(grep -n "if _output_has_provider_rate_limit" "${SCRIPT_DIR}/worker-activity-watchdog.sh" | head -1 | cut -d: -f1)
 if [[ -n "$provider_check_line" && -n "$network_check_line" && "$provider_check_line" -lt "$network_check_line" ]]; then
 	TESTS_RUN=$((TESTS_RUN + 1))
@@ -203,11 +206,11 @@ assert_contains \
 	"$pulse_wd_source"
 
 #######################################
-# Test 7: pulse-dispatch-lib.sh timeout handler emits [lifecycle] line
+# Test 7: extracted pulse-dispatch candidate timeout emits [lifecycle] line
 #######################################
-dispatch_source=$(< "${SCRIPT_DIR}/pulse-dispatch-lib.sh")
+dispatch_source=$(< "${SCRIPT_DIR}/pulse-dispatch-lib-candidates.sh")
 assert_contains \
-	"7. pulse-dispatch-lib.sh per-candidate timeout emits [lifecycle] line" \
+	"7. pulse-dispatch-lib-candidates.sh per-candidate timeout emits [lifecycle] line" \
 	"reason=wait_loop_timeout_" \
 	"$dispatch_source"
 
@@ -283,22 +286,29 @@ done
 #######################################
 # Test 9: kill_reason classification covers all call sites
 #######################################
-# Verify that each kill reason class is mapped in _kill_worker
+# Verify that each kill reason class is mapped for _kill_worker. GH#34067
+# moved the mapping into the shared _worker_kill_reason_class helper.
+kill_class_source="${watchdog_source}
+$(< "${SCRIPT_DIR}/worker-lifecycle-common.sh")"
 assert_contains \
 	"9a. kill_reason class: phase1_zero_output mapped" \
 	"phase1_zero_output" \
-	"$watchdog_source"
+	"$kill_class_source"
 assert_contains \
 	"9b. kill_reason class: hard_kill_stall mapped" \
 	"hard_kill_stall" \
-	"$watchdog_source"
+	"$kill_class_source"
 assert_contains \
 	"9c. kill_reason class: no_output_stall mapped" \
 	"no_output_stall" \
-	"$watchdog_source"
+	"$kill_class_source"
 assert_contains \
 	"9d. kill_reason class: provider_rate_limit mapped" \
 	"provider_rate_limit" \
+	"$kill_class_source"
+assert_contains \
+	"9e. _kill_worker uses the shared kill-reason mapper" \
+	"_worker_kill_reason_class" \
 	"$watchdog_source"
 
 #######################################
@@ -648,6 +658,17 @@ PY
 			TESTS_FAILED=$((TESTS_FAILED + 1))
 			echo "${TEST_RED}FAIL${TEST_NC}: 24b. Network-active defer changed monitored output size (${network_initial_size} -> ${network_after_size})"
 		fi
+		# GH#36700: the per-attempt events file proves the watchdog ran and
+		# records why it deferred, for the wrapper's watchdog_summary.
+		if grep -q 'watchdog_monitoring' "${network_exit}.watchdog_events" 2>/dev/null &&
+			grep -q 'worker_stall_deferred.*reason=network_active.*hard_kill=0s' "${network_exit}.watchdog_events" 2>/dev/null; then
+			TESTS_RUN=$((TESTS_RUN + 1))
+			echo "${TEST_GREEN}PASS${TEST_NC}: 24c. Per-attempt events file records monitoring start and network_active deferral"
+		else
+			TESTS_RUN=$((TESTS_RUN + 1))
+			TESTS_FAILED=$((TESTS_FAILED + 1))
+			echo "${TEST_RED}FAIL${TEST_NC}: 24c. Per-attempt events file missing monitoring start or network_active deferral"
+		fi
 
 		kill "$network_watchdog_pid" 2>/dev/null || true
 		wait "$network_watchdog_pid" 2>/dev/null || true
@@ -662,6 +683,169 @@ else
 	TESTS_RUN=$((TESTS_RUN + 1))
 	echo "${TEST_GREEN}PASS${TEST_NC}: 24. Network-active runtime test skipped — python3 plus lsof/ss required"
 fi
+
+#######################################
+# Test 25: GH#34067 — provider-failure kill requires trusted, fresh evidence
+#######################################
+provider_tmp_dir=$(mktemp -d 2>/dev/null || mktemp -d -t watchdog-provider)
+provider_output="${provider_tmp_dir}/worker.out"
+
+printf '%s\n' 'grep -n "rate limit" docs/provider.md' \
+	'Tool result: retry when the provider failed or returns too many requests (HTTP 429).' >"$provider_output"
+if _worker_output_has_fresh_provider_failure "$provider_output"; then
+	TESTS_RUN=$((TESTS_RUN + 1))
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "${TEST_RED}FAIL${TEST_NC}: 25a. Benign tool/doc text about rate limits was treated as a provider failure"
+else
+	TESTS_RUN=$((TESTS_RUN + 1))
+	echo "${TEST_GREEN}PASS${TEST_NC}: 25a. Benign tool/doc text about rate limits is not provider evidence"
+fi
+
+printf '%s\n' '{"type":"error","error":{"name":"APIError","data":{"statusCode":429,"message":"Too Many Requests"}}}' >"$provider_output"
+if _worker_output_has_fresh_provider_failure "$provider_output"; then
+	TESTS_RUN=$((TESTS_RUN + 1))
+	echo "${TEST_GREEN}PASS${TEST_NC}: 25b. Structured APIError 429 is trusted provider evidence"
+else
+	TESTS_RUN=$((TESTS_RUN + 1))
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "${TEST_RED}FAIL${TEST_NC}: 25b. Structured APIError 429 was not detected"
+fi
+
+printf '%s\n' '{"type":"error","error":{"name":"APIError","data":{"statusCode":503,"message":"Service Unavailable"}}}' >"$provider_output"
+if _worker_output_has_fresh_provider_failure "$provider_output"; then
+	TESTS_RUN=$((TESTS_RUN + 1))
+	echo "${TEST_GREEN}PASS${TEST_NC}: 25c. Structured APIError 5xx is trusted provider evidence"
+else
+	TESTS_RUN=$((TESTS_RUN + 1))
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "${TEST_RED}FAIL${TEST_NC}: 25c. Structured APIError 5xx was not detected"
+fi
+
+printf '%s\n' '{"type":"error","error":{"name":"APIError","data":{"statusCode":401,"message":"Unauthorized"}}}' >"$provider_output"
+if _worker_output_has_fresh_provider_failure "$provider_output"; then
+	TESTS_RUN=$((TESTS_RUN + 1))
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "${TEST_RED}FAIL${TEST_NC}: 25d. Auth failure was misclassified as a provider rate-limit kill"
+else
+	TESTS_RUN=$((TESTS_RUN + 1))
+	echo "${TEST_GREEN}PASS${TEST_NC}: 25d. Auth failure is not a provider rate-limit kill"
+fi
+
+printf '%s\n' '{"type":"error","error":{"name":"APIError","data":{"statusCode":429,"message":"Too Many Requests"}}}' >"$provider_output"
+for _recovered_line in $(seq 1 60); do
+	printf '{"type":"text","part":{"text":"recovered work line %s"}}\n' "$_recovered_line" >>"$provider_output"
+done
+if _worker_output_has_fresh_provider_failure "$provider_output"; then
+	TESTS_RUN=$((TESTS_RUN + 1))
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "${TEST_RED}FAIL${TEST_NC}: 25e. Recovered (stale) provider error still justified a kill"
+else
+	TESTS_RUN=$((TESTS_RUN + 1))
+	echo "${TEST_GREEN}PASS${TEST_NC}: 25e. Recovered provider error outside the output tail is ignored"
+fi
+rm -rf "$provider_tmp_dir"
+
+#######################################
+# Test 26: GH#34067 — persisted kill_reason matches the kill path
+#######################################
+assert_equals "26a. phase1 kill persists phase1_zero_output" \
+	"phase1_zero_output" "$(_worker_kill_reason_class 'phase1: zero output in 180s')"
+assert_equals "26b. provider kill persists provider_rate_limit" \
+	"provider_rate_limit" "$(_worker_kill_reason_class 'provider_rate_limit: marker visible')"
+assert_equals "26c. hard kill persists hard_kill_stall" \
+	"hard_kill_stall" "$(_worker_kill_reason_class 'hard_kill: total elapsed')"
+assert_equals "26d. stall kill persists no_output_stall" \
+	"no_output_stall" "$(_worker_kill_reason_class 'stall: no output growth')"
+# shellcheck disable=SC2016  # Literal string for grep match
+assert_contains "26e. standalone watchdog persists computed reason_class" \
+	'printf '"'"'%s\n'"'"' "$reason_class" >"${EXIT_CODE_FILE}.kill_reason"' \
+	"$watchdog_source"
+lib_source=$(< "${SCRIPT_DIR}/headless-runtime-lib.sh")
+# shellcheck disable=SC2016  # Literal string for grep match
+assert_not_contains "26f. inline watchdog no longer hard-codes no_output_stall" \
+	'"no_output_stall" >"${exit_code_file}.kill_reason"' \
+	"$lib_source"
+
+#######################################
+# Test 27: GH#34068 — elapsed cap after recent liveness deferral is classified
+# hard_kill_cap_active; cap timing, sentinel and exit routing are unchanged.
+# (No-deferral cap kills stay hard_kill_stall:
+#  test-watchdog-hard-kill-continuous-output.sh.)
+#######################################
+assert_equals "27a. cap-active reason maps to hard_kill_cap_active" \
+	"hard_kill_cap_active" "$(_worker_kill_reason_class 'hard_kill_cap_active: total elapsed')"
+
+cap_tmp_dir=$(mktemp -d 2>/dev/null || mktemp -d -t watchdog-cap-active)
+cap_output="${cap_tmp_dir}/worker.out"
+cap_exit="${cap_tmp_dir}/worker.exit"
+cap_log="${cap_tmp_dir}/lifecycle.log"
+printf 'waiting for CI checks to finish before merge\n' >"$cap_output"
+
+bash -c 'while :; do sleep 1; done' >/dev/null 2>&1 &
+cap_worker_pid=$!
+WORKER_LIFECYCLE_LOG="$cap_log" \
+	"${SCRIPT_DIR}/worker-activity-watchdog.sh" \
+	--output-file "$cap_output" \
+	--worker-pid "$cap_worker_pid" \
+	--exit-code-file "$cap_exit" \
+	--stall-timeout 1 \
+	--poll-interval 1 \
+	--hard-kill-seconds 4 >/dev/null 2>&1 &
+cap_watchdog_pid=$!
+wait "$cap_watchdog_pid" 2>/dev/null || true
+
+cap_kill_reason=$(cat "${cap_exit}.kill_reason" 2>/dev/null || true)
+assert_equals "27b. cap kill after CI-wait deferral persists hard_kill_cap_active" \
+	"hard_kill_cap_active" "$cap_kill_reason"
+if [[ -f "${cap_exit}.watchdog_stall_killed" ]]; then
+	TESTS_RUN=$((TESTS_RUN + 1))
+	echo "${TEST_GREEN}PASS${TEST_NC}: 27c. cap-active kill keeps the hard-kill sentinel (exit 79 routing unchanged)"
+else
+	TESTS_RUN=$((TESTS_RUN + 1))
+	TESTS_FAILED=$((TESTS_FAILED + 1))
+	echo "${TEST_RED}FAIL${TEST_NC}: 27c. cap-active kill did not write the hard-kill sentinel"
+fi
+cap_log_text=$(cat "$cap_log" 2>/dev/null || true)
+assert_contains "27d. lifecycle line reports hard_kill_cap_active" \
+	"reason=hard_kill_cap_active" "$cap_log_text"
+assert_contains "27e. lifecycle line reports the last deferral reason" \
+	"last_deferral_reason=ci_wait" "$cap_log_text"
+
+pkill -P "$cap_worker_pid" 2>/dev/null || true
+kill "$cap_worker_pid" 2>/dev/null || true
+wait "$cap_worker_pid" 2>/dev/null || true
+rm -rf "$cap_tmp_dir"
+
+# Downstream: cap-active kills get their own launch_failure_cause.
+eval "$(sed -n '/^_derive_worker_failure_evidence() {/,/^}/p' "${SCRIPT_DIR}/headless-runtime-helper.sh")"
+assert_equals "27f. cap-active kill maps to elapsed_cap_while_active" \
+	"elapsed_cap_while_active	redispatch_worker" \
+	"$(_derive_worker_failure_evidence watchdog_stall_killed 79 1 hard_kill_cap_active watchdog_stall_killed)"
+assert_equals "27g. stall hard kill still maps to stall_hard_killed" \
+	"stall_hard_killed	redispatch_worker" \
+	"$(_derive_worker_failure_evidence watchdog_stall_killed 79 1 hard_kill_stall watchdog_stall_killed)"
+
+# GH#35287: exercise the first cap-crossing window without a previous
+# deferral. Stub only process observations and killing, not cap decisions.
+cap_probe_results=$(
+	eval "$(sed -n '/^_monitor_enforce_hard_kill() {/,/^}/p' "${SCRIPT_DIR}/worker-activity-watchdog.sh")"
+	STALL_TIMEOUT=600 POLL_INTERVAL=10 HARD_KILL_SECONDS=1 STALL_CPU_THRESHOLD=2
+	_MONITOR_START_EPOCH=1 _MONITOR_LAST_DEFER_EPOCH=0
+	_MONITOR_STALL_SECONDS=600 _MONITOR_DEFERRED_STALL_SECONDS=0 WORKER_PID=1
+	_output_has_ci_wait() { if [[ "$signal" == ci_wait ]]; then return 0; fi; return 1; }
+	_watchdog_tree_network_active() { if [[ "$signal" == network_active ]]; then return 0; fi; return 1; }
+	_watchdog_tree_cpu() { if [[ "$signal" == cpu_active ]]; then printf 5; else printf 0; fi; return 0; }
+	_kill_worker() { local reason="$1" kind="$2"; printf '%s:%s:%s\n' "$signal" "${reason%%:*}" "$kind"; return 0; }
+	for signal in ci_wait network_active cpu_active inactive; do
+		_monitor_enforce_hard_kill 100 || true
+	done
+)
+for cap_signal in ci_wait network_active cpu_active; do
+	assert_contains "28. first cap window samples ${cap_signal} without deferring kill" \
+		"${cap_signal}:hard_kill_cap_active:stall_killed" "$cap_probe_results"
+done
+assert_contains "28. first cap window with no liveness remains a stall kill" \
+	"inactive:hard_kill:stall_killed" "$cap_probe_results"
 
 #######################################
 # Summary

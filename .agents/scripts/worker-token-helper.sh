@@ -317,6 +317,14 @@ create_delegated_token() {
 	local permissions="$2"
 	local ttl="$3"
 
+	# GH#37232: avoid a macOS keychain GUI prompt when the keychain is locked
+	# shellcheck source=./background-keychain-helper.sh
+	source "${SCRIPT_DIR}/background-keychain-helper.sh"
+	if ! background_keychain_gh_ready "worker-token-helper"; then
+		log_token "WARN" "Keychain locked or gh item missing; skipping gh auth token"
+		return 1
+	fi
+
 	# Get the current gh auth token
 	local current_token
 	current_token=$(gh auth token 2>/dev/null) || {
@@ -421,7 +429,10 @@ create_token_file() {
 
 _file_uid() {
 	local path="$1"
-	stat -f '%u' "$path" 2>/dev/null || stat -c '%u' "$path" 2>/dev/null
+	# GNU stat -f can emit filesystem data before failing on the BSD format
+	# argument. Dispatch by the already-detected platform, never concatenate a
+	# failed probe's stdout with the actual UID. %u is shared by GNU and BSD.
+	_stat_batch '%u' "$path"
 	return $?
 }
 
@@ -596,8 +607,9 @@ cmd_validate() {
 	log_token "INFO" "Token: strategy=${strategy}, repo=${repo}, expires=${expires_at}"
 
 	local expires_epoch now_epoch
-	expires_epoch=$(date -jf "%Y-%m-%dT%H:%M:%SZ" "$expires_at" +%s 2>/dev/null ||
-		date -d "$expires_at" +%s 2>/dev/null || echo "0")
+	# The literal Z in the BSD format does not select UTC; pin both parsers.
+	expires_epoch=$(date -ujf "%Y-%m-%dT%H:%M:%SZ" "$expires_at" +%s 2>/dev/null ||
+		date -u -d "$expires_at" +%s 2>/dev/null || echo "0")
 	now_epoch=$(date +%s)
 
 	if [[ "$expires_epoch" -le 0 || "$now_epoch" -gt "$expires_epoch" ]]; then
@@ -700,7 +712,7 @@ cmd_revoke() {
 	# Always delete local files regardless of strategy
 	if [[ -f "$token_file" ]]; then
 		# Overwrite before delete (defense in depth)
-		dd if=/dev/urandom bs=64 count=1 2>/dev/null | head -c 64 >"$token_file" 2>/dev/null || true
+		dd if=/dev/urandom bs=64 count=1 >"$token_file" 2>/dev/null || true
 		rm -f "$token_file"
 		log_token "INFO" "Deleted token file: ${token_file}"
 	fi
@@ -732,8 +744,8 @@ cmd_cleanup() {
 
 		if [[ -n "$expires_at" ]]; then
 			local expires_epoch now_epoch
-			expires_epoch=$(date -jf "%Y-%m-%dT%H:%M:%SZ" "$expires_at" +%s 2>/dev/null ||
-				date -d "$expires_at" +%s 2>/dev/null || echo "0")
+			expires_epoch=$(date -ujf "%Y-%m-%dT%H:%M:%SZ" "$expires_at" +%s 2>/dev/null ||
+				date -u -d "$expires_at" +%s 2>/dev/null || echo "0")
 			now_epoch=$(date +%s)
 
 			if [[ "$expires_epoch" -gt 0 ]] && [[ "$now_epoch" -gt "$expires_epoch" ]]; then
@@ -801,8 +813,8 @@ cmd_status() {
 
 			local now_epoch expires_epoch
 			now_epoch=$(date +%s)
-			expires_epoch=$(date -jf "%Y-%m-%dT%H:%M:%SZ" "$expires_at" +%s 2>/dev/null ||
-				date -d "$expires_at" +%s 2>/dev/null || echo "0")
+			expires_epoch=$(date -ujf "%Y-%m-%dT%H:%M:%SZ" "$expires_at" +%s 2>/dev/null ||
+				date -u -d "$expires_at" +%s 2>/dev/null || echo "0")
 
 			if [[ "$expires_epoch" -gt 0 ]] && [[ "$now_epoch" -gt "$expires_epoch" ]]; then
 				((++expired_count))

@@ -41,6 +41,9 @@
 #   AIDEVOPS_GH_SHIM_NO_REST_REWRITE=1 gh …  # skip read-rewrite only (t3037)
 #   AIDEVOPS_GH_EXPLICIT_PAGINATION_DISABLE=1 # retain native opaque pagination
 #   AIDEVOPS_GH_EXACT_QUOTA_CAPTURE=1         # private response-framed quota evidence
+#   AIDEVOPS_GH_SHIM_TIMING=1 gh api ...       # opt-in, value-free phase ms on stderr
+#     Debug mode starts additional Perl clocks and inflates measured wall time;
+#     compare native/shim wall time with the flag off, then inspect phase timing.
 #
 # Ops/audit comments
 # ------------------
@@ -81,6 +84,20 @@
 # =============================================================================
 
 _SHIM_SOURCE="${BASH_SOURCE[0]:-$0}"
+# Opt-in wall-clock diagnostics. Never include arguments, endpoint, or credentials.
+if [[ "${AIDEVOPS_GH_SHIM_TIMING:-0}" == 1 ]]; then
+	_SHIM_TIMING_START=$(perl -MTime::HiRes=time -e 'printf "%.6f", time')
+	_shim_timing() {
+		local phase="$1" now="" elapsed=""
+		now=$(perl -MTime::HiRes=time -e 'printf "%.6f", time')
+		elapsed=$(perl -e 'printf "%.1f", ($ARGV[1] - $ARGV[0]) * 1000' "$_SHIM_TIMING_START" "$now")
+		printf '[gh-shim-timing] phase=%s elapsed_ms=%s\n' "$phase" "$elapsed" >&2
+		_SHIM_TIMING_START="$now"
+		return 0
+	}
+else
+	_shim_timing() { return 0; }
+fi
 while [[ -L "$_SHIM_SOURCE" ]]; do
 	_SHIM_LINK_DIR="$(cd "$(dirname "$_SHIM_SOURCE")" 2>/dev/null && pwd)" || exit 127
 	_SHIM_SOURCE=$(readlink "$_SHIM_SOURCE") || exit 127
@@ -88,19 +105,29 @@ while [[ -L "$_SHIM_SOURCE" ]]; do
 done
 _SHIM_DIR="$(cd "$(dirname "$_SHIM_SOURCE")" 2>/dev/null && pwd)" || _SHIM_DIR=""
 _SHIM_SOURCE="${_SHIM_DIR}/$(basename "$_SHIM_SOURCE")"
+_shim_timing path_resolution
+
+# Select credentials before any quota probe, translation or native transport.
+# The child re-enters this same shim, preserving all write/safety policies.
+if [[ -n "${AIDEVOPS_GITHUB_AUTH_CONSUMER:-}" && "$AIDEVOPS_GITHUB_AUTH_CONSUMER" != "pulse" ]]; then
+	printf 'Unsupported GitHub auth consumer\n' >&2
+	exit 1
+fi
+if [[ ( "${AIDEVOPS_PULSE_AUTH:-0}" == "1" || "${AIDEVOPS_GITHUB_AUTH_CONSUMER:-}" == "pulse" ) && "${AIDEVOPS_PULSE_AUTH_ACTIVE:-0}" != "1" ]]; then
+	export AIDEVOPS_GITHUB_AUTH_CONSUMER=pulse
+	exec python3 "${_SHIM_DIR}/github_auth_runtime.py" exec-gh "$_SHIM_SOURCE" "$@"
+fi
 
 # shellcheck source=./gh-native-transport-lib.sh
 # shellcheck disable=SC1091  # sibling library resolved at runtime via $_SHIM_DIR
 source "${_SHIM_DIR}/gh-native-transport-lib.sh"
-# shellcheck source=./gh-api-guards-lib.sh
-# shellcheck disable=SC1091  # sibling library resolved at runtime via $_SHIM_DIR
-source "${_SHIM_DIR}/gh-api-guards-lib.sh"
-# shellcheck source=./managed-label-provisioning-lib.sh
-# shellcheck disable=SC1091  # sibling library resolved at runtime via $_SHIM_DIR
-source "${_SHIM_DIR}/managed-label-provisioning-lib.sh"
-# shellcheck source=./gh-write-policy-lib.sh
-# shellcheck disable=SC1091  # sibling library resolved at runtime via $_SHIM_DIR
-source "${_SHIM_DIR}/gh-write-policy-lib.sh"
+_shim_timing native_library
+
+if [[ -f "${_SHIM_DIR}/gh-transport-controls.sh" ]]; then
+	# shellcheck source=./gh-transport-controls.sh
+	source "${_SHIM_DIR}/gh-transport-controls.sh"
+fi
+_shim_timing transport_library
 
 # Reject recursive entry rather than forwarding to another shim generation.
 # The resolver below prevents normal cross-generation selection; this sentinel
@@ -124,7 +151,7 @@ if [[ "${AIDEVOPS_GH_SHIM_DISABLE:-0}" == "1" ]]; then
 		exit 1
 	fi
 	_real_gh="$(_find_real_gh)" || {
-		printf '[aidevops] gh shim: native gh binary not found on PATH\n' >&2
+		_shim_report_missing_native_gh 'native gh binary not found on PATH'
 		exit 127
 	}
 	exec "$_real_gh" "$@"
@@ -195,6 +222,7 @@ if ! type gh_run_transport_attempt >/dev/null 2>&1; then
 	}
 fi
 unset _cand _INST_LOADED
+_shim_timing instrumentation_source
 
 # Direct REST calls have documented fixed primary-rate costs, with a documented
 # zero-cost exception for GET /rate_limit. Keep the parser separate from this
@@ -213,6 +241,7 @@ if [[ $_GHQA_LOADED -eq 0 ]]; then
 	_ghqa_exact_success_cost() { return 1; }
 fi
 unset _cand _GHQA_LOADED
+_shim_timing quota_source
 
 # One ID follows the complete wrapper invocation, including REST translation,
 # each explicit page, and any GraphQL fallback retry.
@@ -244,6 +273,7 @@ for _cand in \
 	fi
 done
 unset _cand
+_shim_timing pagination_source
 
 
 # -----------------------------------------------------------------------------
@@ -275,7 +305,7 @@ case "${1:-}:${2:-}" in
 		# native stdin, stdout, stderr, and exit status byte-for-byte for every auth
 		# subcommand.
 		_real_gh="$(_find_real_gh)" || {
-			printf '[aidevops] gh shim: real gh binary not found on PATH\n' >&2
+			_shim_report_missing_native_gh 'real gh binary not found on PATH'
 			exit 127
 		}
 		exec "$_real_gh" "$@"
@@ -294,7 +324,7 @@ api:*)
 	;;
 *)
 	_real_gh="$(_find_real_gh)" || {
-		printf '[aidevops] gh shim: real gh binary not found on PATH\n' >&2
+		_shim_report_missing_native_gh 'real gh binary not found on PATH'
 		exit 127
 	}
 	# GH#21857/t3448: instrument every passthrough gh call (pr merge, pr checks,
@@ -309,8 +339,23 @@ esac
 
 export _AIDEVOPS_GH_SHIM_ACTIVE=1
 
+# GH#37406: refuse --edit-last/--delete-last/--create-if-none before any API
+# call. Optional module so partial shim fixtures keep loading.
+case "${1:-}:${2:-}" in
+issue:comment | pr:comment)
+	if [[ -f "${_SHIM_DIR}/shared-gh-wrappers-comment-selector.sh" ]]; then
+		# shellcheck source=./shared-gh-wrappers-comment-selector.sh
+		# shellcheck disable=SC1091
+		source "${_SHIM_DIR}/shared-gh-wrappers-comment-selector.sh"
+		if gh_comment_selector_refused "$1" "${@:3}"; then
+			exit 2
+		fi
+	fi
+	;;
+esac
+
 REAL_GH="$(_find_real_gh)" || {
-	printf '[aidevops] gh shim: real gh binary not found; aborting\n' >&2
+	_shim_report_missing_native_gh 'real gh binary not found; aborting'
 	exit 127
 }
 
@@ -321,7 +366,7 @@ gh() {
 	local path=""
 	local caller=""
 	path=$(_shim_classify_endpoint "${1:-}" "${2:-}")
-	caller=$(_shim_caller_label "${1:-}" "${2:-}")
+	caller=$(_shim_transport_caller_label "${1:-}" "${2:-}")
 	_shim_run_transport "$REAL_GH" "$path" "$caller" "${AIDEVOPS_GH_RETRY_INDEX:-0}" "$@"
 	return $?
 }
@@ -337,6 +382,9 @@ gh() {
 # -----------------------------------------------------------------------------
 
 if [[ "${1:-}:${2:-}" == "api:graphql" ]]; then
+	# shellcheck source=./gh-api-guards-lib.sh
+	# shellcheck disable=SC1091
+	source "${_SHIM_DIR}/gh-api-guards-lib.sh"
 	_shim_graphql_guard_literal_fields "$@" || exit 1
 fi
 
@@ -467,7 +515,11 @@ if [[ -n "$_SHIM_READ_REWRITE" ]]; then
 		# Prefer REST in pulse/workflow REST-first mode; otherwise use the legacy
 		# low-GraphQL-budget fallback. This shares native GitHub quota pools instead
 		# of imposing a synthetic lower GraphQL budget.
-		_rest_read_first_enabled || _rest_should_fallback || return 1
+		if [[ "$_SHIM_READ_REWRITE" == pr:list ]] && _rest_pr_list_prefers_native_filter "${@:3}"; then
+			_rest_should_fallback || return 1
+		else
+			_rest_read_first_enabled || _rest_should_fallback || return 1
+		fi
 		[[ "$_GH_REQUEST_ATTEMPT_STATE_READY" -eq 1 ]] || return 1
 
 		# Extract repo and build stripped args.
@@ -503,6 +555,10 @@ if [[ -n "$_SHIM_READ_REWRITE" ]]; then
 		exit 0
 	else
 		_rest_rc=$?
+		# A local admission/cooldown stop is not a failed JSON projection and
+		# must not be retried against a different API resource.
+		[[ "$_rest_rc" -ne 75 ]] || exit 75
+		[[ "$_rest_rc" -ne 125 ]] || exit 125
 		if [[ "$_SHIM_REST_REWRITE_ATTEMPTED" -eq 1 ]] && _shim_rest_rewrite_has_http_failure; then
 			exit "$_rest_rc"
 		fi
@@ -523,9 +579,44 @@ if [[ -n "$_SHIM_READ_REWRITE" ]]; then
 	fi
 fi
 
+# Conservative direct REST GET fast path. Accept only one endpoint and the
+# output-only jq selector used by high-frequency reads. Every other shape keeps
+# the full policy path, including implicit POST from fields or input files.
+if [[ "${1:-}" == api && "${2:-}" != graphql && "${2:-}" != graphql/* && "${2:-}" != -* && "${2:-}" != "" ]]; then
+	_SHIM_PLAIN_READ=0
+	case "$#" in
+	2) _SHIM_PLAIN_READ=1 ;;
+	4) [[ "${3:-}" == --jq || "${3:-}" == -q ]] && _SHIM_PLAIN_READ=1 ;;
+	esac
+	if [[ "$_SHIM_PLAIN_READ" -eq 1 ]]; then
+		_transport_caller=$(_shim_transport_caller_label "${1:-}" "${2:-}")
+		gh_record_call rest "$_transport_caller" 2>/dev/null || true
+		_shim_timing logical_log
+		if [[ "${2:-}" == user || "${2:-}" == /user ]] &&
+			declare -F _gh_transport_identity_read >/dev/null 2>&1; then
+			_gh_transport_identity_read "$REAL_GH" "$_transport_caller" "$@"
+			exit $?
+		fi
+		_shim_run_transport "$REAL_GH" rest "$_transport_caller" 0 "$@"
+		exit $?
+	fi
+fi
+
 # -----------------------------------------------------------------------------
 # Locate signature helper.
 # -----------------------------------------------------------------------------
+# Read-only REST and GraphQL paths exit above. Load write-policy and label
+# provisioning only after routing, without weakening any write checks.
+# shellcheck source=./gh-api-guards-lib.sh
+# shellcheck disable=SC1091
+source "${_SHIM_DIR}/gh-api-guards-lib.sh"
+# shellcheck source=./managed-label-provisioning-lib.sh
+# shellcheck disable=SC1091
+source "${_SHIM_DIR}/managed-label-provisioning-lib.sh"
+# shellcheck source=./gh-write-policy-lib.sh
+# shellcheck disable=SC1091
+source "${_SHIM_DIR}/gh-write-policy-lib.sh"
+_shim_timing write_libraries
 SIG_HELPER=""
 for _cand in \
 	"$_SHIM_DIR/gh-signature-helper.sh" \
@@ -928,6 +1019,48 @@ while [[ $_i -lt ${#_modified_args[@]} ]]; do
 	_i=$((_i + 1))
 done
 
+# Raw worker PR writes must use the same identity guard as managed writes.
+# Metadata-only edits remain valid without an inspectable body.
+if [[ "${_modified_args[0]:-}:${_modified_args[1]:-}" == pr:create ]]; then
+	if _shim_is_headless_automation; then
+		_GH_PR_IDENTITY_ORIGIN="origin:worker"
+	else
+		_identity_prev=""
+		for _identity_arg in "${_modified_args[@]:2}"; do
+			if [[ "$_identity_arg" == --label=* && ",${_identity_arg#*=}," == *",origin:worker,"* ]]; then
+				_GH_PR_IDENTITY_ORIGIN="origin:worker"
+			elif [[ "$_identity_arg" == -l?* && "$_identity_arg" != --* && ",${_identity_arg#-l}," == *",origin:worker,"* ]]; then
+				_GH_PR_IDENTITY_ORIGIN="origin:worker"
+			elif [[ "$_identity_prev" == "--label" || "$_identity_prev" == "-l" ]] && [[ ",${_identity_arg}," == *",origin:worker,"* ]]; then
+				_GH_PR_IDENTITY_ORIGIN="origin:worker"
+			fi
+			_identity_prev="$_identity_arg"
+		done
+	fi
+elif [[ "${_modified_args[0]:-}:${_modified_args[1]:-}" == pr:edit ]]; then
+	if ! declare -F gh_pr_view >/dev/null 2>&1; then
+		# Shim has no wrapper library; read PR labels via the native binary.
+		gh_pr_view() {
+			"$REAL_GH" pr view "$@"
+			return $?
+		}
+	fi
+	# Resolve origin from existing PR labels: interactive PRs are not treated as
+	# worker PRs, and worker PRs are guarded regardless of body marker.
+	for _identity_arg in "${_modified_args[@]:2}"; do
+		case "$_identity_arg" in
+		--body | --body=* | -b | -b?* | --body-file | --body-file=* | -F | -F?*)
+			_GH_PR_IDENTITY_ORIGIN="edit"
+			break
+			;;
+		esac
+	done
+fi
+if ! _shim_validate_pr_closing_keywords; then
+	exit 1
+fi
+unset _GH_PR_IDENTITY_ORIGIN
+
 # Open a pre-signed managed body on an inherited descriptor, then remove and
 # verify its only pathname before native gh starts the external write. This is
 # an explicit one-shot mode for public triage comments: callers must use the
@@ -940,6 +1073,10 @@ if [[ "${_modified_args[0]:-}:${_modified_args[1]:-}" != "pr:merge" &&
 		_sig_footer=$("$SIG_HELPER" footer --body "$_body_val" 2>/dev/null || echo "")
 		if [[ -n "$_sig_footer" ]]; then
 			_new_body="${_body_val}${_sig_footer}"
+			if [[ "$_sig_footer" == *'<!-- aidevops:origin:'* ]]; then
+				# GH#36978: the footer carries the one canonical origin marker.
+				_new_body="$(printf '%s\n' "$_body_val" | awk '!/^<!-- aidevops:origin:(interactive|worker) -->[[:space:]]*$/')${_sig_footer}"
+			fi
 			if [[ $_body_eq -eq 1 ]]; then
 				_modified_args[_body_idx]="--body=${_new_body}"
 			else
@@ -982,6 +1119,10 @@ if [[ "${_modified_args[0]:-}:${_modified_args[1]:-}" != "pr:merge" &&
 			# Build augmented body in a temp file we own — never mutate the source.
 			_tmp_body_file=$(mktemp -t aidevops-gh-shim-body.XXXXXX 2>/dev/null) || _tmp_body_file=""
 			if [[ -n "$_tmp_body_file" ]]; then
+				if [[ "$_sig_footer" == *'<!-- aidevops:origin:'* ]]; then
+					# GH#36978: the footer carries the one canonical origin marker.
+					_file_content="$(printf '%s\n' "$_file_content" | awk '!/^<!-- aidevops:origin:(interactive|worker) -->[[:space:]]*$/')"
+				fi
 				if printf '%s%s' "$_file_content" "$_sig_footer" >"$_tmp_body_file" 2>/dev/null; then
 					# Substitute the arg pointing at user's file with our temp file.
 					if [[ $_body_file_eq -eq 1 ]]; then
@@ -1040,5 +1181,9 @@ _shim_ensure_requested_managed_labels_for_create || true
 # comment/edit) — these all use the GraphQL endpoint.
 _transport_caller=$(_shim_caller_label "${1:-}" "${2:-}")
 gh_record_call graphql "$_transport_caller" 2>/dev/null || true
+if [[ "${_modified_args[0]:-}:${_modified_args[1]:-}" == "pr:create" ]]; then
+	_shim_run_pr_create_transport "$REAL_GH" graphql "$_transport_caller" 0 "${_modified_args[@]}"
+	exit $?
+fi
 _shim_run_transport "$REAL_GH" graphql "$_transport_caller" 0 "${_modified_args[@]}"
 exit $?

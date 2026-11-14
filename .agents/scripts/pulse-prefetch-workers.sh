@@ -26,8 +26,34 @@ _prefetch_batch_refresh() {
 	if [[ "${PULSE_BATCH_PREFETCH_ENABLED:-1}" != "1" || ! -x "$_batch_helper" ]]; then
 		return 0
 	fi
-	local _batch_output
-	_batch_output=$("$_batch_helper" refresh 2>/dev/null) || true
+	local _batch_output="" _batch_rc=0
+	local _batch_timeout="${PULSE_BATCH_PREFETCH_TIMEOUT_SECONDS:-180}"
+	[[ "$_batch_timeout" =~ ^[1-9][0-9]*$ ]] || _batch_timeout=180
+	# GH#34527: batch warming must not consume the primary repo-fetch budget.
+	# Reserve the existing 120s parallel cap plus cleanup/publication headroom.
+	if [[ "${PULSE_STAGE_DEADLINE_EPOCH:-}" =~ ^[1-9][0-9]*$ ]]; then
+		_batch_timeout=$(_prefetch_remaining_seconds "$_batch_timeout" 150) || {
+			printf '[pulse-wrapper] prefetch_batch_refresh skipped: reserving primary fetch budget (GH#34527)\n' \
+				>>"${LOGFILE:-/dev/null}" 2>/dev/null || true
+			return 0
+		}
+	fi
+	if ! declare -F run_cmd_with_timeout >/dev/null 2>&1; then
+		printf '[pulse-wrapper] prefetch_batch_refresh skipped: timeout helper unavailable (non-fatal)\n' \
+			>>"${LOGFILE:-/dev/null}" 2>/dev/null || true
+		return 0
+	fi
+	_batch_output=$(run_cmd_with_timeout "$_batch_timeout" "$_batch_helper" refresh 2>/dev/null) || _batch_rc=$?
+	if [[ "$_batch_rc" -eq 124 ]]; then
+		printf '[pulse-wrapper] prefetch_batch_refresh timed out after %ss (non-fatal)\n' \
+			"$_batch_timeout" >>"${LOGFILE:-/dev/null}" 2>/dev/null || true
+	elif [[ "$_batch_rc" -eq 0 ]]; then
+		# GH#33737: this is the same refresh pulse-cache-prime.sh runs. Mark the
+		# caches warm so the next cycle's stale-gated prime skips; otherwise
+		# cycles longer than the prime max age re-prime (800s+) every cycle.
+		mkdir -p "${HOME}/.aidevops/cache" 2>/dev/null &&
+			date -u +'%Y-%m-%dT%H:%M:%SZ' >"${HOME}/.aidevops/cache/pulse-cache-prime-last-run" 2>/dev/null || true
+	fi
 	# Parse counters for health instrumentation (t2830: also parses tickle counters)
 	local _batch_search_calls=0 _batch_cache_writes=0
 	local _tickle_fresh=0 _tickle_stale=0

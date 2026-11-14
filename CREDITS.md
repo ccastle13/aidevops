@@ -29,6 +29,42 @@ Sources, inspirations, and third-party resources incorporated into or referenced
   - Repository: https://github.com/dominikmartn/nothing-design-skill
   - Adapted as `.agents/tools/ui/nothing-design-skill/`
 
+### Hallmark
+
+- **Nutlope/hallmark** (MIT License, copyright 2026 Hallmark contributors) —
+  Structure-first composition, brief-specific design critique, and build/audit/
+  redesign/study concepts adapted into `.agents/tools/design/distinctive-ui.md`
+  and its composition/audit references, not vendored or installed wholesale.
+  - Repository: https://github.com/nutlope/hallmark
+  - Reviewed commit: `13ac0ec7e148655948100b6396439e481361d690`
+  - Value assessment, departures and full MIT notice: `.agents/tools/design/hallmark.md`
+
+### Taste Skill
+
+- **Leonxlnx/taste-skill** (MIT License, copyright 2026 Leonxlnx) —
+  Brand concept boards, optional visual-concept handoff and coherent mobile
+  journeys adapted into `.agents/tools/design/brand-concepts.md` and
+  `.agents/tools/design/visual-concepts.md`; app-screen data truth, image
+  provenance and type-loading checks adapted into Distinctive UI, UI verification
+  and `.agents/tools/design/font-pairing.md`. Not installed or vendored wholesale.
+  - Repository: https://github.com/Leonxlnx/taste-skill
+  - Reviewed commits: `ccbc15639c97057cbfcf32ecebc38ef716e4bb37`,
+    `6010f91a9935f1c167dfc500fb1a475681892e6b` (2.1.4)
+  - Assessment, departures and MIT notice: `.agents/tools/design/taste-skill.md`
+
+### Impeccable
+
+- **pbakaus/impeccable** (Apache License 2.0, copyright 2025 Paul Bakaus) —
+  Visitor modes (persuade, operate, read), scoped refinement vocabulary,
+  typography assessment, hardening and browser-surface concepts paraphrased into
+  `.agents/tools/design/distinctive-ui.md`, its audit, UI verification and
+  `.agents/tools/design/font-pairing.md`. No engine, hooks, live mode or telemetry
+  are installed, and no upstream files are redistributed.
+  - Repository: https://github.com/pbakaus/impeccable
+  - Website: https://impeccable.style/
+  - Reviewed commit: `936867543ac2576920d663cc9803597f6044f3ac` (4.7.1)
+  - Assessment and departures: `.agents/tools/design/impeccable.md`
+
 ### Logo & Brand Identity Tools
 
 - **Brandmark** -- AI logo maker that generates logo, typography, and colour schemes from keywords.
@@ -48,8 +84,9 @@ Sources, inspirations, and third-party resources incorporated into or referenced
 - **Huemint** -- AI colour palette generator for brand identity, logos, and web mockups.
   - Website: https://huemint.com/
 
-- **Fontjoy** -- AI font pairing generator using deep learning to find harmonious heading + body + accent combinations.
+- **Fontjoy** (code MIT License, copyright 2017 Jack Qiao) -- AI font pairing generator; font vectors from a Google web fonts dataset score pairs on similarity and contrast together. Its pairing method informs `.agents/tools/design/font-pairing.md`; no code or data is included.
   - Website: https://fontjoy.com/
+  - Repository: https://github.com/Jack000/fontjoy (reviewed at `3f47f4c2890cd5ede20f728f01fb54d6ad7c97f2`)
 
 - **Poolors** -- Discover unique colour combinations that stand out from the crowd.
   - Website: https://poolors.com/

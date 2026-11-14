@@ -26,8 +26,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=shared-constants.sh
 [[ -f "${SCRIPT_DIR}/shared-constants.sh" ]] && source "${SCRIPT_DIR}/shared-constants.sh"
+# shellcheck source=tabby-python-lib.sh
+source "${SCRIPT_DIR}/tabby-python-lib.sh"
 REPOS_JSON="${HOME}/.config/aidevops/repos.json"
 TABBY_CONFIG_OVERRIDE="${TABBY_CONFIG:-}"
+TABBY_PYTHON_ENV="${AIDEVOPS_TABBY_PYTHON_ENV:-${HOME}/.aidevops/.agent-workspace/python-env/tabby}"
+TABBY_PYYAML_VERSION="6.0.3"
 
 _resolve_tabby_config() {
 	local platform="${1:-$(uname -s)}"
@@ -53,11 +57,6 @@ _error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 # --- Preflight checks ---
 _check_prereqs() {
-	if ! command -v python3 >/dev/null 2>&1; then
-		_error "python3 is required but not found"
-		return 1
-	fi
-
 	if [[ ! -f "$REPOS_JSON" ]]; then
 		_error "repos.json not found at $REPOS_JSON"
 		_info "Run 'aidevops init' in your projects first"
@@ -73,21 +72,65 @@ _check_prereqs() {
 	return 0
 }
 
+_tabby_python() {
+	tabby_python "$TABBY_PYTHON_ENV" || return 1
+	return 0
+}
+
+_bootstrap_tabby_python() {
+	local system_python=""
+	local isolated_python="${TABBY_PYTHON_ENV}/bin/python3"
+	system_python=$(command -v python3 2>/dev/null || true)
+	if [[ -z "$system_python" ]]; then
+		_error "python3 is required to prepare the isolated Tabby environment" >&2
+		return 1
+	fi
+
+	_info "Preparing isolated Tabby Python environment..." >&2
+	if ! (umask 077 && mkdir -p "${TABBY_PYTHON_ENV%/*}" && "$system_python" -m venv --copies "$TABBY_PYTHON_ENV"); then
+		_error "Could not create the isolated Tabby Python environment; Tabby profiles were not modified" >&2
+		return 1
+	fi
+	if ! "$isolated_python" -m pip install --disable-pip-version-check --quiet "PyYAML==${TABBY_PYYAML_VERSION}"; then
+		_error "Could not install pinned PyYAML==${TABBY_PYYAML_VERSION}; Tabby profiles were not modified" >&2
+		return 1
+	fi
+	if ! "$isolated_python" -c 'import yaml' >/dev/null 2>&1; then
+		_error "The isolated Tabby environment could not import PyYAML; Tabby profiles were not modified" >&2
+		return 1
+	fi
+	_success "Isolated Tabby Python environment is ready (PyYAML ${TABBY_PYYAML_VERSION})" >&2
+	printf '%s\n' "$isolated_python"
+	return 0
+}
+
+_ensure_tabby_python() {
+	local python_bin=""
+	if python_bin=$(_tabby_python); then
+		printf '%s\n' "$python_bin"
+		return 0
+	fi
+	_bootstrap_tabby_python
+}
+
 # --- Commands ---
 
 cmd_sync() {
 	if ! _check_prereqs; then
 		return 1
 	fi
+	local python_bin
+	python_bin=$(_ensure_tabby_python) || return 1
 
 	_info "Syncing Tabby profiles from repos.json and detected workspaces..."
 
-	# Back up config before modifying
+	# Retain the existing single-backup behavior instead of accumulating a
+	# separate copy on every optional update.
 	local backup="${TABBY_CONFIG}.backup"
 	cp "$TABBY_CONFIG" "$backup"
 
 	local result
-	if result=$(python3 "${SCRIPT_DIR}/tabby-profile-sync.py" \
+	if result=$("$python_bin" "${SCRIPT_DIR}/tabby-profile-sync.py" \
 		--repos-json "$REPOS_JSON" \
 		--tabby-config "$TABBY_CONFIG" 2>&1); then
 		echo "$result"
@@ -106,8 +149,14 @@ cmd_status() {
 	if ! _check_prereqs; then
 		return 1
 	fi
+	local python_bin
+	if ! python_bin=$(_tabby_python); then
+		_error "No Python with PyYAML is available for Tabby profile status"
+		_info "Run 'aidevops tabby sync' to prepare the isolated environment and reconcile profiles"
+		return 1
+	fi
 
-	python3 "${SCRIPT_DIR}/tabby-profile-sync.py" \
+	"$python_bin" "${SCRIPT_DIR}/tabby-profile-sync.py" \
 		--repos-json "$REPOS_JSON" \
 		--tabby-config "$TABBY_CONFIG" \
 		--status-only
@@ -136,13 +185,11 @@ _fix_shell_check_prereqs() {
 	return 0
 }
 
-_fix_shell_patch_config() {
-	# Parses the Tabby YAML with a targeted state machine and inserts
-	# /bin/zsh as the default shell while preserving the existing file shape.
-	# Prints a single status token: OK, FIXED, SKIP:<shell>, WARN, or INVALID.
+_fix_shell_current_command() {
+	# Print the configured local-profile command or a sentinel for absent YAML nodes.
 	local config_path="$1"
-	local current_cmd=""
-	current_cmd=$(awk '
+
+	awk '
 		function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
 		function key_is(str, key) { return str ~ ("^" key ":[[:space:]]*($|#)") }
 		BEGIN { state="seek_pd"; found_options=0; found_command=0 }
@@ -162,17 +209,13 @@ _fix_shell_patch_config() {
 			}
 
 			if (state=="in_options") {
-				if (stripped !~ /^($|#)/ && indent <= options_indent) {
-					state="done"
-				}
+				if (stripped !~ /^($|#)/ && indent <= options_indent) { state="done" }
 				if (state=="in_options" && indent == options_indent + 2 && stripped ~ /^command:[[:space:]]*/) {
 					value = stripped
 					sub(/^command:[[:space:]]*/, "", value)
 					sub(/[[:space:]]+#.*$/, "", value)
 					value = trim(value)
-					if ((value ~ /^\047.*\047$/) || (value ~ /^\".*\"$/)) {
-						value = substr(value, 2, length(value)-2)
-					}
+					if ((value ~ /^\047.*\047$/) || (value ~ /^\".*\"$/)) { value = substr(value, 2, length(value)-2) }
 					print value
 					found_command=1
 					exit
@@ -180,16 +223,73 @@ _fix_shell_patch_config() {
 			}
 		}
 		END {
-			if (found_command==1) {
-				exit 0
-			}
-			if (found_options==1) {
-				print "__MISSING__"
-			} else {
-				print "__WARN__"
-			}
+			if (found_command==1) { exit 0 }
+			if (found_options==1) { print "__MISSING__" } else { print "__WARN__" }
 		}
-	' "$config_path" 2>/dev/null || printf '%s\n' "__WARN__")
+	' "$config_path" 2>/dev/null || printf '%s\n' "__WARN__"
+
+	return 0
+}
+
+_fix_shell_write_zsh_config() {
+	# Replace local-profile command and args while preserving unrelated YAML shape.
+	local config_path="$1"
+	local tmp_file="$2"
+
+	awk '
+		function key_is(str, key) { return str ~ ("^" key ":[[:space:]]*($|#)") }
+		BEGIN { state="seek_pd"; inserted=0; skip_args=0 }
+		{
+			line=$0
+			stripped=line
+			sub(/^[[:space:]]+/, "", stripped)
+			indent=length(line)-length(stripped)
+
+			if (skip_args==1) {
+				if (stripped ~ /^($|#)/ || indent > args_indent) { next }
+				skip_args=0
+			}
+			if (state=="seek_pd" && key_is(stripped, "profileDefaults")) {
+				state="seek_local"; print line; next
+			}
+			if (state=="seek_local" && key_is(stripped, "local")) {
+				state="seek_options"; print line; next
+			}
+			if (state=="seek_options" && key_is(stripped, "options")) {
+				state="in_options"
+				options_indent=indent
+				child_indent=sprintf("%*s", indent + 2, "")
+				print line
+				print child_indent "command: /bin/zsh"
+				print child_indent "args:"
+				print child_indent "  - '\''-l'\''"
+				inserted=1
+				next
+			}
+			if (state=="in_options") {
+				if (stripped !~ /^($|#)/ && indent <= options_indent) {
+					state="done"; print line; next
+				}
+				if (indent == options_indent + 2 && stripped ~ /^command:[[:space:]]*/) { next }
+				if (indent == options_indent + 2 && key_is(stripped, "args")) {
+					skip_args=1; args_indent=indent; next
+				}
+			}
+			print line
+		}
+		END { if (inserted != 1) { exit 2 } }
+	' "$config_path" >"$tmp_file"
+
+	return 0
+}
+
+_fix_shell_patch_config() {
+	# Parses the Tabby YAML with a targeted state machine and inserts
+	# /bin/zsh as the default shell while preserving the existing file shape.
+	# Prints a single status token: OK, FIXED, SKIP:<shell>, WARN, or INVALID.
+	local config_path="$1"
+	local current_cmd=""
+	current_cmd=$(_fix_shell_current_command "$config_path")
 
 	case "$current_cmd" in
 	"__WARN__")
@@ -208,74 +308,7 @@ _fix_shell_patch_config() {
 	esac
 
 	local tmp_file="${config_path}.tmp.$$"
-	if ! awk '
-		function key_is(str, key) { return str ~ ("^" key ":[[:space:]]*($|#)") }
-		BEGIN {
-			state="seek_pd"
-			inserted=0
-			skip_args=0
-		}
-		{
-			line=$0
-			stripped=line
-			sub(/^[[:space:]]+/, "", stripped)
-			indent=length(line)-length(stripped)
-
-			if (skip_args==1) {
-				if (stripped ~ /^($|#)/ || indent > args_indent) {
-					next
-				}
-				skip_args=0
-			}
-
-			if (state=="seek_pd" && key_is(stripped, "profileDefaults")) {
-				state="seek_local"
-				print line
-				next
-			}
-
-			if (state=="seek_local" && key_is(stripped, "local")) {
-				state="seek_options"
-				print line
-				next
-			}
-
-			if (state=="seek_options" && key_is(stripped, "options")) {
-				state="in_options"
-				options_indent=indent
-				child_indent=sprintf("%*s", indent + 2, "")
-				print line
-				print child_indent "command: /bin/zsh"
-				print child_indent "args:"
-				print child_indent "  - '\''-l'\''"
-				inserted=1
-				next
-			}
-
-			if (state=="in_options") {
-				if (stripped !~ /^($|#)/ && indent <= options_indent) {
-					state="done"
-					print line
-					next
-				}
-				if (indent == options_indent + 2 && stripped ~ /^command:[[:space:]]*/) {
-					next
-				}
-				if (indent == options_indent + 2 && key_is(stripped, "args")) {
-					skip_args=1
-					args_indent=indent
-					next
-				}
-			}
-
-			print line
-		}
-		END {
-			if (inserted != 1) {
-				exit 2
-			}
-		}
-	' "$config_path" >"$tmp_file"; then
+	if ! _fix_shell_write_zsh_config "$config_path" "$tmp_file"; then
 		rm -f "$tmp_file"
 		echo "WARN"
 		return 0
@@ -339,10 +372,11 @@ cmd_help() {
 	echo "tabby-helper.sh — Generate Tabby profiles from repos.json"
 	echo ""
 	echo "Usage:"
-	echo "  tabby-helper.sh sync       Sync profiles from repos.json (create new, skip existing)"
-	echo "  tabby-helper.sh status     Show profile status (which repos have profiles)"
+	echo "  tabby-helper.sh sync       Reconcile managed profiles and create missing targets"
+	echo "  tabby-helper.sh status     Show profile and pending reconciliation status"
 	echo "  tabby-helper.sh zshrc      Deprecated no-op (TABBY_AUTORUN is unused)"
 	echo "  tabby-helper.sh fix-shell  Ensure default local profile uses /bin/zsh (macOS)"
+	printf '%s\n' "  tabby-helper.sh sessions   Remote tmux tabs: new/restore/list/doctor/host (--help)"
 	echo "  tabby-helper.sh help       Show this help"
 	echo ""
 	echo "Profiles are created with:"
@@ -351,7 +385,8 @@ cmd_help() {
 	echo "  - Direct OpenCode launch that leaves a shell open after exit"
 	echo "  - Grouped under 'Projects'"
 	echo ""
-	echo "Existing profiles (matched by cwd path) are never overwritten."
+	echo "Custom profiles and registered offline paths are preserved."
+	echo "Only provably stale or duplicate aidevops-managed profiles are removed."
 	return 0
 }
 
@@ -370,6 +405,10 @@ main() {
 	status) cmd_status ;;
 	zshrc) cmd_zshrc ;;
 	fix-shell) cmd_fix_shell ;;
+	sessions)
+		shift
+		bash "${SCRIPT_DIR}/tabby-session-helper.sh" "$@"
+		;;
 	config-path) cmd_config_path "${2:-}" ;;
 	help | --help | -h) cmd_help ;;
 	*)

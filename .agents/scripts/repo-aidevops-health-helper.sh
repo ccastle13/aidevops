@@ -5,11 +5,11 @@
 #
 # Three drift checks across repos in ~/.config/aidevops/repos.json:
 #
-#   1. Stale-version bump (autonomous, safe). For each initialized_repos[] entry
-#      whose path exists and contains .aidevops.json with an older version than
-#      the currently-installed framework: rewrite .aidevops.json on a dedicated
-#      branch, commit, push, and open a PR (skip for local_only:true). Skipped if
-#      the repo has uncommitted changes.
+#   1. Stale local-config update (autonomous, safe). For each maintained
+#      initialized_repos[] entry whose path contains an untracked .aidevops.json
+#      with an older .version than the installed framework: update the local
+#      metadata atomically. Legacy tracked configs are preserved and routed to
+#      the audited linked-worktree migration plan.
 #
 #   2. Missing-folder detection (human-gated, follow-up task tNNN). For each
 #      entry where path does not exist and entry is not archived: file or
@@ -38,7 +38,7 @@
 #   AIDEVOPS_REPO_HEALTH=false               Disable even if scheduler is installed
 #   AIDEVOPS_REPO_HEALTH_INTERVAL=1440       Minutes between runs (default 1440 = daily)
 #   REPOS_DRIFT_FLAG_INTERVAL_DAYS=7         Min days between re-flagging the same drift
-#   AIDEVOPS_REPO_HEALTH_DRY_RUN=1           Log detections without writes/pushes/issue creation
+#   AIDEVOPS_REPO_HEALTH_DRY_RUN=1           Log detections without writes or issue creation
 #
 # Logs: ~/.aidevops/logs/repo-aidevops-health.log
 # State: ~/.aidevops/cache/repo-aidevops-health-state.json (includes last_flagged timestamps)
@@ -59,6 +59,12 @@ _resolve_script_path() {
 SCRIPT_DIR="$(_resolve_script_path)" || exit
 unset -f _resolve_script_path
 source "${SCRIPT_DIR}/shared-constants.sh"
+# shellcheck source=aidevops-cli/repo-discovery-lib.sh
+source "${SCRIPT_DIR}/aidevops-cli/repo-discovery-lib.sh"
+# shellcheck source=aidevops-cli/aidevops-project-config-lib.sh
+source "${SCRIPT_DIR}/aidevops-cli/aidevops-project-config-lib.sh"
+# shellcheck source=repo-onboarding-audit-lib.sh
+source "${SCRIPT_DIR}/repo-onboarding-audit-lib.sh"
 # shellcheck source=/dev/null
 if [[ -f "${SCRIPT_DIR}/shared-gh-wrappers.sh" ]]; then
 	source "${SCRIPT_DIR}/shared-gh-wrappers.sh"
@@ -72,6 +78,7 @@ readonly LOCK_DIR="$HOME/.aidevops/locks"
 readonly LOCK_FILE="$LOCK_DIR/repo-aidevops-health.lock"
 readonly LOG_FILE="$HOME/.aidevops/logs/repo-aidevops-health.log"
 readonly STATE_FILE="$HOME/.aidevops/cache/repo-aidevops-health-state.json"
+readonly HEALTH_SYSTEMD_BACKEND="systemd"
 readonly CRON_MARKER="# aidevops-repo-aidevops-health"
 readonly DEFAULT_INTERVAL=1440
 readonly REPO_AIDEVOPS_HEALTH_SCHEDULE='daily(@03:30)'
@@ -325,15 +332,17 @@ update_state_action() {
 
 #######################################
 # Update state file after a sync run
-# Arguments:
-#   $1 - synced count
-#   $2 - skipped count
-#   $3 - failed count
+# Arguments: bumped, bump-skipped, bump-failed, registered-config-missing,
+# missing-folder, no-init counts.
 #######################################
 update_state() {
-	local synced="$1"
-	local skipped="$2"
-	local failed="$3"
+	local bumped="$1"
+	local bump_skipped="$2"
+	local bump_failed="$3"
+	local registered_config_missing="$4"
+	local missing_folder="$5"
+	local no_init="$6"
+	local skipped_total=$((bump_skipped + registered_config_missing + missing_folder + no_init))
 	local timestamp
 	timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -347,373 +356,89 @@ update_state() {
 
 	if [[ -f "$STATE_FILE" ]]; then
 		jq --arg ts "$timestamp" \
-			--argjson synced "$synced" \
-			--argjson skipped "$skipped" \
-			--argjson failed "$failed" \
+			--argjson bumped "$bumped" \
+			--argjson bump_skipped "$bump_skipped" \
+			--argjson bump_failed "$bump_failed" \
+			--argjson registered_config_missing "$registered_config_missing" \
+			--argjson missing_folder "$missing_folder" \
+			--argjson no_init "$no_init" \
+			--argjson skipped_total "$skipped_total" \
 			'. + {
 				last_sync: $ts,
-				last_synced: $synced,
-				last_skipped: $skipped,
-				last_failed: $failed,
-				total_synced: ((.total_synced // 0) + $synced),
-				total_failed: ((.total_failed // 0) + $failed)
+				last_synced: $bumped,
+				last_skipped: $skipped_total,
+				last_failed: $bump_failed,
+				last_bumped: $bumped,
+				last_bump_skipped: $bump_skipped,
+				last_bump_failed: $bump_failed,
+				last_registered_config_missing: $registered_config_missing,
+				last_missing_folder: $missing_folder,
+				last_no_init: $no_init,
+				total_synced: ((.total_synced // 0) + $bumped),
+				total_bumped: ((.total_bumped // .total_synced // 0) + $bumped),
+				total_failed: ((.total_failed // 0) + $bump_failed)
 			}' "$STATE_FILE" >"$tmp_state" 2>/dev/null && mv "$tmp_state" "$STATE_FILE"
 	else
 		jq -n --arg ts "$timestamp" \
-			--argjson synced "$synced" \
-			--argjson skipped "$skipped" \
-			--argjson failed "$failed" \
+			--argjson bumped "$bumped" \
+			--argjson bump_skipped "$bump_skipped" \
+			--argjson bump_failed "$bump_failed" \
+			--argjson registered_config_missing "$registered_config_missing" \
+			--argjson missing_folder "$missing_folder" \
+			--argjson no_init "$no_init" \
+			--argjson skipped_total "$skipped_total" \
 			'{
 				last_sync: $ts,
-				last_synced: $synced,
-				last_skipped: $skipped,
-				last_failed: $failed,
-				total_synced: $synced,
-				total_failed: $failed
+				last_synced: $bumped,
+				last_skipped: $skipped_total,
+				last_failed: $bump_failed,
+				last_bumped: $bumped,
+				last_bump_skipped: $bump_skipped,
+				last_bump_failed: $bump_failed,
+				last_registered_config_missing: $registered_config_missing,
+				last_missing_folder: $missing_folder,
+				last_no_init: $no_init,
+				total_synced: $bumped,
+				total_bumped: $bumped,
+				total_failed: $bump_failed
 			}' >"$STATE_FILE"
 	fi
 	return 0
 }
 
 #######################################
-# One-shot sync of all configured repos
-# This is what the scheduler calls
-#######################################
-
-#######################################
-# Build a deterministic version-bump branch name for a managed repo.
-# Args:
-#   $1 — slug
-#   $2 — target_version
-#######################################
-_version_bump_branch_name() {
-	local slug="$1"
-	local target_version="$2"
-	local safe_slug
-	safe_slug=$(printf '%s' "$slug" | tr -c '[:alnum:]._-' '-')
-	safe_slug="${safe_slug##-}"
-	safe_slug="${safe_slug%%-}"
-	printf 'chore/aidevops-version-v%s-%s\n' "$target_version" "$safe_slug"
-	return 0
-}
-
-#######################################
-# Format the PR body for a repo version bump.
-# Args:
-#   $1 — entry_version
-#   $2 — target_version
-#######################################
-_version_bump_pr_body() {
-	local entry_version="$1"
-	local target_version="$2"
-	cat <<EOF
-## Summary
-
-- Bump \`.aidevops.json\` from v${entry_version} to v${target_version}.
-- Keep r914 repo-aidevops health updates compatible with protected default branches.
-
-## Testing
-
-- Generated by \`repo-aidevops-health-helper.sh\` after validating a clean default-branch worktree.
-EOF
-	return 0
-}
-
-#######################################
-# Open (or reuse) a PR for an already-pushed version-bump branch.
-# Args:
-#   $1 — slug
-#   $2 — repo_path
-#   $3 — branch_name
-#   $4 — default_branch
-#   $5 — entry_version
-#   $6 — target_version
-#######################################
-_open_version_bump_pr() {
-	local slug="$1"
-	local repo_path="$2"
-	local branch_name="$3"
-	local default_branch="$4"
-	local entry_version="$5"
-	local target_version="$6"
-
-	local existing_pr
-	existing_pr=$(gh pr list --repo "$slug" --head "$branch_name" --state open --json url --jq '.[0].url // empty' 2>/dev/null || true)
-	if [[ -n "$existing_pr" ]]; then
-		log_info "bumped: $slug → v${target_version} via existing PR $existing_pr"
-		git -C "$repo_path" checkout -q "$default_branch" >/dev/null 2>&1 || true
-		return 0
-	fi
-
-	if ! command -v gh_create_pr >/dev/null 2>&1; then
-		log_warn "bump failed ($slug): gh_create_pr unavailable"
-		git -C "$repo_path" checkout -q "$default_branch" >/dev/null 2>&1 || true
-		return 1
-	fi
-
-	local pr_title pr_body pr_url
-	pr_title="chore: bump .aidevops.json to v${target_version}"
-	pr_body=$(_version_bump_pr_body "$entry_version" "$target_version")
-	if ! pr_url=$(gh_create_pr \
-		--repo "$slug" \
-		--title "$pr_title" \
-		--body "$pr_body" \
-		--head "$branch_name" \
-		--base "$default_branch" 2>&1); then
-		log_warn "bump failed ($slug): gh_create_pr failed: $pr_url"
-		git -C "$repo_path" checkout -q "$default_branch" >/dev/null 2>&1 || true
-		return 1
-	fi
-	log_info "bumped: $slug → v${target_version} via PR $pr_url"
-	git -C "$repo_path" checkout -q "$default_branch" >/dev/null 2>&1 || true
-	return 0
-}
-
-#######################################
-# Push a version-bump branch and open/reuse its PR.
-# Args:
-#   $1 — slug
-#   $2 — repo_path
-#   $3 — branch_name
-#   $4 — default_branch
-#   $5 — entry_version
-#   $6 — target_version
-#######################################
-_push_version_bump_pr() {
-	local slug="$1"
-	local repo_path="$2"
-	local branch_name="$3"
-	local default_branch="$4"
-	local entry_version="$5"
-	local target_version="$6"
-
-	if ! git -C "$repo_path" push -q -f -u origin "$branch_name"; then
-		log_warn "bump failed ($slug): branch push failed"
-		git -C "$repo_path" checkout -q "$default_branch" >/dev/null 2>&1 || true
-		return 1
-	fi
-	_open_version_bump_pr "$slug" "$repo_path" "$branch_name" "$default_branch" "$entry_version" "$target_version"
-	return $?
-}
-
-#######################################
-# Read the configured aidevops version for one managed repo.
-# Args:
-#   $1 — .aidevops.json path
-# Outputs: version string, or empty when unreadable/missing.
-#######################################
-_repo_aidevops_entry_version() {
-	local adj_file="$1"
-	jq -r '.aidevops_version // empty' "$adj_file" 2>/dev/null || true
-	return 0
-}
-
-#######################################
-# Check whether a managed repo is clean enough for an automatic bump.
-# Args:
-#   $1 — slug
-#   $2 — repo_path
-# Returns: 0 when clean, 1 when dirty/unreadable.
-#######################################
-_repo_bump_worktree_is_clean() {
-	local slug="$1"
-	local repo_path="$2"
-	if [[ -n "$(git -C "$repo_path" status --porcelain 2>/dev/null)" ]]; then
-		log_warn "bump skipped ($slug): uncommitted changes present"
-		return 1
-	fi
-	return 0
-}
-
-#######################################
-# Resolve the default and current branch for a managed repo.
-# Args:
-#   $1 — repo_path
-# Outputs: default_branch<TAB>current_branch
-#######################################
-_repo_bump_branch_state() {
-	local repo_path="$1"
-	local default_branch current_branch
-	default_branch=$(git -C "$repo_path" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|^refs/remotes/origin/||' || true)
-	[[ -z "$default_branch" ]] && default_branch="main"
-	current_branch=$(git -C "$repo_path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
-	printf '%s\t%s\n' "$default_branch" "$current_branch"
-	return 0
-}
-
-#######################################
-# Publish a preserved default-branch-only .aidevops.json bump through a PR.
-# Args:
-#   $1 — slug
-#   $2 — repo_path
-#   $3 — local_only flag
-#   $4 — target_version
-#   $5 — entry_version
-#   $6 — default_branch
-# Outputs: one of "bumped", "skipped", "failed".
-#######################################
-_publish_preserved_default_branch_bump() {
-	local slug="$1"
-	local repo_path="$2"
-	local local_only="$3"
-	local target_version="$4"
-	local entry_version="$5"
-	local default_branch="$6"
-
-	if [[ "$local_only" == "true" ]] || ! git -C "$repo_path" rev-parse --verify "origin/${default_branch}" >/dev/null 2>&1; then
-		echo skipped
-		return 0
-	fi
-
-	local ahead_count ahead_files branch_name
-	ahead_count=$(git -C "$repo_path" rev-list --count "origin/${default_branch}..HEAD" 2>/dev/null || echo 0)
-	ahead_files=$(git -C "$repo_path" diff --name-only "origin/${default_branch}..HEAD" 2>/dev/null || true)
-	if [[ "$ahead_count" == "0" || "$ahead_files" != ".aidevops.json" ]]; then
-		echo skipped
-		return 0
-	fi
-
-	branch_name=$(_version_bump_branch_name "$slug" "$target_version")
-	if git -C "$repo_path" checkout -q -B "$branch_name" HEAD >/dev/null 2>&1 &&
-		_push_version_bump_pr "$slug" "$repo_path" "$branch_name" "$default_branch" "$entry_version" "$target_version"; then
-		git -C "$repo_path" checkout -q "$default_branch" >/dev/null 2>&1 || true
-		git -C "$repo_path" reset --hard "origin/${default_branch}" >/dev/null 2>&1 || true
-		echo bumped
-		return 0
-	fi
-
-	log_warn "bump failed ($slug): could not convert unpushed default-branch bump to PR"
-	echo failed
-	return 0
-}
-
-#######################################
-# Prepare the version-bump branch when the target repo is not local-only.
-# Args:
-#   $1 — slug
-#   $2 — repo_path
-#   $3 — local_only flag
-#   $4 — branch_name
-#   $5 — default_branch
-# Returns: 0 when ready, 1 on pull/branch failure.
-#######################################
-_prepare_version_bump_branch() {
-	local slug="$1"
-	local repo_path="$2"
-	local local_only="$3"
-	local branch_name="$4"
-	local default_branch="$5"
-	if [[ "$local_only" == "true" ]]; then
-		return 0
-	fi
-	if ! git -C "$repo_path" pull --ff-only origin "$default_branch" >/dev/null 2>&1; then
-		log_warn "bump failed ($slug): pull --ff-only failed"
-		return 1
-	fi
-	if ! git -C "$repo_path" checkout -q -B "$branch_name" "$default_branch" >/dev/null 2>&1; then
-		log_warn "bump failed ($slug): branch create/reset failed"
-		return 1
-	fi
-	return 0
-}
-
-#######################################
-# Atomically rewrite .aidevops.json with the target framework version.
-# Args:
-#   $1 — slug
-#   $2 — adj_file
-#   $3 — target_version
-# Returns: 0 on success, 1 on jq/mktemp failure.
-#######################################
-_rewrite_repo_aidevops_version() {
-	local slug="$1"
-	local adj_file="$2"
-	local target_version="$3"
-	local tmp_adj
-	tmp_adj=$(mktemp) || return 1
-	if ! jq --arg v "$target_version" '.aidevops_version = $v' "$adj_file" >"$tmp_adj" 2>/dev/null; then
-		log_warn "bump failed ($slug): jq rewrite error"
-		rm -f "$tmp_adj"
-		return 1
-	fi
-	if ! mv "$tmp_adj" "$adj_file"; then
-		log_warn "bump failed ($slug): mv error for $adj_file"
-		rm -f "$tmp_adj"
-		return 1
-	fi
-	return 0
-}
-
-#######################################
-# Commit the rewritten .aidevops.json in a managed repo.
-# Args:
-#   $1 — slug
-#   $2 — repo_path
-#   $3 — target_version
-#   $4 — default_branch
-# Returns: 0 on success, 1 on git add/commit failure.
-#######################################
-_commit_repo_aidevops_version() {
-	local slug="$1"
-	local repo_path="$2"
-	local target_version="$3"
-	local default_branch="$4"
-	if ! git -C "$repo_path" add .aidevops.json >/dev/null 2>&1 ||
-		! git -C "$repo_path" commit -m "chore: bump .aidevops.json to v${target_version} (r914)" >/dev/null 2>&1; then
-		log_warn "bump failed ($slug): commit error"
-		git -C "$repo_path" checkout -f -q "$default_branch" >/dev/null 2>&1 || true
-		return 1
-	fi
-	return 0
-}
-
-#######################################
-# Bump one repo's .aidevops.json to the current framework version.
-# Globals: CONFIG_FILE (implicit via callers), AIDEVOPS_* env vars
-# Args:
-#   $1 — slug (for logs)
-#   $2 — repo_path (expanded)
-#   $3 — local_only flag ("true"|"false")
-#   $4 — target_version
-#   $5 — dry_run flag ("0"|"1")
+# Update one repo's local .aidevops.json to the current framework version.
+# Legacy tracked configs are preserved and routed to the audited migration plan.
 # Outputs: one of "bumped", "skipped", "failed" on stdout.
-# Returns: 0 always (count errors via stdout)
 #######################################
-_bump_single_repo() {
+_sync_single_repo_config() {
 	local slug="$1"
 	local repo_path="$2"
-	local local_only="$3"
-	local target_version="$4"
-	local dry_run="$5"
+	local target_version="$3"
+	local dry_run="$4"
 
 	local adj_file="$repo_path/.aidevops.json"
 	local entry_version
-	entry_version=$(_repo_aidevops_entry_version "$adj_file")
+	entry_version=$(_project_config_read_version "$adj_file" 2>/dev/null || true)
 	if [[ -z "$entry_version" ]]; then
+		log_warn "bump failed ($slug): .aidevops.json has no valid .version"
+		echo failed
+		return 0
+	fi
+
+	if _project_config_is_tracked "$repo_path"; then
+		log_warn "bump skipped ($slug): tracked .aidevops.json requires audited linked-worktree migration"
+		if [[ "$dry_run" != "1" ]] && ! _project_config_write_migration_plan "$repo_path" >>"$LOG_FILE" 2>&1; then
+			log_warn "bump failed ($slug): could not write tracked-config migration plan"
+			echo failed
+			return 0
+		fi
 		echo skipped
 		return 0
 	fi
 
-	# Safety: skip if uncommitted changes
-	if ! _repo_bump_worktree_is_clean "$slug" "$repo_path"; then
-		echo skipped
-		return 0
-	fi
-
-	# Ensure on default branch
-	local default_branch current_branch
-	IFS=$'\t' read -r default_branch current_branch <<<"$(_repo_bump_branch_state "$repo_path")"
-	if [[ "$current_branch" != "$default_branch" ]]; then
-		log_warn "bump skipped ($slug): not on default branch ($current_branch != $default_branch)"
-		echo skipped
-		return 0
-	fi
-
-	# Semver compare — newer or equal means no bump needed. If a previous r914
-	# direct-push attempt left the default branch ahead with the version bump,
-	# publish that preserved commit through a PR so future runs stop looping.
 	if [[ "$(printf '%s\n%s\n' "$entry_version" "$target_version" | sort -V | tail -1)" == "$entry_version" ]]; then
-		_publish_preserved_default_branch_bump "$slug" "$repo_path" "$local_only" "$target_version" "$entry_version" "$default_branch"
+		echo skipped
 		return 0
 	fi
 
@@ -723,32 +448,10 @@ _bump_single_repo() {
 		return 0
 	fi
 
-	local branch_name
-	branch_name=$(_version_bump_branch_name "$slug" "$target_version")
-	if ! _prepare_version_bump_branch "$slug" "$repo_path" "$local_only" "$branch_name" "$default_branch"; then
+	if ! _project_config_write_version "$adj_file" "$target_version"; then
+		log_warn "bump failed ($slug): could not update local .version"
 		echo failed
 		return 0
-	fi
-
-	# Atomic jq rewrite — NEVER sed (session lesson mem_20260419012142_0aa16fa7)
-	if ! _rewrite_repo_aidevops_version "$slug" "$adj_file" "$target_version"; then
-		if [[ "$local_only" != "true" ]]; then
-			git -C "$repo_path" checkout -f -q "$default_branch" >/dev/null 2>&1 || true
-		fi
-		echo failed
-		return 0
-	fi
-
-	if ! _commit_repo_aidevops_version "$slug" "$repo_path" "$target_version" "$default_branch"; then
-		echo failed
-		return 0
-	fi
-
-	if [[ "$local_only" != "true" ]]; then
-		if ! _push_version_bump_pr "$slug" "$repo_path" "$branch_name" "$default_branch" "$entry_version" "$target_version"; then
-			echo failed
-			return 0
-		fi
 	fi
 
 	log_info "bumped: $slug → v${target_version}"
@@ -762,7 +465,8 @@ _bump_single_repo() {
 #   $1 — target_version
 #   $2 — dry_run flag
 # Side effects: writes counters into module-scoped globals
-#   _R914_BUMPED, _R914_BUMP_SKIPPED, _R914_BUMP_FAILED (resets them to 0 first).
+#   _R914_BUMPED, _R914_BUMP_SKIPPED, _R914_BUMP_FAILED,
+#   _R914_REGISTERED_CONFIG_MISSING (resets them to 0 first).
 # Bash 3.2 compatible: uses globals instead of `local -n` namerefs.
 #######################################
 _check_version_bumps() {
@@ -771,24 +475,29 @@ _check_version_bumps() {
 	_R914_BUMPED=0
 	_R914_BUMP_SKIPPED=0
 	_R914_BUMP_FAILED=0
-	[[ -z "$target_version" ]] && return 0
+	_R914_REGISTERED_CONFIG_MISSING=0
 
 	local entries_raw
 	entries_raw=$(jq -r '
 		.initialized_repos[]? |
 		select(.maintenance != false) |
-		[.slug, (.path // ""), (.local_only // false)] |
+		[.slug, (.path // "")] |
 		@tsv
 	' "$CONFIG_FILE" 2>/dev/null || true)
 
-	local slug repo_path local_only outcome
+	local slug repo_path outcome
 	{
-		while IFS=$'\t' read -r slug repo_path local_only; do
+		while IFS=$'\t' read -r slug repo_path; do
 			[[ -z "$slug" ]] && continue
 			repo_path="${repo_path/#\~/$HOME}"
 			[[ -z "$repo_path" || ! -d "$repo_path" ]] && continue
-			[[ -f "$repo_path/.aidevops.json" ]] || continue
-			outcome=$(_bump_single_repo "$slug" "$repo_path" "$local_only" "$target_version" "$dry_run")
+			if [[ ! -f "$repo_path/.aidevops.json" ]]; then
+				log_warn "registered-config-missing: $slug — registered directory has no .aidevops.json; preview aidevops project-config restore '$slug' (prefer a verified backup)"
+				_R914_REGISTERED_CONFIG_MISSING=$((_R914_REGISTERED_CONFIG_MISSING + 1))
+				continue
+			fi
+			[[ -z "$target_version" ]] && continue
+			outcome=$(_sync_single_repo_config "$slug" "$repo_path" "$target_version" "$dry_run")
 			case "$outcome" in
 			bumped) _R914_BUMPED=$((_R914_BUMPED + 1)) ;;
 			skipped) _R914_BUMP_SKIPPED=$((_R914_BUMP_SKIPPED + 1)) ;;
@@ -878,19 +587,334 @@ _check_no_init_repos() {
 	local parent_dir candidate
 	for parent_dir in "${parent_dirs[@]}"; do
 		[[ -d "$parent_dir" ]] || continue
-		# Newline-delimited is safe here: git repo dirs rarely contain newlines.
-		raw=$(find "$parent_dir" -maxdepth 1 -mindepth 1 -type d 2>/dev/null)
-		{
-			while IFS= read -r candidate; do
-				[[ -d "$candidate/.git" ]] || continue
-				_is_path_tracked "$candidate" "${known_paths[@]}" && continue
-				[[ -f "$candidate/.aidevops-skip" ]] && continue
-				[[ -f "$candidate/.aidevops.json" ]] && continue
-				log_warn "no-init: $candidate — git repo with no .aidevops.json and no .aidevops-skip marker. Will file issue in follow-up implementation."
-				_R914_NO_INIT=$((_R914_NO_INIT + 1))
-			done
-		} <<<"$raw"
+		while IFS= read -r -d '' candidate; do
+			_is_path_tracked "$candidate" "${known_paths[@]}" && continue
+			[[ -f "$candidate/.aidevops-skip" ]] && continue
+			[[ -f "$candidate/.aidevops.json" ]] && continue
+			log_warn "no-init: $candidate — git repo with no .aidevops.json and no .aidevops-skip marker. Will file issue in follow-up implementation."
+			_R914_NO_INIT=$((_R914_NO_INIT + 1))
+		done < <(aidevops_discover_canonical_repos "$parent_dir")
 	done
+	return 0
+}
+
+#######################################
+# Drift check #4 — required trust workflows (GH#36907).
+# Installs each REQUIRED_TRUST_WORKFLOWS entry on public, pulse-enabled,
+# maintainer-role repos that classify as NO-WORKFLOW, via a tracking issue
+# plus sync-workflows-helper.sh --apply --install-missing. Idempotent:
+# sync-workflows-helper.sh skips repos with an open sync PR, the tracking
+# issue is looked up before creation, and attempts are rate-limited in state.
+#######################################
+readonly REQUIRED_TRUST_WORKFLOWS=("issue-triage-gate")
+readonly TRUST_WORKFLOW_ISSUE_TITLE="chore: install aidevops issue triage gate"
+readonly TRUST_VISIBILITY_TTL_SECONDS=604800
+readonly TRUST_ATTEMPT_INTERVAL_SECONDS=72000
+
+#######################################
+# Read one value from the keeper state file (empty when absent).
+# Args: $1 — jq filter
+#######################################
+_trust_state_get() {
+	local filter="$1"
+	[[ -f "$STATE_FILE" ]] || return 0
+	jq -r "$filter // empty" "$STATE_FILE" 2>/dev/null || true
+	return 0
+}
+
+#######################################
+# Set a numeric value under a state map key.
+# Args: $1 — map name, $2 — key (slug or slug|workflow), $3 — value
+#######################################
+_trust_state_set() {
+	local map="$1"
+	local key="$2"
+	local value="$3"
+	local tmp_state
+	tmp_state=$(mktemp)
+	if [[ -f "$STATE_FILE" ]]; then
+		jq --arg map "$map" --arg key "$key" --argjson value "$value" \
+			'.[$map] = ((.[$map] // {}) + {($key): $value})' "$STATE_FILE" >"$tmp_state" 2>/dev/null &&
+			mv "$tmp_state" "$STATE_FILE"
+	else
+		jq -n --arg map "$map" --arg key "$key" --argjson value "$value" \
+			'{($map): {($key): $value}}' >"$tmp_state" 2>/dev/null &&
+			mv "$tmp_state" "$STATE_FILE"
+	fi
+	rm -f "$tmp_state"
+	return 0
+}
+
+#######################################
+# Echo "public", "private" or "unknown" for a slug. Cached weekly in state.
+# Args: $1 — slug, $2 — dry_run flag (dry run never writes the cache)
+#######################################
+_trust_repo_visibility() {
+	local slug="$1"
+	local dry_run="$2"
+	local now cached_at cached_vis
+	now=$(date +%s)
+	cached_at=$(_trust_state_get ".visibility_checked[\"$slug\"]")
+	cached_vis=$(_trust_state_get ".visibility[\"$slug\"]")
+	if [[ -n "$cached_at" && -n "$cached_vis" ]] && [[ "$cached_at" =~ ^[0-9]+$ ]] &&
+		((now - cached_at < TRUST_VISIBILITY_TTL_SECONDS)); then
+		echo "$cached_vis"
+		return 0
+	fi
+	local private vis
+	private=$(gh api "repos/${slug}" --jq '.private' 2>/dev/null || true)
+	case "$private" in
+	false) vis="public" ;;
+	true) vis="private" ;;
+	*)
+		echo "unknown"
+		return 0
+		;;
+	esac
+	if [[ "$dry_run" != "1" ]]; then
+		local vis_json
+		vis_json=$(jq -n --arg v "$vis" '$v')
+		_trust_state_set "visibility_checked" "$slug" "$now"
+		# visibility values are strings; store via a dedicated jq update
+		local tmp_state
+		tmp_state=$(mktemp)
+		jq --arg key "$slug" --argjson v "$vis_json" \
+			'.visibility = ((.visibility // {}) + {($key): $v})' "$STATE_FILE" >"$tmp_state" 2>/dev/null &&
+			mv "$tmp_state" "$STATE_FILE"
+		rm -f "$tmp_state"
+	fi
+	echo "$vis"
+	return 0
+}
+
+#######################################
+# Find or create the single tracking issue for a rollout.
+# Echoes the issue number on stdout; returns 1 on failure.
+# Args: $1 — slug
+#######################################
+_trust_ensure_tracking_issue() {
+	local slug="$1"
+	local existing
+	existing=$(gh issue list --repo "$slug" --state open --search "\"${TRUST_WORKFLOW_ISSUE_TITLE}\" in:title" \
+		--json number,title --jq "[.[] | select(.title == \"${TRUST_WORKFLOW_ISSUE_TITLE}\")] | first | .number // empty" 2>/dev/null || true)
+	if [[ "$existing" =~ ^[0-9]+$ ]]; then
+		echo "$existing"
+		return 0
+	fi
+	local body_file out number
+	body_file=$(mktemp)
+	cat >"$body_file" <<'EOF'
+Automated rollout by the aidevops repo health keeper (r914): install the issue triage gate caller workflow so external issue authors get trust labels at creation time.
+
+Closed by the sync PR (`Resolves` link). No manual step is required.
+
+Files: `.github/workflows/issue-triage-gate.yml` (rendered from `issue-triage-gate-caller.yml`).
+Reference: `.agents/scripts/sync-workflows-helper.sh --apply --install-missing --workflow issue-triage-gate`.
+Verification: `gh api repos/<slug>/contents/.github/workflows/issue-triage-gate.yml` succeeds after merge.
+EOF
+	# Origin is derived by the wrapper from AIDEVOPS_SESSION_ORIGIN (origin:worker);
+	# an explicit --label would bypass its absent-label fallback (GH#35954).
+	out=$(AIDEVOPS_SESSION_ORIGIN=worker gh_create_issue --repo "$slug" \
+		--title "$TRUST_WORKFLOW_ISSUE_TITLE" --body-file "$body_file" 2>&1) || {
+		rm -f "$body_file"
+		log_warn "trust-workflows: $slug — could not create tracking issue: ${out}"
+		return 1
+	}
+	rm -f "$body_file"
+	number=$(printf '%s\n' "$out" | grep -oE '/issues/[0-9]+' | tail -1 | grep -oE '[0-9]+' || true)
+	[[ "$number" =~ ^[0-9]+$ ]] || {
+		log_warn "trust-workflows: $slug — tracking issue number not parsed from wrapper output"
+		return 1
+	}
+	echo "$number"
+	return 0
+}
+
+#######################################
+# Confirm a workflow caller on the remote default branch (GH#37510).
+# check-workflows-helper.sh is a no-network local audit, so a canonical
+# checkout behind its upstream reports NO-WORKFLOW for a caller that is
+# already merged remotely. Only an explicit HTTP 404 proves absence.
+# Echoes: present | absent | unknown
+# Args: $1 slug, $2 workflow
+#######################################
+_trust_remote_workflow_state() {
+	local slug="$1"
+	local workflow="$2"
+	local err_file rc=0
+	err_file=$(mktemp)
+	gh api "repos/${slug}/contents/.github/workflows/${workflow}.yml" --silent 2>"$err_file" || rc=$?
+	if [[ "$rc" -eq 0 ]]; then
+		rm -f "$err_file"
+		echo present
+		return 0
+	fi
+	if grep -q 'HTTP 404' "$err_file"; then
+		rm -f "$err_file"
+		echo absent
+		return 0
+	fi
+	rm -f "$err_file"
+	echo unknown
+	return 0
+}
+
+#######################################
+# Install one required workflow on one repo.
+# Echoes: installed-pr | present | skipped | failed
+# Args: $1 slug, $2 workflow, $3 dry_run
+#######################################
+_trust_install_one() {
+	local slug="$1"
+	local workflow="$2"
+	local dry_run="$3"
+	local check_helper="${SCRIPT_DIR}/check-workflows-helper.sh"
+	local sync_helper="${SCRIPT_DIR}/sync-workflows-helper.sh"
+	local class
+	class=$("$check_helper" --json --repo "$slug" --workflow "$workflow" 2>/dev/null |
+		jq -r 'select(.workflow == "'"$workflow"'") | .classification // empty' 2>/dev/null | sed -n '1p' || true)
+	if [[ -z "$class" ]]; then
+		log_warn "trust-workflows: $slug — no classification returned for $workflow"
+		echo failed
+		return 0
+	fi
+	if [[ "$class" != "NO-WORKFLOW" ]]; then
+		echo present
+		return 0
+	fi
+	# Never file a tracking issue (and a worker dispatch) on stale local evidence.
+	local remote_state
+	remote_state=$(_trust_remote_workflow_state "$slug" "$workflow")
+	case "$remote_state" in
+	present)
+		log_info "trust-workflows: $slug — $workflow present on remote default branch; local checkout is stale"
+		echo present
+		return 0
+		;;
+	absent) ;;
+	*)
+		log_warn "trust-workflows: $slug — remote $workflow state unverified; not filing this run"
+		echo skipped
+		return 0
+		;;
+	esac
+
+	local now last
+	now=$(date +%s)
+	last=$(_trust_state_get ".trust_workflow_attempted[\"${slug}|${workflow}\"]")
+	if [[ "$last" =~ ^[0-9]+$ ]] && ((now - last < TRUST_ATTEMPT_INTERVAL_SECONDS)); then
+		log_info "trust-workflows: $slug — $workflow attempted recently, skipping (rate limit)"
+		echo skipped
+		return 0
+	fi
+	if [[ "$dry_run" == "1" ]]; then
+		log_info "trust-workflows (dry-run): $slug — would install $workflow"
+		echo installed-pr
+		return 0
+	fi
+	_trust_state_set "trust_workflow_attempted" "${slug}|${workflow}" "$now"
+
+	local archived
+	archived=$(gh api "repos/${slug}" --jq '.archived' 2>/dev/null || true)
+	if [[ "$archived" == "true" ]]; then
+		log_info "trust-workflows: $slug — archived, skipping $workflow"
+		echo skipped
+		return 0
+	fi
+
+	local issue_number
+	if ! issue_number=$(_trust_ensure_tracking_issue "$slug"); then
+		echo failed
+		return 0
+	fi
+	local sync_out
+	if ! sync_out=$("$sync_helper" --apply --install-missing --workflow "$workflow" \
+		--repo "$slug" --issue "$issue_number" 2>&1); then
+		if grep -qiE 'workflow.*scope|refusing to allow.*workflow' <<<"$sync_out"; then
+			log_warn "trust-workflows: $slug — blocked: token lacks 'workflow' scope (run gh auth refresh -s workflow)"
+		else
+			log_warn "trust-workflows: $slug — sync-workflows-helper failed for $workflow: $(printf '%s' "$sync_out" | tail -n 3 | tr '\n\t' '  ')"
+		fi
+		echo failed
+		return 0
+	fi
+	# Result rows are TSV: slug<TAB>status<TAB>APPLIED|SKIPPED|FAILED<TAB>detail
+	if grep -qE $'\t''APPLIED'$'\t' <<<"$sync_out"; then
+		log_info "trust-workflows: $slug — $workflow sync PR opened (issue #${issue_number})"
+		echo installed-pr
+		return 0
+	fi
+	if grep -qE $'\t''FAILED'$'\t' <<<"$sync_out"; then
+		log_warn "trust-workflows: $slug — $workflow sync reported failure: $(printf '%s' "$sync_out" | tail -n 3 | tr '\n\t' '  ')"
+		echo failed
+		return 0
+	fi
+	log_info "trust-workflows: $slug — $workflow sync made no PR: $(printf '%s' "$sync_out" | grep -E $'\t''SKIPPED'$'\t' | tail -n 1 | tr '\t' ' ')"
+	echo skipped
+	return 0
+}
+
+#######################################
+# Persist the last trust-workflow counts so `status` can show them.
+# Args: $1 installed-pr, $2 present, $3 skipped, $4 failed
+#######################################
+_trust_state_record_counts() {
+	local installed="$1"
+	local present="$2"
+	local skipped="$3"
+	local failed="$4"
+	[[ -f "$STATE_FILE" ]] || return 0
+	local tmp_state
+	tmp_state=$(mktemp)
+	jq --argjson i "$installed" --argjson p "$present" --argjson s "$skipped" --argjson f "$failed" \
+		'.last_trust_workflows = {installed_pr: $i, present: $p, skipped: $s, failed: $f}' \
+		"$STATE_FILE" >"$tmp_state" 2>/dev/null &&
+		mv "$tmp_state" "$STATE_FILE"
+	rm -f "$tmp_state"
+	return 0
+}
+
+_check_required_trust_workflows() {
+	local dry_run="$1"
+	_R914_TRUST_INSTALLED=0
+	_R914_TRUST_PRESENT=0
+	_R914_TRUST_SKIPPED=0
+	_R914_TRUST_FAILED=0
+
+	if ! command -v gh >/dev/null 2>&1; then
+		log_warn "trust-workflows: gh not installed — skipping"
+		return 0
+	fi
+
+	local slugs_raw slug vis workflow outcome
+	slugs_raw=$(jq -r '
+		.initialized_repos[]? |
+		select(.pulse == true and .maintenance != false and (.local_only // false) != true
+			and ((.role // "maintainer") == "maintainer")) |
+		.slug // empty
+	' "$CONFIG_FILE" 2>/dev/null || true)
+
+	{
+		while IFS= read -r slug; do
+			[[ -z "$slug" ]] && continue
+			vis=$(_trust_repo_visibility "$slug" "$dry_run")
+			if [[ "$vis" != "public" ]]; then
+				[[ "$vis" == "unknown" ]] && log_warn "trust-workflows: $slug — visibility unknown, skipped"
+				_R914_TRUST_SKIPPED=$((_R914_TRUST_SKIPPED + 1))
+				continue
+			fi
+			for workflow in "${REQUIRED_TRUST_WORKFLOWS[@]}"; do
+				outcome=$(_trust_install_one "$slug" "$workflow" "$dry_run")
+				case "$outcome" in
+				installed-pr) _R914_TRUST_INSTALLED=$((_R914_TRUST_INSTALLED + 1)) ;;
+				present) _R914_TRUST_PRESENT=$((_R914_TRUST_PRESENT + 1)) ;;
+				skipped) _R914_TRUST_SKIPPED=$((_R914_TRUST_SKIPPED + 1)) ;;
+				*) _R914_TRUST_FAILED=$((_R914_TRUST_FAILED + 1)) ;;
+				esac
+			done
+		done
+	} <<<"$slugs_raw"
+	log_info "trust-workflows: ${_R914_TRUST_INSTALLED} installed-pr, ${_R914_TRUST_PRESENT} present, ${_R914_TRUST_SKIPPED} skipped(private), ${_R914_TRUST_FAILED} failed"
 	return 0
 }
 
@@ -937,7 +961,7 @@ cmd_check() {
 	local dry_run=0
 	if [[ "${AIDEVOPS_REPO_HEALTH_DRY_RUN:-0}" == "1" ]]; then
 		dry_run=1
-		log_info "DRY-RUN mode: detections will log only, no writes/pushes/issues"
+		log_info "DRY-RUN mode: detections will log only, no writes/issues"
 	fi
 
 	local current_version
@@ -950,15 +974,21 @@ cmd_check() {
 
 	# Counters below are populated by the _check_* helpers into module-scoped
 	# globals (_R914_BUMPED, _R914_BUMP_SKIPPED, _R914_BUMP_FAILED,
-	# _R914_MISSING_FOLDER, _R914_NO_INIT). Bash 3.2 safe — no namerefs.
+	# _R914_REGISTERED_CONFIG_MISSING, _R914_MISSING_FOLDER, _R914_NO_INIT).
+	# Bash 3.2 safe — no namerefs.
 	_check_version_bumps "$current_version" "$dry_run"
 	_check_missing_folders
 	_check_no_init_repos
+	_check_required_trust_workflows "$dry_run"
+	_check_onboarding_gaps "$dry_run"
 
-	log_info "r914 complete: ${_R914_BUMPED} bumped, ${_R914_BUMP_SKIPPED} bump-skipped, ${_R914_BUMP_FAILED} bump-failed, ${_R914_MISSING_FOLDER} missing-folder, ${_R914_NO_INIT} no-init"
-	update_state "$_R914_BUMPED" "$((_R914_BUMP_SKIPPED + _R914_MISSING_FOLDER + _R914_NO_INIT))" "$_R914_BUMP_FAILED"
+	log_info "r914 complete: ${_R914_BUMPED} bumped, ${_R914_BUMP_SKIPPED} bump-skipped, ${_R914_BUMP_FAILED} bump-failed, ${_R914_REGISTERED_CONFIG_MISSING} registered-config-missing, ${_R914_MISSING_FOLDER} missing-folder, ${_R914_NO_INIT} no-init"
+	update_state "$_R914_BUMPED" "$_R914_BUMP_SKIPPED" "$_R914_BUMP_FAILED" "$_R914_REGISTERED_CONFIG_MISSING" "$_R914_MISSING_FOLDER" "$_R914_NO_INIT"
 
-	[[ $_R914_BUMP_FAILED -gt 0 ]] && return 1
+	log_info "r914 trust-workflows summary: ${_R914_TRUST_INSTALLED} installed-pr, ${_R914_TRUST_PRESENT} present, ${_R914_TRUST_SKIPPED} skipped, ${_R914_TRUST_FAILED} failed"
+	_trust_state_record_counts "$_R914_TRUST_INSTALLED" "$_R914_TRUST_PRESENT" "$_R914_TRUST_SKIPPED" "$_R914_TRUST_FAILED"
+
+	[[ $_R914_BUMP_FAILED -gt 0 || $_R914_TRUST_FAILED -gt 0 ]] && return 1
 	return 0
 }
 
@@ -1058,7 +1088,8 @@ After=network.target
 [Service]
 Type=oneshot
 KillMode=control-group
-ExecStart=/bin/bash -lc '\"${script_path}\" check'
+ExecStart=/usr/bin/env bash -lc '\"${script_path}\" check'
+$(aidevops_systemd_path_env)
 TimeoutStartSec=300
 Nice=10
 IOSchedulingClass=idle
@@ -1218,7 +1249,7 @@ cmd_enable() {
 	if [[ "$backend" == "launchd" ]]; then
 		_enable_launchd "$script_path" "$interval"
 		return $?
-	elif [[ "$backend" == "systemd" ]]; then
+	elif [[ "$backend" == "$HEALTH_SYSTEMD_BACKEND" ]]; then
 		_enable_systemd "$script_path" "$interval"
 		return $?
 	fi
@@ -1279,7 +1310,7 @@ cmd_disable() {
 			print_info "Repo sync was not enabled"
 		fi
 		return 0
-	elif [[ "$backend" == "systemd" ]]; then
+	elif [[ "$backend" == "$HEALTH_SYSTEMD_BACKEND" ]]; then
 		_disable_systemd
 		return $?
 	fi
@@ -1310,6 +1341,74 @@ cmd_disable() {
 #######################################
 # Show status
 #######################################
+# Report persistent repo-sync drift without contacting remotes or rewriting state.
+_status_repo_sync_drift() {
+	local sync_state="$HOME/.aidevops/cache/repo-sync-state.json"
+	[[ -f "$sync_state" ]] && command -v jq >/dev/null 2>&1 || return 0
+	jq -r '
+		(now - 86400 | strftime("%Y-%m-%dT%H:%M:%SZ")) as $cutoff |
+		(.repo_observations // {} | to_entries | sort_by(.key)[]) |
+		if .value.last_result == "FAIL" and (.value.fail_runs // 0) >= 3 then
+			"  Repo sync: FAIL " + .key + " (" + (.value.fail_runs | tostring) + " consecutive runs)"
+		elif .value.last_result == "STALE" and (.value.stale_since // "") < $cutoff then
+			"  Repo sync: STALE " + .key + " (since " + .value.stale_since + ")"
+		else empty end
+	' "$sync_state" 2>/dev/null || true
+	return 0
+}
+
+# A service/program path is missing, or an interpreter's first script is gone.
+_scheduler_program_missing() {
+	local program="$1"
+	local script="$2"
+	if [[ "$program" == /* && ! -e "$program" ]]; then
+		return 0
+	fi
+	if [[ "$program" == */bash || "$program" == */sh || "$program" == */zsh || "$program" == */python3 ]] &&
+		[[ "$script" == /* && ! -e "$script" ]]; then
+		return 0
+	fi
+	return 1
+}
+
+# Check loaded aidevops jobs only; never unload or change a user scheduler.
+_status_missing_scheduler_programs() {
+	local backend="$1"
+	local program script label plist unit unit_file line
+	local launchctl_name='launchctl'
+	local -a argv=()
+	if [[ "$backend" == "launchd" ]] && command -v launchctl >/dev/null 2>&1; then
+		while read -r _ _ label; do
+			[[ "$label" == sh.aidevops.* ]] || continue
+			plist="$HOME/Library/LaunchAgents/$label.plist"
+			if [[ ! -f "$plist" ]]; then
+				printf '  Scheduler: %s has no plist at expected path; remove: %s bootout gui/%s/%s\n' "$label" "$launchctl_name" "$(id -u)" "$label"
+				continue
+			fi
+			command -v plutil >/dev/null 2>&1 || continue
+			program=$(plutil -extract ProgramArguments.0 raw -o - "$plist" 2>/dev/null) || continue
+			script=$(plutil -extract ProgramArguments.1 raw -o - "$plist" 2>/dev/null) || script=""
+			if _scheduler_program_missing "$program" "$script"; then
+				printf '  Scheduler: %s missing program/script; remove: %s bootout gui/%s/%s\n' "$label" "$launchctl_name" "$(id -u)" "$label"
+			fi
+		done < <(launchctl list 2>/dev/null)
+	elif [[ "$backend" == "$HEALTH_SYSTEMD_BACKEND" ]] && command -v systemctl >/dev/null 2>&1; then
+		while read -r unit _; do
+			[[ "$unit" == aidevops-*.service ]] || continue
+			unit_file=$(systemctl --user show "$unit" --property=FragmentPath --value 2>/dev/null) || continue
+			[[ -f "$unit_file" ]] || continue
+			line=$(grep -m1 '^ExecStart=' "$unit_file" 2>/dev/null) || continue
+			read -r -a argv <<<"${line#ExecStart=}"
+			program="${argv[0]:-}"
+			script="${argv[1]:-}"
+			if _scheduler_program_missing "$program" "$script"; then
+				printf '  Scheduler: %s missing program/script; remove: systemctl --user disable --now %s\n' "$unit" "$unit"
+			fi
+		done < <(systemctl --user list-unit-files --no-legend 'aidevops-*.service' 2>/dev/null)
+	fi
+	return 0
+}
+
 cmd_status() {
 	ensure_dirs
 
@@ -1377,19 +1476,29 @@ cmd_status() {
 
 	# Show state file info
 	if [[ -f "$STATE_FILE" ]] && command -v jq &>/dev/null; then
-		local last_sync last_synced last_skipped last_failed total_synced total_failed
+		local last_sync last_bumped last_bump_skipped last_bump_failed
+		local last_registered_config_missing last_missing_folder last_no_init total_bumped total_failed
 		last_sync=$(jq -r '.last_sync // "never"' "$STATE_FILE" 2>/dev/null)
-		last_synced=$(jq -r '.last_synced // 0' "$STATE_FILE" 2>/dev/null)
-		last_skipped=$(jq -r '.last_skipped // 0' "$STATE_FILE" 2>/dev/null)
-		last_failed=$(jq -r '.last_failed // 0' "$STATE_FILE" 2>/dev/null)
-		total_synced=$(jq -r '.total_synced // 0' "$STATE_FILE" 2>/dev/null)
+		last_bumped=$(jq -r '.last_bumped // .last_synced // 0' "$STATE_FILE" 2>/dev/null)
+		last_bump_skipped=$(jq -r '.last_bump_skipped // .last_skipped // 0' "$STATE_FILE" 2>/dev/null)
+		last_bump_failed=$(jq -r '.last_bump_failed // .last_failed // 0' "$STATE_FILE" 2>/dev/null)
+		last_registered_config_missing=$(jq -r '.last_registered_config_missing // 0' "$STATE_FILE" 2>/dev/null)
+		last_missing_folder=$(jq -r '.last_missing_folder // 0' "$STATE_FILE" 2>/dev/null)
+		last_no_init=$(jq -r '.last_no_init // 0' "$STATE_FILE" 2>/dev/null)
+		total_bumped=$(jq -r '.total_bumped // .total_synced // 0' "$STATE_FILE" 2>/dev/null)
 		total_failed=$(jq -r '.total_failed // 0' "$STATE_FILE" 2>/dev/null)
 
 		echo ""
-		echo "  Last sync:    $last_sync"
-		echo "  Last result:  ${last_synced} pulled, ${last_skipped} skipped, ${last_failed} failed"
-		echo "  Lifetime:     ${total_synced} total pulled, ${total_failed} total failed"
+		echo "  Last check:   $last_sync"
+		echo "  Last result:  ${last_bumped} bumped, ${last_bump_skipped} bump-skipped, ${last_bump_failed} bump-failed"
+		echo "                ${last_registered_config_missing} registered-config-missing, ${last_missing_folder} missing-folder, ${last_no_init} no-init"
+		echo "  Lifetime:     ${total_bumped} total bumped, ${total_failed} total failed"
+		local trust_counts
+		trust_counts=$(jq -r '.last_trust_workflows // empty | "\(.installed_pr) installed-pr, \(.present) present, \(.skipped) skipped, \(.failed) failed"' "$STATE_FILE" 2>/dev/null || true)
+		[[ -n "$trust_counts" ]] && echo "  Trust wf:     ${trust_counts}"
 	fi
+	_status_repo_sync_drift
+	_status_missing_scheduler_programs "$backend"
 
 	# Check env var overrides
 	if [[ "${AIDEVOPS_REPO_HEALTH:-}" == "false" ]]; then
@@ -1654,7 +1763,7 @@ cmd_logs() {
 #######################################
 cmd_help() {
 	cat <<'EOF'
-repo-aidevops-health-helper.sh - Daily git pull of repos in configured parent directories
+repo-aidevops-health-helper.sh - Daily aidevops project-config drift check
 
 USAGE:
     repo-aidevops-health-helper.sh <command> [options]
@@ -1663,20 +1772,22 @@ USAGE:
 COMMANDS:
     enable              Install daily scheduler (launchd on macOS, cron on Linux)
     disable             Remove scheduler
-    status              Show current state and last sync results
-    check               One-shot: sync all configured repos now
+    status              Show current state and last drift-check results
+    check               One-shot: check all configured repos now
+    onboarding [--all]  Report onboarding gaps (all maintained candidates with --all)
     dirs [subcmd]       Manage git parent directories:
         list            Show configured directories (default)
         add <path>      Add a parent directory
         remove <path>   Remove a parent directory
     config              Show configuration and how to edit it
-    logs [--tail N]     View sync logs (default: last 50 lines)
+    logs [--tail N]     View health logs (default: last 50 lines)
     logs --follow       Follow log output in real-time
     help                Show this help
 
 ENVIRONMENT:
     AIDEVOPS_REPO_HEALTH=false             Disable even when scheduler is installed
-    AIDEVOPS_REPO_HEALTH_INTERVAL=1440     Minutes between syncs (default: 1440 = daily)
+    AIDEVOPS_REPO_HEALTH_INTERVAL=1440     Minutes between checks (default: 1440 = daily)
+    AIDEVOPS_REPO_HEALTH_DRY_RUN=1         Log drift without writing local config
 
 CONFIGURATION:
     Manage with: aidevops repo-aidevops-health dirs [add|remove|list]
@@ -1685,12 +1796,11 @@ CONFIGURATION:
     Default: ~/Git
 
 SAFETY:
-    - Only runs git pull --ff-only (never creates merge commits)
-    - Skips repos with dirty working trees (uncommitted changes)
-    - Skips repos not on their default branch (main/master)
-    - Skips repos with no remote configured
-    - Logs failures without stopping (other repos still sync)
-    - Worktrees are ignored — only main checkouts are synced
+    - Updates only the canonical .version key in untracked local config
+    - Never commits, branches, pushes, or opens PRs for ignored local metadata
+    - Preserves tracked legacy configs and emits an audited migration plan
+    - Reports registered directories with missing config without guessing choices
+    - Logs failures without stopping checks for other repositories
 
 SCHEDULER BACKENDS:
     macOS:  launchd LaunchAgent (~/Library/LaunchAgents/sh.aidevops.repo-aidevops-health.plist)
@@ -1699,14 +1809,10 @@ SCHEDULER BACKENDS:
 
 HOW IT WORKS:
     1. Scheduler runs 'repo-aidevops-health-helper.sh check' daily
-    2. Reads git_parent_dirs from ~/.config/aidevops/repos.json
-    3. Scans each parent directory to find git repos (maxdepth 1)
-    4. On each repo:
-       a. Skips when no remote, detached HEAD, or not on default branch
-       b. Skips when working tree is dirty
-       c. Fetches from remote
-       d. Pulls with --ff-only when upstream has new commits
-    5. Logs results (pulled/skipped/failed) to ~/.aidevops/logs/repo-aidevops-health.log
+    2. Checks initialized_repos[] for stale or missing local .aidevops.json
+    3. Updates stale untracked .version values atomically
+    4. Reports missing folders, missing registered configs, and no-init repos
+    5. Logs and stores separate counters for every drift class
 
 LOGS:
     ~/.aidevops/logs/repo-aidevops-health.log
@@ -1727,6 +1833,7 @@ main() {
 	disable) cmd_disable "$@" ;;
 	status) cmd_status "$@" ;;
 	check | run) cmd_check "$@" ;;
+	onboarding) cmd_onboarding "$@" ;;
 	dirs) cmd_dirs "$@" ;;
 	config) cmd_config "$@" ;;
 	logs) cmd_logs "$@" ;;

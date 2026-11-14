@@ -32,10 +32,12 @@ material, dispatch paths, and logs remain private with restrictive modes.
 
 Pulse reads routine definitions from exactly one top-level `## Routines`
 section in each `TODO.md`. Fenced code, HTML comments, indented Markdown code,
-and all other sections are documentation only. A missing or duplicate canonical
-heading, or an unclosed fence/comment that makes the boundaries ambiguous,
-fails closed: Pulse dispatches no routines from that file and records a local
-diagnostic.
+and all other sections are documentation only. A `TODO.md` with no registry and
+no routine-shaped lines simply has no routines: Pulse skips it silently. A
+duplicate canonical heading, routine-shaped lines (`- [x] rNNN ... repeat:`)
+outside any registry, or an unclosed fence/comment that makes the boundaries
+ambiguous fails closed: Pulse dispatches no routines from that file and records
+a local diagnostic.
 
 ## Fields
 
@@ -57,6 +59,8 @@ diagnostic.
 | `weekly(day@HH:MM)` | `weekly(mon@09:00)` | Weekly on a named day |
 | `monthly(N@HH:MM)` | `monthly(1@09:00)` | Day N of each month |
 | `cron(expr)` | `cron(15 2 * * *)` | Complex schedules only |
+
+Markdown formatters can rewrite `*` in `TODO.md`. Prettier writes `\*`, or `_` where two asterisks could form emphasis. The scheduler reads both as `*`; check a routine's effective schedule with `routine-schedule-helper.sh parse '<expression>'`.
 
 Calendar expressions use this precedence: the routine's optional `timezone:`
 field, global `AIDEVOPS_SCHEDULE_TIMEZONE`, the inherited `TZ`, then the host
@@ -92,16 +96,139 @@ a long-lived retry process.
 
 Use `run:` for scripts, exports, health checks. Use `agent:` when judgment or summarisation is needed.
 
+Agent routines and other `headless-runtime-helper.sh run` callers keep the
+activity watchdog's liveness deferrals: a quiet worker with an open API socket,
+CPU activity or CI-wait text is killed only by the `WORKER_STALL_HARD_KILL_SECONDS`
+cap (default 1500s; `0` disables it). The cap is checked only when a stall is
+confirmed, and each deferral resets the stall timer, so the kill lands at the
+first confirmed stall after the cap: one more `WORKER_STALL_TIMEOUT` window
+(default 600s) plus poll overhead at most, up to about 2100s with defaults. Keep
+any outer per-attempt limit (`timeout(1)`, systemd `TimeoutStartSec`) above
+cap + stall timeout + margin, or lower the cap in the routine's environment.
+Otherwise the outer limit fires first and leaves only the shared lifecycle log's
+`worker_stall_deferred` events as the deferral record (GH#36700; see
+[worker diagnostics](worker-diagnostics.md#activity-watchdog-v36126-fixed-v36140)).
+
+Script routines inherit Pulse's `SSH_AUTH_SOCK` from `~/.ssh/agent.env`, which holds
+only the headless signing key and is restarted automatically after a reboot. A
+routine that SSHes to other hosts needs its own scoped key via `IdentityFile`; see
+[Git signing → Agent lifecycle](git-signing.md#agent-lifecycle).
+
+Core routine **r923**, certificate watch, runs daily at 06:40 via
+`scripts/cert-watch-helper.sh run --apply`. It baselines Certificate Transparency,
+audits inherited CAA, and files deduplicated operator-triage issues only in
+verified private repositories. It never changes DNS or revokes certificates.
+See [cert-watch configuration and triage](../tools/security/cert-watch.md).
+
+### Single-owner custom adapters
+
+For `run:custom/scripts/<name>.sh`, install the adapter only on its owner host.
+Other Pulse hosts sharing the registry skip an absent adapter and log
+`owner adapter not installed on this host; skipping`. Their local routine state
+records `last_status: skipped_not_owner` without increasing `consecutive_failures`
+or advancing the successful `last_run` boundary. Existing failure counts are
+preserved, not reset. The next due evaluation checks for the adapter again, so
+installing it allows normal execution without a state reset. No execution
+lifecycle success or failure is recorded for the skip, and no agent fallback runs.
+
+An installed but non-executable adapter, a broken symlink, or an adapter that
+executes and fails still records a failure. Missing scripts outside
+`custom/scripts/` (including paths containing `..`) also remain failures. This
+behavior does not verify host identity: a copy installed on another host will
+run there too. Do not install duplicate adapters for single-writer routines.
+
+## Routine PR trust and tracking anchors
+
+A routine may publish repository changes through a PR without a new task issue
+per run. An `origin:worker` PR still needs a verifiable maintainer brief: the
+t2449 worker-briefed trust gate does not accept a routine ID or a TODO.md link
+alone. Use one persistent tracking issue per PR-producing routine instead of
+adding a special merge exemption.
+
+During maintainer-led `/routine` setup, run:
+
+```bash
+routine-log-helper.sh create-issue r004 --repo owner/repo \
+  --title "r004: Nightly repo triage" --schedule "cron(15 2 * * *)" --type "agent:Build+"
+```
+
+The helper provisions missing labels and creates an anchor labelled `routines`,
+`routine-tracking`, `persistent`, and `no-auto-dispatch`; its stdout is the issue
+number. The latter two labels record the durable tracking-only purpose: keep it
+open and never dispatch it as an implementation task. Do not add `parent-task`.
+Existing local tracking state is reused, so verify that its repository and open
+issue number are correct before installing the SOP. Existing anchors need these
+labels applied during migration; closed anchors must be reopened or replaced by
+the maintainer, not silently reused as merge authority.
+
+Write the actual standalone `Ref #N` line into the maintainer-authored routine
+SOP nested under its TODO.md entry and into any scheduler prompt/prompt file.
+Every generated PR must copy that line into its body. Use `Ref`, not `Resolves`,
+`Fixes`, or `Closes`: a successful run must not close the recurring anchor.
+Keep the anchor focused on tracking the routine rather than describing a partial
+implementation or a child-task checklist that triggers partial-closeout handling.
+
+The normal GH#17671 boundary remains binding: the linked anchor's author must
+pass the existing OWNER/MEMBER, live maintainer permission, trusted-author, or
+verified cryptographic approval checks. A `routine-tracking` label is not proof
+of authority. A missing link, closed anchor, `parent-task` anchor, untrusted
+author, or failed metadata lookup still denies worker-briefed admission. All
+other CI, review, approval and branch-protection gates remain unchanged; never
+remove `origin:worker` or use `--admin` to bypass them.
+
+Validate the generated PR body and run `full-loop-helper.sh pre-merge-gate N
+owner/repo` before attempting the normal guarded merge. Existing routines can
+adopt this convention by creating/reusing a maintainer-authored anchor and
+updating their persisted SOP/prompt once; no new issue is required each run.
+
 ## Scheduler ownership
 
 Enabled `repeat:` routines in registered repositories are normally evaluated by
 the shared supervisor Pulse. Their schedule definition and enabled state live in
 the repository `TODO.md`; they do not receive a dedicated launchd or systemd unit.
 Check the Pulse service plus the routine state file when diagnosing a missed run.
+Pulse-owned routines start at the first `evaluate_routines` pass after their
+scheduled slot, so they may be late by up to one full pulse cycle on a busy
+host. Treat a run as missed only if a pass after the slot did not mark it due;
+check `rg "Stage start: evaluate_routines|routine <id> is due" ~/.aidevops/logs/pulse.log`.
+Platform-unit routines (launchd/systemd) are not affected.
 
 Only routines explicitly documented as persistent or externally scheduled use a
 dedicated platform unit. Generated routine descriptions name that unit when one
 exists; do not derive a service label from the routine title or ID.
+
+For core routines with dedicated units, Pulse is a fallback scheduler: it skips
+the canonical core ID/target pair when its launchd job is loaded, its systemd user
+timer is enabled or active, or an uncommented aidevops crontab entry runs that
+target. A plist or unit file alone is not ownership evidence. Removing/disabling
+the platform scheduler restores Pulse evaluation; Pulse-only routines (including
+r916–r918) and custom targets are unaffected. This applies equally to r906,
+r908, r914, r919 and r922; their platform execution failures still need diagnosis in
+their own service logs rather than duplicate Pulse retries.
+
+r922 Storage hygiene is the scheduled form of `aidevops cleanup all --apply`
+(`scripts/storage-cleanup-helper.sh`); run `aidevops cleanup` for current store
+sizes and whether its scheduler is installed.
+
+Platform wrappers retain per-routine tracking state under
+`~/.aidevops/.agent-workspace/cron/<id>/routine-state.json`. Successful updates
+persist `last_success`; Pulse reads the newer of that boundary and its shared
+`routine-state.json` successful `last_run`. Failed attempts never advance the
+successful calendar boundary. Legacy successful tracking entries use `last_run`
+until their first updated run.
+
+Framework-managed routines have no `TODO.md` line; `pulse-routines.sh` evaluates
+them through the same schedule, retry and REST-budget path:
+
+| ID | Default schedule | Runs | Opt-out |
+| --- | --- | --- | --- |
+| `r-session-miner` | `daily(@04:40)` (`AIDEVOPS_SESSION_MINER_SCHEDULE`) | `session-miner-pulse.sh --create-issues` | — |
+| `r-issue-archive` | `daily(@05:20)` (`AIDEVOPS_ISSUE_ARCHIVE_SCHEDULE`) | `issue-archive-helper.sh run` | host: `AIDEVOPS_ISSUE_ARCHIVE_ENABLED=0`; repo: `"issue_archive": false` in `repos.json` |
+
+`r-issue-archive` archives issue/PR discussions of each pulse-enabled,
+non-`local_only` registered repo to its orphan `aidevops/issues-archive` branch.
+Enable it on one pulse host per repo so there is a single writer. Details:
+`reference/forge-portability.md` "Issue and PR discussion archive".
 
 ## Anti-patterns
 
@@ -158,7 +285,7 @@ Operator-private setup:
 
 The supervisor LLM cycle triages GitHub state — issues, PRs, labels, scanner findings — but never inspects processes, logs, pulse-stats counters, or deployed-script mtimes. That gap is a structural blind spot: bugs visible to any operator running `ps`, `jq`, `tail` go unraised for hours.
 
-`r-runtime-audit` runs a registry of small detectors against **local files only** — no GitHub API or GraphQL calls (which would amplify the blind spot many of the detectors surface). When a detector fires, the orchestrator either prints the finding (`--dry-run`, default) or files an auto-dispatch issue tagged with `<!-- aidevops:generator=runtime-audit detector=<id> -->`. The pre-dispatch validator re-runs the cited detector before any worker spawns, so transient regressions (the kind that resolve before a worker arrives) are auto-closed instead of consuming worker time.
+`r-runtime-audit` runs a registry of small detectors against **local files only** — no GitHub API or GraphQL calls (which would amplify the blind spot many of the detectors surface). When a detector fires, the orchestrator either prints the finding (`--dry-run`, default) or files an issue tagged with `<!-- aidevops:generator=runtime-audit detector=<id> -->`. Findings are `auto-dispatch` only on the framework repo (`marcusquinn/aidevops`), whose worktrees contain the `.agents/scripts/` sources the briefs cite; `--apply --repo <other>` files operator-triage issues without `auto-dispatch` (GH#33574). The pre-dispatch validator re-runs the cited detector before any worker spawns, so transient regressions (the kind that resolve before a worker arrives) are auto-closed instead of consuming worker time.
 
 ### Detectors
 
@@ -177,7 +304,7 @@ Each detector lives in `.agents/scripts/runtime-audit-rules/<id>.sh` as a self-c
 1. **Dry-run first.** The routine ships **disabled** in `TODO.md` so the operator can review baseline noise: `runtime-health-audit-helper.sh --dry-run`.
 2. **Tune thresholds.** Each detector has env-overridable inputs (e.g. `REGRESSION_MULT`, `LEAK_THRESHOLD`, `DRIFT_SECONDS`). If the dry-run flags benign conditions, raise the threshold or add the routine entry to `~/.aidevops/cron-overrides.conf` with custom env.
 3. **Enable.** Flip the `[ ]` to `[x]` in the `## Routines` block once you're satisfied.
-4. **Investigate findings.** Filed issues are real — they cite local files an operator can confirm in seconds. Close with rationale if benign; otherwise the issue body itself contains the worker-ready brief (file paths, verification commands, acceptance criteria) per t1900.
+4. **Investigate findings.** Filed issues are real — they cite local files an operator can confirm in seconds. Close with rationale if benign; otherwise, on the framework repo, the issue body itself contains the worker-ready brief (file paths, verification commands, acceptance criteria) per t1900. Findings filed elsewhere are operator triage: confirm locally, then report upstream with `framework-issue-helper.sh log`.
 
 ### Anti-patterns specific to this routine
 
@@ -213,3 +340,23 @@ It gathers evidence from:
 `<!-- aidevops:generator=pulse-check finding=... -->`; issue bodies must stay
 aggregate-only and must not include private repo names, local paths, issue
 titles, or raw worker examples.
+
+## Private mirror sync (r919)
+
+Register private mirrors in `~/.config/aidevops/repos.json` under
+`initialized_repos` with `slug` (the mirror's `owner/repo`) and
+`mirror_upstream` (a string upstream `owner/repo`). Optional
+`mirror_upstream_url` overrides the upstream fetch URL. Boolean
+`mirror_upstream` is a privacy marker only and is not synchronised. Set
+`"mirror_sync": false` on an entry to opt out.
+
+When eligible entries exist, setup installs a daily 20:00 job with label
+`sh.aidevops.mirror-sync` on macOS (or a systemd/cron equivalent on Linux).
+`mirror-sync-helper.sh check [--repo owner/repo]` inspects without pushing;
+`sync` fetches upstream and mirror in a disposable repository. It pushes only
+to the private mirror: a pure mirror advances by fast-forward; divergence
+creates a dated `sync/upstream-YYYYMMDD` branch and fast-forward pushes the
+clean merge. Conflicts leave the default branch untouched and appear in
+`mirror-sync-helper.sh status`. Neither force pushes, tags nor writes to the
+upstream are performed. Mirror identities and conflict paths remain local;
+do not copy them to public issues or TODOs.

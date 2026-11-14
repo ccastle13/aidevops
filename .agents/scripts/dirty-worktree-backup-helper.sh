@@ -14,7 +14,7 @@ fi
 
 BACKUP_ROOT="${AIDEVOPS_DIRTY_BACKUP_ROOT:-${HOME}/.aidevops/.agent-workspace/tmp/dirty-main-backups}"
 DEFAULT_RETENTION_DAYS="${AIDEVOPS_DIRTY_BACKUP_RETENTION_DAYS:-30}"
-REAL_GIT="${AIDEVOPS_REAL_GIT_BIN:-/usr/bin/git}"
+REAL_GIT="${AIDEVOPS_REAL_GIT_BIN:-aidevops-native-git-not-found}"
 BACKUP_SCHEMA="dirty-worktree-backup-v3"
 LEGACY_BACKUP_SCHEMA="dirty-worktree-backup-v2"
 UNTRACKED_LIST_NAME="untracked-files.nul"
@@ -46,13 +46,18 @@ Commands:
   recover-clean --repo PATH --backup ID --confirm RECOVER_DIRTY_WORKTREE_CLEAN
       Resume rollback after an interrupted clean, restoring the pre-clean state.
   restore --repo PATH --backup ID --confirm RESTORE_DIRTY_WORKTREE_BACKUP
-      Restore the original HEAD, index, worktree, and untracked state.
+      Restore the original HEAD, index, worktree, and untracked state. This is a
+      full pre-operation rollback: it also rewinds the branch to the captured
+      HEAD. Untracked files already reinstated from the same backup are accepted.
   acknowledge --backup ID --confirm ACKNOWLEDGE_DIRTY_WORKTREE_BACKUP
       Mark an open backup eligible for retention pruning.
   list
       List recorded dirty-worktree backups.
   prune [--dry-run] [--force] [--retention-days N]
       Remove only acknowledged/restored backups that are terminal or stale.
+      Dry-run is the default; --dry-run always overrides --force.
+  delete --backup ID --confirm DELETE_DIRTY_WORKTREE_BACKUP [--dry-run]
+      Remove one acknowledged/restored backup (no .keep marker) by ID.
 
 Environment:
   AIDEVOPS_DIRTY_BACKUP_ROOT            Override backup directory.
@@ -639,6 +644,58 @@ parse_backup_args() {
 	return 0
 }
 
+agent_artifact_paths() {
+	# GH#35159: list untracked paths that look like agent-generated artifacts.
+	local nul_path="$1"
+	tr '\0' '\n' <"$nul_path" | grep -E '(^|/)\.playwright-mcp(/|$)|\.(png|jpe?g|webp|pdf|webm)$' || true
+	return 0
+}
+
+# GH#35159: find an open/acknowledged backup of the same repo that holds a
+# byte-identical untracked payload and no tracked/staged changes. A canonical
+# fast-forward changes HEAD each time, so the full fingerprint never matches;
+# one stray file therefore produced a new backup per merge, silently.
+find_identical_untracked_backup() {
+	local repo_path="$1"
+	local capture_dir="$2"
+	local candidate="" state=""
+	[[ -s "$capture_dir/tracked.patch" || -s "$capture_dir/staged.patch" ]] && return 1
+	[[ -s "$capture_dir/$UNTRACKED_LIST_NAME" && -n "${CAPTURE_UNTRACKED_HASH:-}" ]] || return 1
+	[[ -d "$BACKUP_ROOT" ]] || return 1
+	for candidate in "$BACKUP_ROOT"/*/; do
+		candidate="${candidate%/}"
+		[[ -f "$candidate/manifest.tsv" ]] || continue
+		[[ "$(manifest_value "$candidate/manifest.tsv" repo_path)" == "$repo_path" ]] || continue
+		state=$(manifest_value "$candidate/manifest.tsv" state)
+		[[ "$state" == "open" || "$state" == "acknowledged" ]] || continue
+		[[ "$(manifest_value "$candidate/manifest.tsv" untracked_payload_sha256)" == "$CAPTURE_UNTRACKED_HASH" ]] || continue
+		[[ -s "$candidate/tracked.patch" || -s "$candidate/staged.patch" ]] && continue
+		printf '%s\n' "$candidate"
+		return 0
+	done
+	return 1
+}
+
+# Emit one owner notice per reused backup, then record it in the manifest.
+notify_stray_untracked() {
+	local repo_path="$1"
+	local backup_dir="$2"
+	local capture_dir="$3"
+	local manifest_path="$backup_dir/manifest.tsv"
+	[[ -z "$(manifest_value "$manifest_path" stray_notice_at)" ]] || return 0
+	local backup_id="" likely=""
+	backup_id=$(manifest_value "$manifest_path" backup_id)
+	likely=$(agent_artifact_paths "$capture_dir/$UNTRACKED_LIST_NAME")
+	print_warning "Identical untracked files in $repo_path were already backed up in $backup_id and have reappeared; they are not cleaned automatically."
+	if [[ -n "$likely" ]]; then
+		print_warning "Likely agent artifacts (screenshots/PDFs/.playwright-mcp) at a canonical root:"
+		printf '%s\n' "$likely" | sed 's/^/  /' >&2
+	fi
+	print_warning "Remove them (verified backup exists) with: $0 clean --repo $repo_path --backup $backup_id --confirm CLEAN_VERIFIED_DIRTY_WORKTREE_BACKUP"
+	manifest_set "$manifest_path" stray_notice_at "$(iso_utc)" || return 1
+	return 0
+}
+
 cmd_backup() {
 	parse_backup_args "$@" || return 1
 	[[ "$PARSED_BACKUP_HELP" == true ]] && return 0
@@ -675,10 +732,24 @@ cmd_backup() {
 	if [[ -d "$backup_dir" ]]; then
 		verify_backup_dir "$repo_path" "$backup_dir" || return 1
 		current_state_matches_backup "$repo_path" "$backup_dir" || return 1
+		# An operation may reuse a restored/acknowledged content-addressed
+		# backup before deleting its source. Reopen it before returning so the
+		# only remaining copy cannot be pruned after that deletion.
+		if [[ -n "$operation_id" ]]; then
+			manifest_set "$backup_dir/manifest.tsv" state open || return 1
+		fi
 		rm -rf "$capture_dir"
 		capture_dir=""
 		[[ "$machine" == true ]] && printf '%s|%s\n' "$backup_id" "$backup_dir" || printf '%s\n' "$backup_dir"
 		return 0
+	fi
+	# GH#35159: the same stray untracked payload re-appearing across tip moves
+	# is surfaced to the owner once. A new backup is still created because
+	# clean/matches/restore are bound to the HEAD captured in the backup.
+	local existing_dir=""
+	existing_dir=$(find_identical_untracked_backup "$repo_path" "$capture_dir" || true)
+	if [[ -n "$existing_dir" ]]; then
+		notify_stray_untracked "$repo_path" "$existing_dir" "$capture_dir" || true
 	fi
 	local backup_ref="refs/aidevops/dirty-worktree-backups/${backup_id}"
 	"$REAL_GIT" check-ref-format "$backup_ref" >/dev/null 2>&1 || return 1
@@ -869,8 +940,11 @@ cmd_clean() {
 	original_head=$(manifest_value "$backup_dir/manifest.tsv" head)
 	manifest_set "$backup_dir/manifest.tsv" clean_started_at "$(iso_utc)" || return 1
 	manifest_set "$backup_dir/manifest.tsv" clean_state in_progress || return 1
-	if ! "$REAL_GIT" -C "$repo_path" read-tree --reset -u "$original_head" ||
-		! remove_preserved_untracked "$repo_path" "$backup_dir"/"$UNTRACKED_LIST_NAME" ||
+	# Remove the captured inventory before reset can restore HEAD-tracked paths
+	# that were staged as deleted and recreated as untracked (GH#35149).
+	# rollback_restore uses the same ordering to avoid deleting restored files.
+	if ! remove_preserved_untracked "$repo_path" "$backup_dir"/"$UNTRACKED_LIST_NAME" ||
+		! "$REAL_GIT" -C "$repo_path" read-tree --reset -u "$original_head" ||
 		{ [[ -n "${AIDEVOPS_DIRTY_BACKUP_AFTER_REMOVE_HOOK:-}" ]] &&
 			! bash "$AIDEVOPS_DIRTY_BACKUP_AFTER_REMOVE_HOOK"; } ||
 		[[ -n "$("$REAL_GIT" -C "$repo_path" status --porcelain=v1)" ]]; then
@@ -907,6 +981,76 @@ cmd_recover_clean() {
 	return 0
 }
 
+# Accept a restore target whose only state is untracked files reinstated from
+# this backup: tracked/index state must be clean, every visible untracked file
+# must be listed in the backup inventory, and every existing untracked
+# inventory path (including ones the current tip ignores) must be byte-, type-
+# and mode-identical to its preserved copy, so restore can lose nothing
+# (GH#34770).
+untracked_state_is_backup_copy() {
+	local repo_path="$1"
+	local backup_dir="$2"
+	local tracked_status=""
+	local visible_path=""
+	local tracked_path=""
+	tracked_status=$("$REAL_GIT" -C "$repo_path" status --porcelain=v1 --untracked-files=no) || return 1
+	[[ -z "$tracked_status" ]] || return 1
+	visible_path=$(mktemp) || return 1
+	tracked_path=$(mktemp) || {
+		rm -f "$visible_path"
+		return 1
+	}
+	if ! "$REAL_GIT" -C "$repo_path" ls-files --others --exclude-standard -z >"$visible_path" ||
+		! "$REAL_GIT" -C "$repo_path" ls-files --cached -z >"$tracked_path"; then
+		rm -f "$visible_path" "$tracked_path"
+		return 1
+	fi
+	local check_rc=0
+	python3 - "$repo_path" "$backup_dir/untracked" "$backup_dir/$UNTRACKED_LIST_NAME" "$visible_path" "$tracked_path" 2>/dev/null <<'PY' || check_rc=$?
+import filecmp
+import os
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1]).resolve()
+source_root = pathlib.Path(sys.argv[2]).resolve()
+inventory_path = pathlib.Path(sys.argv[3])
+inventory = set()
+if inventory_path.exists():
+    inventory = {raw for raw in inventory_path.read_bytes().split(b"\0") if raw}
+visible = {raw for raw in pathlib.Path(sys.argv[4]).read_bytes().split(b"\0") if raw}
+tracked = {raw for raw in pathlib.Path(sys.argv[5]).read_bytes().split(b"\0") if raw}
+if not visible <= inventory:
+    raise SystemExit(1)
+for raw in sorted(inventory - tracked):
+    relative = pathlib.Path(os.fsdecode(raw))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise SystemExit(1)
+    if not os.path.lexists(root / relative):
+        continue
+    current = root / relative
+    preserved = source_root / relative
+    current_meta = current.lstat()
+    preserved_meta = preserved.lstat()
+    if stat.S_IFMT(current_meta.st_mode) != stat.S_IFMT(preserved_meta.st_mode):
+        raise SystemExit(1)
+    if stat.S_ISLNK(current_meta.st_mode):
+        if os.readlink(current) != os.readlink(preserved):
+            raise SystemExit(1)
+        continue
+    if not stat.S_ISREG(current_meta.st_mode):
+        raise SystemExit(1)
+    if stat.S_IMODE(current_meta.st_mode) != stat.S_IMODE(preserved_meta.st_mode):
+        raise SystemExit(1)
+    if not filecmp.cmp(current, preserved, shallow=False):
+        raise SystemExit(1)
+PY
+	rm -f "$visible_path" "$tracked_path"
+	[[ "$check_rc" -eq 0 ]] || return 1
+	return 0
+}
+
 rollback_restore() {
 	local repo_path="$1"
 	local branch_ref="$2"
@@ -927,7 +1071,7 @@ cmd_restore() {
 	local backup_dir=""
 	backup_dir=$(resolve_backup_dir "$PARSED_BACKUP_ID") || return 1
 	verify_backup_dir "$repo_path" "$backup_dir" || return 1
-	[[ -z "$("$REAL_GIT" -C "$repo_path" status --porcelain=v1)" ]] || return 1
+	untracked_state_is_backup_copy "$repo_path" "$backup_dir" || return 1
 	local branch=""
 	branch=$("$REAL_GIT" -C "$repo_path" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
 	[[ "$branch" == "$(manifest_value "$backup_dir/manifest.tsv" branch)" ]] || return 1
@@ -1022,6 +1166,13 @@ remove_backup_dir() {
 		print_info "[dry-run] Would remove backup ($reason): $(basename "$backup_dir")"
 		return 0
 	fi
+	# Revalidate eligibility immediately before mutation: a restore/acknowledge
+	# or .keep marker may have changed state since the prune scan selected it.
+	[[ -f "$manifest_path" && ! -f "$backup_dir/.keep" ]] || return 0
+	case "$(manifest_value "$manifest_path" state)" in
+	acknowledged | restored) ;;
+	*) return 0 ;;
+	esac
 	local repo_path=""
 	local backup_ref=""
 	local worktree_commit=""
@@ -1040,6 +1191,7 @@ remove_backup_dir() {
 
 cmd_prune() {
 	local force=false
+	local dry_run=false
 	local retention_days="$DEFAULT_RETENTION_DAYS"
 	while [[ $# -gt 0 ]]; do
 		local arg="$1"
@@ -1049,7 +1201,7 @@ cmd_prune() {
 			shift
 			;;
 		--dry-run)
-			force=false
+			dry_run=true
 			shift
 			;;
 		--retention-days)
@@ -1060,6 +1212,11 @@ cmd_prune() {
 		esac
 	done
 	[[ "$retention_days" =~ ^[0-9]+$ ]] || return 1
+	# --dry-run is a safety guard: it always wins over --force, in any order.
+	if [[ "$dry_run" == true && "$force" == true ]]; then
+		print_info "[dry-run] --dry-run overrides --force; no backups will be removed"
+		force=false
+	fi
 	[[ -d "$BACKUP_ROOT" ]] || return 0
 	local backup_dir=""
 	for backup_dir in "$BACKUP_ROOT"/*; do
@@ -1085,6 +1242,62 @@ cmd_prune() {
 			remove_backup_dir "$backup_dir" "$force" "age ${age_days}d >= ${retention_days}d" || return 1
 		fi
 	done
+	return 0
+}
+
+cmd_delete() {
+	local backup_id=""
+	local confirmation=""
+	local dry_run=false
+	while [[ $# -gt 0 ]]; do
+		local arg="$1"
+		case "$arg" in
+		--backup)
+			backup_id="${2:-}"
+			shift 2
+			;;
+		--confirm)
+			confirmation="${2:-}"
+			shift 2
+			;;
+		--dry-run)
+			dry_run=true
+			shift
+			;;
+		*)
+			print_error "Unknown delete option: $arg"
+			return 1
+			;;
+		esac
+	done
+	[[ "$confirmation" == "DELETE_DIRTY_WORKTREE_BACKUP" ]] || {
+		print_error "delete requires --confirm DELETE_DIRTY_WORKTREE_BACKUP"
+		return 1
+	}
+	local backup_dir=""
+	local state=""
+	backup_dir=$(resolve_backup_dir "$backup_id") || {
+		print_error "Unknown or invalid backup ID"
+		return 1
+	}
+	if [[ -f "$backup_dir/.keep" ]]; then
+		print_error "Refusing to delete backup with .keep marker: $backup_id"
+		return 1
+	fi
+	state=$(manifest_value "$backup_dir/manifest.tsv" state)
+	case "$state" in
+	acknowledged | restored) ;;
+	*)
+		print_error "Refusing to delete backup in state '${state}' (must be acknowledged or restored): $backup_id"
+		return 1
+		;;
+	esac
+	if [[ "$dry_run" == true ]]; then
+		remove_backup_dir "$backup_dir" false "explicit delete" || return 1
+		return 0
+	fi
+	remove_backup_dir "$backup_dir" true "explicit delete" || return 1
+	[[ ! -d "$backup_dir" ]] || return 1
 	return 0
 }
 
@@ -1126,6 +1339,10 @@ main() {
 		;;
 	prune)
 		cmd_prune "$@"
+		return $?
+		;;
+	delete)
+		cmd_delete "$@"
 		return $?
 		;;
 	help | --help | -h)

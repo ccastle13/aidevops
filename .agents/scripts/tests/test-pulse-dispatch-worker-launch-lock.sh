@@ -16,6 +16,37 @@ source "${SCRIPTS_DIR}/shared-constants.sh"
 # shellcheck source=../pulse-dispatch-worker-launch.sh
 source "${SCRIPTS_DIR}/pulse-dispatch-worker-launch.sh"
 
+# GH#34505: launch-time closure is authoritative, not the dispatch snapshot.
+(
+	live_state=open
+	projection=''
+	unlocked=0
+	gh() {
+		[[ "$live_state" != unavailable ]] || return 1
+		printf '%s' "$live_state"
+		return 0
+	}
+	set_issue_status() {
+		projection="$*"
+		return 0
+	}
+	unlock_issue_after_worker() { unlocked=1; return 0; }
+	_dlw_live_issue_open_guard 42 owner/repo runner || exit 1
+	[[ -z "$projection" ]] || exit 1
+	live_state=closed
+	if _dlw_live_issue_open_guard 42 owner/repo runner; then exit 1; fi
+	[[ "$projection" == '42 owner/repo done --remove-assignee runner' && "$unlocked" == 1 ]] || exit 1
+	projection=''
+	# The final ownership fence must apply the state guard before assignment.
+	if _dlw_final_assignment_guard 42 owner/repo runner; then exit 1; fi
+	[[ "$projection" == '42 owner/repo done --remove-assignee runner' ]] || exit 1
+	projection=''
+	live_state=unavailable
+	if _dlw_live_issue_open_guard 42 owner/repo runner; then exit 1; fi
+	[[ -z "$projection" ]] || exit 1
+) || exit 1
+printf 'PASS: live closed issues reject launch and clear runner ownership; unavailable state fails closed\n'
+
 TEST_TMP="$(mktemp -d "${TMPDIR:-/tmp}/t3458-worker-launch-lock-XXXXXX")"
 
 cleanup() {
@@ -76,25 +107,91 @@ if [[ -e "${wt_dir}/node_modules/.bin" || -L "${wt_dir}/node_modules/.bin" ]]; t
 	fail "dispatcher-created canonical node_modules .bin link was not removed"
 fi
 
+# Rejected provisioning must consume the same directory budget as success.
+# Keep the real restore loop and lock; replace only the protected copy boundary.
+(
+	restore_repo="${TEST_TMP}/restore-repo"
+	restore_wt="${TEST_TMP}/restore-worktree"
+	for package in one two three four; do
+		mkdir -p "${restore_repo}/${package}/node_modules" "${restore_wt}/${package}"
+		printf '{}\n' >"${restore_wt}/${package}/package.json"
+		printf '{}\n' >"${restore_wt}/${package}/package-lock.json"
+	done
+	_provision_worktree_node_modules() {
+		restore_calls=$((restore_calls + 1))
+		case "$restore_mode" in
+		success) return 0 ;;
+		mixed) [[ "$restore_calls" -eq 1 ]] && return 0 ;;
+		esac
+		return 1
+	}
+	for restore_mode in rejected mixed success; do
+		for restore_limit in 0 1 2 invalid; do
+			restore_calls=0
+			expected_calls="$restore_limit"
+			[[ "$restore_limit" == invalid ]] && expected_calls=2
+			LOGFILE="${TEST_TMP}/restore.log" AIDEVOPS_WORKSPACE_DIR="$TEST_TMP" \
+				WORKTREE_NODE_MODULES_RESTORE_MAX_DIRS="$restore_limit" \
+				_dlw_restore_worktree_deps "$restore_wt" "$restore_repo" || fail "restore failed instead of continuing safely"
+			[[ "$restore_calls" -eq "$expected_calls" ]] || fail "${restore_mode} restore attempted ${restore_calls} directories with budget ${restore_limit}; expected ${expected_calls}"
+			[[ ! -d "$(_dlw_node_modules_restore_lock_dir)" ]] || fail "restore left its lock behind"
+		done
+	done
+
+	# Lockless package directories (bun.lock, pnpm workspace members whose
+	# lock is at the root) are guaranteed validator rejections: never attempt.
+	lockless_repo="${TEST_TMP}/lockless-repo"
+	lockless_wt="${TEST_TMP}/lockless-worktree"
+	for package in bun-managed workspace-member; do
+		mkdir -p "${lockless_repo}/${package}/node_modules" "${lockless_wt}/${package}"
+		printf '{}\n' >"${lockless_wt}/${package}/package.json"
+	done
+	printf '\n' >"${lockless_wt}/bun-managed/bun.lock"
+	restore_mode=success
+	restore_calls=0
+	LOGFILE="${TEST_TMP}/restore.log" AIDEVOPS_WORKSPACE_DIR="$TEST_TMP" \
+		_dlw_restore_worktree_deps "$lockless_wt" "$lockless_repo" || fail "lockless restore failed instead of continuing safely"
+	[[ "$restore_calls" -eq 0 ]] || fail "lockless package directories spent ${restore_calls} provisioning attempts"
+) || exit 1
+printf 'PASS: rejected, mixed and successful provisioning respect directory attempt budgets; lockless directories are skipped\n'
+
 if ! declare -F _dlw_append_node_tool_env >/dev/null 2>&1; then
-	fail "worker launch does not provide a local command path for canonical Node tools"
+	fail "worker launch does not provide a local command path for worktree Node tools"
 fi
 worker_cmd=(env)
 worker_home="${TEST_TMP}/home"
 mkdir -p "${worker_home}/.bun/bin" "${worker_home}/.local/bin" \
-	"${worker_home}/.aidevops/bin" "${worker_home}/.aidevops/agents/scripts"
-HOME="$worker_home" PATH="${worker_home}/.bun/bin:${PATH}" _dlw_append_node_tool_env "$repo_dir"
-expected_tool_prefix="PATH=${repo_dir}/node_modules/.bin:${worker_home}/.bun/bin:${worker_home}/.local/bin:${worker_home}/.aidevops/bin:${worker_home}/.aidevops/agents/scripts:"
+	"${worker_home}/.aidevops/bin" "${worker_home}/.aidevops/agents/scripts" \
+	"${wt_dir}/node_modules/.bin" "${wt_dir}/node_modules/prettier/bin"
+printf '#!/usr/bin/env bash\nprintf "worktree-tool\\n"\n' >"${wt_dir}/node_modules/prettier/bin/prettier.cjs" || fail "failed to create worktree tool fixture"
+chmod +x "${wt_dir}/node_modules/prettier/bin/prettier.cjs" || fail "failed to make worktree tool fixture executable"
+ln -s ../prettier/bin/prettier.cjs "${wt_dir}/node_modules/.bin/prettier" || fail "failed to create worktree tool symlink"
+HOME="$worker_home" PATH="${worker_home}/.bun/bin:${PATH}" _dlw_append_node_tool_env "$wt_dir"
+expected_tool_prefix="PATH=${wt_dir}/node_modules/.bin:${worker_home}/.bun/bin:${worker_home}/.local/bin:${worker_home}/.aidevops/bin:${worker_home}/.aidevops/agents/scripts:"
 if [[ "${worker_cmd[1]:-}" != "$expected_tool_prefix"* ]]; then
-	fail "worker launch did not prepend canonical Node and stable user tool directories"
+	fail "worker launch did not prepend worktree Node and stable user tool directories"
+fi
+if [[ ":${worker_cmd[1]#PATH=}:" == *":${repo_dir}/node_modules/.bin:"* ]]; then
+	fail "worker launch leaked the canonical Node tool directory"
 fi
 bun_path_count=$(printf '%s' "${worker_cmd[1]}" | tr ':' '\n' | grep -Fxc "${worker_home}/.bun/bin" || true)
 if [[ "$bun_path_count" -ne 1 ]]; then
 	fail "worker launch did not deduplicate the stable Bun directory"
 fi
 tool_output=$("${worker_cmd[@]}" prettier) || fail "dispatcher-provided Node tool did not execute"
-if [[ "$tool_output" != "fixture-tool" ]]; then
+if [[ "$tool_output" != "worktree-tool" ]]; then
 	fail "dispatcher-provided Node tool returned unexpected output"
+fi
+
+rm -rf "${wt_dir}/node_modules/.bin" || fail "failed to remove worktree Node tool fixture"
+worker_cmd=(env)
+HOME="$worker_home" PATH="${worker_home}/.bun/bin:${PATH}" _dlw_append_node_tool_env "$wt_dir"
+if [[ ":${worker_cmd[1]#PATH=}:" == *":${repo_dir}/node_modules/.bin:"* ||
+	":${worker_cmd[1]#PATH=}:" == *":${wt_dir}/node_modules/.bin:"* ]]; then
+	fail "worker launch added a project Node tool directory when the worktree bin was absent"
+fi
+if ! grep -Fq "_dlw_append_node_tool_env \"\$worker_worktree_path\"" "${SCRIPTS_DIR}/pulse-dispatch-worker-launch.sh"; then
+	fail "worker launch does not pass the validated worktree path to Node tool discovery"
 fi
 
 _dlw_zero_output_comment_count() {
@@ -297,6 +394,59 @@ HEADLESS_RUNTIME_HELPER="${TEST_TMP}/bin/headless-runtime-helper.sh" \
 
 if [[ "$_DLW_DISPATCH_TIER" != "bundle" || "$_DLW_DISPATCH_MODEL_TIER" != "simple" || "$_DLW_SELECTED_MODEL" != "selected-simple" ]]; then
 	fail "bundle model default was not applied to unlabeled worker dispatch"
+fi
+
+HEADLESS_RUNTIME_HELPER="${TEST_TMP}/bin/headless-runtime-helper.sh" \
+	_dlw_resolve_tier_and_model '{"labels":[]}' "" "$bundle_repo" "docs: refresh the README" ""
+
+if [[ "$_DLW_DISPATCH_TIER" != "bundle" || "$_DLW_DISPATCH_MODEL_TIER" != "standard" || "$_DLW_SELECTED_MODEL" != "selected-standard" ]]; then
+	fail "bundle documentation model default was not applied to documentation dispatch"
+fi
+
+infrastructure_repo="${TEST_TMP}/infrastructure"
+mkdir -p "$infrastructure_repo" || fail "failed to create infrastructure bundle fixture"
+printf '{"bundle":"infrastructure"}\n' >"${infrastructure_repo}/.aidevops.json" || fail "failed to create infrastructure bundle config fixture"
+
+HEADLESS_RUNTIME_HELPER="${TEST_TMP}/bin/headless-runtime-helper.sh" \
+	_dlw_resolve_tier_and_model '{"labels":[]}' "" "$infrastructure_repo" "architecture: redesign deployment boundaries" ""
+
+if [[ "$_DLW_DISPATCH_TIER" != "bundle" || "$_DLW_DISPATCH_MODEL_TIER" != "thinking" || "$_DLW_SELECTED_MODEL" != "selected-thinking" ]]; then
+	fail "bundle architecture model default was not applied to architecture dispatch"
+fi
+
+HEADLESS_RUNTIME_HELPER="${TEST_TMP}/bin/headless-runtime-helper.sh" \
+	_dlw_resolve_tier_and_model '{"labels":[]}' "" "$infrastructure_repo" "triage: classify deployment reports" ""
+
+if [[ "$_DLW_DISPATCH_TIER" != "bundle" || "$_DLW_DISPATCH_MODEL_TIER" != "simple" || "$_DLW_SELECTED_MODEL" != "selected-simple" ]]; then
+	fail "bundle triage model default was not applied to triage dispatch"
+fi
+
+HEADLESS_RUNTIME_HELPER="${TEST_TMP}/bin/headless-runtime-helper.sh" \
+	_dlw_resolve_tier_and_model '{"labels":[]}' "" "$infrastructure_repo" "review: audit the deployment change" ""
+
+if [[ "$_DLW_DISPATCH_TIER" != "bundle" || "$_DLW_DISPATCH_MODEL_TIER" != "thinking" || "$_DLW_SELECTED_MODEL" != "selected-thinking" ]]; then
+	fail "bundle review model default was not applied to review dispatch"
+fi
+
+HEADLESS_RUNTIME_HELPER="${TEST_TMP}/bin/headless-runtime-helper.sh" \
+	_dlw_resolve_tier_and_model '{"labels":[]}' "" "$infrastructure_repo" "verification: prove the deployment" ""
+
+if [[ "$_DLW_DISPATCH_TIER" != "bundle" || "$_DLW_DISPATCH_MODEL_TIER" != "thinking" || "$_DLW_SELECTED_MODEL" != "selected-thinking" ]]; then
+	fail "bundle verification model default was not applied to verification dispatch"
+fi
+
+HEADLESS_RUNTIME_HELPER="${TEST_TMP}/bin/headless-runtime-helper.sh" \
+	_dlw_resolve_tier_and_model '{"labels":[]}' "" "$infrastructure_repo" "fix: preserve deploy state" "Review documentation and verification before completion"
+
+if [[ "$_DLW_DISPATCH_TIER" != "bundle" || "$_DLW_DISPATCH_MODEL_TIER" != "standard" || "$_DLW_SELECTED_MODEL" != "selected-standard" ]]; then
+	fail "generated prompt instructions overrode the implementation model default"
+fi
+
+HEADLESS_RUNTIME_HELPER="${TEST_TMP}/bin/headless-runtime-helper.sh" \
+	_dlw_resolve_tier_and_model '{"labels":[]}' "" "$infrastructure_repo" "fix: repair documentation verification" ""
+
+if [[ "$_DLW_DISPATCH_TIER" != "bundle" || "$_DLW_DISPATCH_MODEL_TIER" != "standard" || "$_DLW_SELECTED_MODEL" != "selected-standard" ]]; then
+	fail "incidental workload words in an implementation title overrode its model default"
 fi
 
 HEADLESS_RUNTIME_HELPER="${TEST_TMP}/bin/headless-runtime-helper.sh" \

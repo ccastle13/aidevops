@@ -9,6 +9,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readdirSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -16,19 +17,62 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import test from "node:test";
+import test, { after } from "node:test";
 import {
   bindActiveScriptsDir,
+  checkArgvSafetyGate,
   checkCanonicalGitSafetyGate,
   checkCanonicalWriteSafetyGate,
   checkCommandSafetyGate,
   isDirectFileMutationTool,
 } from "../quality-hooks-git-safety.mjs";
+import { validateBashWorkingDirectory } from "../quality-hooks-workdir.mjs";
 import { createQualityHooks } from "../quality-hooks.mjs";
+import { processStartIdentity } from "../process-start-identity.mjs";
+import { resolveTrustedExecutable } from "../../../scripts/trusted-executable.mjs";
+
+// GH#35139: the worker write fence reads the ambient headless environment.
+// Run the suite as an interactive session; the fence test opts back in.
+for (const key of ["FULL_LOOP_HEADLESS", "AIDEVOPS_HEADLESS", "OPENCODE_HEADLESS", "GITHUB_ACTIONS", "WORKER_WORKTREE_PATH"]) {
+  delete process.env[key];
+}
 
 const here = dirname(fileURLToPath(import.meta.url));
 const scriptsDir = join(here, "..", "..", "..", "scripts");
-const realGit = "/usr/bin/git";
+// Resolve before fixtures change PATH, without selecting caller-owned wrappers.
+const realGit = resolveTrustedExecutable("git");
+
+// Ownership checks must never initialize or modify the developer's registry.
+const lifecycleRoot = realpathSync(mkdtempSync(join(tmpdir(), "git-gate-lifecycle-")));
+const lifecycleKeys = ["AIDEVOPS_LIFECYCLE_STATE_DIR", "AIDEVOPS_PRIVATE_WORKLOAD", "AIDEVOPS_LIFECYCLE_DISABLED",
+  "OPENCODE_PID", "OPENCODE_PID_START_IDENTITY", "OPENCODE_SESSION_ID"];
+const lifecycleEnvironment = Object.fromEntries(lifecycleKeys.map((key) => [key, process.env[key]]));
+for (const key of lifecycleKeys) delete process.env[key];
+process.env.AIDEVOPS_LIFECYCLE_STATE_DIR = join(lifecycleRoot, "state");
+// Model the runtime's session-bound native generation proof, not a self fallback.
+process.env.OPENCODE_PID = String(process.pid);
+process.env.OPENCODE_PID_START_IDENTITY = processStartIdentity(process.pid);
+process.env.OPENCODE_SESSION_ID = "fixture-owner";
+after(() => {
+  for (const key of lifecycleKeys) {
+    if (lifecycleEnvironment[key] === undefined) delete process.env[key];
+    else process.env[key] = lifecycleEnvironment[key];
+  }
+  rmSync(lifecycleRoot, { recursive: true, force: true });
+});
+
+test("trusted JS and Python discovery preserve explicit PATH and symlink/.. components", () => {
+  for (const name of ["git", "python3"]) {
+    for (const searchPath of ["/bin/../bin", "/usr/bin", "", "relative"]) {
+      const expected = execFileSync("python3", [
+        "-c",
+        "import sys; sys.path.insert(0, sys.argv[1]); from trusted_executable import trusted_executable; print(trusted_executable(sys.argv[3], sys.argv[2]) or '/nonexistent/aidevops-untrusted-' + sys.argv[3])",
+        scriptsDir, searchPath, name,
+      ], { encoding: "utf8" }).trim();
+      assert.equal(resolveTrustedExecutable(name, searchPath), expected);
+    }
+  }
+});
 
 function setupRepo({ managed = true } = {}) {
   const root = mkdtempSync(join(tmpdir(), "aidevops-git-gate-"));
@@ -49,12 +93,133 @@ function setupRepo({ managed = true } = {}) {
   return { root, repo, linked };
 }
 
+// GH#32849 exempts unregistered temp marker repositories from the canonical
+// Git guard, so fixtures asserting a canonical block must be registered.
+function registerRepo(root, repo) {
+  const reposFile = join(root, "repos.json");
+  writeFileSync(reposFile, `${JSON.stringify({ initialized_repos: [{ path: repo }] })}\n`);
+  const previous = process.env.AIDEVOPS_REPOS_FILE;
+  process.env.AIDEVOPS_REPOS_FILE = reposFile;
+  return () => {
+    if (previous === undefined) delete process.env.AIDEVOPS_REPOS_FILE;
+    else process.env.AIDEVOPS_REPOS_FILE = previous;
+  };
+}
+
+test("Bash and bounded operations require controlled worktree creation", async () => {
+  const { root, linked } = setupRepo();
+  try {
+    const hooks = createQualityHooks({ scriptsDir, logsDir: root, repositoryDir: linked });
+    const reason = /git\.worktree-controlled-creation-required.*worktree-helper\.sh add.*aidevops worktree add/s;
+    for (const command of [
+      "git worktree add ../example",
+      "git -C . worktree add -b feature/example ../example",
+      "worktree-helper.sh add feature/example; git worktree add ../other",
+    ]) {
+      await assert.rejects(
+        () => hooks.toolExecuteBefore({ tool: "bash" }, { args: { command, workdir: linked } }),
+        reason,
+      );
+    }
+    // Exercise the bounded-operation argv gate without requiring a live owner
+    // admission in this suite's deliberately uninitialized lifecycle registry.
+    for (const worker of [false, true]) {
+      assert.throws(
+        () => checkArgvSafetyGate(["git", "-C", linked, "worktree", "add", "../example"], scriptsDir, linked, { worker }),
+        reason,
+      );
+      assert.doesNotThrow(() => checkArgvSafetyGate(["worktree-helper.sh", "add", "feature/example"], scriptsDir, linked, { worker }));
+    }
+    for (const command of ["git worktree list --porcelain", "worktree-helper.sh add feature/example", "aidevops worktree add feature/example"]) {
+      assert.doesNotThrow(() => checkCommandSafetyGate(command, scriptsDir, linked));
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("classifies built-in and namespaced direct file mutation tools", () => {
   for (const tool of ["Write", "write_file", "edit", "edit_file", "write", "functions.apply_patch", "namespace/Edit", "tools::apply-patch"]) {
     assert.equal(isDirectFileMutationTool(tool), true, tool);
   }
   for (const tool of ["Bash", "read", "functions.read", "glob"]) {
     assert.equal(isDirectFileMutationTool(tool), false, tool);
+  }
+});
+
+test("validates Bash workdirs without rewriting valid external paths", () => {
+  const root = mkdtempSync(join(tmpdir(), "aidevops-bash-workdir-"));
+  const directory = join(root, "directory");
+  const directoryAlias = join(root, "directory-alias");
+  const regularFile = join(root, "regular-file");
+  const brokenAlias = join(root, "broken-alias");
+  const missing = join(root, "missing");
+  mkdirSync(directory);
+  symlinkSync(directory, directoryAlias, "dir");
+  writeFileSync(regularFile, "not a directory\n");
+  symlinkSync(missing, brokenAlias, "dir");
+  try {
+    assert.equal(validateBashWorkingDirectory(directory), undefined);
+    assert.equal(validateBashWorkingDirectory(directoryAlias), undefined);
+    assert.throws(() => validateBashWorkingDirectory(missing), /workdir does not exist/);
+    assert.throws(() => validateBashWorkingDirectory(brokenAlias), /workdir is a broken symlink/);
+    assert.throws(() => validateBashWorkingDirectory(regularFile), /workdir is not a directory/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("blocks an invalid Bash workdir before command policy execution", async () => {
+  const root = mkdtempSync(join(tmpdir(), "aidevops-bash-workdir-order-"));
+  try {
+    const hooks = createQualityHooks({
+      scriptsDir: join(root, "missing-scripts"),
+      logsDir: root,
+      repositoryDir: root,
+    });
+    for (const args of [
+      { command: "pwd", workdir: join(root, "missing-workdir") },
+      { command: "pwd", cwd: join(root, "missing-cwd") },
+    ]) {
+      await assert.rejects(
+        () => hooks.toolExecuteBefore({ tool: "Bash" }, { args }),
+        /Bash workdir does not exist/,
+      );
+    }
+    for (const args of [
+      { command: "pwd", workdir: "" },
+      { command: "pwd", cwd: " " },
+    ]) {
+      await assert.rejects(
+        () => hooks.toolExecuteBefore({ tool: "Bash" }, { args }),
+        /Bash workdir must be a non-empty path/,
+      );
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("preserves valid Bash workdir inputs and the implicit fallback", async () => {
+  const root = mkdtempSync(join(tmpdir(), "aidevops-bash-workdir-valid-"));
+  const originalCwd = process.cwd();
+  const directoryAlias = join(root, "directory-alias");
+  symlinkSync(root, directoryAlias, "dir");
+  try {
+    process.chdir(root);
+    const hooks = createQualityHooks({ scriptsDir, logsDir: root, repositoryDir: root });
+    for (const args of [
+      { command: "pwd", workdir: root },
+      { command: "pwd", cwd: directoryAlias },
+      { command: "pwd" },
+    ]) {
+      const output = { args: { ...args } };
+      await assert.doesNotReject(() => hooks.toolExecuteBefore({ tool: "Bash", sessionID: "fixture-owner" }, output));
+      assert.deepEqual(output.args, args);
+    }
+  } finally {
+    process.chdir(originalCwd);
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -117,11 +282,91 @@ test("uses the plugin repository directory when mutation tools omit workdir", as
     const linkedPatch = `*** Begin Patch\n*** Add File: ${join(linked, "plugin-context.md")}\n+safe\n*** End Patch\n`;
     await assert.doesNotReject(
       () => hooks.toolExecuteBefore(
-        { tool: "functions.apply_patch" },
+        { tool: "functions.apply_patch", sessionID: "fixture-owner" },
         { args: { patchText: linkedPatch } },
       ),
       "the plugin project directory must establish same-repository linked-worktree identity",
     );
+
+    const runOperation = (operationID) => execFileSync(process.execPath, [
+      join(here, "..", "bounded-operation-supervisor.mjs"),
+    ], {
+      cwd: linked, detached: true, encoding: "utf8", timeout: 10000,
+      input: JSON.stringify({ operationID, command: [process.execPath, "-e", "process.stdout.write('operation-executed')"] }),
+    }).trim();
+    assert.equal(runOperation("fixture-operation"), "operation-executed");
+
+    const preparation = JSON.parse(execFileSync("python3", [
+      "-E", "-s", "-B", join(scriptsDir, "..", "worker-lifecycle", "worker-registry.py"),
+      "--state-dir", process.env.AIDEVOPS_LIFECYCLE_STATE_DIR,
+      "prepare-cleanup", "--path", realpathSync(linked),
+    ], { encoding: "utf8" }));
+    assert.equal(preparation.status, "waiting-for-runs");
+    assert.equal(preparation.registered_runs, 2);
+    assert.equal(preparation.unfinished_runs, 1);
+    assert.equal(preparation.admission, "open");
+    // Explicit shutdown is distinct from cleanup's conditional quiescent close.
+    execFileSync("python3", ["-E", "-s", "-B", "-c", [
+      "import sys, uuid",
+      "from pathlib import Path",
+      "sys.path.insert(0, sys.argv[1])",
+      "from worker_lifecycle.storage import LifecycleRegistry",
+      "from worker_lifecycle.admission import AdmissionRegistry",
+      "AdmissionRegistry(LifecycleRegistry(Path(sys.argv[2]))).close_generation(str(uuid.uuid4()), sys.argv[3])",
+    ].join("\n"), join(scriptsDir, "..", "worker-lifecycle"),
+    process.env.AIDEVOPS_LIFECYCLE_STATE_DIR, preparation.generation_id]);
+    assert.throws(() => runOperation("closed-operation"), (error) =>
+      error.status === 75 && !String(error.stdout).includes("operation-executed"));
+    await assert.rejects(() => hooks.toolExecuteBefore(
+      { tool: "functions.apply_patch", sessionID: "different-owner" },
+      { args: { patchText: linkedPatch } },
+    ), /lifecycle owner admission/);
+    await assert.doesNotReject(() => hooks.toolExecuteBefore(
+      { tool: "functions.apply_patch", sessionID: "fixture-owner" },
+      { args: { patchText: linkedPatch } },
+    ));
+
+    // Read-only inspection of another tree admits no owner (GH#37022), so a closed
+    // generation does not refuse it and the inspector cannot block retirement;
+    // writes, config overrides and output-writing flags still require admission.
+    const refused = /lifecycle owner admission/;
+    for (const [command, otherSession] of [
+      [`git -C "${linked}" add README.md`, refused],
+      [`git -C "${linked}" -C . add README.md`, refused],
+      [`git -c core.fsmonitor=x -C "${linked}" status`, refused],
+      [`git -C "${linked}" log --output=out.txt`, refused],
+      [`git -C "${linked}" branch --list --set-upstream-to=x`, refused],
+      [`git -C "${linked}" status`, /^admitted$/],
+      [`git -C "${linked}" worktree list`, /^admitted$/],
+      [`git -C "${linked}" branch --list`, /^admitted$/],
+      [`git --no-pager -C "${linked}" log -1`, /^admitted$/],
+    ]) {
+      const outcome = (sessionID) => hooks.toolExecuteBefore(
+        { tool: "bash", sessionID },
+        { args: { workdir: repo, command } },
+      ).then(() => "admitted", String);
+      assert.match(await outcome("different-owner"), otherSession, command);
+      assert.equal(await outcome("fixture-owner"), "admitted", command);
+    }
+    await assert.rejects(() => hooks.toolExecuteBefore(
+      { tool: "bash", sessionID: "fixture-owner" },
+      { args: { workdir: repo, command: `cd "${linked}" && git status` } },
+    ), /directory-changing shell builtins are unsupported/);
+    await assert.rejects(() => hooks.toolExecuteBefore(
+      { tool: "aidevops_bounded_operation", sessionID: "different-owner" },
+      { args: { action: "start", cwd: repo, command: [realGit, "-C", linked, "add", "README.md"] } },
+    ), /lifecycle owner admission/);
+
+    // An exec-based Claude hook observes this same native runtime parent.
+    const claudeHook = (sessionID) => execFileSync("sh", [
+      "-c", 'exec "$1" "$2"', "hook",
+      resolveTrustedExecutable("python3"), join(scriptsDir, "..", "hooks", "git_safety_guard.py"),
+    ], {
+      cwd: linked, encoding: "utf8",
+      input: JSON.stringify({ session_id: sessionID, tool_name: "Write", tool_input: { file_path: join(linked, "result.md") } }),
+    }).trim();
+    assert.equal(claudeHook("fixture-owner"), "");
+    assert.equal(JSON.parse(claudeHook("different-owner")).hookSpecificOutput.permissionDecision, "deny");
 
     const canonicalPatch = "*** Begin Patch\n*** Update File: README.md\n@@\n-seed\n+unsafe\n*** End Patch\n";
     await assert.rejects(
@@ -131,6 +376,107 @@ test("uses the plugin repository directory when mutation tools omit workdir", as
       ),
       /canonical write policy.*read-only session mirrors/,
       "relative mutation targets must resolve from the plugin project directory",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("admits tools without an inherited runtime identity (GH#36430)", async () => {
+  // The OpenCode server exports no OPENCODE_PID/OPENCODE_PID_START_IDENTITY and
+  // its session never equals an inherited OPENCODE_SESSION_ID.
+  const runtimeKeys = ["OPENCODE_PID", "OPENCODE_PID_START_IDENTITY", "OPENCODE_SESSION_ID"];
+  const saved = runtimeKeys.map((key) => process.env[key]);
+  for (const key of runtimeKeys) delete process.env[key];
+  const { root, repo, linked } = setupRepo();
+  const helper = join(scriptsDir, "worker-lifecycle-session-helper.py");
+  const runHelper = (args, env = process.env) => {
+    try {
+      return JSON.parse(execFileSync("python3", ["-E", "-s", "-B", helper, ...args], { encoding: "utf8", env }));
+    } catch (error) {
+      return JSON.parse(error.stdout);
+    }
+  };
+  try {
+    const hooks = createQualityHooks({ scriptsDir, logsDir: root, repositoryDir: repo });
+    const session = { tool: "bash", sessionID: "ses_unbound_runtime" };
+    // Non-linked targets need no runtime owner: outside Git and canonical.
+    await assert.doesNotReject(() => hooks.toolExecuteBefore(session, { args: { workdir: root, command: "pwd" } }));
+    await assert.doesNotReject(() => hooks.toolExecuteBefore(session, { args: { workdir: repo, command: "git status --short" } }));
+    // Linked targets are owned by the runtime process that loaded the plugin.
+    await assert.doesNotReject(() => hooks.toolExecuteBefore(session, { args: { workdir: linked, command: "git status --short" } }));
+    const preparation = JSON.parse(execFileSync("python3", [
+      "-E", "-s", "-B", join(scriptsDir, "..", "worker-lifecycle", "worker-registry.py"),
+      "--state-dir", process.env.AIDEVOPS_LIFECYCLE_STATE_DIR,
+      "prepare-cleanup", "--path", realpathSync(linked),
+    ], { encoding: "utf8" }));
+    assert.equal(preparation.registered_runs, 1);
+
+    // An empty PID no longer aborts argument parsing before classification.
+    assert.equal(runHelper(["--cwd", realpathSync(root), "--runtime-pid", "", "--session-id", "x"]).status, "not-applicable");
+    assert.equal(runHelper(["--cwd", realpathSync(repo), "--runtime-pid", "", "--session-id", "x"]).status, "not-applicable");
+    assert.deepEqual(runHelper(["--cwd", realpathSync(linked), "--runtime-pid", "", "--session-id", "x"]),
+      { status: "unavailable", reason: "runtime-owner-unresolved" });
+    // The shell expands `git -C ~/repo`; admission resolves the same target.
+    // Write verbs: read-only inspection targets are not resolved (GH#37022).
+    const home = { ...process.env, HOME: realpathSync(root) };
+    assert.equal(runHelper(["--cwd", realpathSync(root), "--runtime-pid", "", "--session-id", "x",
+      "--command", "git -C ~/repo commit -m x"], home).status, "not-applicable");
+    assert.deepEqual(runHelper(["--cwd", realpathSync(root), "--runtime-pid", "", "--session-id", "x",
+      "--command", "git -C ~/missing commit -m x"], home), { status: "unavailable", reason: "git-target-unavailable" });
+    assert.equal(runHelper(["--cwd", realpathSync(root), "--runtime-pid", "", "--session-id", "x",
+      "--command", `git -C "${realpathSync(linked)}" status`]).status, "not-applicable");
+    // Quoted tildes, exec argv and `--git-dir=~/x` reach Git literally; admission must not expand them.
+    const literal = { status: "unavailable", reason: "git-target-unavailable" };
+    for (const declared of [
+      ["--command", "git -C '~/repo' commit -m x"],
+      ["--command", 'git -C "~/repo" commit -m x'],
+      ["--argv-json", JSON.stringify(["git", "-C", "~/repo", "commit", "-m", "x"])],
+      ["--command", "git --git-dir=~/repo/.git commit -m x"],
+    ]) {
+      assert.deepEqual(runHelper(["--cwd", realpathSync(root), "--runtime-pid", "", "--session-id", "x",
+        ...declared], home), literal, declared.join(" "));
+    }
+  } finally {
+    runtimeKeys.forEach((key, index) => {
+      if (saved[index] === undefined) delete process.env[key];
+      else process.env[key] = saved[index];
+    });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("uses an explicit linked-worktree context without weakening canonical or escape denials", async () => {
+  const { root, repo, linked } = setupRepo();
+  try {
+    const hooks = createQualityHooks({ scriptsDir, logsDir: root, repositoryDir: root });
+    const linkedPatch = `*** Begin Patch\n*** Add File: ${join(linked, "explicit-context.md")}\n+safe\n*** End Patch\n`;
+    await assert.doesNotReject(
+      () => hooks.toolExecuteBefore(
+        { tool: "functions.apply_patch", sessionID: "fixture-owner" },
+        { args: { workdir: linked, patchText: linkedPatch } },
+      ),
+    );
+    const canonicalPatch = `*** Begin Patch\n*** Update File: ${join(repo, "README.md")}\n@@\n-seed\n+unsafe\n*** End Patch\n`;
+    await assert.rejects(
+      () => hooks.toolExecuteBefore(
+        { tool: "functions.apply_patch" },
+        { args: { workdir: linked, patchText: canonicalPatch } },
+      ),
+      /canonical write policy.*read-only session mirrors/,
+    );
+    const outside = join(root, "outside");
+    const escape = join(linked, "escape");
+    mkdirSync(outside);
+    writeFileSync(join(outside, "outside.md"), "seed\n");
+    symlinkSync(outside, escape, "dir");
+    const escapedPatch = `*** Begin Patch\n*** Update File: ${join(escape, "outside.md")}\n@@\n-seed\n+unsafe\n*** End Patch\n`;
+    await assert.rejects(
+      () => hooks.toolExecuteBefore(
+        { tool: "functions.apply_patch" },
+        { args: { workdir: linked, patchText: escapedPatch } },
+      ),
+      /symlinked write target escapes/,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -293,6 +639,7 @@ test("allows cross-repository linked writes only inside the trusted Git workspac
 
 test("blocks canonical branch mutation before execution", () => {
   const { root, repo } = setupRepo();
+  const restoreRepos = registerRepo(root, repo);
   try {
     assert.throws(
       () => checkCommandSafetyGate("git branch -m main safety/example", scriptsDir, repo),
@@ -300,6 +647,7 @@ test("blocks canonical branch mutation before execution", () => {
     );
     assert.equal(execFileSync(realGit, ["symbolic-ref", "--short", "HEAD"], { cwd: repo, encoding: "utf8" }).trim(), "main");
   } finally {
+    restoreRepos();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -321,6 +669,7 @@ test("allows the repository full-loop commit-and-pr wrapper only from a linked w
   const { root, repo, linked } = setupRepo();
   const wrapperCommand = "PR_NUMBER=$(full-loop-helper.sh commit-and-pr --issue 123 --testing 'git tests pass')";
   const activeScriptsDir = join(root, "active", "agents", "scripts");
+  const restoreRepos = registerRepo(root, repo);
   try {
     mkdirSync(join(repo, ".agents", "scripts"), { recursive: true });
     writeFileSync(join(repo, ".agents", "scripts", "full-loop-helper.sh"), "#!/bin/sh\n");
@@ -425,6 +774,7 @@ test("allows the repository full-loop commit-and-pr wrapper only from a linked w
       /unclassified nested Git invocation/,
     );
   } finally {
+    restoreRepos();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -763,6 +1113,9 @@ test("fails closed when required policy is malformed", () => {
       copyFileSync(join(scriptsDir, moduleName), join(isolatedScripts, moduleName));
     }
     copyFileSync(join(scriptsDir, "canonical-git-command-guard.py"), join(isolatedScripts, "canonical-git-command-guard.py"));
+    // Shared PATH-based resolver imported by command_policy_evaluation.py.
+    copyFileSync(join(scriptsDir, "trusted_executable.py"), join(isolatedScripts, "trusted_executable.py"));
+    copyFileSync(join(scriptsDir, "native_git.py"), join(isolatedScripts, "native_git.py"));
     writeFileSync(join(isolatedConfigs, "command-policy.json"), "{not-json\n");
     assert.throws(
       () => checkCommandSafetyGate("printf safe", isolatedScripts, process.cwd()),
@@ -787,6 +1140,125 @@ test("fails closed when command policy exits nonzero with an allow payload", () 
       /shared command policy \(allow/,
     );
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function withPolicyHelperTimeout(timeoutMs, callback) {
+  const previous = process.env.AIDEVOPS_POLICY_HELPER_TIMEOUT_MS;
+  process.env.AIDEVOPS_POLICY_HELPER_TIMEOUT_MS = String(timeoutMs);
+  try {
+    return callback();
+  } finally {
+    if (previous === undefined) delete process.env.AIDEVOPS_POLICY_HELPER_TIMEOUT_MS;
+    else process.env.AIDEVOPS_POLICY_HELPER_TIMEOUT_MS = previous;
+  }
+}
+
+test("retries a policy helper once after a host-load timeout", () => {
+  const root = mkdtempSync(join(tmpdir(), "aidevops-command-policy-timeout-"));
+  const isolatedScripts = join(root, "scripts");
+  const marker = join(root, "first-attempt");
+  mkdirSync(isolatedScripts);
+  try {
+    writeFileSync(
+      join(isolatedScripts, "command-policy-helper.py"),
+      `import os, time\nmarker = ${JSON.stringify(marker)}\nif not os.path.exists(marker):\n    open(marker, "w").close()\n    time.sleep(10)\nprint('{"decision":"allow"}')\n`,
+    );
+    withPolicyHelperTimeout(500, () => assert.doesNotThrow(
+      () => checkCommandSafetyGate("printf safe", isolatedScripts, process.cwd()),
+    ));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("labels a repeated policy helper timeout as transient infrastructure", () => {
+  const root = mkdtempSync(join(tmpdir(), "aidevops-command-policy-timeout-"));
+  const isolatedScripts = join(root, "scripts");
+  mkdirSync(isolatedScripts);
+  try {
+    for (const helper of ["command-policy-helper.py", "canonical-write-policy-helper.py"]) {
+      writeFileSync(join(isolatedScripts, helper), "import time\ntime.sleep(10)\n");
+    }
+    withPolicyHelperTimeout(300, () => {
+      assert.throws(
+        () => checkCommandSafetyGate("printf safe", isolatedScripts, process.cwd()),
+        /BLOCKED: command policy timed out under host load \(transient infrastructure timeout, not a policy decision\)/,
+      );
+      assert.throws(
+        () => checkCanonicalWriteSafetyGate(join(root, "file.txt"), isolatedScripts, root),
+        /BLOCKED: canonical-write policy timed out under host load/,
+      );
+      assert.throws(
+        () => checkCommandSafetyGate("git push -u origin feature/checkpoint", isolatedScripts, root),
+        /TERMINAL_BLOCKER_REASON=push_policy_timeout/,
+      );
+      assert.throws(
+        () => checkCommandSafetyGate("git fetch origin", isolatedScripts, root),
+        (error) => /policy timed out/.test(error.message) &&
+          !error.message.includes("push_policy_timeout"),
+      );
+      assert.throws(
+        () => checkCommandSafetyGate("curl -fsS https://example.com/health", isolatedScripts, root),
+        /policy timed out[\s\S]*TERMINAL_BLOCKER_REASON=network_policy_timeout/,
+      );
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// GH#35139: headless workers read widely but write only in their own worktree.
+test("headless workers cannot write or run mutating git in sibling worktrees", () => {
+  const { root, repo, linked } = setupRepo();
+  const sibling = join(root, "sibling");
+  const keys = ["AIDEVOPS_HEADLESS", "WORKER_WORKTREE_PATH", "AIDEVOPS_TEMP_DIR"];
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  try {
+    execFileSync(realGit, ["worktree", "add", "-q", "-b", "feature/sibling", sibling], { cwd: repo });
+    process.env.AIDEVOPS_HEADLESS = "1";
+    process.env.WORKER_WORKTREE_PATH = linked;
+    process.env.AIDEVOPS_TEMP_DIR = join(root, "managed-tmp");
+
+    assert.throws(
+      () => checkCanonicalWriteSafetyGate(join(sibling, "README.md"), scriptsDir, linked),
+      /Sibling worktrees are read-only for workers/,
+    );
+    const siblingPatch = `*** Begin Patch\n*** Update File: ${join(sibling, "README.md")}\n@@\n-seed\n+x\n*** End Patch\n`;
+    assert.throws(
+      () => checkCanonicalWriteSafetyGate("", scriptsDir, linked, siblingPatch),
+      /Sibling worktrees are read-only for workers/,
+    );
+    assert.doesNotThrow(() => checkCanonicalWriteSafetyGate(join(linked, "README.md"), scriptsDir, linked));
+    assert.doesNotThrow(() => checkCanonicalWriteSafetyGate(join(root, "managed-tmp", "note.txt"), scriptsDir, linked));
+    // GH#35495: a non-worktree scratch target names both accepted roots.
+    assert.throws(
+      () => checkCanonicalWriteSafetyGate(join(root, "private-tmp", "batch", "claim.json"), scriptsDir, linked),
+      (error) => /Sibling worktrees are read-only for workers/.test(error.message)
+        && error.message.includes(`AIDEVOPS_TEMP_DIR (${join(realpathSync(root), "managed-tmp")})`)
+        && error.message.includes(`own worktree (${realpathSync(linked)})`)
+        && /0700 subdirectory of AIDEVOPS_TEMP_DIR/.test(error.message),
+    );
+
+    assert.throws(
+      () => checkCommandSafetyGate(`git -C ${sibling} commit -m x`, scriptsDir, linked),
+      /Sibling worktrees are read-only for workers/,
+    );
+    assert.throws(
+      () => checkCommandSafetyGate(`cd ${sibling} && git add -A`, scriptsDir, linked),
+      /Sibling worktrees are read-only for workers/,
+    );
+    assert.doesNotThrow(() => checkCommandSafetyGate(`git -C ${sibling} status`, scriptsDir, linked));
+    assert.doesNotThrow(() => checkCommandSafetyGate(`git -C ${linked} add README.md`, scriptsDir, linked));
+
+    delete process.env.AIDEVOPS_HEADLESS;
+    assert.doesNotThrow(() => checkCanonicalWriteSafetyGate(join(sibling, "README.md"), scriptsDir, linked));
+  } finally {
+    for (const key of keys) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
     rmSync(root, { recursive: true, force: true });
   }
 });

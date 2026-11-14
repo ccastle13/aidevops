@@ -38,6 +38,13 @@
 [[ -n "${_PULSE_TRIAGE_EVALUATION_LIB_LOADED:-}" ]] && return 0
 _PULSE_TRIAGE_EVALUATION_LIB_LOADED=1
 _PTE_JSON_ARRAY_TYPE="array"
+_PTE_JSON_OBJECT_TYPE="object"
+_PTE_JSON_STRING_TYPE="string"
+_PTE_ISSUE_OPEN_STATE="OPEN"
+_PTE_STATUS_CLAIMED="status:claimed"
+_PTE_STATUS_IN_PROGRESS="status:in-progress"
+_PTE_STATUS_IN_REVIEW="status:in-review"
+_PTE_STATUS_QUEUED="status:queued"
 
 # Defensive SCRIPT_DIR fallback
 if [[ -z "${SCRIPT_DIR:-}" ]]; then
@@ -55,6 +62,10 @@ fi
 _pte_rest_core_deferrable_allows_next() {
 	local context="$1"
 	local budget_rc=0
+	if [[ "${_LABEL_MAINTENANCE_DEADLINE:-}" =~ ^[0-9]+$ ]] && [[ "$(date +%s)" -ge "$_LABEL_MAINTENANCE_DEADLINE" ]]; then
+		echo "[pulse-wrapper] Label maintenance: deadline reached at ${context}; resuming next cycle" >>"${LOGFILE:-/dev/null}"
+		return 1
+	fi
 	if declare -F pulse_rest_core_priority_allows_next >/dev/null 2>&1; then
 		pulse_rest_core_priority_allows_next deferrable "$context" || budget_rc=$?
 	elif declare -F pulse_rest_core_priority_allows >/dev/null 2>&1; then
@@ -65,6 +76,210 @@ _pte_rest_core_deferrable_allows_next() {
 	[[ "$budget_rc" -eq 0 ]] && return 0
 	echo "[pulse-wrapper] Label maintenance: REST-core reserve reached at ${context}; remaining work deferred (GH#29742)" >>"${LOGFILE:-/dev/null}"
 	return 1
+}
+
+# Cursor helpers are inert outside the orchestrated maintenance stage. Persist
+# before work so a watchdog kill can repeat at most the current idempotent unit.
+# Numeric phases distinguish backfill's lock sweep, metadata and label sweep.
+_pte_label_cursor_write() {
+	local slug="$1" phase="${2:-0}" issue="${3:-0}"
+	[[ -n "${_LABEL_CURSOR_FILE:-}" ]] || return 0
+	local tmp=""
+	tmp=$(mktemp "${_LABEL_CURSOR_FILE}.XXXXXX") || return 1
+	printf '%s %s %s\n' "$slug" "$phase" "$issue" >"$tmp"
+	mv -f "$tmp" "$_LABEL_CURSOR_FILE" || return 1
+	return 0
+}
+
+_pte_label_repos() {
+	local rows="$1"
+	# Earlier repositories already completed in this sweep. Unknown/deleted
+	# resume repositories reset the pass rather than dropping the entire list.
+	printf '%s\n' "$rows" | awk -F '|' -v start="${_LABEL_CURSOR_SLUG:-}" '
+		NF { a[++n]=$0; if ($(1) == start) s=n }
+		END { if (!s) s=1; for (i=s; i<=n; i++) print a[i] }'
+	return 0
+}
+
+_pte_label_issue_start() {
+	local slug="$1" phase="$2" issue="$3"
+	if [[ "$slug" == "${_LABEL_CURSOR_SLUG:-}" ]]; then
+		[[ "$phase" -lt "${_LABEL_CURSOR_PHASE:-0}" ]] && return 1
+		if [[ "$phase" -eq "${_LABEL_CURSOR_PHASE:-0}" && "$issue" -lt "${_LABEL_CURSOR_ISSUE:-0}" ]]; then
+			return 1
+		fi
+	fi
+	_pte_label_cursor_write "$slug" "$phase" "$issue" || return 2
+	return 0
+}
+
+_pte_label_phase_needed() {
+	local slug="$1" phase="$2"
+	[[ "$slug" == "${_LABEL_CURSOR_SLUG:-}" && "$phase" -lt "${_LABEL_CURSOR_PHASE:-0}" ]] && return 1
+	return 0
+}
+
+_pte_label_pass_finished() {
+	local deferred="$1"
+	[[ -n "${_LABEL_CURSOR_FILE:-}" ]] || return 0
+	if [[ "$deferred" -ne 0 ]]; then
+		# GH#37986: the held-first step can stop before the sweep writes a cursor.
+		local resume="sweep start"
+		[[ ! -r "$_LABEL_CURSOR_FILE" ]] || resume=$(<"$_LABEL_CURSOR_FILE")
+		echo "[pulse-wrapper] Label maintenance: partial ${_LABEL_MAINTENANCE_KEY:-}; resume ${resume}" >>"${LOGFILE:-/dev/null}"
+		return 2
+	fi
+	rm -f "$_LABEL_CURSOR_FILE" || return 1
+	return 0
+}
+
+#######################################
+# GH#37986: held-first helpers. The per-repository sweeps below spend their
+# slices listing repositories that hold nothing, so a held issue in a
+# repository late in sweep order could wait for days. Each re-evaluation
+# substage first re-checks the open issues that carry its label, found with
+# one search call per group of five owners (the pattern tbr_discover in
+# terminal-blocker-recovery-helper.sh uses), and only then starts its sweep.
+# The sweep stays the safety net: a failed, incomplete, truncated or empty
+# search never proves that nothing is held. Inside the orchestrated stage the
+# step uses at most two thirds of the substage's time, so a long held list
+# cannot keep the sweep from advancing its own cursor.
+#######################################
+
+# Print one compact JSON object {slug,number} per open issue carrying a label,
+# for the owners of the given repository rows. The search index can lag an
+# edit, so it only names candidates: the body is read later, per issue.
+# Arguments: $1 - label, $2 - repo rows ("slug" or "slug|path", one per line)
+# Returns: 0 when every owner group answered, 1 otherwise (found rows still print)
+_pte_held_issues() {
+	local label="$1" rows="$2"
+	local owners="" line="" owner="" group="" result="" rc=0
+	local -a owner_list=()
+	owners=$(printf '%s\n' "$rows" | sed -n 's|^\([A-Za-z0-9_.-][A-Za-z0-9_.-]*\)/.*$|\1|p' | sort -fu)
+	[[ -n "$owners" ]] || return 1
+	while IFS= read -r line; do
+		[[ -n "${line// /}" ]] || continue
+		read -ra owner_list <<<"$line"
+		group=""
+		for owner in "${owner_list[@]}"; do
+			group+=" user:${owner}"
+		done
+		if ! _pte_rest_core_deferrable_allows_next "held_query:${label}"; then
+			rc=1
+			break
+		fi
+		# One page per owner group bounds the query; the sweep covers the rest.
+		# GitHub's incomplete_results flag is a failed read, never absence.
+		result=$(gh api -X GET search/issues \
+			-f q="is:issue is:open label:\"${label}\"${group}" \
+			-f sort=created -f order=asc -f per_page=100 \
+			--jq 'if .incomplete_results then error("incomplete search results") else .items[] | select(.pull_request == null) | {slug: (.repository_url | sub("^.*/repos/"; "")), number} | tojson end' \
+			2>/dev/null) || {
+			rc=1
+			continue
+		}
+		[[ -z "$result" ]] || printf '%s\n' "$result"
+	done < <(printf '%s\n' "$owners" | paste -d' ' - - - - -)
+	return "$rc"
+}
+
+# Keep held issues that belong to the given repository rows, attach each row's
+# slug and path, and start after the issue a previous run reached, so a slice
+# that cannot finish the list does not re-check the same leading issues.
+# Arguments: $1 - JSON lines from _pte_held_issues, $2 - repo rows
+# Stdout: one compact JSON object {slug,path,number} per issue
+_pte_held_issue_order() {
+	local held="$1" rows="$2" cursor_slug="" cursor_issue=0
+	local cursor_file="${_LABEL_CURSOR_FILE:+${_LABEL_CURSOR_FILE%.cursor}.held}"
+	if [[ -n "$cursor_file" && -r "$cursor_file" ]]; then
+		read -r cursor_slug cursor_issue <"$cursor_file" || true
+		if [[ ! "$cursor_slug" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ || ! "$cursor_issue" =~ ^[0-9]{1,9}$ ]]; then
+			cursor_slug="" cursor_issue=0
+		fi
+	fi
+	printf '%s\n' "$held" | jq -cs --arg rows "$rows" --arg slug "$cursor_slug" --arg issue "$cursor_issue" '
+		($rows | split("\n") | map(select(length > 0) | split("|")
+			| {key: (.[0] | ascii_downcase), value: {slug: .[0], path: (.[1] // "")}}) | from_entries) as $repos
+		| [$slug, ($issue | tonumber)] as $cursor
+		| map(objects
+			| {slug: (.slug | strings), number: (.number | numbers)}
+			| ($repos[.slug | ascii_downcase]) as $repo
+			| select($repo != null)
+			| {slug: $repo.slug, path: $repo.path, number})
+		| unique_by([.slug, .number])
+		| map(select([.slug, .number] > $cursor)) + map(select([.slug, .number] <= $cursor))
+		| .[]' 2>/dev/null
+	return 0
+}
+
+# Record the held issue being re-checked. Inert outside the orchestrated stage.
+_pte_held_cursor_write() {
+	local slug="$1" issue="$2"
+	[[ -n "${_LABEL_CURSOR_FILE:-}" ]] || return 0
+	local file="${_LABEL_CURSOR_FILE%.cursor}.held" tmp=""
+	tmp=$(mktemp "${file}.XXXXXX") || return 1
+	printf '%s %s\n' "$slug" "$issue" >"$tmp"
+	mv -f "$tmp" "$file" || return 1
+	return 0
+}
+
+# Re-check the held issues carrying a label before the caller's sweep.
+# Arguments: $1 - label, $2 - repo rows, $3 - per-issue function called with
+#   (number, slug, body, repo_path) that returns 0 when it cleared the label,
+#   $4 - budget-gate context prefix, $5 - "current-body" when the function
+#   measures the issue body: the step then reads the current body, one call
+#   per issue, because a stale search result could clear a hold that a newer
+#   body still earns. Otherwise the function receives an empty body.
+# Sets in the caller's scope: _PTE_HELD_CLEARED (count), _PTE_HELD_DONE
+#   (space-delimited "slug#number" keys the sweep skips in this run)
+# Returns: 0 to continue with the sweep (also when the step used its time
+#   share; the next run resumes after the last issue it reached), 2 when a
+#   budget or deadline gate stopped the step (the caller defers the sweep)
+_pte_reevaluate_held_issues() {
+	local label="$1" rows="$2" evaluate_fn="$3" context="$4" body_source="${5:-}"
+	local held="" issue="" body="" checked=0 rc=0
+	local slug="" num="" rpath=""
+	local now="" share_deadline=0 share_used=""
+	if [[ "${_LABEL_MAINTENANCE_DEADLINE:-}" =~ ^[0-9]+$ ]] && now=$(date +%s 2>/dev/null) &&
+		[[ "$now" =~ ^[0-9]+$ && "$now" -lt "$_LABEL_MAINTENANCE_DEADLINE" ]]; then
+		share_deadline=$((now + (_LABEL_MAINTENANCE_DEADLINE - now) * 2 / 3))
+	fi
+	held=$(_pte_held_issues "$label" "$rows") || true
+	[[ -n "$held" ]] || return 0
+	while IFS= read -r issue; do
+		[[ -n "$issue" ]] || continue
+		# read assigns all three, empty when the row cannot be parsed.
+		IFS=$'\t' read -r slug num rpath < <(jq -r '[.slug, .number, .path] | @tsv' <<<"$issue") || true
+		[[ -n "$slug" && "$num" =~ ^[0-9]+$ ]] || continue
+		if [[ "$share_deadline" -gt 0 ]] && now=$(date +%s 2>/dev/null) &&
+			[[ "$now" =~ ^[0-9]+$ && "$now" -ge "$share_deadline" ]]; then
+			share_used="; time share used, the sweep continues"
+			break
+		fi
+		if ! _pte_rest_core_deferrable_allows_next "${context}:${slug}#${num}"; then
+			rc=2
+			break
+		fi
+		_pte_held_cursor_write "$slug" "$num" || true
+		body=""
+		if [[ "$body_source" == "current-body" ]]; then
+			# A failed or empty read leaves the issue to the sweep, which
+			# lists bodies itself.
+			body=$(gh_issue_view "$num" --repo "$slug" --json body --jq '.body // ""' 2>/dev/null) || body=""
+			[[ -n "$body" ]] || continue
+		fi
+		# Measure against the latest remote state, as the sweep does (t2433).
+		[[ -z "$rpath" ]] || _pulse_refresh_repo "$rpath"
+		if "$evaluate_fn" "$num" "$slug" "$body" "$rpath"; then
+			_PTE_HELD_CLEARED=$((_PTE_HELD_CLEARED + 1))
+		fi
+		_PTE_HELD_DONE+="${slug}#${num} "
+		checked=$((checked + 1))
+	done < <(_pte_held_issue_order "$held" "$rows")
+	if [[ "$checked" -gt 0 || -n "$share_used" ]]; then
+		echo "[pulse-wrapper] Label maintenance: held-first ${label} re-checked ${checked} issue(s), cleared ${_PTE_HELD_CLEARED}${share_used} (GH#37986)" >>"${LOGFILE:-/dev/null}"
+	fi
+	return "$rc"
 }
 
 # t2161: Idempotently remove the `needs-consolidation` label from an issue
@@ -83,32 +298,94 @@ _clear_needs_consolidation_label() {
 }
 
 #######################################
+# Return validated metadata used by consolidation ownership checks. A complete
+# pre-fetched dispatch bundle avoids another API call; partial or absent input
+# is refreshed because ownership is mutable safety state.
+# Args: $1=issue_number $2=repo_slug $3=optional pre-fetched issue JSON
+# Returns: 0 with metadata on stdout, 2 when ownership cannot be verified
+#######################################
+_consolidation_issue_ownership_metadata() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local metadata="${3:-}"
+
+	if ! printf '%s' "$metadata" | jq -e --arg object_type "$_PTE_JSON_OBJECT_TYPE" '
+		type == $object_type and has("state") and has("labels") and has("assignees")
+	' >/dev/null 2>&1; then
+		metadata=$(gh issue view "$issue_number" --repo "$repo_slug" \
+			--json state,labels,assignees 2>/dev/null) || return 2
+	fi
+	if ! printf '%s' "$metadata" | jq -e \
+		--arg array_type "$_PTE_JSON_ARRAY_TYPE" \
+		--arg object_type "$_PTE_JSON_OBJECT_TYPE" \
+		--arg string_type "$_PTE_JSON_STRING_TYPE" '
+		type == $object_type and
+		(.state | type == $string_type and length > 0) and
+		(.labels | type == $array_type) and
+		all(.labels[]; .name | type == $string_type and length > 0) and
+		(.assignees | type == $array_type) and
+		all(.assignees[]; .login | type == $string_type and length > 0)
+	' >/dev/null 2>&1; then
+		return 2
+	fi
+	printf '%s' "$metadata"
+	return 0
+}
+
+#######################################
+# Return whether validated issue metadata carries active ownership. The label
+# and assignee must both exist; stale recovery remains responsible for clearing
+# abandoned lifecycle state before consolidation may resume.
+# Args: $1=validated issue metadata JSON
+# Returns: 0=active ownership, 1=no active ownership
+#######################################
+_consolidation_metadata_has_active_ownership() {
+	local metadata="$1"
+	printf '%s' "$metadata" | jq -e \
+		--arg claimed "$_PTE_STATUS_CLAIMED" \
+		--arg in_progress "$_PTE_STATUS_IN_PROGRESS" \
+		--arg in_review "$_PTE_STATUS_IN_REVIEW" \
+		--arg open_state "$_PTE_ISSUE_OPEN_STATE" \
+		--arg queued "$_PTE_STATUS_QUEUED" '
+		(.state | ascii_upcase) == $open_state and
+		([.labels[].name] | any(. == $queued or . == $claimed or
+			. == $in_progress or . == $in_review)) and
+		(.assignees | length > 0)
+	' >/dev/null 2>&1
+}
+
+#######################################
 # Return whether an issue has a fresh, positively verified interactive claim.
 # This mirrors stale-assignment recovery's ownership proof: a signed claim
 # comment must be recent, its author must still be assigned, and the open
-# issue must retain status:in-review. API or timestamp ambiguity returns 2 so
+# issue must retain an active lifecycle status. API or timestamp ambiguity returns 2 so
 # consolidation defers rather than creating a conflicting planning task.
-# Args: $1=issue_number $2=repo_slug
+# Args: $1=issue_number $2=repo_slug $3=optional validated issue metadata
 # Returns: 0=live claim, 1=no live claim, 2=ambiguous read
 #######################################
 _consolidation_live_interactive_claim() {
 	local issue_number="$1"
 	local repo_slug="$2"
-	local issue_meta_json="" comments_json="" claim_record=""
+	local issue_meta_json="${3:-}" comments_json="" claim_record=""
 	local claim_timestamp="" claim_author="" claim_epoch="" now_epoch=""
 	local claim_age=0 stale_threshold="${INTERACTIVE_STALE_THRESHOLD_SECONDS:-7200}"
 
 	comments_json=$(gh api "repos/${repo_slug}/issues/${issue_number}/comments" \
 		--paginate --jq '.' 2>/dev/null) || return 2
-	claim_record=$(printf '%s' "$comments_json" | jq -r '
-		[.[] | if type == "array" then .[] else . end
+	claim_record=$(printf '%s' "$comments_json" | jq -sr \
+		--arg array_type "$_PTE_JSON_ARRAY_TYPE" '
+		add
+		| [.[] | if type == $array_type then .[] else . end]
+		| [.[]
 		 | select((.body // "") | contains("<!-- aidevops-interactive-claim/v1 -->"))
 		 | [(.created_at // .createdAt // ""), (.user.login // .author.login // "")] | @tsv]
 		| last // empty
 	' 2>/dev/null) || return 2
 	[[ -n "$claim_record" ]] || return 1
-	issue_meta_json=$(gh issue view "$issue_number" --repo "$repo_slug" \
-		--json state,labels,assignees 2>/dev/null) || return 2
+	if [[ -z "$issue_meta_json" ]]; then
+		issue_meta_json=$(_consolidation_issue_ownership_metadata \
+			"$issue_number" "$repo_slug") || return 2
+	fi
 	IFS=$'\t' read -r claim_timestamp claim_author <<<"$claim_record"
 	[[ -n "$claim_timestamp" && -n "$claim_author" ]] || return 2
 	claim_epoch=$(date -u -d "$claim_timestamp" +%s 2>/dev/null) ||
@@ -118,11 +395,47 @@ _consolidation_live_interactive_claim() {
 	claim_age=$((now_epoch - claim_epoch))
 	[[ "$claim_age" -ge 0 && "$claim_age" -lt "$stale_threshold" ]] || return 1
 
-	if printf '%s' "$issue_meta_json" | jq -e --arg claimant "$claim_author" '
-		(.state | ascii_downcase) == "open" and
-		([.labels[]?.name] | index("status:in-review") != null) and
+	if printf '%s' "$issue_meta_json" | jq -e \
+		--arg claimed "$_PTE_STATUS_CLAIMED" \
+		--arg claimant "$claim_author" \
+		--arg in_progress "$_PTE_STATUS_IN_PROGRESS" \
+		--arg in_review "$_PTE_STATUS_IN_REVIEW" \
+		--arg open_state "$_PTE_ISSUE_OPEN_STATE" '
+		(.state | ascii_upcase) == $open_state and
+		([.labels[]?.name] | any(. == $claimed or . == $in_progress or . == $in_review)) and
 		([.assignees[]?.login] | index($claimant) != null)
 	' >/dev/null 2>&1; then
+		return 0
+	fi
+	return 1
+}
+
+# Manual holds are independent of live session claims. Re-read at mutation
+# boundaries, including direct terminal-breaker routes that bypass dispatch.
+_consolidation_dispatch_defers_for_manual_hold() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local metadata=""
+	metadata=$(gh issue view "$issue_number" --repo "$repo_slug" \
+		--json state,labels,assignees 2>/dev/null) || metadata=""
+	if ! printf '%s' "$metadata" | jq -e \
+		--arg array_type "$_PTE_JSON_ARRAY_TYPE" \
+		--arg object_type "$_PTE_JSON_OBJECT_TYPE" \
+		--arg string_type "$_PTE_JSON_STRING_TYPE" '
+		def nonempty_string: type == $string_type and length > 0;
+		type == $object_type and (.state | nonempty_string) and
+		(.labels | type == $array_type) and
+		all(.labels[]; .name | nonempty_string)
+	' >/dev/null 2>&1; then
+		echo "[pulse-wrapper] Consolidation: unreadable parent hold state for #${issue_number} in ${repo_slug}; deferring dispatch" >>"$LOGFILE"
+		return 0
+	fi
+	if printf '%s' "$metadata" | jq -e --arg open_state "$_PTE_ISSUE_OPEN_STATE" '
+		((.state | ascii_upcase) != $open_state) or
+		([.labels[].name] | any(. == "no-auto-dispatch" or
+			. == "hold-for-review" or . == "no-takeover" or . == "on hold"))
+	' >/dev/null 2>&1; then
+		echo "[pulse-wrapper] Consolidation: manual hold or non-open parent #${issue_number} in ${repo_slug}; deferring dispatch" >>"$LOGFILE"
 		return 0
 	fi
 	return 1
@@ -131,14 +444,61 @@ _consolidation_live_interactive_claim() {
 _consolidation_dispatch_defers_for_interactive_claim() {
 	local issue_number="$1"
 	local repo_slug="$2"
+	local issue_meta_json="${3:-}"
 	local interactive_claim_rc=0
 
-	_consolidation_live_interactive_claim "$issue_number" "$repo_slug" || interactive_claim_rc=$?
+	_consolidation_live_interactive_claim \
+		"$issue_number" "$repo_slug" "$issue_meta_json" || interactive_claim_rc=$?
 	if [[ "$interactive_claim_rc" -eq 0 || "$interactive_claim_rc" -eq 2 ]]; then
 		echo "[pulse-wrapper] Consolidation: live or unreadable interactive ownership for #${issue_number} in ${repo_slug}; deferring dispatch" >>"$LOGFILE"
 		return 0
 	fi
 	return 1
+}
+
+_consolidation_classification_defers_for_ownership() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local pre_fetched_json="${3:-}"
+	local was_already_labeled="$4"
+	local issue_meta_json="" interactive_claim_rc=0
+
+	issue_meta_json=$(_consolidation_issue_ownership_metadata \
+		"$issue_number" "$repo_slug" "$pre_fetched_json") || issue_meta_json=""
+	[[ -n "$issue_meta_json" ]] || return 0
+	if _consolidation_metadata_has_active_ownership "$issue_meta_json"; then
+		[[ "$was_already_labeled" != false ]] &&
+			_clear_needs_consolidation_label "$issue_number" "$repo_slug" "active lifecycle ownership exists"
+		return 0
+	fi
+	_consolidation_live_interactive_claim \
+		"$issue_number" "$repo_slug" "$issue_meta_json" || interactive_claim_rc=$?
+	if [[ "$interactive_claim_rc" -eq 0 ]]; then
+		[[ "$was_already_labeled" != false ]] &&
+			_clear_needs_consolidation_label "$issue_number" "$repo_slug" "live interactive claim exists"
+		return 0
+	fi
+	[[ "$interactive_claim_rc" -eq 2 ]] && return 0
+	return 1
+}
+
+_consolidation_dispatch_defers_for_active_ownership() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local issue_meta_json=""
+
+	issue_meta_json=$(_consolidation_issue_ownership_metadata \
+		"$issue_number" "$repo_slug") || issue_meta_json=""
+	if [[ -z "$issue_meta_json" ]]; then
+		echo "[pulse-wrapper] Consolidation: unreadable active ownership for #${issue_number} in ${repo_slug}; deferring dispatch" >>"$LOGFILE"
+		return 0
+	fi
+	if _consolidation_metadata_has_active_ownership "$issue_meta_json"; then
+		echo "[pulse-wrapper] Consolidation: active lifecycle ownership for #${issue_number} in ${repo_slug}; deferring dispatch" >>"$LOGFILE"
+		return 0
+	fi
+	_consolidation_dispatch_defers_for_interactive_claim \
+		"$issue_number" "$repo_slug" "$issue_meta_json"
 }
 
 _consolidation_dispatch_preflight_skips() {
@@ -163,40 +523,59 @@ _consolidation_dispatch_preflight_skips() {
 # issue. Runs between the initial fill and the post-maintenance refill so this
 # cross-repository sweep cannot delay already-eligible work (GH#28880).
 #######################################
+_pte_reevaluate_consolidation_issue() {
+	local num="$1" slug="$2"
+	# _issue_needs_consolidation returns 1 (no consolidation needed)
+	# AND auto-clears the label when was_already_labeled=true
+	_issue_needs_consolidation "$num" "$slug" && return 1
+	return 0
+}
+
 _reevaluate_consolidation_labels() {
 	local repos_json="$REPOS_JSON"
 	[[ -f "$repos_json" ]] || return 0
 
 	local total_cleared=0 rest_deferred=0
+	local held_label="needs-consolidation"
+	local repo_rows="" _PTE_HELD_CLEARED=0 _PTE_HELD_DONE=" "
+	repo_rows=$(jq -r '.initialized_repos[] | select(.maintenance != false and .pulse == true and (.local_only // false) == false and .slug != "") | .slug' "$repos_json" 2>/dev/null)
+	# GH#37986: held issues first, then the per-repository sweep.
+	_pte_reevaluate_held_issues "$held_label" "$repo_rows" \
+		_pte_reevaluate_consolidation_issue "consolidation_held_issue" || rest_deferred=1
+	total_cleared="$_PTE_HELD_CLEARED"
 	while IFS= read -r slug; do
+		[[ "$rest_deferred" -eq 0 ]] || break
 		[[ -n "$slug" ]] || continue
+		_pte_label_issue_start "$slug" 0 0 || { [[ "$?" -eq 1 ]] || return 1; }
 		if ! _pte_rest_core_deferrable_allows_next "consolidation_repo:${slug}"; then
 			rest_deferred=1
 			break
 		fi
 		local issues_json
 		issues_json=$(gh_issue_list --repo "$slug" --state open \
-			--label "needs-consolidation" \
-			--json number --limit 50 2>/dev/null) || issues_json="[]"
+			--label "$held_label" \
+			--json number --limit 50 2>/dev/null) || { rest_deferred=1; break; }
 
 		while IFS= read -r num; do
 			[[ "$num" =~ ^[0-9]+$ ]] || continue
+			# Already re-checked by the held-first step in this run.
+			[[ "$_PTE_HELD_DONE" != *" ${slug}#${num} "* ]] || continue
+			_pte_label_issue_start "$slug" 1 "$num" || { [[ "$?" -eq 1 ]] && continue; return 1; }
 			if ! _pte_rest_core_deferrable_allows_next "consolidation_issue:${slug}#${num}"; then
 				rest_deferred=1
 				break
 			fi
-			# _issue_needs_consolidation returns 1 (no consolidation needed)
-			# AND auto-clears the label when was_already_labeled=true
-			if ! _issue_needs_consolidation "$num" "$slug"; then
+			if _pte_reevaluate_consolidation_issue "$num" "$slug"; then
 				total_cleared=$((total_cleared + 1))
 			fi
-		done < <(printf '%s' "$issues_json" | jq -r '.[]?.number // ""')
+		done < <(printf '%s' "$issues_json" | jq -r 'sort_by(.number) | .[]?.number // ""')
 		[[ "$rest_deferred" -eq 0 ]] || break
-	done < <(jq -r '.initialized_repos[] | select(.maintenance != false and .pulse == true and (.local_only // false) == false and .slug != "") | .slug' "$repos_json" 2>/dev/null)
+	done < <(_pte_label_repos "$repo_rows")
 
 	if [[ "$total_cleared" -gt 0 ]]; then
 		echo "[pulse-wrapper] Consolidation re-evaluation: cleared ${total_cleared} stale needs-consolidation label(s)" >>"$LOGFILE"
 	fi
+	_pte_label_pass_finished "$rest_deferred" || return $?
 	return 0
 }
 
@@ -317,7 +696,7 @@ _reevaluate_stale_continuations() {
 			break # Unresolvable → conservative
 		fi
 
-		cont_state=$(printf '%s' "$cont_info" | jq -r '.state // "OPEN"' 2>/dev/null)
+		cont_state=$(printf '%s' "$cont_info" | jq -r --arg open_state "$_PTE_ISSUE_OPEN_STATE" '.state // $open_state' 2>/dev/null)
 		cont_state_upper=$(printf '%s' "$cont_state" | tr '[:lower:]' '[:upper:]')
 		if [[ "$cont_state_upper" != "CLOSED" ]]; then
 			all_stale=0
@@ -382,6 +761,10 @@ _backfill_simplification_auto_dispatch_labels() {
 	local slug="$1"
 	local issues_json="[]"
 	local updated=0
+	if ! _pte_label_phase_needed "$slug" 1; then
+		printf '0\n'
+		return 0
+	fi
 
 	[[ -n "$slug" ]] || {
 		printf '0\n'
@@ -389,24 +772,25 @@ _backfill_simplification_auto_dispatch_labels() {
 	}
 	if ! _pte_rest_core_deferrable_allows_next "simplification_backfill_repo:${slug}"; then
 		printf '0\n'
-		return 0
+		return 2
 	fi
 
 	issues_json=$(gh_issue_list --repo "$slug" --state open \
 		--label "function-complexity-debt" --label "status:available" \
-		--json number,labels --limit 100 2>/dev/null) || issues_json="[]"
+		--json number,labels --limit 100 2>/dev/null) || return 2
 
 	local num="" labels_to_add=""
 	while IFS=$'\t' read -r num labels_to_add; do
 		[[ "$num" =~ ^[0-9]+$ ]] || continue
-		_pte_rest_core_deferrable_allows_next "simplification_backfill_issue:${slug}#${num}" || break
+		_pte_label_issue_start "$slug" 1 "$num" || { [[ "$?" -eq 1 ]] && continue; return 2; }
+		_pte_rest_core_deferrable_allows_next "simplification_backfill_issue:${slug}#${num}" || return 2
 		[[ -n "$labels_to_add" ]] || labels_to_add="auto-dispatch"
 		if gh issue edit "$num" --repo "$slug" \
 			--add-label "$labels_to_add" >/dev/null 2>&1; then
 			updated=$((updated + 1))
 		fi
 	done < <(printf '%s' "$issues_json" | jq -r '
-		.[]?
+		sort_by(.number) | .[]?
 		| (.labels | map(.name)) as $labels
 		| select(($labels | index("auto-dispatch")) == null)
 		| select(($labels | index("no-auto-dispatch")) == null)
@@ -437,6 +821,30 @@ _backfill_simplification_auto_dispatch_labels() {
 # the deadlock where phantom continuation citations block the gate from
 # re-firing and creating a fresh (accurate) debt issue.
 #######################################
+_pte_reevaluate_simplification_issue() {
+	local num="$1" slug="$2" body="$3" rpath="$4"
+	# _issue_targets_large_files returns 1 (no large files) AND
+	# auto-clears the label when was_already_labeled.
+	# t1998: pass force_recheck=true to bypass the
+	# skip-if-already-labeled short-circuit at pulse-dispatch-core.sh:592.
+	# Without this flag, the re-eval loop never sees a cleared case
+	# because the function returns 0 immediately on any already-labeled
+	# issue, keeping stale needs-simplification labels forever.
+	if ! _issue_targets_large_files "$num" "$slug" "$body" "$rpath" "true"; then
+		# t2042: post follow-up "CLEARED" comment so the original
+		# "Held from dispatch" comment doesn't mislead readers.
+		_post_simplification_gate_cleared_comment "$num" "$slug"
+		return 0
+	fi
+	# t2170 Fix E (secondary): file still targets large files but
+	# check if ALL cited continuation issues are stale/phantom.
+	# Clears the label so the next dispatch cycle re-evaluates
+	# the gate fresh — breaking the deadlock where a phantom
+	# continuation blocks new accurate debt issue creation.
+	_reevaluate_stale_continuations "$num" "$slug" "$rpath" && return 0
+	return 1
+}
+
 _reevaluate_simplification_labels() {
 	local repos_json="$REPOS_JSON"
 	[[ -f "$repos_json" ]] || return 0
@@ -444,8 +852,17 @@ _reevaluate_simplification_labels() {
 	local total_cleared=0
 	local total_backfilled=0
 	local rest_deferred=0
+	local held_label="needs-simplification"
+	local repo_rows="" _PTE_HELD_CLEARED=0 _PTE_HELD_DONE=" "
+	repo_rows=$(jq -r '.initialized_repos[] | select(.maintenance != false and .pulse == true and (.local_only // false) == false and .slug != "" and .path != "") | "\(.slug)|\(.path)"' "$repos_json" 2>/dev/null)
+	# GH#37986: held issues first, then the per-repository sweep.
+	_pte_reevaluate_held_issues "$held_label" "$repo_rows" \
+		_pte_reevaluate_simplification_issue "simplification_held_issue" "current-body" || rest_deferred=1
+	total_cleared="$_PTE_HELD_CLEARED"
 	while IFS='|' read -r slug rpath; do
+		[[ "$rest_deferred" -eq 0 ]] || break
 		[[ -n "$slug" && -n "$rpath" ]] || continue
+		_pte_label_issue_start "$slug" 0 0 || { [[ "$?" -eq 1 ]] || return 1; }
 		if ! _pte_rest_core_deferrable_allows_next "simplification_repo:${slug}"; then
 			rest_deferred=1
 			break
@@ -460,7 +877,7 @@ _reevaluate_simplification_labels() {
 		_pulse_refresh_repo "$rpath"
 
 		local backfilled_count=0
-		backfilled_count=$(_backfill_simplification_auto_dispatch_labels "$slug") || backfilled_count=0
+		backfilled_count=$(_backfill_simplification_auto_dispatch_labels "$slug") || { rest_deferred=1; break; }
 		[[ "$backfilled_count" =~ ^[0-9]+$ ]] || backfilled_count=0
 		total_backfilled=$((total_backfilled + backfilled_count))
 		if ! _pte_rest_core_deferrable_allows_next "simplification_repo_after_backfill:${slug}"; then
@@ -470,43 +887,27 @@ _reevaluate_simplification_labels() {
 
 		local issues_json
 		issues_json=$(gh_issue_list --repo "$slug" --state open \
-			--label "needs-simplification" \
-			--json number --limit 50 2>/dev/null) || issues_json="[]"
+			--label "$held_label" \
+			--json number,body --limit 50 2>/dev/null) || { rest_deferred=1; break; }
 
-		while IFS= read -r num; do
+		local issue="" num="" body=""
+		while IFS= read -r issue; do
+			num=$(jq -r '.number // ""' <<<"$issue")
 			[[ "$num" =~ ^[0-9]+$ ]] || continue
+			# Already re-checked by the held-first step in this run.
+			[[ "$_PTE_HELD_DONE" != *" ${slug}#${num} "* ]] || continue
+			_pte_label_issue_start "$slug" 2 "$num" || { [[ "$?" -eq 1 ]] && continue; return 1; }
 			if ! _pte_rest_core_deferrable_allows_next "simplification_issue:${slug}#${num}"; then
 				rest_deferred=1
 				break
 			fi
-			local body
-			body=$(gh issue view "$num" --repo "$slug" \
-				--json body --jq '.body // ""' 2>/dev/null) || body=""
-			# _issue_targets_large_files returns 1 (no large files) AND
-			# auto-clears the label when was_already_labeled.
-			# t1998: pass force_recheck=true to bypass the
-			# skip-if-already-labeled short-circuit at pulse-dispatch-core.sh:592.
-			# Without this flag, the re-eval loop never sees a cleared case
-			# because the function returns 0 immediately on any already-labeled
-			# issue, keeping stale needs-simplification labels forever.
-			if ! _issue_targets_large_files "$num" "$slug" "$body" "$rpath" "true"; then
+			body=$(jq -r '.body // ""' <<<"$issue")
+			if _pte_reevaluate_simplification_issue "$num" "$slug" "$body" "$rpath"; then
 				total_cleared=$((total_cleared + 1))
-				# t2042: post follow-up "CLEARED" comment so the original
-				# "Held from dispatch" comment doesn't mislead readers.
-				_post_simplification_gate_cleared_comment "$num" "$slug"
-			else
-				# t2170 Fix E (secondary): file still targets large files but
-				# check if ALL cited continuation issues are stale/phantom.
-				# Clears the label so the next dispatch cycle re-evaluates
-				# the gate fresh — breaking the deadlock where a phantom
-				# continuation blocks new accurate debt issue creation.
-				if _reevaluate_stale_continuations "$num" "$slug" "$rpath"; then
-					total_cleared=$((total_cleared + 1))
-				fi
 			fi
-		done < <(printf '%s' "$issues_json" | jq -r '.[]?.number // ""')
+		done < <(printf '%s' "$issues_json" | jq -c 'sort_by(.number) | .[]?')
 		[[ "$rest_deferred" -eq 0 ]] || break
-	done < <(jq -r '.initialized_repos[] | select(.maintenance != false and .pulse == true and (.local_only // false) == false and .slug != "" and .path != "") | "\(.slug)|\(.path)"' "$repos_json" 2>/dev/null)
+	done < <(_pte_label_repos "$repo_rows")
 
 	if [[ "$total_cleared" -gt 0 ]]; then
 		echo "[pulse-wrapper] Simplification re-evaluation: cleared ${total_cleared} stale needs-simplification label(s)" >>"$LOGFILE"
@@ -514,6 +915,7 @@ _reevaluate_simplification_labels() {
 	if [[ "$total_backfilled" -gt 0 ]]; then
 		echo "[pulse-wrapper] Simplification re-evaluation: backfilled auto-dispatch on ${total_backfilled} function-complexity-debt issue(s)" >>"$LOGFILE"
 	fi
+	_pte_label_pass_finished "$rest_deferred" || return $?
 	return 0
 }
 
@@ -598,7 +1000,7 @@ _consolidation_dispatch_comment_owns_parent() {
 	local child_json=""
 	child_json=$(gh issue view "$marker_child" --repo "$repo_slug" \
 		--json state,closedAt 2>/dev/null) || return 0
-	if printf '%s' "$child_json" | jq -e '.state == "OPEN"' >/dev/null 2>&1; then
+	if printf '%s' "$child_json" | jq -e --arg open_state "$_PTE_ISSUE_OPEN_STATE" '.state == $open_state' >/dev/null 2>&1; then
 		return 0
 	fi
 	printf '%s' "$child_json" | jq -e '.state == "CLOSED" and (.closedAt | type == "string")' >/dev/null 2>&1 || return 0
@@ -614,6 +1016,39 @@ _consolidation_dispatch_comment_owns_parent() {
 	return 1
 }
 
+#######################################
+# GH#36536: Post-lock re-check for an open consolidation-task child. The
+# search-based check in _consolidation_child_exists reads GitHub's eventually
+# consistent search index, so a child created seconds earlier by another runner
+# (which then released its lock) can be missed. This lists open
+# consolidation-task issues by label (not search) and matches either the
+# "Consolidation target: #N" body anchor or the "merge thread on #N" title.
+# The body marker is anchored to the generated first line so copied parent
+# text cannot masquerade as a child marker. Fails closed: an API error or
+# invalid count returns 2 (distinct from a confirmed empty list).
+# Args: $1=parent_num $2=repo_slug
+# Returns: 0 if an open child names the parent, 1 if none, 2 on read error.
+#######################################
+_PTE_CONSOLIDATION_TASK_LABEL="consolidation-task"
+_consolidation_open_child_listed() {
+	local parent_num="$1"
+	local repo_slug="$2"
+
+	[[ "$parent_num" =~ ^[0-9]+$ && -n "$repo_slug" ]] || return 1
+
+	# parent_num is validated numeric above, so inlining it in the filter is safe.
+	local jq_filter="" match_count="" list_exit=0
+	jq_filter="[.[]? | select(((.body // \"\") | test(\"^(## )?Consolidation target: #${parent_num}([^0-9]|\$)\")) or ((.title // \"\") | test(\"merge thread on #${parent_num}([^0-9]|\$)\")))] | length"
+	match_count=$(gh_issue_list --repo "$repo_slug" --state open \
+		--label "$_PTE_CONSOLIDATION_TASK_LABEL" \
+		--json number,title,body --limit 1000 \
+		--jq "$jq_filter" 2>/dev/null) || list_exit=$?
+	[[ "$list_exit" -eq 0 ]] || return 2
+	[[ "$match_count" =~ ^[0-9]+$ ]] || return 2
+	[[ "$match_count" -gt 0 ]] && return 0
+	return 1
+}
+
 _consolidation_child_exists() {
 	local parent_num="$1"
 	local repo_slug="$2"
@@ -624,7 +1059,7 @@ _consolidation_child_exists() {
 	# Fast path: any open child immediately owns the parent.
 	local open_count open_exit=0
 	open_count=$(gh_issue_list --repo "$repo_slug" --state open \
-		--label "consolidation-task" \
+		--label "$_PTE_CONSOLIDATION_TASK_LABEL" \
 		--search "in:body \"Consolidation target: #${parent_num}\"" \
 		--json number --jq 'length' --limit 5 2>/dev/null) || open_exit=$?
 	if [[ "$open_exit" -ne 0 ]]; then
@@ -663,7 +1098,7 @@ _consolidation_child_exists() {
 
 	local recent_closed_count recent_closed_exit=0
 	recent_closed_count=$(gh_issue_list --repo "$repo_slug" --state closed \
-		--label "consolidation-task" \
+		--label "$_PTE_CONSOLIDATION_TASK_LABEL" \
 		--search "in:body \"Consolidation target: #${parent_num}\" closed:>${cutoff_iso}" \
 		--json number --jq 'length' --limit 5 2>/dev/null) || recent_closed_exit=$?
 	[[ "$recent_closed_exit" -eq 0 ]] || return 0
@@ -711,13 +1146,17 @@ _consolidation_child_exists() {
 # Closing-keyword regex sourced from `_extract_linked_issue` in
 # pulse-merge.sh:1173 — matches GitHub's full close keyword list:
 # close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved
-# (case-insensitive). Bare `#NNN` references and `For #NNN` / `Ref #NNN`
-# references do NOT match — those are intentionally non-closing.
+# (case-insensitive). GH#33284: `For #NNN` / `Ref #NNN` also count here.
+# They are non-closing for GitHub, but briefs that keep an issue open
+# (held or blocked parents) direct workers to use them, so an open PR with
+# them is still in-flight work on the parent. Bare `#NNN` mentions do NOT
+# match. This helper only gates consolidation; closure semantics elsewhere
+# are unchanged.
 #
 # Args: $1=parent_num $2=repo_slug
-# Returns: 0 if an open PR with a closing keyword referencing the parent
-#          exists, 1 otherwise (including network/parse errors — fail open
-#          so a misbehaving search never blocks legitimate consolidation).
+# Returns: 0 if an open PR with a closing or For/Ref keyword referencing the
+#          parent exists, 1 otherwise (including network/parse errors — fail
+#          open so a misbehaving search never blocks legitimate consolidation).
 #######################################
 _consolidation_resolving_pr_exists() {
 	local parent_num="$1"
@@ -734,15 +1173,14 @@ _consolidation_resolving_pr_exists() {
 		--json number,body --limit 10 2>/dev/null) || prs_json="[]"
 	[[ -n "$prs_json" ]] || prs_json="[]"
 
-	# Filter for GitHub-native closing keyword + #N (case-insensitive).
-	# Word boundary on the trailing # is enforced via the look-ahead
-	# `[^0-9]` (or end of string) so #${parent_num} does not match
+	# Filter for a closing or For/Ref keyword + #N (case-insensitive).
+	# The trailing `\b` keeps #${parent_num} from matching
 	# #${parent_num}1 / #${parent_num}99 etc.
 	local match_count
 	match_count=$(printf '%s' "$prs_json" | jq --arg n "$parent_num" '
 		[.[] | select(
 			(.body // "")
-			| test("(?i)\\b(close[ds]?|fix(es|ed)?|resolve[ds]?)[ \\t]+#" + $n + "\\b")
+			| test("(?i)\\b(close[ds]?|fix(es|ed)?|resolve[ds]?|for|ref)[ \\t]+#" + $n + "\\b")
 		)] | length
 	' 2>/dev/null) || match_count=0
 	[[ "$match_count" =~ ^[0-9]+$ ]] || match_count=0
@@ -753,56 +1191,69 @@ _consolidation_resolving_pr_exists() {
 }
 
 #######################################
-# t1982: Fetch and filter substantive comments on an issue using the same
-# predicate as the substantive_count in _issue_needs_consolidation. Returns
-# a JSON array of {login, created_at, body} objects on stdout.
-#
-# Kept in its own helper so the dispatch path can reuse the filter without
-# re-implementing it, and so future filter tweaks live in one place.
+# Filter a fetched comments payload through the single consolidation
+# significance predicate. Length is measured without the standard aidevops
+# provenance footer so automation metadata cannot turn a short note into a
+# substantive scope change. Original bodies are retained in the output.
+# Args: $1=comments JSON (one array or paginated arrays)
+# Returns: JSON array of {id, url, login, created_at, body} objects.
+#######################################
+_consolidation_filter_substantive_comments() {
+	local comments_json="$1"
+	local min_chars="$ISSUE_CONSOLIDATION_COMMENT_MIN_CHARS"
+
+	printf '%s' "$comments_json" | jq -s --argjson min "$min_chars" '
+		add as $comments |
+		def significant_body:
+			(.body // "")
+			| split("\n<!-- aidevops:origin:")[0]
+			| split("\n<!-- aidevops:sig -->")[0];
+		(
+			"DISPATCH_CLAIM nonce="
+			+ "|^(<!-- ops:start[^>]*-->\\s*)?Dispatching worker"
+			+ "|^<!-- (aidevops-interactive-claim/v1|nmr-hold|aidevops-signed|ops:start|provenance:start)"
+			+ "|^<!-- WORKER_SUPERSEDED"
+			+ "|^<!-- stale-recovery-tick"
+			+ "|^<!-- cost-circuit-breaker:fired"
+			+ "|^<!-- triage-escalation"
+			+ "|^<!-- review-feedback-"
+			+ "|CLAIM_RELEASED reason="
+			+ "|^(Worker failed:|## Worker Watchdog Kill)"
+			+ "|^(\\*\\*)?Stale assignment recovered"
+			+ "|^## (Triage Review|Completion Summary|Large File Simplification Gate|Issue Consolidation Needed|Issue Consolidation Dispatched|Additional Review Feedback|Cascade Tier Escalation)"
+			+ "|^## Review: Recommendation:"
+			+ "|^This quality-debt issue was auto-generated by"
+			+ "|<!-- MERGE_SUMMARY -->"
+			+ "|^Closing:"
+			+ "|^Worker failed: orphan worktree"
+			+ "|sudo aidevops approve"
+			+ "|^_Automated by"
+			+ "|^<!-- aidevops:brief-(hold|scope-normalized)"
+			+ "|^Brief (repaired|scope normalized):"
+			+ "|^(#{1,6}[[:space:]]*)?Implementation checkpoint\\b"
+		) as $patterns |
+		[$comments[] | select(
+			(significant_body | length) >= $min
+			and (.user.type != "Bot")
+			and ((.body // "") | contains("<!-- aidevops:ops") | not)
+			and ((.body // "") | test($patterns) | not)
+		) | {id: .id, url: .html_url, login: .user.login, created_at: .created_at, body: .body}]
+	' 2>/dev/null || printf '[]'
+	return 0
+}
+
+#######################################
+# Fetch substantive comments for consolidation child composition.
+# Args: $1=issue_number $2=repo_slug
 #######################################
 _consolidation_substantive_comments() {
 	local issue_number="$1"
 	local repo_slug="$2"
-
 	local comments_json
 	comments_json=$(gh api "repos/${repo_slug}/issues/${issue_number}/comments" \
 		--paginate --jq '.' 2>/dev/null) || comments_json="[]"
-
-	local min_chars="$ISSUE_CONSOLIDATION_COMMENT_MIN_CHARS"
-
-	# t2144: Added ^<!-- WORKER_SUPERSEDED and ^<!-- stale-recovery-tick
-	# patterns here too — this helper is used by the dispatch path to compose
-	# the child issue body, so it must stay in lockstep with the predicate in
-	# _issue_needs_consolidation above. Divergence between the two filters
-	# would mean the child ISSUE shows WORKER_SUPERSEDED comments as
-	# "substantive" even though they can no longer trigger dispatch.
-	printf '%s' "$comments_json" | jq -s --argjson min "$min_chars" '
-		add as $comments |
-		[$comments[] | select(
-			(.body | length) >= $min
-			and (.user.type != "Bot")
-			and (.body | test("DISPATCH_CLAIM nonce=") | not)
-			and (.body | test("^(<!-- ops:start[^>]*-->\\s*)?Dispatching worker") | not)
-			and (.body | test("^<!-- (nmr-hold|aidevops-signed|ops:start|provenance:start)") | not)
-			and (.body | test("^<!-- WORKER_SUPERSEDED") | not)
-			and (.body | test("^<!-- stale-recovery-tick") | not)
-			and (.body | test("^<!-- cost-circuit-breaker:fired") | not)
-			and (.body | test("^<!-- triage-escalation") | not)
-			and (.body | test("^<!-- review-feedback-") | not)
-			and (.body | test("CLAIM_RELEASED reason=") | not)
-			and (.body | test("^(Worker failed:|## Worker Watchdog Kill)") | not)
-			and (.body | test("^(\\*\\*)?Stale assignment recovered") | not)
-			and (.body | test("^## (Triage Review|Completion Summary|Large File Simplification Gate|Issue Consolidation Needed|Issue Consolidation Dispatched|Additional Review Feedback|Cascade Tier Escalation)") | not)
-			and (.body | test("^## Review: Recommendation:") | not)
-			and (.body | test("^This quality-debt issue was auto-generated by") | not)
-			and (.body | test("<!-- MERGE_SUMMARY -->") | not)
-			and (.body | test("^Closing:") | not)
-			and (.body | test("^Worker failed: orphan worktree") | not)
-			and (.body | test("sudo aidevops approve") | not)
-			and (.body | test("^_Automated by") | not)
-		) | {login: .user.login, created_at: .created_at, body: .body}]
-	' 2>/dev/null || printf '[]'
-	return 0
+	_consolidation_filter_substantive_comments "$comments_json"
+	return $?
 }
 
 #######################################

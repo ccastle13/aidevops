@@ -20,6 +20,8 @@
 #            * triple-tier reduction picks the highest-rank tier
 #            * single-label issues are a no-op
 #            * triage-missing issues are counted (not auto-fixed)
+#            * finite publication-backed tasks cannot remain persistent
+#            * genuine persistent tracker identities are preserved
 #            * counter file is written after the pass
 #
 # Failure history: PR #18519 (t2033) and PR #18441 (t1997) fixed the
@@ -131,39 +133,86 @@ else
 		"(got: ${ISSUE_TIER_LABEL_RANK[*]:-})"
 fi
 
+# GH#32654: human-action labels share one bold colour that no other group uses.
 attention_labels=(
-	"SYSTEM_LABELS:needs-maintainer-review"
-	"SYSTEM_LABELS:security"
-	"SYSTEM_LABELS:security-adjacent"
-	"SYSTEM_LABELS:critical"
-	"PRIORITY_LABELS:priority:critical"
-	"STATUS_LABELS:status:blocked"
 	"SYSTEM_LABELS:hold-for-review"
 	"SYSTEM_LABELS:security-review"
-	"SYSTEM_LABELS:needs-review"
-	"SYSTEM_LABELS:needs-review-fixes"
 )
+for canonical_def in "${ALL_CANONICAL_LABELS[@]}"; do
+	IFS='|' read -r canonical_name _ _ <<<"$canonical_def"
+	if [[ "$canonical_name" == needs-* || "$canonical_name" == status:needs-* ]]; then
+		attention_labels+=("ALL_CANONICAL_LABELS:$canonical_name")
+	fi
+done
 
 for attention_spec in "${attention_labels[@]}"; do
 	attention_array="${attention_spec%%:*}"
 	attention_name="${attention_spec#*:}"
 	attention_color=$(find_label_color "$attention_array" "$attention_name" 2>/dev/null || true)
-	if [[ "$attention_color" == "D73A4A" ]]; then
-		print_result "canonical human-attention label $attention_name is red" 0
+	if [[ "$attention_color" == "$LABEL_COLOR_ATTENTION" ]]; then
+		print_result "canonical human-action label $attention_name uses attention colour" 0
 	else
-		print_result "canonical human-attention label $attention_name is red" 1 "(got: '${attention_color:-missing}')"
+		print_result "canonical human-action label $attention_name uses attention colour" 1 "(got: '${attention_color:-missing}')"
 	fi
 done
 
-origin_labels=(origin:interactive origin:worker origin:worker-takeover)
-for origin_name in "${origin_labels[@]}"; do
-	origin_color=$(find_label_color "ORIGIN_LABELS" "$origin_name" 2>/dev/null || true)
-	if [[ "$origin_color" == "1D76DB" ]]; then
-		print_result "canonical origin label $origin_name is blue" 0
+attention_misuse=""
+for canonical_def in "${ALL_CANONICAL_LABELS[@]}"; do
+	IFS='|' read -r canonical_name canonical_color _ <<<"$canonical_def"
+	[[ "$canonical_color" == "$LABEL_COLOR_ATTENTION" ]] || continue
+	case "$canonical_name" in
+	needs-* | status:needs-* | hold-for-review | security-review) ;;
+	*) attention_misuse="${attention_misuse} ${canonical_name}" ;;
+	esac
+done
+if [[ -z "$attention_misuse" ]]; then
+	print_result "attention colour is reserved for human-action labels" 0
+else
+	print_result "attention colour is reserved for human-action labels" 1 "(misused by:${attention_misuse})"
+fi
+
+risk_labels=(
+	"SYSTEM_LABELS:security|D73A4A"
+	"SYSTEM_LABELS:security-adjacent|D73A4A"
+	"SYSTEM_LABELS:critical|D73A4A"
+	"PRIORITY_LABELS:priority:critical|B60205"
+	"STATUS_LABELS:status:blocked|D93F0B"
+)
+for risk_spec in "${risk_labels[@]}"; do
+	risk_expected="${risk_spec##*|}"
+	risk_spec="${risk_spec%|*}"
+	risk_array="${risk_spec%%:*}"
+	risk_name="${risk_spec#*:}"
+	risk_color=$(find_label_color "$risk_array" "$risk_name" 2>/dev/null || true)
+	if [[ "$risk_color" == "$risk_expected" ]]; then
+		print_result "canonical label $risk_name has expected colour" 0
 	else
-		print_result "canonical origin label $origin_name is blue" 1 "(got: '${origin_color:-missing}')"
+		print_result "canonical label $risk_name has expected colour" 1 "(got: '${risk_color:-missing}')"
 	fi
 done
+
+# Origin labels are pale metadata and must match managed-label-provisioning-lib.sh.
+# shellcheck source=/dev/null
+source "${TEST_SCRIPTS_DIR}/managed-label-provisioning-lib.sh"
+origin_idx=0
+while [[ $origin_idx -lt ${#_MANAGED_ORIGIN_LABEL_SPECS[@]} ]]; do
+	origin_name="${_MANAGED_ORIGIN_LABEL_SPECS[$origin_idx]}"
+	origin_expected="${_MANAGED_ORIGIN_LABEL_SPECS[$((origin_idx + 2))]}"
+	origin_color=$(find_label_color "ORIGIN_LABELS" "$origin_name" 2>/dev/null || true)
+	if [[ "$origin_color" == "$origin_expected" ]]; then
+		print_result "canonical origin label $origin_name matches provisioning colour" 0
+	else
+		print_result "canonical origin label $origin_name matches provisioning colour" 1 "(got: '${origin_color:-missing}', want '$origin_expected')"
+	fi
+	origin_idx=$((origin_idx + 3))
+done
+
+nmr_provision_color="${_MANAGED_APPROVAL_HOLD_LABEL_SPECS[2]:-}"
+if [[ "$nmr_provision_color" == "$LABEL_COLOR_ATTENTION" ]]; then
+	print_result "provisioned needs-maintainer-review uses attention colour" 0
+else
+	print_result "provisioned needs-maintainer-review uses attention colour" 1 "(got: '${nmr_provision_color:-missing}')"
+fi
 
 review_labels=(
 	"review:approve|0E8A16"
@@ -214,12 +263,22 @@ case "$1" in
 			printf '%s\t%s\t%s\n' \
 				"status:available" "0e8a16" "Task is available for claiming" \
 				"status:queued" "fbca04" "Worker dispatched, not yet started" \
-				"status:claimed" "f9d0c4" "Interactive session claimed this task" \
+				"status:claimed" "f9d0c4" "Interactive implementation is actively claimed" \
 				"status:in-progress" "1d76db" "Worker actively running" \
-				"status:in-review" "5319e7" "PR open, awaiting review/merge" \
+				"status:in-review" "5319e7" "Non-draft PR ready for review/merge" \
 				"status:done" "6f42c1" "Task is complete" \
-				"status:blocked" "d93f0b" "Waiting on blocker task"
+				"status:blocked" "d93f0b" "Partial work blocked; inspect reason and next action"
 			exit 0
+		fi
+		# GH#33896: status transitions require an exact GraphQL label
+		# snapshot. Answer it from the REST fixture above (same contract as
+		# test-interactive-session-claim.sh) instead of returning no data.
+		if [[ "$2" == "graphql" && "$*" == *'label0: label(name:'* ]]; then
+			"$0" api '/repos/fixture/labels?per_page=100' | jq -Rn '
+				[inputs | split("\t") | {name: .[0], color: .[1], description: .[2]}]
+				| to_entries | map({key: ("label" + (.key | tostring)), value: .value})
+				| from_entries | {data: {repository: .}}'
+			exit $?
 		fi
 		# Force the compatibility path; REST-first behavior has a dedicated
 		# production-wrapper test in test-status-label-state-machine.sh.
@@ -321,6 +380,9 @@ export PULSE_QUEUED_SCAN_LIMIT=100
 #   #13: auto-dispatch missing tier → conservative tier:standard backfill
 #   #14: auto-dispatch + no-auto-dispatch missing tier → backfill without
 #         clearing the explicit hold
+#   #15: finite publication-backed task + persistent → remove persistent only
+#   #16: health dashboard with task-like residue → preserve persistent identity
+#   #17: persistent + dispatch labels without publication hold → preserve
 OLD_ISO=$(date -u -d '-1 hour' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null ||
 	TZ=UTC date -v-1H '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "2026-04-13T00:00:00Z")
 NEW_ISO=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
@@ -341,7 +403,10 @@ ISSUES_JSON=$(
 	{"number":11,"labels":null,"createdAt":"${OLD_ISO}"},
 	{"number":12,"createdAt":"${OLD_ISO}"},
 	{"number":13,"labels":[{"name":"auto-dispatch"},{"name":"needs-maintainer-review"}],"createdAt":"${OLD_ISO}"},
-	{"number":14,"labels":[{"name":"auto-dispatch"},{"name":"no-auto-dispatch"}],"createdAt":"${OLD_ISO}"}
+	{"number":14,"labels":[{"name":"auto-dispatch"},{"name":"no-auto-dispatch"}],"createdAt":"${OLD_ISO}"},
+	{"number":15,"labels":[{"name":"persistent"},{"name":"publication:pending"},{"name":"auto-dispatch"},{"name":"status:claimed"},{"name":"tier:standard"}],"createdAt":"${OLD_ISO}"},
+	{"number":16,"labels":[{"name":"persistent"},{"name":"source:health-dashboard"},{"name":"publication:pending"},{"name":"auto-dispatch"},{"name":"status:available"},{"name":"tier:standard"}],"createdAt":"${OLD_ISO}"},
+	{"number":17,"labels":[{"name":"persistent"},{"name":"auto-dispatch"},{"name":"status:available"},{"name":"tier:standard"}],"createdAt":"${OLD_ISO}"}
 ]
 JSON
 )
@@ -363,12 +428,20 @@ case "$1" in
 			printf '%s\t%s\t%s\n' \
 				"status:available" "0e8a16" "Task is available for claiming" \
 				"status:queued" "fbca04" "Worker dispatched, not yet started" \
-				"status:claimed" "f9d0c4" "Interactive session claimed this task" \
+				"status:claimed" "f9d0c4" "Interactive implementation is actively claimed" \
 				"status:in-progress" "1d76db" "Worker actively running" \
-				"status:in-review" "5319e7" "PR open, awaiting review/merge" \
+				"status:in-review" "5319e7" "Non-draft PR ready for review/merge" \
 				"status:done" "6f42c1" "Task is complete" \
-				"status:blocked" "d93f0b" "Waiting on blocker task"
+				"status:blocked" "d93f0b" "Partial work blocked; inspect reason and next action"
 			exit 0
+		fi
+		# GH#33896: exact GraphQL label snapshot from the REST fixture above.
+		if [[ "$2" == "graphql" && "$*" == *'label0: label(name:'* ]]; then
+			"$0" api '/repos/fixture/labels?per_page=100' | jq -Rn '
+				[inputs | split("\t") | {name: .[0], color: .[1], description: .[2]}]
+				| to_entries | map({key: ("label" + (.key | tostring)), value: .value})
+				| from_entries | {data: {repository: .}}'
+			exit $?
 		fi
 		[[ "$2" == /repos/*/issues/[0-9]* ]] && exit 1
 		;;
@@ -498,6 +571,21 @@ else
 	print_result "reconciler backfills a missing tier without clearing explicit hold" 1 "(line: '$edit14')"
 fi
 
+edit15=$(grep "^issue edit 15 " "$GH_CALLS" | head -1)
+if [[ "$edit15" == *"--remove-label persistent"* && "$edit15" != *"--remove-label publication:pending"* ]]; then
+	print_result "reconciler removes persistent from a finite publication-backed task" 0
+else
+	print_result "reconciler removes persistent from a finite publication-backed task" 1 "(line: '$edit15')"
+fi
+
+n16=$(count_edits_for 16)
+n17=$(count_edits_for 17)
+if [[ "$n16" -eq 0 && "$n17" -eq 0 ]]; then
+	print_result "reconciler preserves explicit trackers and ambiguous persistent issues" 0
+else
+	print_result "reconciler preserves explicit trackers and ambiguous persistent issues" 1 "(edits: #16=$n16 #17=$n17)"
+fi
+
 # Counter file must be written with exact numbers
 COUNTER_FILE="${HOME}/.aidevops/cache/pulse-label-invariants.$(hostname -s 2>/dev/null || echo unknown).json"
 if [[ -f "$COUNTER_FILE" ]]; then
@@ -509,6 +597,7 @@ fi
 if [[ -f "$COUNTER_FILE" ]]; then
 	status_fixed=$(jq -r '.status_fixed' "$COUNTER_FILE" 2>/dev/null || echo 0)
 	tier_fixed=$(jq -r '.tier_fixed' "$COUNTER_FILE" 2>/dev/null || echo 0)
+	persistent_fixed=$(jq -r '.persistent_fixed' "$COUNTER_FILE" 2>/dev/null || echo 0)
 	triage_missing=$(jq -r '.triage_missing' "$COUNTER_FILE" 2>/dev/null || echo 0)
 
 	# status_fixed: #1, #2, #4 → 3
@@ -525,11 +614,38 @@ if [[ -f "$COUNTER_FILE" ]]; then
 		print_result "counter tier_fixed=3 (issues #3, #13, #14)" 1 "(got: $tier_fixed)"
 	fi
 
+	if [[ "$persistent_fixed" -eq 1 ]]; then
+		print_result "counter persistent_fixed=1 (only finite contradictory #15)" 0
+	else
+		print_result "counter persistent_fixed=1 (only finite contradictory #15)" 1 "(got: $persistent_fixed)"
+	fi
+
 	# triage_missing: #6 only (#7 is recent, #8 has a tier, #9/#10 are non-task labels)
 	if [[ "$triage_missing" -eq 1 ]]; then
 		print_result "counter triage_missing=1 (only #6 matches all criteria; non-task labels ignored)" 0
 	else
 		print_result "counter triage_missing=1 (only #6 matches all criteria; non-task labels ignored)" 1 "(got: $triage_missing)"
+	fi
+fi
+
+# =============================================================================
+# Part 4b — terminal PR labels are transitioned on every close event (GH#32627)
+# =============================================================================
+WORKFLOW_FILE="$(cd "${TEST_SCRIPTS_DIR}/../.." && pwd)/.github/workflows/issue-sync-reusable.yml"
+if [[ -f "$WORKFLOW_FILE" ]]; then
+	pr_terminal_block=$(awk '
+		/^  sync-pr-terminal-labels:/ { in_block=1 }
+		in_block { print }
+	' "$WORKFLOW_FILE")
+	if [[ "$pr_terminal_block" == *"github.event.action == 'closed'"* &&
+		"$pr_terminal_block" == *'--add-label "status:done"'* &&
+		"$pr_terminal_block" == *'status:*'* &&
+		"$pr_terminal_block" == *'auto-dispatch'* &&
+		"$pr_terminal_block" == *'needs-maintainer-permissions'* &&
+		"$pr_terminal_block" == *'if gh '* ]]; then
+		print_result "workflow transitions terminal PR labels on close without failing hygiene" 0
+	else
+		print_result "workflow transitions terminal PR labels on close without failing hygiene" 1
 	fi
 fi
 

@@ -65,7 +65,7 @@ Stop for explicit confirmation before:
 - final submit on legal, compliance, financial, government, HR, or client-impacting forms;
 - payments, purchases, subscriptions, checkouts, or saved-payment changes;
 - destructive/admin changes, deletion, permission changes, or data mutation beyond stated scope;
-- anti-detect, proxy, VPN, geo-routing, CAPTCHA solver, or profile-rotation use for a target;
+- anti-detect, proxy, VPN, geo-routing, CAPTCHA solver, or profile-rotation use for a target (exception: paced public search-result collection with a registered egress profile is pre-approved; see `aidevops/reach-capture.md` "Public Search-result Collection");
 - extracting personal/private data beyond the stated scope.
 
 Use secure references for credentials (`aidevops secret`, gopass, or documented credential refs). Never write credential values, cookies, bearer tokens, private client names, or private local paths into repo artifacts or chat.
@@ -79,10 +79,10 @@ Use the cheapest viable level first, escalating only when evidence shows the che
 | Fetch/API/static parse | Public/static pages, obvious JSON, no login | `webfetch`, shell fetches only for trusted URLs, parsers |
 | Authenticated API discovery | Dashboard data, hidden XHR, export endpoints | `curl-copy.md`, `sweet-cookie.md`, `chrome-devtools.md` |
 | Crawler/extractor | Many pages, sitemap/docs, structured content | `crawl4ai.md`, `watercrawl.md`, `seo/site-crawler.md` |
-| Deterministic browser | Known flow, forms, downloads, repeatable UI | `playwright.md`, `playwright-cli.md`, `agent-browser.md` |
+| Deterministic browser | Known flow, forms, downloads, repeatable UI; standalone Brave preferred | `playwright.md`, `playwright-cli.md`, `agent-browser.md` |
 | Persistent profile | Recurring logged-in workflows | `dev-browser.md`, `browser-profiles.md` |
-| Existing browser | User already has a live session and approves inspection | `chromium-debug-use.md`, `playwriter.md` |
-| High-agency discovery | Dynamic/fuzzy/visual flows where selectors fail | `stagehand.md`, `browser-use.md` (CLI 3.0), `skyvern.md` |
+| Interactive existing browser | User is available, has a live session, and approves selected tabs or inspection | `playwright.md` extension mode, `chromium-debug-use.md` |
+| High-agency discovery | Dynamic/fuzzy/visual flows where selectors fail | `browser-use.md` (CLI 3.0), `skyvern.md` |
 | Authorized stealth/profile stack | Legitimate profile/proxy/geo isolation need | `anti-detect-browser.md`, `proxy-integration.md` |
 
 Prefer ARIA snapshots and DOM/text extraction over screenshots. Use screenshots for visual evidence only and obey screenshot size limits.
@@ -146,7 +146,7 @@ Graduate the lowest-agency reliable artifact:
 | Static or crawlable content | Crawl4AI/WaterCrawl/site-crawler schema |
 | Stable UI selectors | Playwright/agent-browser script |
 | Recurring logged-in workflow | Private custom agent + profile policy |
-| Fuzzy UI only | Stagehand/browser-use CLI 3.0/Skyvern-backed private agent with fallback notes |
+| Fuzzy UI only | browser-use CLI 3.0/Skyvern-backed private agent with fallback notes |
 | Framework-generalizable pattern | Sanitized `todo/auto-browse/...` plan or task brief |
 
 Promoted private workflow agents should be written for user review before hot-loading:

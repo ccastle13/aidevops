@@ -26,7 +26,7 @@ Produce short, punchy onboarding videos that show one feature working. The outpu
 - **Output**: Remotion project rendering MP4, plus optional portrait, landscape, and social variants.
 - **Default format**: 1080×1920 portrait, 30fps, 3–8 seconds per beat, rarely over 30 seconds total.
 - **Core style**: crop, mask, or extract the UI component that proves the feature works; avoid full-screen tours unless the user explicitly needs whole-screen context.
-- **Related agents**: `tools/video/remotion.md`, `tools/browser/browser-automation.md`, `tools/design/design-md.md`, `tools/vision/image-generation.md`, `tools/vision/create-screenshots.md`.
+- **Related agents**: `tools/video/remotion/remotion.md`, `tools/browser/browser-automation.md`, `tools/design/design-md.md`, `tools/vision/image-generation.md`, `tools/vision/create-screenshots.md`.
 
 ## Intake
 
@@ -45,7 +45,7 @@ Ask a focused question when stills, browser access, feature intent, or branding 
 
 1. **Read `DESIGN.md`** in the project root when present. Extract colours, typography, radius, elevation, spacing, product tone, and agent prompt guidance.
 2. If `DESIGN.md` is absent, use `tools/design/design-md.md` to create or derive a lightweight design brief before composing visuals.
-3. Use browser automation only from authorised user-provided app URLs or local dev servers. Prefer `tools/browser/browser-automation.md` to choose Playwright, dev-browser, Chrome DevTools, or Stagehand.
+3. Use browser automation only from authorised user-provided app URLs or local dev servers. Prefer `tools/browser/browser-automation.md` to choose Playwright, dev-browser, or Chrome DevTools.
 4. Capture assets at render-friendly dimensions. Prefer UI slices, DOM elements, and state screenshots over full-page images. Avoid `fullPage: true` unless explicitly needed for the deliverable.
 5. Store source stills under `public/<flow-or-screen>/<state>.png`. Treat `<flow-or-screen>` and `<state>` as user-provided path components: sanitize directory and file names, then validate that the resolved real path stays inside `public/` before writing. This prevents path traversal vulnerabilities. Document the selector, viewport, state setup, and capture command in the project README or notes.
 
@@ -82,7 +82,7 @@ Rules:
 
 ## Remotion Build Rules
 
-Load `tools/video/remotion.md` before authoring or modifying the composition. Apply these constraints:
+Load `tools/video/remotion/remotion.md` before authoring or modifying the composition. Apply these constraints:
 
 - Use `spring()`, `interpolate()`, `useCurrentFrame()`, and `<Sequence>`/`<Series>`; never CSS transitions, timers, or React state for animation values.
 - One `<Composition>` per onboarding flow; one sequence per beat.

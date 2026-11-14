@@ -73,6 +73,190 @@ parsed=$(_dep_graph_process_issue_json "$issue" "$acc")
 assert_eq "self task reference ignored" '[]' "$(printf '%s' "$parsed" | jq -c '.blocked_by_map["20"].task_ids')"
 assert_eq "self issue reference ignored" '["10"]' "$(printf '%s' "$parsed" | jq -c '.blocked_by_map["20"].issue_nums')"
 
+# GH#33414: exercise the production cache reducer, not only the shell parser.
+_test_cache_blocker_nums() {
+	local body="$1"
+	jq -n --arg body "$body" '[{number:30,title:"t30: child",state:"OPEN",body:$body,labels:[]}]' |
+		jq -f "$DEP_GRAPH_REDUCE_FILTER" | jq -c '.blocked_by["30"].issue_nums // []'
+	return 0
+}
+
+assert_eq "cache ignores prose blocked-by reference" '[]' \
+	"$(_test_cache_blocker_nums '- **Blocked by #10:** open a Resolves #20 data PR.')"
+assert_eq "cache preserves bold structured field" '["10"]' \
+	"$(_test_cache_blocker_nums '**Blocked by:** #10')"
+assert_eq "cache preserves bare list field and case" '["10"]' \
+	"$(_test_cache_blocker_nums ' + BLOCKED-BY: #10')"
+assert_eq "cache ignores inline and quoted fields" '[]' \
+	"$(_test_cache_blocker_nums $'Prose blocked-by: #10\n> **Blocked by:** #20')"
+assert_eq "cache strips comments and both fence types" '["10"]' \
+	"$(_test_cache_blocker_nums $'```md\nblocked-by: #20\n```\n~~~\nblocked-by: #21\n~~~\n<!--\nblocked-by: #22\n-->\n<!-- hidden -->**Blocked by:** #10')"
+assert_eq "cache requires matching fence character and length" '["10"]' \
+	"$(_test_cache_blocker_nums $'````md\n```\nblocked-by: #20\n~~~~\nblocked-by: #21\n````\nblocked-by: #10')"
+assert_eq "cache drops unterminated comments" '["10"]' \
+	"$(_test_cache_blocker_nums $'blocked-by: #10\n<!--\nblocked-by: #20')"
+assert_eq "cache drops unterminated fences" '["10"]' \
+	"$(_test_cache_blocker_nums $'blocked-by: #10\n~~~\nblocked-by: #20')"
+assert_eq "cache accepts CRLF fields" '["10"]' \
+	"$(_test_cache_blocker_nums $'**Blocked by:** #10\r\n')"
+
+consolidation_graph=$(jq -n '[
+	{number:30,title:"consolidation-task: merge thread on #20 into single spec",state:"OPEN",
+	 body:"**Blocked by:** #20, t20, #10, t10",labels:[{name:"consolidation-task"},{name:"blocked-by:#20"},{name:"blocked-by:t20"}]},
+	{number:31,title:"consolidation-task: merge thread on #20 into single spec",state:"OPEN",
+	 body:"blocked-by: #20, t20",labels:[{name:"consolidation-task"}]},
+	{number:32,title:"ordinary issue",state:"OPEN",body:"blocked-by: #20, t20",labels:[]},
+	{number:20,title:"t20: parent",state:"OPEN",body:"",labels:[]},
+	{number:10,title:"t10: predecessor",state:"OPEN",body:"",labels:[]}
+]' | jq -f "$DEP_GRAPH_REDUCE_FILTER")
+assert_eq "consolidation cache excludes parent number including labels" '["10"]' \
+	"$(printf '%s' "$consolidation_graph" | jq -c '.blocked_by["30"].issue_nums')"
+assert_eq "consolidation cache excludes parent task aliases including labels" '["t10"]' \
+	"$(printf '%s' "$consolidation_graph" | jq -c '.blocked_by["30"].task_ids')"
+assert_eq "parent-only consolidation has no blocker entry" 'false' \
+	"$(printf '%s' "$consolidation_graph" | jq -c '.blocked_by | has("31")')"
+assert_eq "ordinary child still depends on parent" '["20"]' \
+	"$(printf '%s' "$consolidation_graph" | jq -c '.blocked_by["32"].issue_nums')"
+
+# GH#34783: failed rebuilds must not refresh the age of preserved repo data.
+_test_preserved_repo_freshness() (
+	local initial_fail="$fail"
+	export HOME="${TMP_ROOT}/cache-home"
+	mkdir -p "${HOME}/.config/aidevops"
+	printf '%s\n' '{"initialized_repos":[{"slug":"owner/stale","pulse":true},{"slug":"owner/healthy","pulse":true},{"slug":"owner/legacy","pulse":true}]}' >"${HOME}/.config/aidevops/repos.json"
+	local DEP_GRAPH_CACHE_FILE="${TMP_ROOT}/dep-cache.json"
+	local DEP_GRAPH_CACHE_TTL_SECS=100
+	local PULSE_DEP_GRAPH_FORCE_REBUILD=1
+	local old_epoch=""
+	old_epoch=$(($(date +%s) - 1000))
+	jq -n --argjson old "$old_epoch" \
+		'{repos:{"owner/stale":{built_at:$old,open_issues:[2],blocked_by:{}},"owner/legacy":{open_issues:[2],blocked_by:{}}}}' >"$DEP_GRAPH_CACHE_FILE"
+	gh_issue_list() {
+		local args="$*"
+		[[ "$args" == *"owner/healthy"* ]] || return 1
+		printf '%s\n' '[]'
+		return 0
+	}
+	build_dependency_graph_cache
+	assert_eq "failed repo retains successful build timestamp" "$old_epoch" \
+		"$(jq -r '.repos["owner/stale"].built_at' "$DEP_GRAPH_CACHE_FILE")"
+	assert_eq "fresh file does not revive stale repo" false \
+		"$(_blocked_by_load_cache owner/stale | jq -r '.use_cache')"
+	assert_eq "successful repo in mixed rebuild remains usable" true \
+		"$(_blocked_by_load_cache owner/healthy | jq -r '.use_cache')"
+	assert_eq "preserved legacy repo has unknown age" 0 \
+		"$(jq -r '.repos["owner/legacy"].built_at' "$DEP_GRAPH_CACHE_FILE")"
+	assert_eq "preserved legacy repo falls back to live lookup" false \
+		"$(_blocked_by_load_cache owner/legacy | jq -r '.use_cache')"
+	build_dependency_graph_cache
+	assert_eq "repeated failures never reset repo age" "$old_epoch" \
+		"$(jq -r '.repos["owner/stale"].built_at' "$DEP_GRAPH_CACHE_FILE")"
+	local refreshed=""
+	_refresh_graph_repo() {
+		local slug="$1"
+		refreshed="${refreshed}${slug} "
+		return 0
+	}
+	refresh_blocked_status_from_graph
+	assert_eq "normalization skips expired preserved repos" 'owner/healthy ' "$refreshed"
+	printf '%s\n' '{"repos":{"owner/legacy":{"blocked_by":{}}}}' >"$DEP_GRAPH_CACHE_FILE"
+	refreshed=""
+	refresh_blocked_status_from_graph
+	assert_eq "fresh legacy cache remains eligible for normalization" 'owner/legacy ' "$refreshed"
+	touch -t 200001010000 "$DEP_GRAPH_CACHE_FILE"
+	refreshed=""
+	refresh_blocked_status_from_graph
+	assert_eq "expired legacy cache cannot normalize status" '' "$refreshed"
+	# Compiler diagnostics must be observable without polluting graph stdout.
+	local DEP_GRAPH_REDUCE_FILTER="${TMP_ROOT}/invalid-filter.jq"
+	printf '%s\n' 'reduce (' >"$DEP_GRAPH_REDUCE_FILTER"
+	if _dep_graph_build_repo_data owner/healthy >/dev/null; then
+		assert_eq "invalid reducer fails repo build" failure success
+	fi
+	assert_true "reducer compiler reason is logged" grep -q 'jq: error:' "$LOGFILE"
+	assert_true "reducer failure identifies repo" grep -q 'reducer failed for owner/healthy' "$LOGFILE"
+	[[ "$fail" -eq "$initial_fail" ]] || return 1
+	return 0
+)
+assert_true "per-repo freshness and reducer diagnostics" _test_preserved_repo_freshness
+
+# GH#37938: drive the production builder through deadline yield and resume.
+_test_checkpoint_resume() (
+	local initial_fail="$fail"
+	export HOME="${TMP_ROOT}/resume-home"
+	mkdir -p "${HOME}/.config/aidevops"
+	local DEP_GRAPH_CACHE_FILE="${TMP_ROOT}/resume-cache.json"
+	local DEP_GRAPH_CACHE_TTL_SECS=100
+	local PULSE_DEP_GRAPH_FORCE_REBUILD=0 PULSE_STAGE_DEADLINE_EPOCH=1002
+	local clock_file="${TMP_ROOT}/clock" reads="${TMP_ROOT}/reads" rc=0
+	printf '1000\n' >"$clock_file"
+	: >"$reads"
+	printf '%s\n' '{"initialized_repos":[{"slug":"owner/a","pulse":true},{"slug":"owner/b","pulse":true},{"slug":"owner/c","pulse":true}]}' >"${HOME}/.config/aidevops/repos.json"
+	date() {
+		local arg="${1:-}"
+		if [[ "$arg" == +%s ]]; then
+			command cat "$clock_file"
+		else
+			command date "$@"
+		fi
+		return 0
+	}
+	_dep_graph_build_repo_data() {
+		local slug="$1" now=""
+		printf '%s\n' "$slug" >>"$reads"
+		now=$(date +%s)
+		printf '%s\n' "$((now + 1))" >"$clock_file"
+		printf '%s\n' '{"open_issues":[],"blocked_by":{}}'
+		return 0
+	}
+	build_dependency_graph_cache || rc=$?
+	assert_eq "deadline yields resumably" 124 "$rc"
+	assert_eq "checkpoint is incomplete after two repositories" false "$(jq -r '.rebuild_complete' "$DEP_GRAPH_CACHE_FILE")"
+	assert_eq "completed repository data survives yield" 2 "$(jq '.repos | length' "$DEP_GRAPH_CACHE_FILE")"
+	# Expire per-repo TTL, remove a completed repo, disable another, add unread d.
+	printf '100000\n' >"$clock_file"
+	printf '%s\n' '{"initialized_repos":[{"slug":"owner/b","pulse":true},{"slug":"owner/c","pulse":false},{"slug":"owner/d","pulse":true}]}' >"${HOME}/.config/aidevops/repos.json"
+	PULSE_STAGE_DEADLINE_EPOCH=0
+	build_dependency_graph_cache || assert_eq "resume succeeds" 0 "$?"
+	assert_eq "resume skips completed reads even after TTL expires" 'owner/a owner/b owner/d ' "$(tr '\n' ' ' <"$reads")"
+	assert_eq "resume drops removed and disabled repositories" '["owner/b","owner/d"]' "$(jq -c '.repos | keys' "$DEP_GRAPH_CACHE_FILE")"
+	assert_eq "resume completes generation" true "$(jq -r '.rebuild_complete' "$DEP_GRAPH_CACHE_FILE")"
+	assert_eq "checkpoint preserves own repository timestamp" 1002 "$(jq '.repos["owner/b"].built_at' "$DEP_GRAPH_CACHE_FILE")"
+	# Missing field on a fresh legacy cache still short-circuits.
+	printf '%s\n' '{"repos":{}}' >"$DEP_GRAPH_CACHE_FILE"
+	build_dependency_graph_cache
+	assert_eq "legacy cache within TTL is unchanged" '{"repos":{}}' "$(<"$DEP_GRAPH_CACHE_FILE")"
+	# Explicit rebuilds must not mistake same-second prior data for this pass.
+	PULSE_DEP_GRAPH_FORCE_REBUILD=1
+	build_dependency_graph_cache
+	build_dependency_graph_cache
+	assert_eq "force rebuild rereads complete caches" 7 "$(wc -l <"$reads" | tr -d ' ')"
+	local ordered=""
+	ordered=$(_dep_graph_checkpoint_order $'{"slug":"new"}\n{"slug":"old"}\n{"slug":"older"}' '{"rebuild_pending":["new","old","older"],"repos":{"old":{"built_at":20},"older":{"built_at":10}}}')
+	assert_eq "oldest snapshots are processed first" 'new older old ' "$(printf '%s\n' "$ordered" | jq -r '.slug' | tr '\n' ' ')"
+	local before=""
+	before=$(<"$DEP_GRAPH_CACHE_FILE")
+	if _dep_graph_checkpoint_write "$DEP_GRAPH_CACHE_FILE" invalid false 2>/dev/null; then
+		assert_eq "invalid write fails" failure success
+	fi
+	assert_eq "failed atomic write preserves cache" "$before" "$(<"$DEP_GRAPH_CACHE_FILE")"
+	# Fail precisely the graph merge, after seed and timestamp jq calls succeed.
+	jq() {
+		local args="$*"
+		# shellcheck disable=SC2016 # Match literal jq variables, not shell variables.
+		[[ "$args" != *'.repos[$slug] = $rd'* ]] || return 1
+		command jq "$@" || return 1
+		return 0
+	}
+	rc=0
+	build_dependency_graph_cache 2>/dev/null || rc=$?
+	assert_eq "jq failure surfaces as failure" 1 "$rc"
+	assert_eq "jq failure cannot mark checkpoint complete" false "$(jq -r '.rebuild_complete' "$DEP_GRAPH_CACHE_FILE")"
+	[[ "$fail" -eq "$initial_fail" ]] || return 1
+	return 0
+)
+assert_true "checkpoint deadline resume and atomic failure safety" _test_checkpoint_resume
+
 entry='{"task_ids":["t10"],"issue_nums":["11"]}'
 assert_true "closed roadmap predecessors resolve" \
 	_refresh_all_blockers_resolved "$entry" '{"t10":10}' '[10,11]' '[10,11,20]'
@@ -96,6 +280,11 @@ assert_eq "active lifecycle wins blocked available conflict" "in-review" "$(_pic
 
 status_write=""
 current_status="status:available"
+# Label-write tests below assume a live unresolved native dependency. Exercise
+# the real native verifier separately in test-pulse-ready-block-audit.sh.
+_blocked_by_check_native_relationships() {
+	return 0
+}
 gh() {
 	local command="$1"
 	local target="${2:-}"
@@ -213,6 +402,74 @@ dependency_status_writes=""
 assert_true "active dependency lifecycle is left unchanged" \
 	_ensure_dependency_status_blocked "20" "owner/repo" "native_relationship_linked"
 assert_eq "active dependency lifecycle receives no status write" "" "$dependency_status_writes"
+
+# GH#33957: enrich must not revert a verified unblock. A declared edge whose
+# complete native blocker set is closed leaves the issue available; open,
+# missing, truncated or unreadable native state still blocks.
+native_blockers_json=""
+native_read_rc=0
+gh() {
+	local command="$1"
+	local target="${2:-}"
+	if [[ "$command $target" == "api graphql" ]]; then
+		[[ "$native_read_rc" -eq 0 ]] || return "$native_read_rc"
+		printf '%s\n' "$native_blockers_json"
+	elif [[ "$command $target" == "issue view" ]]; then
+		printf '%s\n' "$dependency_status"
+	elif [[ "$command $target" == "issue edit" ]]; then
+		dependency_status_writes="${dependency_status_writes}$(_test_render_args "$@")"$'\n'
+		dependency_status="status:blocked,auto-dispatch"
+	fi
+	return 0
+}
+export -f gh
+_native_blockers_fixture() {
+	local nodes="$1" has_next="${2:-false}"
+	printf '{"data":{"repository":{"issue":{"blockedBy":{"nodes":%s,"pageInfo":{"hasNextPage":%s}}}}}}' "$nodes" "$has_next"
+	return 0
+}
+closed_10='{"id":"I_10","number":10,"state":"CLOSED","repository":{"nameWithOwner":"owner/repo"}}'
+closed_11='{"id":"I_11","number":11,"state":"CLOSED","repository":{"nameWithOwner":"owner/repo"}}'
+open_11='{"id":"I_11","number":11,"state":"OPEN","repository":{"nameWithOwner":"owner/repo"}}'
+_run_closed_blocker_case() {
+	local label="$1" expected="$2" blocker_ref="$3" nodes="$4" has_next="${5:-false}" read_rc="${6:-0}"
+	dependency_status="status:available,auto-dispatch"
+	dependency_status_writes=""
+	native_read_rc="$read_rc"
+	native_blockers_json=$(_native_blockers_fixture "$nodes" "$has_next")
+	_ensure_dependency_status_blocked "20" "owner/repo" "native_relationship_already_present" "$blocker_ref" || true
+	if [[ -n "$dependency_status_writes" ]]; then
+		assert_eq "$label" "$expected" "blocked"
+	else
+		assert_eq "$label" "$expected" "available"
+	fi
+	return 0
+}
+_run_closed_blocker_case "closed native blocker by number is not re-blocked" available 10 "[${closed_10}]"
+_run_closed_blocker_case "closed native blocker by node ID is not re-blocked" available I_10 "[${closed_10},${closed_11}]"
+_run_closed_blocker_case "another open native blocker still blocks" blocked 10 "[${closed_10},${open_11}]"
+_run_closed_blocker_case "declared blocker missing from native set still blocks" blocked 12 "[${closed_10}]"
+_run_closed_blocker_case "empty native set still blocks" blocked 10 "[]"
+_run_closed_blocker_case "truncated native set still blocks" blocked 10 "[${closed_10}]" true
+_run_closed_blocker_case "native read failure still blocks" blocked 10 "[${closed_10}]" false 1
+dependency_status="status:available,auto-dispatch"
+dependency_status_writes=""
+native_read_rc=0
+native_blockers_json=$(_native_blockers_fixture "[${closed_10}]")
+_ensure_dependency_status_blocked "20" "owner/repo" "native_relationship_batch_failed" || true
+assert_true "retry hold without blocker evidence still blocks" \
+	grep -Fq -- "--add-label status:blocked" <<<"$dependency_status_writes"
+# A closed-edge skip must not mark the issue synced: a later failed edge for
+# the same issue in the same pass still holds it blocked.
+_RELATIONSHIP_STATUS_SYNCED_FILE="${TMP_ROOT}/status-synced"
+: >"$_RELATIONSHIP_STATUS_SYNCED_FILE"
+dependency_status="status:available,auto-dispatch"
+dependency_status_writes=""
+_ensure_dependency_status_blocked "20" "owner/repo" "native_relationship_already_present" "10" || true
+_hold_dependency_sync_retry "20" "owner/repo" "native_relationship_batch_failed" || true
+assert_true "closed-edge skip leaves later retry hold effective" \
+	grep -Fq -- "--add-label status:blocked" <<<"$dependency_status_writes"
+unset _RELATIONSHIP_STATUS_SYNCED_FILE
 
 _run_relationship_status_sync_cases() (
 	local dependency_status="status:available,auto-dispatch"
@@ -346,7 +603,7 @@ assert_eq "cycle pruning keeps one dependency direction" '[]' \
 	"$(printf '%s' "$pruned_graph" | jq -c '.blocked_by["10"].issue_nums')"
 
 gh_issue_list() {
-	printf '%s\n' '[{"number":10,"title":"t10: first","state":"OPEN","body":"Blocked by #20","labels":[]},{"number":20,"title":"t20: second","state":"OPEN","body":"Blocked by #10","labels":[]}]'
+	printf '%s\n' '[{"number":10,"title":"t10: first","state":"OPEN","body":"Blocked by: #20","labels":[]},{"number":20,"title":"t20: second","state":"OPEN","body":"Blocked by: #10","labels":[]}]'
 	return 0
 }
 export -f gh_issue_list
@@ -382,46 +639,67 @@ assert_eq "repo normalization fails safely without HOME" "1" "$home_result"
 
 # The shared candidate selector must recover an all-blocked roadmap even when
 # called directly by a workers sweep without the full pulse preflight.
+SCRIPT_DIR="$SCRIPTS_DIR"
 # shellcheck disable=SC1090
 source "${SCRIPTS_DIR}/pulse-repo-meta.sh"
 candidate_fetch_file="${TMP_ROOT}/candidate-fetch-count"
 normalization_file="${TMP_ROOT}/normalization-count"
+normalization_seconds_file="${TMP_ROOT}/normalization-seconds"
 printf '0\n' >"$candidate_fetch_file"
 printf '0\n' >"$normalization_file"
-export candidate_fetch_file normalization_file
+printf '0\n' >"$normalization_seconds_file"
+export candidate_fetch_file normalization_file normalization_seconds_file
 gh_issue_list() {
 	local candidate_fetch_count=""
 	candidate_fetch_count=$(<"$candidate_fetch_file")
 	candidate_fetch_count=$((candidate_fetch_count + 1))
 	printf '%s\n' "$candidate_fetch_count" >"$candidate_fetch_file"
 	if [[ "$candidate_fetch_count" -eq 1 ]]; then
-		printf '%s\n' '[{"number":20,"title":"next child","url":"","updatedAt":"2026-07-11T00:00:00Z","assignees":[],"labels":[{"name":"auto-dispatch"},{"name":"status:blocked"}]},{"number":30,"title":"unrelated work","url":"","updatedAt":"2026-07-11T00:00:00Z","assignees":[],"labels":[{"name":"auto-dispatch"},{"name":"status:available"}]}]'
+		# A complete snapshot with 118 blocked issues and one runnable issue.
+		jq -cn '[20, range(100;217)] | map({number:., title:"blocked child",
+			url:"", assignees:[], labels:[{name:"auto-dispatch"},{name:"status:blocked"}]})
+			+ [{number:30,title:"unrelated work",url:"",assignees:[],
+			labels:[{name:"auto-dispatch"},{name:"status:available"}]}]'
 	else
 		printf '%s\n' '[{"number":20,"title":"next child","url":"","updatedAt":"2026-07-11T00:00:00Z","assignees":[],"labels":[{"name":"auto-dispatch"},{"name":"status:available"}]},{"number":30,"title":"unrelated work","url":"","updatedAt":"2026-07-11T00:00:00Z","assignees":[],"labels":[{"name":"auto-dispatch"},{"name":"status:available"}]}]'
 	fi
 	return 0
 }
 normalize_repo_dependency_readiness_if_due() {
-	local normalization_count=""
+	local normalization_count="" normalization_seconds=0
 	normalization_count=$(<"$normalization_file")
 	normalization_count=$((normalization_count + 1))
 	printf '%s\n' "$normalization_count" >"$normalization_file"
+	# Simulate the observed 936-second backlog cost without a real sleep.
+	normalization_seconds=$(<"$normalization_seconds_file")
+	printf '%s\n' "$((normalization_seconds + 936))" >"$normalization_seconds_file"
 	return 0
 }
 export -f gh_issue_list normalize_repo_dependency_readiness_if_due
-fast_candidates=$(list_dispatchable_issue_candidates_json "owner/repo" 100 "" "" "skip")
+completeness_file="${TMP_ROOT}/candidate-completeness"
+fast_candidates=$(list_dispatchable_issue_candidates_json "owner/repo" 200 "" "" "skip" "$completeness_file")
 assert_eq "fast candidate mode fetches once" "1" "$(<"$candidate_fetch_file")"
 assert_eq "fast candidate mode skips dependency normalization" "0" "$(<"$normalization_file")"
+assert_eq "slow backlog normalization consumes no fast refill time" "0" "$(<"$normalization_seconds_file")"
+assert_eq "all 118 blocked candidates remain filtered" "1" "$(jq 'length' <<<"$fast_candidates")"
 assert_eq "fast candidate mode keeps blocked child out" "0" \
 	"$(printf '%s' "$fast_candidates" | jq 'map(select(.number == 20)) | length')"
+assert_eq "deferred blocked readiness cannot lend reserved product slots" "0" "$(<"$completeness_file")"
+assert_eq "fast candidate mode keeps already-available work" "30" \
+	"$(printf '%s' "$fast_candidates" | jq -r '.[0].number')"
+
+fast_candidates=$(list_dispatchable_issue_candidates_json "owner/repo" 200 "" "" "skip" "$completeness_file")
+assert_eq "fast candidate mode with no blocked work retains completeness" "1" "$(<"$completeness_file")"
 
 printf '0\n' >"$candidate_fetch_file"
 printf '0\n' >"$normalization_file"
-recovered_candidates=$(list_dispatchable_issue_candidates_json "owner/repo" 100)
+recovered_candidates=$(list_dispatchable_issue_candidates_json "owner/repo" 200 "" "" "normalize" "$completeness_file")
 assert_eq "default candidate mode fetches again after normalization" "2" "$(<"$candidate_fetch_file")"
 assert_eq "all-blocked roadmap triggers dependency normalization" "1" "$(<"$normalization_file")"
+assert_eq "normal sweep retains the simulated slow normalization" "936" "$(<"$normalization_seconds_file")"
 assert_eq "next dependency-ready child reaches shared candidate stream" "20" \
 	"$(printf '%s' "$recovered_candidates" | jq -r 'map(select(.number == 20))[0].number')"
+assert_eq "successful normal readiness scan retains completeness" "1" "$(<"$completeness_file")"
 
 # A successful command that returns null after dependency normalization is not
 # a complete empty snapshot. Preserve failure provenance so campaign renewal
@@ -512,18 +790,28 @@ _refresh_try_unblock_issue "owner/repo" "20" '{"task_ids":[],"issue_nums":[]}' '
 assert_true "concurrent queued transition wins resolved unblock" \
 	grep -Fq -- "--remove-label status:available" <<<"$status_write"
 
+# Missing native edges use declared fallback; return 2 means positively clear,
+# not an incomplete repair. Keep both admission contracts covered separately.
+fixture_native_clear=false
 _blocked_by_check_native_relationships() {
-	return 2
+	[[ "$fixture_native_clear" != true ]] || return 2
+	return 1
 }
 _blocked_by_check_issue_num() {
 	return 0
 }
 export -f _blocked_by_check_native_relationships _blocked_by_check_issue_num
 if _refresh_dependency_is_resolved "owner/repo" "20" '{"task_ids":[],"issue_nums":["10"]}' '{}' '[]' '[10,20]'; then
-	assert_eq "partial native repair still checks declared edge" "blocked" "resolved"
+	assert_eq "missing native relationships still check declared edge" "blocked" "resolved"
 else
-	assert_eq "partial native repair still checks declared edge" "blocked" "blocked"
+	assert_eq "missing native relationships still check declared edge" "blocked" "blocked"
 fi
+# Contract since 138608aa76: a complete, positively clear native set is
+# authoritative over stale body/TODO edges (mirrors
+# test-pulse-dep-graph-stale-label-cleanup.sh).
+fixture_native_clear=true
+assert_true "positively clear native relationships remain authoritative" \
+	_refresh_dependency_is_resolved "owner/repo" "20" '{"task_ids":[],"issue_nums":["10"]}' '{}' '[]' '[10,20]'
 
 python3 - "$SCRIPTS_DIR/pulse-check-queue-scan.py" <<'PY'
 import datetime as dt
@@ -576,6 +864,16 @@ parent["dependency_inconsistent"] = False
 available = module._count_issue(aggregate, parent, dt.datetime.now(dt.timezone.utc), 30)
 assert available is False
 
+# Contributor information waits remain unavailable even when stale runnable
+# labels coexist, but stay distinct from explicit maintainer holds.
+aggregate = module._empty_aggregate()
+needs_info = issue(201, "", ["status:available", "status:needs-info", "auto-dispatch", "tier:standard"])
+needs_info["dependency_inconsistent"] = False
+available = module._count_issue(aggregate, needs_info, dt.datetime.now(dt.timezone.utc), 30)
+assert available is False
+assert aggregate["blocked_labels"] == 1
+assert aggregate["blocked_explicit_hold"] == 0
+
 # Dependency-inconsistent availability is reported separately and excluded.
 aggregate = module._empty_aggregate()
 roadmap_child["dependency_inconsistent"] = True
@@ -583,7 +881,7 @@ available = module._count_issue(aggregate, roadmap_child, dt.datetime.now(dt.tim
 assert available is False
 assert aggregate["dependency_inconsistent_available"] == 1
 assert aggregate["available_unassigned"] == 0
-print("PASS: queue scanner native/text/missing/parent diagnostics")
+print("PASS: queue scanner native/text/missing/parent/needs-info diagnostics")
 PY
 python_rc=$?
 if [[ "$python_rc" -eq 0 ]]; then

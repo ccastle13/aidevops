@@ -9,6 +9,221 @@ Rules for preventing credential exposure in AI agent sessions. Extracted from `A
 
 ---
 
+## Reusing purpose-scoped tokens
+
+Prefer reusable, purpose-scoped tokens whose resource access and permissions
+can be edited in place (for example, GitHub fine-grained PATs) over one-off
+tokens per repository. Use one token per owner and purpose, select only the
+repositories needing that purpose, and extend that list when adding a repo.
+Keep least privilege by purpose: release and sync tokens stay separate with
+their own minimum permissions; never select all repositories or add unrelated
+permissions for convenience. Store each value once in gopass with
+`aidevops secret set NAME`, then distribute it through
+`aidevops secret NAME -- cmd` without printing it (pipe to `gh secret set` via
+stdin, not a value-bearing argument). Editing access preserves the value;
+regenerating a lost value revokes the old one, so update every repository copy.
+Use distinct local secret names for different owners rather than overwriting
+another owner's stored token; repository secret names remain unchanged.
+Reuse increases the impact of a leak to all selected repositories. Retain
+per-repository tokens when policy requires stronger isolation, or the platform
+cannot scope one token to an explicit repository set.
+
+## Migrating plaintext credentials safely
+
+### Optional systemd-creds storage
+
+On Linux with systemd 259 or newer, opt in per secret using
+`aidevops secret set NAME --backend systemd-creds`. Input remains hidden or is
+read from stdin/`--from-file`; never supply a value in argv or AI chat.
+The backend requires both `--user` (introduced in 256) and `--refuse-null`
+(introduced in 259). Older versions and macOS retain existing behavior; an
+explicit request for an unavailable backend fails without writing plaintext.
+
+Credentials are user-scoped, host-key encrypted, authenticated and stored in
+`~/.config/aidevops/creds/NAME.cred` (directory 700, files 600). Writes encrypt
+from stdin, decrypt-compare in memory, and atomically replace only ciphertext.
+The first version deliberately uses `--with-key=host`, not automatic TPM
+selection or null-key encryption; TPM provisioning and NixOS packaging remain
+outside this feature. Host-key access may require administrator provisioning
+of systemd's host key and authorization. Operations disable password prompts
+and have timeouts; they never silently downgrade to plaintext.
+
+Reads prefer a listed gopass entry, then a present encrypted credential, then
+`credentials.sh`. An unreadable encrypted credential fails closed, including
+when systemd-creds is unavailable; `check` returns 3 without output. Existing
+encrypted names keep their backend on ordinary `set` unless gopass owns the
+same name. An explicit encrypted write does not remove a higher-priority
+gopass entry: reconcile that entry before expecting the new value to resolve.
+`list` and `inventory` discover names without decrypting; guarded `rm` removes
+the encrypted copy as well as the existing backends and performs read-back.
+
+The helper decrypts on demand rather than changing user unit configuration.
+Headless `systemd-run --user` workers use the same resolver as interactive
+commands. Subprocess injection uses an owned tmpfs runtime directory when
+encrypted entries exist and refuses persistent temporary storage. Values still
+exist in process memory, subprocess environments and the runtime tmpfs; disable
+unencrypted swap and restrict core dumps if the host policy requires protection
+against those copies. This is not protection against root or same-user process
+compromise. A copied credential alone is not portable: user-scoped encryption
+binds the host key, machine identity, username and numeric UID. Copying the host
+key and all identity material can defeat that protection. Host-key loss or
+identity changes can make secrets unrecoverable; retain an independently secured
+recovery source and protect host-key backups separately from ciphertext backups.
+
+`aidevops secret import-credentials --to systemd-creds` imports eligible unique
+literal secret exports from the active plaintext store, using the existing
+strict parser. It skips existing encrypted names, verifies each new encrypted
+value, and always retains the source. It does not automatically migrate gopass
+or prune plaintext. Existing `prune-plaintext` remains gopass-only; do not use
+it as verification of this backend. After migrating callers and checking names
+through the resolver, retire retained sources through the operator's normal
+secure secret-management process, accounting for backups and snapshots.
+
+`aidevops secret import-credentials` imports **only the active tenant's store**
+(or the single `credentials.sh`) into the flat `aidevops/NAME` namespace used
+by `check`, `get` and subprocess injection. Other tenants are not merged into
+that shared namespace. Existing entries are never overwritten: the report
+distinguishes value-equal entries from differing/unreadable entries without
+printing values. Earlier `aidevops/tenants/TENANT/NAME` imports are not resolver
+entries; reimport from retained plaintext and reconcile conflicts privately.
+
+Import and pruning accept private, owned, regular non-symlink files and simple
+literal exports only. Names ending in `_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`,
+`_PASS`, `_CREDENTIAL` or `_CREDENTIALS` (or those words alone) are candidates.
+Other names are retained as configuration, including
+`AIDEVOPS_HEADLESS_PROVIDER_ALLOWLIST`, `GCP_PROJECT_ID` and `GCP_SA_KEY_FILE`.
+Duplicate assignments and placeholders are kept. Files containing shell
+expressions, single-quoted values, multiline values, heredocs or any syntax
+other than comments, blank lines and simple literal exports are rejected as a
+whole before any migration writes. This prevents mistaking text inside a
+multiline value for a top-level export; reconcile such files privately.
+
+**Import does not replace shell environment loading.** Shell startup files and
+env-only helpers that source `credentials.sh` do not automatically read gopass.
+Before removing plaintext, change those callers to run through
+`aidevops secret NAME -- cmd` (or `aidevops secret run cmd`). Prefer explicit names
+to minimize injected credentials. Existing shells may still hold old exported
+values; restart them after changing the callers. Never print secrets to verify.
+
+Preview the separate, opt-in removal step:
+
+```bash
+aidevops secret prune-plaintext --dry-run
+aidevops secret prune-plaintext
+aidevops secret check NAME
+```
+
+Pruning removes an eligible active-store export only when the flat gopass entry
+is readable, has exactly the same complete value (trailing newlines follow the
+injection contract), and `secret check NAME` succeeds. Missing, locked, differing
+or ambiguous entries are kept. The rewrite is atomic, uses the credential writer
+lock, preserves other lines and creates a mode-600 result; it does not create
+another plaintext backup. Neither operation sources the credential file.
+
+`secret status` and `secret drift` warn about `credentials.sh.bak-*` in the main
+configuration directory and tenant stores, including unsafe permissions. Drift
+warnings go to stderr, preserving `--json` output. These backups are
+not removed by pruning. Review and restrict/delete them under your local
+secure-deletion policy; ordinary removal cannot erase snapshots or SSD copies.
+
+## Retiring a credential
+
+```bash
+aidevops secret rm NAME [NAME...] [--yes]   # aliases: remove, delete
+```
+
+Use this instead of raw `gopass rm`: `gopass rm -f a b` treats `b` as a field of
+`a` and deletes nothing. Every name must be stored directly (an alias or
+provider default is refused; remove its source by name) or nothing is deleted.
+The command warns about registry records and `dependents` references, asks for
+confirmation (`--yes` for non-interactive use, which also removes the registry
+record), runs one `gopass rm -f` per name, removes single-line exports from the
+active-tenant plaintext store only, then reads back with `secret check`. Exit is
+non-zero if a name is still resolvable (for example from another tenant file).
+Output is names only. Revoke the credential at the provider separately.
+
+---
+
+## Storing multi-line secrets
+
+Run secret setup in your own terminal, never paste secret values into AI chat.
+The hidden `aidevops secret set NAME` prompt accepts **one line only**. For PEM
+keys, JSON service-account credentials, or other multi-line values, initialize
+encrypted storage with `aidevops secret init`, then use:
+
+```bash
+chmod 600 /secure/path/app.pem
+aidevops secret set APP_KEY --from-file /secure/path/app.pem
+```
+
+`--from-file` requires a readable regular file, refuses symlinks and any
+group/other permissions, and validates the opened descriptor before reading.
+Alternatively, full redirected/piped stdin is accepted, for example
+`aidevops secret set APP_KEY < /secure/path/app.pem` in your terminal.
+Embedded newlines are preserved; trailing newlines are trimmed consistently
+with environment injection. NUL bytes are rejected. PEM keys remain valid
+without their final newline. The plaintext `credentials.sh` fallback refuses
+multi-line input without changing existing credentials; use gopass instead.
+It also refuses dollar signs and backticks, which its line-oriented readers
+cannot safely round-trip as literal shell data.
+
+Verify without printing the key:
+
+```bash
+aidevops secret APP_KEY -- sh -c 'printf "%s\n" "$APP_KEY" | openssl pkey -noout -check'
+```
+
+After successful storage and verification, delete the source file using your
+local secure-deletion policy (ordinary removal does not guarantee erasure on
+SSDs, snapshots or backups). A detected multi-line terminal paste is silently
+drained and rejected, never stored as a first-line fragment. The drain waits
+for a short quiet interval; it cannot protect arbitrary delayed input, so
+always use file/stdin input for multi-line secrets. If a key was previously
+pasted into the shell or appears in scrollback/history, revoke and replace it.
+
+---
+
+## Headless runner GPG availability
+
+`aidevops secret check NAME` is status-only: exit 0 means readable, 1 means
+missing (or empty plaintext), and 3 means a gopass-owned entry is unreadable
+or empty. It never prints values or decryption errors. The runner capability
+log reports `reason=secret_missing name=NAME`, `secret_unreadable`,
+`check_timeout`, or `probe_failed path=...` without secret material.
+
+Gopass is authoritative for names it owns: failed decryption **does not** fall
+back to `credentials.sh`. Deferrals state `store=gopass fallback=disabled`.
+A locked agent is the common cause, but an unreadable entry can also mean
+corruption or missing decryption keys. Status-only decryption is bounded using
+the existing four-second headless resolver; an owned entry that times out
+returns 3. The outer capability watchdog reports `check_timeout` if the whole
+command (including store listing) exceeds five seconds.
+Pulse emits one `runner_health: gpg store locked or entry unreadable` line
+per cycle and skips subsequent secret-gated checks for that cycle; ungated
+candidates can still run. `runner_capability_health secret_gated_deferred=N`
+records the running count of rejected gate calls, not a final candidate total.
+Cycle state contains only names/counts in a mode-600 file under the runner's
+workspace temp directory, with an exclusive lock shared across watchdog
+subshells and concurrent candidates. Old cycle metadata expires after a day.
+The next cycle retries, so unlocking does not require restarting pulse.
+
+For unattended runners, provision the agent unlock outside AI chat. Set both
+`default-cache-ttl` and `max-cache-ttl` in the operator's `gpg-agent.conf` long
+enough for the intended unattended window, reload with `gpg-connect-agent
+reloadagent /bye`, then perform one interactive unlock after every agent
+restart. Reloading or connecting alone does **not** unlock a key. Finite cache
+TTLs expire: renew the unlock before expiry rather than assuming an unlimited
+cache. Longer TTLs increase the period a compromised runner can decrypt data;
+choose them according to the runner's security policy, not automatically.
+
+Alternatively, use a securely stored `credentials.sh` entry (mode 600) and
+remove the corresponding gopass entry through the operator's normal secret
+management process. Adding plaintext while retaining the gopass entry cannot
+repair a locked-store deferral. Never put passphrases or secret values in
+logs, issue bodies, command arguments, or transcripts.
+
+---
+
 ## 8.1 Session Transcript Exposure (t1457)
 
 **Threat:** AI tool inputs and outputs are captured in session transcripts and may be sent to a remote model provider.
@@ -76,7 +291,7 @@ Secret protection is deliberately layered so one missed path does not expose raw
   - UNSAFE: `curl -H "Authorization: Bearer $TOKEN" ...` — `ps` shows full command line; error output may echo headers
   - UNSAFE: `mysql -p"$PASSWORD" dbname` — password visible in process list
   - SAFE: `SECRET=$(gopass show -o name) MY_SECRET="$SECRET" cmd` — subprocess reads via `getenv("MY_SECRET")`; error handlers never print env vars
-  - SAFE: `aidevops secret NAME -- cmd` — injects as env var with automatic output redaction
+  - SAFE: `aidevops secret NAME -- cmd` — injects as env var with automatic output redaction; stdout and stderr stay separate streams (each redacted) and stdin is inherited, so it is a transparent launcher for stdio MCP servers in `mcp.<name>.command` entries (GH#35896)
   - SAFE: `SSH_AUTH_SOCK=... ssh ...` — env-based auth, no secret in argv
   - Subprocess must read value from environment (`getenv()` in C/PHP, `process.env` in Node, `os.environ` in Python, `ENV[]` in Ruby), not from `$1`/`argv`.
   - Last resort (program only accepts args): write secret to `mktemp` file (`chmod 0600`), pass the path, clean up via `trap EXIT`.

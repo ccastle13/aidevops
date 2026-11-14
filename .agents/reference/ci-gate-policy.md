@@ -7,6 +7,42 @@ Use CI as a throughput control, not a progress trap. Required merge gates should
 match the risk of the target branch; slower integration checks should create
 feedback loops when they find defects.
 
+## GitHub Actions unavailable
+
+Before implementation, check the registered repository's `actions` capability
+in `repos.json` (see [field reference](repos-json-fields.md)). When explicitly
+`"unavailable"`, run **all configured/documented local checks** from the start:
+the repository's lint, typecheck and unit scripts, or documented equivalents
+such as `scripts/lint.sh` and `scripts/smoke-test.sh`. Do not invent a lighter
+check set, skip applicable checks, or introduce test infrastructure to substitute
+for existing scripts. Preserve command results and diagnostics.
+
+After the final commit, record its full head SHA and each command/result in the
+PR body or a comment from a currently write-authorized collaborator. Use this
+marker followed immediately by one JSON line (replace the placeholder SHA):
+
+```text
+<!-- aidevops:local-verification:v1 -->
+{"head":"FULL_40_CHARACTER_HEAD_SHA","status":"passed","checks_complete":true,"checks":[{"command":"bash scripts/lint.sh","exit_code":0,"result":"Lint passed"},{"command":"bash scripts/smoke-test.sh","exit_code":0,"result":"Smoke checks passed"}]}
+```
+
+`checks_complete: true` attests the complete configured/documented local check
+set. A prose "tested" claim, an empty check list, failed commands, stale SHA or
+external-author receipt is insufficient. New commits invalidate prior evidence;
+rerun applicable checks and publish a new receipt for the pushed exact head.
+Never record `passed` before checks actually pass.
+
+`full-loop-helper.sh merge` and `wait-checks` make one exact-head observation,
+without polling unavailable Actions. Only terminal failures from GitHub Actions
+whose annotations match `CI_BILLING_OUTAGE_PATTERN` are non-blocking with the
+trusted receipt. Non-billing terminal failures, including optional checks and
+commit statuses, still block; API/parse failures fail closed. Review-bot,
+external-author/cryptographic approval and native protection gates are unchanged.
+If native protection requires unavailable checks, defer to the repository owner;
+local evidence cannot bypass it. Admin fallback reads native required-check
+evidence, not this local exception. No remote checks at all can be acceptable
+with trusted local evidence; absence alone is never verification.
+
 ## Evidence-guided verification
 
 Tests and checks are evidence-gathering methods, not independent objectives.
@@ -20,6 +56,9 @@ new test assets are separate decisions:
 1. Start with the production-facing behaviour through the existing app, API,
    CLI, integration, or deployment path. Prefer standard logs, telemetry,
    framework diagnostics, and existing targeted checks over synthetic machinery.
+   Get code diagnostics from the project's lint, typecheck, or compiler
+   commands; do not depend on editor or runtime LSP diagnostics (OpenCode 2
+   does not run language servers).
 2. Run explicit repository-required gates directly. Before adding or broadening
    test code, or running a non-required broad suite, identify what decision its
    result can change or what material uncertainty it reduces. Do not create a
@@ -50,6 +89,16 @@ new test assets are separate decisions:
    acceptance criteria and repository-required gates, reconsider conclusions
    when material new evidence appears, and report any remaining uncertainty.
    Passing tests alone do not prove the user-visible outcome.
+
+### Running Python tests
+
+Run a hyphenated unittest file directly from the repository root:
+`python3 .agents/scripts/tests/<file>.py [-v] [-k pattern]` (for example,
+`python3 .agents/scripts/tests/test-source-access-helper.py -k trusted`).
+Do not pass its path to `python3 -m unittest`: hyphenated names cannot be
+imported that way. `pytest` is not a framework dependency. Some `test-*.py`
+files instead run script-style assertions under `__main__` or at top level;
+run those directly too, without `-k` (they do not provide unittest filtering).
 
 ## Default policy
 
@@ -106,6 +155,112 @@ new test assets are separate decisions:
     follow-up issues. Repositories with exceptional sensitivity may explicitly
     opt into `review_gate.completion_behavior: strict`; never make that the
     framework default.
+14. Qlty has credit limits on private repositories and on every
+    organisation-owned repository, public or private; only public repositories
+    on personal accounts are unlimited. On a limited repository, skip a qlty
+    check that fails because the credits ran out (for example "Qlty did not
+    run because you are out of minutes"). It is billing, not a code result: do
+    not rerun it, change code, file an issue or wait for it. Merge when the
+    other checks pass, and note the skipped check in the PR body
+    (`full-loop-helper.sh merge` records it automatically). A qlty
+    failure with real findings still counts, and an out-of-credits failure on
+    a public personal-account repository is unexpected: report it. The free
+    minutes return monthly, so keep the app installed (it is not a reason to
+    remove Qlty) and never make "qlty check" a required check on a limited
+    repository. Setup guidance: `tools/code-review/qlty.md`.
+
+## Hosted CI demand and required contexts
+
+For public aidevops CI, keep GitHub-hosted execution (GH#37499). Do not activate
+`CI_RUNNER` or enroll public jobs in private infrastructure. Public job logs expose
+runner and machine names; a guarded selector is not a runner admission boundary.
+
+- Cancel superseded PR validation with a workflow/PR-number concurrency group.
+  For mixed event workflows, enable cancellation only for PR events and use a
+  distinct non-PR group. In `pull_request_target`, `github.ref` is the base branch,
+  not a PR identity: use `github.event.pull_request.number`.
+- Keep cancellation disabled for main pushes, release/publication, durable sync
+  and post-merge acceptance. A shared group with `cancel-in-progress: false`
+  still replaces older **pending** runs. Use SHA/run ID groups for independent
+  main validation; retain serialized groups for publication or mutable state.
+- Label-only refreshes must not displace head validation, even in the pending
+  queue. Use separate groups/identities. The Qlty new-file gate gives label
+  events unique groups; the regression gate has a separate refresh caller.
+  Review-bot evaluators retain their documented job-level, non-cancelling
+  admission rule (GH#2973/GH#28316).
+- Consolidate small lints into steps only when their required check contexts
+  remain intact. A step name does **not** publish a job check context. Without
+  explicit authority to migrate protection, retain the existing lint jobs and
+  names rather than manufacture successful placeholder checks. GH#37499 retains
+  the counter, portability, shell-init, parity, cascade, URL and task-ID jobs on
+  this basis; no branch protection is changed.
+- Prefer narrow `paths:` filters for optional workflows. For required checks,
+  keep the workflow triggered and scope expensive steps/jobs internally so a
+  docs/planning PR does not remain permanently `expected`. Code Quality scope
+  excludes nested Markdown and planning files from shell work and heavy
+  substantive analysis; workflow/source edits still run full validation, and
+  missing diff metadata still runs everything.
+- Keep blocking regression, portability, lifecycle and security checks on PRs.
+  `code-quality-advisory.yml` consolidates the three full-tree complexity totals
+  and Python Lizard/Pyflakes reports into one post-merge job. They were already
+  informational; required PR regression checks are not moved or weakened.
+
+### GH#37499 measurement checkpoint
+
+The pre-change Code Quality run `42728170506` on head `573d73fa5` had 12 successful
+jobs: job creation-to-start median **68.5 s**, max **257 s**. Actions job timestamps
+show Complexity Analysis executing for 656 s (nesting 290 s; lifecycle contracts
+262 s), Framework Validation 489 s, and ShellCheck 255 s. These are one-run
+measurements, not a 24-hour baseline or proof of improvement.
+
+After merge, compare equal pre/post 24-hour windows using the Actions runs and
+per-run jobs APIs. Record run/job identity, head SHA, event, attempt, created/start/
+completion times, sample count, median/p95/max queue delay and execution separately.
+Exclude cancelled/failed runs, retries, outages and job-less samples consistently;
+compare like workflows/events, and retain raw timestamps. Run-level
+`run_started_at - created_at` may be zero while individual jobs queue for minutes;
+it is not a substitute for job creation-to-start. The post-merge window cannot be
+observed before merge; no 24-hour reduction is claimed by this PR.
+
+## Private repositories and public launch
+
+Code developed privately for a later open-source launch (WordPress plugins,
+CLIs, libraries, apps) uses two phases, because Actions minutes and most
+code-review apps are billed on private repositories and free on public ones.
+
+1. **Private phase: fast, advisory.**
+   - Build the project's own CI early: lint, static analysis with a baseline
+     that only shrinks, build/release preflight, and a smoke test on the
+     minimum and latest supported runtimes. Make the same scripts run locally.
+   - Keep every check advisory: no branch protection, required status checks
+     or paid review apps. Fix failures the PR itself causes before merge; file
+     a follow-up issue with the run link for any other failure and merge.
+   - Skip a qlty check that fails because the credits ran out (design
+     rule 14).
+   - Control cost: run only lint on draft PRs, cancel superseded runs with
+     `concurrency`, cache tool results, and use short artifact retention.
+   - Use secure defaults from the start, since they cost nothing: actions
+     pinned to commit SHAs, `permissions: contents: read`,
+     `persist-credentials: false`, no `|| true` on checks, and Dependabot for
+     actions and dev tools.
+2. **Public launch: full sweep, then required.** With owner approval to
+   publish, in the same step:
+   - turn on free whole-codebase reviewers (CodeRabbit full review, Codacy,
+     SonarQube Cloud, qlty, Socket), CodeQL, secret scanning with push
+     protection, Dependabot alerts, and OpenSSF Scorecard. Qlty stays
+     credit-limited on organisation repositories (design rule 14);
+   - fix findings in small PRs by area, security first. Fix, justify inline,
+     or dismiss each one with a reason in the service;
+   - empty static-analysis baselines, then raise strictness one level at a
+     time while findings stay real;
+   - make the core CI checks required on the default branch (rules below),
+     and add `SECURITY.md` with private vulnerability reporting,
+     `CONTRIBUTING.md`, and issue/PR templates;
+   - run `workflows/public-launch-checklist.md` → "Open-sourcing a code
+     repository".
+
+WordPress plugin gates: `tools/wordpress/wp-plugin-release.md` → "Pull
+request quality gates".
 
 ## Ruleset checklist
 

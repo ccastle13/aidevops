@@ -47,6 +47,73 @@ pulse_stats_set_gauge pulse_merge_zero_progress_cycles 0
 gauge_value="$("$HELPER" get-gauge pulse_merge_zero_progress_cycles)"
 [[ "$gauge_value" == "0" ]]
 
+malformed_fixture="${TMP_DIR}/malformed-original"
+printf '{"counters":{}}\n{"orphaned":[1,2]}\n' >"$PULSE_STATS_FILE"
+command cp "$PULSE_STATS_FILE" "$malformed_fixture"
+pulse_stats_increment recovered_increment
+
+python3 - "$PULSE_STATS_FILE" <<'PY'
+import json
+import sys
+import time
+
+with open(sys.argv[1]) as fh:
+    data = json.load(fh)
+events = data['counters']['recovered_increment']
+assert len(events) == 1
+assert abs(time.time() - events[0]) < 10
+PY
+shopt -s nullglob
+quarantines=("$PULSE_STATS_FILE".corrupt.*)
+shopt -u nullglob
+[[ ${#quarantines[@]} -eq 1 ]]
+cmp "$malformed_fixture" "${quarantines[0]}"
+# GNU stat -f can emit filesystem data before failing on the BSD format.
+# Python is already required by this fixture and reads file modes portably.
+quarantine_mode=$(python3 -c 'import os, stat, sys; print(format(stat.S_IMODE(os.stat(sys.argv[1]).st_mode), "o"))' "${quarantines[0]}")
+[[ "$quarantine_mode" == "600" ]]
+
+printf '{"counters":{}} trailing-invalid\n' >"$PULSE_STATS_FILE"
+pulse_stats_set_gauge recovered_gauge 7
+jq -e '.gauges.recovered_gauge.value == 7 and (.counters | type == "object")' "$PULSE_STATS_FILE" >/dev/null
+
+printf '{"counters":{}} cannot-quarantine\n' >"$PULSE_STATS_FILE"
+command cp "$PULSE_STATS_FILE" "${TMP_DIR}/unrecoverable-original"
+recovery_error="${TMP_DIR}/recovery-error.txt"
+fail_cp_bin="${TMP_DIR}/fail-cp-bin"
+mkdir "$fail_cp_bin"
+cat >"${fail_cp_bin}/cp" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+chmod +x "${fail_cp_bin}/cp"
+_PULSE_STATS_RECOVERY_FAILURE_REPORTED=""
+PATH="${fail_cp_bin}:${PATH}" pulse_stats_increment unrecoverable_increment 2>"$recovery_error"
+cmp "${TMP_DIR}/unrecoverable-original" "$PULSE_STATS_FILE"
+grep -q 'Pulse stats recovery failed (quarantine-copy)' "$recovery_error"
+
+printf '{"counters":{"obsolete":[1]}} reset-trailing-data\n' >"$PULSE_STATS_FILE"
+pulse_stats_reset obsolete >/dev/null
+jq -e '. == {"counters":{}}' "$PULSE_STATS_FILE" >/dev/null
+
+original_stats_file="$PULSE_STATS_FILE"
+PULSE_STATS_FILE="${TMP_DIR}/fresh/nested/pulse-stats.json"
+pulse_stats_increment first_write
+jq -e '.counters.first_write | length == 1' "$PULSE_STATS_FILE" >/dev/null
+PULSE_STATS_FILE="$original_stats_file"
+
+mkdir "${PULSE_STATS_FILE}.lock"
+printf 'truncated-owner\n' >"${PULSE_STATS_FILE}.lock/owner.pid"
+pulse_stats_increment stale_lock_recovered
+jq -e '.counters.stale_lock_recovered | length == 1' "$PULSE_STATS_FILE" >/dev/null
+
+printf '{"counters":{}}\n' >"$PULSE_STATS_FILE"
+for index in {1..20}; do
+	"$HELPER" increment "concurrent_${index}" &
+done
+wait
+jq -e '[.counters | to_entries[] | select(.key | startswith("concurrent_"))] | length == 20' "$PULSE_STATS_FILE" >/dev/null
+
 python3 - "$PULSE_STATS_FILE" <<'PY'
 import json
 import sys
@@ -61,6 +128,26 @@ exit 42
 SH
 chmod +x "${FAKE_BIN}/jq"
 PATH="${FAKE_BIN}:${PATH}" _pulse_stats_ensure_file
+command cp "$PULSE_STATS_FILE" "${TMP_DIR}/valid-original"
+# Isolate quarantine accounting from earlier malformed fixtures.
+PULSE_STATS_FILE="${TMP_DIR}/failure-stats.json"
+command cp "${TMP_DIR}/valid-original" "$PULSE_STATS_FILE"
+_PULSE_STATS_JQ="${FAKE_BIN}/jq"
+_PULSE_STATS_RECOVERY_FAILURE_REPORTED=""
+for index in {1..3}; do
+	pulse_stats_set_gauge failing_gauge "$index" 2>>"${TMP_DIR}/jq-errors"
+done
+pulse_stats_increment failing_counter 2>>"${TMP_DIR}/jq-errors"
+if pulse_stats_reset failing_counter 2>>"${TMP_DIR}/jq-errors"; then
+	printf 'reset unexpectedly succeeded with failing jq\n' >&2
+	exit 1
+fi
+cmp "${TMP_DIR}/valid-original" "$PULSE_STATS_FILE"
+shopt -s nullglob
+quarantines=("${PULSE_STATS_FILE}".corrupt.*)
+shopt -u nullglob
+[[ ${#quarantines[@]} -eq 0 ]]
+[[ $(wc -l <"${TMP_DIR}/jq-errors") -eq 1 ]]
 python3 - "$PULSE_STATS_FILE" <<'PY'
 import json
 import sys

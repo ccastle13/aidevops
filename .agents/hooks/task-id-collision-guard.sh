@@ -337,6 +337,20 @@ _repo_has_claim() {
 }
 
 # ---------------------------------------------------------------------------
+# A shallow repository cannot prove that an at-or-below-counter task ID was
+# never claimed: the claim commit may sit behind the shallow boundary. CI once
+# made its full clone shallow with depth-limited refetches, so every task ID
+# claimed more than ~100 claims earlier failed as unclaimed (GH#35949).
+# Returns 0 when the current repository is shallow, 1 otherwise.
+# ---------------------------------------------------------------------------
+_repo_history_is_shallow() {
+	local shallow=""
+	shallow=$(git rev-parse --is-shallow-repository 2>/dev/null) || return 1
+	[[ "$shallow" == "true" ]] && return 0
+	return 1
+}
+
+# ---------------------------------------------------------------------------
 # Extract all tNNN references from text.
 # Outputs one per line.
 # ---------------------------------------------------------------------------
@@ -349,6 +363,18 @@ _extract_tids() {
 	# a malformed canonical ID when check-pr scans the claim commit itself.
 	scan_text=$(printf '%s' "$text" | sed -E 's/chore: claim t[0-9]+\.\.t[0-9]+//g')
 	if task_identity_has_malformed_candidate "$scan_text"; then
+		# Preserve padded tokens for actionable diagnostics, without weakening
+		# the generic malformed sentinel for other invalid identities.
+		local padded_ere='(^|[^[:alnum:].])(t0+[0-9]+(\.[0-9]+)*)($|[^[:alnum:].]|\.($|[^[:alnum:].]))'
+		local remaining="$scan_text" matched="" padded=""
+		while [[ "$remaining" =~ $padded_ere ]]; do
+			matched="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+			padded="${BASH_REMATCH[2]}"
+			if task_identity_unpad_legacy "$padded" >/dev/null; then
+				printf '%s\n' "$padded"
+			fi
+			remaining="${remaining#*"$matched"}"
+		done
 		printf '%s\n' '__malformed__'
 		return 0
 	fi
@@ -467,6 +493,10 @@ _check_tid() {
 
 	if ! num=$(_legacy_sequence_for_collision_check "$tid"); then
 		CHECK_MESSAGE_VIOLATION="  ${tid} — malformed task identity\n"
+		local canonical=""
+		if canonical=$(task_identity_unpad_legacy "$tid"); then
+			CHECK_MESSAGE_VIOLATION="  ${tid} is a padded legacy ID; use ${canonical}\n"
+		fi
 		return 1
 	fi
 	if [[ -z "$num" ]]; then
@@ -500,6 +530,12 @@ _check_tid() {
 			return 2
 		fi
 		if [[ "$verify_rc" -eq 1 ]]; then
+			# Allow only this unprovable ID; the caller keeps checking the
+			# message's other IDs, and IDs above the counter still block.
+			if _repo_history_is_shallow; then
+				_warn "${tid} — ≤ counter ${counter} with no visible 'chore: claim ${tid}' commit, but history is shallow so the claim may be hidden; allowing. Fetch full history (git fetch --unshallow) to verify."
+				return 0
+			fi
 			CHECK_MESSAGE_VIOLATION="  ${tid} — ≤ counter ${counter}, but no 'chore: claim ${tid}' commit on this branch, in repo history, or linked issue title\n"
 			return 1
 		fi

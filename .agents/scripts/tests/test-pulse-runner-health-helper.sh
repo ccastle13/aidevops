@@ -216,15 +216,17 @@ for i in 1 2 3; do
 	_h record-outcome no_worker_process "owner/repo#$i" >/dev/null 2>&1
 done
 [[ -f "$RUNNER_HEALTH_ADVISORY_FILE" ]] && advisory_count=1 || advisory_count=0
-mtime1=$(stat -f '%m' "$RUNNER_HEALTH_ADVISORY_FILE" 2>/dev/null \
-	|| stat -c '%Y' "$RUNNER_HEALTH_ADVISORY_FILE" 2>/dev/null \
+# GNU first: on Linux `stat -f` succeeds with filesystem stats (free blocks
+# drift between calls), so the BSD form must only be the fallback.
+mtime1=$(stat -c '%Y' "$RUNNER_HEALTH_ADVISORY_FILE" 2>/dev/null \
+	|| stat -f '%m' "$RUNNER_HEALTH_ADVISORY_FILE" 2>/dev/null \
 	|| echo "0")
 sleep 1
 # Trigger another outcome — but breaker already tripped so trip path
 # shouldn't fire again. Record outcome won't re-trip a tripped breaker.
 _h record-outcome no_worker_process owner/repo#4 >/dev/null 2>&1
-mtime2=$(stat -f '%m' "$RUNNER_HEALTH_ADVISORY_FILE" 2>/dev/null \
-	|| stat -c '%Y' "$RUNNER_HEALTH_ADVISORY_FILE" 2>/dev/null \
+mtime2=$(stat -c '%Y' "$RUNNER_HEALTH_ADVISORY_FILE" 2>/dev/null \
+	|| stat -f '%m' "$RUNNER_HEALTH_ADVISORY_FILE" 2>/dev/null \
 	|| echo "0")
 if [[ "$advisory_count" -eq 1 && "$mtime1" == "$mtime2" ]]; then
 	print_result "advisory file written once on trip, not regenerated on subsequent records" "PASS"
@@ -309,6 +311,157 @@ if [[ "$ordinary_rc" -eq 1 && "$signing_rc" -eq 0 && "$reason" == *"signal=worke
 else
 	print_result "signing failure trips immediately while ordinary signal retains threshold" "FAIL" \
 		"ordinary_rc=$ordinary_rc signing_rc=$signing_rc reason=$reason"
+fi
+_teardown_sandbox
+
+# --- Test 14: routine signing failure is audit-only, not issue-runner health ---
+_setup_sandbox
+_h record-outcome no_worker_process owner/repo#1 >/dev/null 2>&1
+for routine in routine-pulse routine-maintenance routine-pulse; do
+	_h record-outcome worker_signing_unavailable "$routine" >/dev/null 2>&1
+done
+routine_rc=0
+_h is-paused || routine_rc=$?
+counter=$(jq -r '.consecutive_zero_attempts' "$RUNNER_HEALTH_STATE_FILE")
+routine_entries=$(jq '[.last_outcomes[] | select(.issue | startswith("routine-"))] | length' "$RUNNER_HEALTH_STATE_FILE")
+if [[ "$routine_rc" -eq 1 && "$counter" -eq 1 && "$routine_entries" -eq 3 ]]; then
+	print_result "routine signing failures are audited without changing issue health" "PASS"
+else
+	print_result "routine signing failures are audited without changing issue health" "FAIL" \
+		"paused_rc=$routine_rc counter=$counter ledger_entries=$routine_entries"
+fi
+# GH#29920 remains intact even after the excluded routine failures.
+_h record-outcome worker_signing_unavailable routine-tools/app#2 >/dev/null 2>&1
+issue_rc=0
+_h is-paused || issue_rc=$?
+if [[ "$issue_rc" -eq 0 ]]; then
+	print_result "issue signing failure still trips immediately after routine outcomes" "PASS"
+else
+	print_result "issue signing failure still trips immediately after routine outcomes" "FAIL" "paused_rc=$issue_rc"
+fi
+_teardown_sandbox
+
+# --- Test 14b: post-activity continuation signing failure is audit-only (GH#37597) ---
+_setup_sandbox
+_h record-outcome no_worker_process owner/repo#1 >/dev/null 2>&1
+_h record-outcome worker_signing_unavailable_after_activity owner/repo#1 >/dev/null 2>&1
+continuation_rc=0
+_h is-paused || continuation_rc=$?
+counter=$(jq -r '.consecutive_zero_attempts' "$RUNNER_HEALTH_STATE_FILE")
+entries=$(jq '[.last_outcomes[] | select(.signal == "worker_signing_unavailable_after_activity")] | length' "$RUNNER_HEALTH_STATE_FILE")
+if [[ "$continuation_rc" -eq 1 && "$counter" -eq 1 && "$entries" -eq 1 ]]; then
+	print_result "post-activity continuation signing failure is audited without tripping" "PASS"
+else
+	print_result "post-activity continuation signing failure is audited without tripping" "FAIL" \
+		"paused_rc=$continuation_rc counter=$counter ledger_entries=$entries"
+fi
+_teardown_sandbox
+
+# Routine signing failures must leave even an expired issue window untouched.
+_setup_sandbox
+_h record-outcome no_worker_process owner/repo#1 >/dev/null 2>&1
+expired_state=$(jq '.window_started_at = "2000-01-01T00:00:00Z"' "$RUNNER_HEALTH_STATE_FILE")
+printf '%s\n' "$expired_state" >"$RUNNER_HEALTH_STATE_FILE"
+_h record-outcome worker_signing_unavailable routine-pulse >/dev/null 2>&1
+counter=$(jq -r '.consecutive_zero_attempts' "$RUNNER_HEALTH_STATE_FILE")
+window=$(jq -r '.window_started_at' "$RUNNER_HEALTH_STATE_FILE")
+if [[ "$counter" -eq 1 && "$window" == "2000-01-01T00:00:00Z" ]]; then
+	print_result "routine signing leaves expired issue counter and window untouched" "PASS"
+else
+	print_result "routine signing leaves expired issue counter and window untouched" "FAIL" \
+		"counter=$counter window=$window"
+fi
+_h record-outcome no_worker_process owner/repo#2 >/dev/null 2>&1
+counter=$(jq -r '.consecutive_zero_attempts' "$RUNNER_HEALTH_STATE_FILE")
+window=$(jq -r '.window_started_at' "$RUNNER_HEALTH_STATE_FILE")
+if [[ "$counter" -eq 1 && "$window" != "2000-01-01T00:00:00Z" ]]; then
+	print_result "next issue outcome still expires and re-anchors stale window" "PASS"
+else
+	print_result "next issue outcome still expires and re-anchors stale window" "FAIL" \
+		"counter=$counter window=$window"
+fi
+_teardown_sandbox
+
+# A successful update check with unchanged deployment must not resume dispatch.
+_setup_sandbox
+mkdir -p "$HOME/.aidevops/agents/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$HOME/.aidevops/agents/scripts/auto-update-helper.sh"
+chmod +x "$HOME/.aidevops/agents/scripts/auto-update-helper.sh"
+printf '%s\n' 'unchanged' >"$HOME/.aidevops/agents/VERSION"
+for i in 1 2 3; do
+	_h record-outcome no_worker_process "owner/repo#$i" >/dev/null 2>&1
+done
+rc=0
+_h is-paused || rc=$?
+outcome=$(jq -r '.circuit_breaker.last_update_outcome' "$RUNNER_HEALTH_STATE_FILE")
+if [[ "$rc" -eq 0 && "$outcome" == "no_change" ]]; then
+	print_result "no-op update keeps breaker paused" "PASS"
+else
+	print_result "no-op update keeps breaker paused" "FAIL" "rc=$rc outcome=$outcome"
+fi
+_teardown_sandbox
+
+# --- Streak tests (t18927): window measures idleness, not streak age ---
+_rh_epoch_ts() {
+	local epoch="$1"
+	date -u -d "@${epoch}" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+		|| date -u -r "$epoch" '+%Y-%m-%dT%H:%M:%SZ'
+	return 0
+}
+
+# Record zero-attempt outcomes at a fixed gap (minutes); optionally one
+# overridden gap at index N and one real-attempt outcome at index M.
+_rh_run_streak() {
+	local gap_min="$1"
+	local count="$2"
+	local gap_override_idx="${3:-0}"
+	local gap_override_min="${4:-0}"
+	local real_idx="${5:-0}"
+	local t=1800000000 i signal ts
+	for ((i = 1; i <= count; i++)); do
+		if [[ "$i" -gt 1 ]]; then
+			if [[ "$i" -eq "$gap_override_idx" ]]; then
+				t=$((t + gap_override_min * 60))
+			else
+				t=$((t + gap_min * 60))
+			fi
+		fi
+		signal="no_worker_process"
+		[[ "$i" -eq "$real_idx" ]] && signal="real_attempt_with_commit"
+		ts=$(_rh_epoch_ts "$t") || return 1
+		[[ -n "$ts" ]] || return 1
+		RUNNER_HEALTH_TEST_NOW="$ts" _h record-outcome "$signal" "owner/repo#$i" >/dev/null 2>&1
+	done
+	return 0
+}
+
+_setup_sandbox
+export RUNNER_HEALTH_FAILURE_THRESHOLD=10 RUNNER_HEALTH_WINDOW_HOURS=6
+_rh_run_streak 50 10
+if _h is-paused; then
+	print_result "10 zero-attempts 50min apart trip the breaker" "PASS"
+else
+	print_result "10 zero-attempts 50min apart trip the breaker" "FAIL"
+fi
+_teardown_sandbox
+
+_setup_sandbox
+export RUNNER_HEALTH_FAILURE_THRESHOLD=10 RUNNER_HEALTH_WINDOW_HOURS=6
+_rh_run_streak 50 10 5 420
+if _h is-paused; then
+	print_result "idle gap beyond window decays streak (no trip)" "FAIL"
+else
+	print_result "idle gap beyond window decays streak (no trip)" "PASS"
+fi
+_teardown_sandbox
+
+_setup_sandbox
+export RUNNER_HEALTH_FAILURE_THRESHOLD=10 RUNNER_HEALTH_WINDOW_HOURS=6
+_rh_run_streak 50 10 0 0 5
+if _h is-paused; then
+	print_result "real attempt mid-streak resets it (no trip)" "FAIL"
+else
+	print_result "real attempt mid-streak resets it (no trip)" "PASS"
 fi
 _teardown_sandbox
 

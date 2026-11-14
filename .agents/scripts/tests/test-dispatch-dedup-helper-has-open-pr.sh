@@ -56,6 +56,8 @@ if [[ "${1:-}" == "api" && "${2:-}" == "graphql" ]]; then
 	query_string=""
 	query_owner=""
 	query_name=""
+	query_number=""
+	query_cursor=""
 	shift 2
 	for argument in "$@"; do
 		case "$argument" in
@@ -63,6 +65,8 @@ if [[ "${1:-}" == "api" && "${2:-}" == "graphql" ]]; then
 		queryString=*) query_string="${argument#queryString=}" ;;
 		owner=*) query_owner="${argument#owner=}" ;;
 		name=*) query_name="${argument#name=}" ;;
+		number=*) query_number="${argument#number=}" ;;
+		cursor=*) query_cursor="${argument#cursor=}" ;;
 		esac
 	done
 	if [[ -n "${GH_GRAPHQL_CALL_LOG:-}" ]]; then
@@ -132,7 +136,25 @@ EOF
 _append_gh_stub_graphql_tail() {
 	local stub_path="$1"
 	cat >>"$stub_path" <<'EOF'
+	if [[ "$query_text" == *"commits(first: 100, after:"* ]]; then
+		if [[ "${GH_COMMIT_DENIAL_PAGE:-0}" == 1 ]]; then
+			printf '%s\n' '{"errors":[{"type":"FORBIDDEN","message":"private diagnostic must not escape","path":["repository","pullRequest","commits","nodes",0]}]}'
+			exit 1
+		fi
+		page_json="${GH_OPEN_COMMIT_PAGE_JSON:-}"
+		[[ -n "$page_json" ]] || page_json='{"commits":[],"hasNextPage":false,"endCursor":null}'
+		jq -cn --argjson page "$page_json" --argjson cost "$graphql_cost" '
+			{data:{repository:{pullRequest:{commits:{
+				nodes:[($page.commits // [])[] | {commit:{messageHeadline:(.messageHeadline // "")}}],
+				pageInfo:{hasNextPage:($page.hasNextPage // false),endCursor:($page.endCursor // null)}
+			}}},rateLimit:{cost:$cost}}}'
+		exit 0
+	fi
 	if [[ "$query_text" == *"commits(first: 100)"* ]]; then
+		if [[ "${GH_COMMIT_DENIAL:-0}" == 1 ]]; then
+			printf '%s\n' '{"data":{"repository":{"pullRequests":{"nodes":[{"number":99,"commits":{"nodes":[null]}}]}},"rateLimit":{"cost":1}},"errors":[{"type":"FORBIDDEN","message":"private diagnostic must not escape","path":["repository","pullRequests","nodes",0,"commits","nodes",0]}]}'
+			exit "${GH_COMMIT_DENIAL_RC:-1}"
+		fi
 		jq -cn --argjson nodes "${GH_OPEN_COMMITS_JSON:-[]}" --argjson cost "$graphql_cost" '
 			{
 				data: {
@@ -144,7 +166,10 @@ _append_gh_stub_graphql_tail() {
 								isDraft: ($pr.isDraft // false),
 								commits: {
 									nodes: [($pr.commits // [])[] | {commit: {messageHeadline: (.messageHeadline // "")}}],
-									pageInfo: {hasNextPage: false}
+									pageInfo: {
+										hasNextPage: ($pr.hasNextPage // false),
+										endCursor: ($pr.endCursor // null)
+									}
 								}
 							}))
 						}
@@ -165,6 +190,27 @@ EOF
 _append_gh_stub_native_reads() {
 	local stub_path="$1"
 	cat >>"$stub_path" <<'EOF'
+# gh api repos/R/issues/N/events — returns GH_ISSUE_EVENTS_JSON (GH#33071).
+if [[ "${1:-}" == "api" ]]; then
+	events_path=""
+	events_jq="."
+	shift
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--jq) events_jq="${2:-.}"; shift 2 ;;
+		--paginate) shift ;;
+		*) events_path="$1"; shift ;;
+		esac
+	done
+	if [[ "$events_path" =~ ^repos/[^/]+/[^/]+/issues/[0-9]+/events ]]; then
+		[[ "${GH_ISSUE_EVENTS_FAIL:-0}" == "1" ]] && exit 1
+		printf '%s' "${GH_ISSUE_EVENTS_JSON:-[]}" | jq -r "$events_jq"
+		exit 0
+	fi
+	printf 'unsupported gh api path in test stub: %s\n' "$events_path" >&2
+	exit 1
+fi
+
 # gh pr list — returns fixture JSON for (repo, state, search) lookup.
 if [[ "${1:-}" == "pr" && "${2:-}" == "list" ]]; then
 	if [[ "${GH_PR_LIST_FAIL:-0}" == "1" ]]; then
@@ -251,6 +297,7 @@ setup_test_env() {
 	export GH_PR_VIEW_FIXTURE_FILE
 	export GH_GRAPHQL_CALL_LOG
 	export AIDEVOPS_DDPR_LOOKUP_RETRY_DELAY=0
+	export AIDEVOPS_DDPR_PERMISSION_CACHE_DIR="${TEST_ROOT}/permission-cache"
 	export AIDEVOPS_GH_SECONDARY_COOLDOWN_FILE="${TEST_ROOT}/gh-secondary-cooldown.json"
 	export AIDEVOPS_GH_SECONDARY_COOLDOWN_EVENTS_FILE="${TEST_ROOT}/gh-cooldown-events.jsonl"
 	export AIDEVOPS_GH_READ_RAMP_STATE_FILE="${TEST_ROOT}/gh-read-ramp-state.tsv"
@@ -352,12 +399,38 @@ test_has_open_pr_detects_response_metered_commit_reference() {
 	return 0
 }
 
+test_has_open_pr_paginates_only_oversized_pr_commit_evidence() {
+	local output=""
+	export GH_OPEN_COMMITS_JSON='[
+		{"number":1062,"title":"Unrelated oversized PR","isDraft":false,"commits":[{"messageHeadline":"ordinary first page"}],"hasNextPage":true,"endCursor":"cursor-100"},
+		{"number":1063,"title":"Other complete PR","isDraft":false,"commits":[{"messageHeadline":"ordinary complete commit"}]}
+	]'
+	export GH_OPEN_COMMIT_PAGE_JSON='{"commits":[{"messageHeadline":"Fixes #10002 on a later page"}],"hasNextPage":false,"endCursor":null}'
+	printf '' >"$GH_GRAPHQL_CALL_LOG"
+
+	if output=$("$HELPER_SCRIPT" has-open-pr 10002 marcusquinn/aidevops 't10002: bounded commit pagination'); then
+		unset GH_OPEN_COMMITS_JSON GH_OPEN_COMMIT_PAGE_JSON
+		if [[ "$output" == *"open PR #1062 has commits targeting issue #10002"* ]] &&
+			grep -qF '1|dispatch-dedup-open-commit-page-exact-cost|' "$GH_GRAPHQL_CALL_LOG"; then
+			print_result "has-open-pr contains oversized commit evidence to the affected PR" 0
+			return 0
+		fi
+		print_result "has-open-pr contains oversized commit evidence to the affected PR" 1 "output=${output}"
+		return 0
+	fi
+
+	unset GH_OPEN_COMMITS_JSON GH_OPEN_COMMIT_PAGE_JSON
+	print_result "has-open-pr contains oversized commit evidence to the affected PR" 1 \
+		"Expected later-page commit evidence without repository-wide uncertainty"
+	return 0
+}
+
 test_has_open_pr_allows_owner_repo_same_name() {
 	local output=""
 	export GH_OPEN_COMMITS_JSON='[{"number":1061,"title":"Same-name repo fix","isDraft":false,"commits":[{"messageHeadline":"Fixes #10001 in same-name owner repo"}]}]'
 	printf '' >"$GH_GRAPHQL_CALL_LOG"
 
-	if output=$("$HELPER_SCRIPT" has-open-pr 10001 awardsapp/awardsapp 't10001: same-name repo dispatch dedup'); then
+	if output=$("$HELPER_SCRIPT" has-open-pr 10001 sameapp/sameapp 't10001: same-name repo dispatch dedup'); then
 		unset GH_OPEN_COMMITS_JSON
 		if [[ "$output" == *"open PR #1061 has commits targeting issue #10001"* ]] && \
 			grep -qF '1|dispatch-dedup-open-commits-exact-cost|' "$GH_GRAPHQL_CALL_LOG"; then
@@ -483,6 +556,33 @@ marcusquinn/aidevops|open|#18779 in:body|[{"number":18906,"body":"Resolves #1877
 	return 0
 }
 
+test_has_open_pr_distinguishes_body_mentions_from_references() {
+	local is_draft body title output rc expected
+	for is_draft in true false; do
+		for body in 'The results phase (#33653) stays open.' 'For #33653.' 'Refs: owner/repo#33653.' 'GH#33653'; do
+			title="Implement another issue"
+			expected=0
+			[[ "$body" == 'The results phase (#33653) stays open.' ]] && expected=1
+			set_gh_fixtures "marcusquinn/aidevops|open|#33653|[{\"number\":33654,\"title\":\"${title}\",\"body\":\"${body}\",\"isDraft\":${is_draft},\"reviewDecision\":\"APPROVED\",\"mergeStateStatus\":\"CLEAN\",\"labels\":[{\"name\":\"origin:worker\"}]}]"
+			rc=0
+			output=$("$HELPER_SCRIPT" has-open-pr 33653 marcusquinn/aidevops 'body reference regression') || rc=$?
+			if [[ "$rc" -eq "$expected" ]]; then
+				print_result "has-open-pr body reference (draft=${is_draft}): ${body}" 0
+			else
+				print_result "has-open-pr body reference (draft=${is_draft}): ${body}" 1 "Expected rc=${expected}, got rc=${rc}: ${output}"
+			fi
+		done
+		# Bare title references remain valid even when the body is only prose.
+		set_gh_fixtures "marcusquinn/aidevops|open|#33653|[{\"number\":33654,\"title\":\"Implement #33653\",\"body\":\"The results phase (#33653) stays open.\",\"isDraft\":${is_draft},\"reviewDecision\":\"APPROVED\",\"mergeStateStatus\":\"CLEAN\"}]"
+		if "$HELPER_SCRIPT" has-open-pr 33653 marcusquinn/aidevops 'bare title regression' >/dev/null; then
+			print_result "has-open-pr preserves bare title reference (draft=${is_draft})" 0
+		else
+			print_result "has-open-pr preserves bare title reference (draft=${is_draft})" 1
+		fi
+	done
+	return 0
+}
+
 test_has_open_pr_marks_worker_draft_for_stale_routing() {
 	set_gh_fixtures 'marcusquinn/aidevops|open|#18780|[{"number":18907,"title":"Worker checkpoint for #18780","body":"Resolves #18780. Incomplete worker checkpoint.","isDraft":true,"reviewDecision":"REVIEW_REQUIRED","mergeStateStatus":"UNKNOWN","labels":[{"name":"origin:worker"}]}]'
 
@@ -501,6 +601,23 @@ test_has_open_pr_marks_worker_draft_for_stale_routing() {
 	return 0
 }
 
+test_has_open_pr_inline_for_matches_continuation_predicate() {
+	local body='Partial data checkpoint; publication remain pending. For #18790'
+	set_gh_fixtures "marcusquinn/aidevops|open|#18790|[{\"number\":18917,\"title\":\"Worker checkpoint\",\"body\":\"${body}\",\"isDraft\":true,\"reviewDecision\":\"REVIEW_REQUIRED\",\"mergeStateStatus\":\"UNKNOWN\",\"labels\":[{\"name\":\"origin:worker\"}]}]"
+
+	local pr_json output=""
+	pr_json=$(jq -n --arg body "$body" '{body:$body,isDraft:true,isCrossRepository:false,closingIssuesReferences:[],labels:[{name:"origin:worker"}]}')
+	if output=$("$HELPER_SCRIPT" has-open-pr 18790 marcusquinn/aidevops 'inline checkpoint') &&
+		[[ "$output" == WORKER_DRAFT_CHECKPOINT:* ]] &&
+		bash -c 'source "$1" && _pr_checkpoint_nonclosing_draft_links_issue "$2" 18790' _ \
+			"${SCRIPT_DIR}/../pr-checkpoint-target-lib.sh" "$pr_json"; then
+		print_result "has-open-pr and continuation agree on inline 'For #N' draft" 0
+		return 0
+	fi
+	print_result "has-open-pr and continuation agree on inline 'For #N' draft" 1 "Unexpected output: ${output}"
+	return 0
+}
+
 test_has_open_pr_keeps_protected_draft_unroutable() {
 	set_gh_fixtures 'marcusquinn/aidevops|open|#18781|[{"number":18908,"title":"Interactive checkpoint for #18781","body":"Resolves #18781. Held for review.","isDraft":true,"reviewDecision":"REVIEW_REQUIRED","mergeStateStatus":"UNKNOWN","labels":[{"name":"origin:interactive"}]}]'
 
@@ -516,6 +633,27 @@ test_has_open_pr_keeps_protected_draft_unroutable() {
 
 	print_result "has-open-pr keeps protected draft out of stale routing" 1 \
 		"Expected protected draft checkpoint to block ordinary redispatch"
+	return 0
+}
+
+# GH#34233: a seed draft (label seed-pr + exact marker) is not a checkpoint.
+test_has_open_pr_ignores_seed_draft_only_for_its_issue() {
+	local seed_labels='[{"name":"origin:interactive"},{"name":"seed-pr"}]' output="" rc=0
+	set_gh_fixtures "marcusquinn/aidevops|open|#18783|[{\"number\":18909,\"title\":\"GH#18783: seed companion files\",\"body\":\"<!-- aidevops:seed-pr issue=18783 -->\\nFor #18783\",\"isDraft\":true,\"reviewDecision\":\"REVIEW_REQUIRED\",\"mergeStateStatus\":\"UNKNOWN\",\"labels\":${seed_labels}}]"
+	output=$("$HELPER_SCRIPT" has-open-pr 18783 marcusquinn/aidevops 'seeded issue') || rc=$?
+	if [[ "$rc" -eq 1 ]]; then
+		print_result "has-open-pr does not block on the issue's own seed draft" 0
+	else
+		print_result "has-open-pr does not block on the issue's own seed draft" 1 "rc=${rc}: ${output}"
+	fi
+	# A marker for another issue keeps the ordinary draft-checkpoint block.
+	set_gh_fixtures "marcusquinn/aidevops|open|#18783|[{\"number\":18909,\"title\":\"GH#18783: seed companion files\",\"body\":\"<!-- aidevops:seed-pr issue=18784 -->\\nFor #18783\",\"isDraft\":true,\"reviewDecision\":\"REVIEW_REQUIRED\",\"mergeStateStatus\":\"UNKNOWN\",\"labels\":${seed_labels}}]"
+	output=$("$HELPER_SCRIPT" has-open-pr 18783 marcusquinn/aidevops 'foreign seed marker') || true
+	if [[ "$output" == *"draft PR #18909 is a durable checkpoint"* ]]; then
+		print_result "has-open-pr still blocks a seed-labelled draft without this issue's marker" 0
+	else
+		print_result "has-open-pr still blocks a seed-labelled draft without this issue's marker" 1 "output: ${output}"
+	fi
 	return 0
 }
 
@@ -610,14 +748,52 @@ test_has_open_pr_fails_closed_on_partial_sibling_connections() {
 		return 0
 	fi
 
-	fixture='marcusquinn/aidevops|open|#18785|[{"number":18910,"title":"Checkpoint for #18785","body":"For #18785","isDraft":true,"filesHasNextPage":true}]'
-	set_gh_fixtures "$fixture"
-	rc=0
+	print_result "has-open-pr rejects partial sibling labels" 0
+	return 0
+}
+
+# t18670: a partial file page (over 100 changed files) is decided, not uncertain.
+# The draft still blocks as a checkpoint; only the uncertainty is gone.
+test_has_open_pr_decides_draft_with_partial_sibling_files() {
+	set_gh_fixtures 'marcusquinn/aidevops|open|#18785|[{"number":18910,"title":"Checkpoint for #18785","body":"For #18785","isDraft":true,"changedFiles":595,"filesHasNextPage":true}]'
+	local output=""
+	local rc=0
 	output=$("$HELPER_SCRIPT" has-open-pr 18785 marcusquinn/aidevops 'partial sibling files') || rc=$?
-	if [[ "$rc" -eq 0 && "$output" == PR_LOOKUP_UNCERTAIN:* ]]; then
-		print_result "has-open-pr rejects partial sibling connections" 0
+	if [[ "$rc" -eq 0 && "$output" == *"draft PR #18910 is a durable checkpoint for issue #18785"* &&
+		"$output" != *PR_LOOKUP_UNCERTAIN* ]]; then
+		print_result "has-open-pr decides a draft sibling with partial files" 0
 	else
-		print_result "has-open-pr rejects partial sibling connections" 1 "rc=${rc} output=${output}"
+		print_result "has-open-pr decides a draft sibling with partial files" 1 "rc=${rc} output=${output}"
+	fi
+	return 0
+}
+
+# t18670: search matches PRs that mention the issue anywhere. A large open PR
+# that does not reference the issue in its title or body must not block it.
+test_has_open_pr_allows_past_oversized_unrelated_sibling() {
+	set_gh_fixtures 'marcusquinn/aidevops|open|#18786|[{"number":18911,"title":"Sync platform users into the CRM","body":"For #18700","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","changedFiles":595,"files":[{"path":"src/a.ts"}],"filesHasNextPage":true}]'
+	local output=""
+	local rc=0
+	output=$("$HELPER_SCRIPT" has-open-pr 18786 marcusquinn/aidevops 'oversized unrelated sibling') || rc=$?
+	if [[ "$rc" -eq 1 && "$output" != *PR_LOOKUP_UNCERTAIN* ]]; then
+		print_result "has-open-pr allows dispatch past an oversized unrelated sibling" 0
+	else
+		print_result "has-open-pr allows dispatch past an oversized unrelated sibling" 1 "rc=${rc} output=${output}"
+	fi
+	return 0
+}
+
+# t18670: a truncated file page is never exempt as planning-only, even when its
+# first page and changedFiles alone would look complete and planning-only.
+test_has_open_pr_blocks_truncated_planning_looking_sibling() {
+	set_gh_fixtures 'marcusquinn/aidevops|open|#18787|[{"number":18912,"title":"Planning first page","body":"For #18787.","isDraft":false,"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","changedFiles":2,"files":[{"path":"TODO.md"},{"path":"todo/tasks/t18787-brief.md"}],"filesHasNextPage":true}]'
+	local output=""
+	local rc=0
+	output=$("$HELPER_SCRIPT" has-open-pr 18787 marcusquinn/aidevops 'truncated planning-looking sibling') || rc=$?
+	if [[ "$rc" -eq 0 && "$output" == *"open PR #18912 is approved or mergeable for issue #18787"* ]]; then
+		print_result "has-open-pr keeps a truncated planning-looking sibling owning" 0
+	else
+		print_result "has-open-pr keeps a truncated planning-looking sibling owning" 1 "rc=${rc} output=${output}"
 	fi
 	return 0
 }
@@ -863,9 +1039,61 @@ test_has_open_pr_allows_dispatch_on_task_id_collision() {
 	return 0
 }
 
+# GH#33071: a closing PR merged before the issue's latest reopen belongs to
+# an earlier lifecycle (e.g. file-size-debt reopened by the large-file gate).
+readonly REOPEN_EVENTS_FIXTURE='[{"event":"closed","created_at":"2026-07-29T03:12:57Z"},{"event":"reopened","created_at":"2026-09-27T08:44:15Z"},{"event":"closed","created_at":"2026-09-27T12:48:30Z"},{"event":"reopened","created_at":"2026-09-28T05:23:16Z"}]'
+
+test_has_open_pr_allows_reopened_issue_after_merged_close() {
+	set_gh_fixtures 'marcusquinn/aidevops|merged|#28839 in:body|[{"number":28845,"body":"Resolves #28839","mergedAt":"2026-07-29T03:12:56Z"}]
+marcusquinn/aidevops|merged|t28839 in:title|[{"number":28845,"body":"Resolves #28839","mergedAt":"2026-07-29T03:12:56Z"}]'
+	export GH_ISSUE_EVENTS_JSON="$REOPEN_EVENTS_FIXTURE"
+	local output="" rc=0
+	output=$("$HELPER_SCRIPT" has-open-pr 28839 marcusquinn/aidevops 't28839: file-size-debt') || rc=$?
+	unset GH_ISSUE_EVENTS_JSON
+
+	if [[ "$rc" -eq 1 && -z "$output" ]]; then
+		print_result "has-open-pr allows reopened issue whose closing PRs predate the reopen" 0
+		return 0
+	fi
+	print_result "has-open-pr allows reopened issue whose closing PRs predate the reopen" 1 \
+		"rc=${rc} output=${output}"
+	return 0
+}
+
+test_has_open_pr_blocks_merge_after_latest_reopen() {
+	set_gh_fixtures 'marcusquinn/aidevops|merged|#28839 in:body|[{"number":28845,"body":"Resolves #28839","mergedAt":"2026-07-29T03:12:56Z"},{"number":33072,"body":"Resolves #28839","mergedAt":"2026-09-29T19:58:07Z"}]'
+	export GH_ISSUE_EVENTS_JSON="$REOPEN_EVENTS_FIXTURE"
+	local output="" rc=0
+	output=$("$HELPER_SCRIPT" has-open-pr 28839 marcusquinn/aidevops 'file-size-debt') || rc=$?
+	unset GH_ISSUE_EVENTS_JSON
+
+	if [[ "$rc" -eq 0 && "$output" == *"merged PR #33072 references issue #28839 via keyword"* ]]; then
+		print_result "has-open-pr blocks when a closing PR merged after the latest reopen" 0
+		return 0
+	fi
+	print_result "has-open-pr blocks when a closing PR merged after the latest reopen" 1 \
+		"rc=${rc} output=${output}"
+	return 0
+}
+
+test_has_open_pr_fails_closed_when_reopen_lookup_fails() {
+	set_gh_fixtures 'marcusquinn/aidevops|merged|#28839 in:body|[{"number":28845,"body":"Resolves #28839","mergedAt":"2026-07-29T03:12:56Z"}]'
+	export GH_ISSUE_EVENTS_FAIL=1
+	local output="" rc=0
+	output=$("$HELPER_SCRIPT" has-open-pr 28839 marcusquinn/aidevops 'file-size-debt') || rc=$?
+	unset GH_ISSUE_EVENTS_FAIL
+
+	if [[ "$rc" -eq 0 && "$output" == *"PR_LOOKUP_RESULT=uncertain reason=api_request_failed scope=merged_body_reopen"* ]]; then
+		print_result "has-open-pr fails closed when the reopen lookup fails" 0
+		return 0
+	fi
+	print_result "has-open-pr fails closed when the reopen lookup fails" 1 "rc=${rc} output=${output}"
+	return 0
+}
+
 test_has_open_pr_blocks_superseded_consolidated_issue() {
 	set_gh_fixtures 'marcusquinn/aidevops|merged|#26241|[{"number":26266,"title":"For #26241: split mixed PR view fields","body":"## Summary\n\n- Split mixed gh_pr_view requests into REST and GraphQL subsets.\n\nFor #26241\n\n## Testing\n\n- .agents/scripts/tests/test-gh-wrapper-rest-fallback.sh"}]'
-	export ISSUE_META_JSON='{"body":"_Supersedes #26241 — this issue is the consolidated spec._\n\nImplement the remaining mixed REST/GQL field-split phase."}'
+	export ISSUE_META_JSON='{"body":"_Supersedes #26241 — this issue is the consolidated spec._"}'
 
 	local output=""
 	if output=$("$HELPER_SCRIPT" has-open-pr 26274 marcusquinn/aidevops 'consolidated: split mixed gh_pr_view REST/GQL fields'); then
@@ -888,7 +1116,7 @@ test_has_open_pr_blocks_superseded_consolidated_issue() {
 
 test_has_open_pr_blocks_crlf_superseded_consolidated_issue() {
 	set_gh_fixtures 'marcusquinn/aidevops|merged|#26241|[{"number":26266,"title":"For #26241: split mixed PR view fields","body":"For #26241. Implements the fix."}]'
-	export ISSUE_META_JSON='{"body":"_Supersedes #26241 — this issue is the consolidated spec._\r\n\r\nImplement the remaining phase."}'
+	export ISSUE_META_JSON='{"body":"_Supersedes #26241 — this issue is the consolidated spec._\r\n"}'
 
 	local output=""
 	if output=$("$HELPER_SCRIPT" has-open-pr 26274 marcusquinn/aidevops 'consolidated: split mixed gh_pr_view REST/GQL fields'); then
@@ -903,6 +1131,61 @@ test_has_open_pr_blocks_crlf_superseded_consolidated_issue() {
 
 	unset ISSUE_META_JSON
 	print_result "has-open-pr accepts CRLF supersedes marker" 1 "Unexpected output: ${output}"
+	return 0
+}
+
+test_has_open_pr_allows_successor_only_scope() {
+	set_gh_fixtures 'marcusquinn/aidevops|merged|#26241|[{"number":26266,"title":"For #26241: split mixed PR view fields","body":"For #26241. Implements the earlier phase."}]'
+	export ISSUE_META_JSON='{"body":"_Supersedes #26241 — this issue is the consolidated spec._\n\n## What\n\nImplement the remaining mixed REST/GQL field-split phase."}'
+
+	if "$HELPER_SCRIPT" has-open-pr 26274 marcusquinn/aidevops 'consolidated: remaining mixed fields'; then
+		unset ISSUE_META_JSON
+		print_result "has-open-pr allows consolidated successor-only scope" 1 \
+			"Expected component PR evidence not to suppress explicit remaining work"
+		return 0
+	fi
+
+	unset ISSUE_META_JSON
+	print_result "has-open-pr allows consolidated successor-only scope" 0
+	return 0
+}
+
+test_has_open_pr_allows_partial_multi_component_coverage() {
+	set_gh_fixtures $'marcusquinn/aidevops|merged|#30001|[{"number":30101,"title":"Fix #30001","body":"Implements #30001."}]\nmarcusquinn/aidevops|merged|#30002|[]'
+	export ISSUE_META_JSON='{"body":"_Supersedes #30001 — this issue is the consolidated spec._\n_Supersedes #30002 — this issue is the consolidated spec._"}'
+
+	if "$HELPER_SCRIPT" has-open-pr 30100 marcusquinn/aidevops 'consolidated: combine two components'; then
+		unset ISSUE_META_JSON
+		print_result "has-open-pr allows partial multi-component coverage" 1 \
+			"Expected one uncovered superseded component to remain dispatchable"
+		return 0
+	fi
+
+	unset ISSUE_META_JSON
+	print_result "has-open-pr allows partial multi-component coverage" 0
+	return 0
+}
+
+test_has_open_pr_blocks_complete_multi_component_coverage() {
+	set_gh_fixtures $'marcusquinn/aidevops|merged|#30001|[{"number":30101,"title":"Fix #30001","body":"Implements #30001."}]\nmarcusquinn/aidevops|merged|#30002|[{"number":30102,"title":"Fix #30002","body":"Implements #30002."}]'
+	export ISSUE_META_JSON='{"body":"_Supersedes #30001 — this issue is the consolidated spec._\n_Supersedes #30002 — this issue is the consolidated spec._\n\n<!-- aidevops:origin:worker -->\n<!-- aidevops:sig -->\n---\n[aidevops.sh](https://aidevops.sh) generated footer"}'
+
+	local output=""
+	if output=$("$HELPER_SCRIPT" has-open-pr 30100 marcusquinn/aidevops 'consolidated: combine two completed components'); then
+		unset ISSUE_META_JSON
+		case "$output" in
+		*'PR #30101 for #30001, PR #30102 for #30002'*'consolidated issue #30100'*)
+			print_result "has-open-pr blocks complete multi-component coverage" 0
+			return 0
+			;;
+		esac
+		print_result "has-open-pr blocks complete multi-component coverage" 1 "Unexpected output: ${output}"
+		return 0
+	fi
+
+	unset ISSUE_META_JSON
+	print_result "has-open-pr blocks complete multi-component coverage" 1 \
+		"Expected complete superseded-component evidence to block dispatch"
 	return 0
 }
 
@@ -1010,6 +1293,84 @@ test_has_open_pr_requires_canonical_supersedes_marker() {
 	return 0
 }
 
+test_commit_permission_cooldown() {
+	local output="" before="" after="" cache_file="" rc=0
+	set_gh_fixtures ''
+	export GH_COMMIT_DENIAL=1
+	export AIDEVOPS_DDPR_CAPABILITY_CONTEXT="permission-test"
+	printf '' >"$GH_GRAPHQL_CALL_LOG"
+	output=$("$HELPER_SCRIPT" has-open-pr 70001 example/repo) || rc=$?
+	if [[ "$rc" == 0 && "$output" == *"reason=commit_permission_denied"* && "$output" != *"private diagnostic"* ]] &&
+		[[ $(grep -cF '1|dispatch-dedup-open-commits-exact-cost|' "$GH_GRAPHQL_CALL_LOG") -eq 1 ]]; then
+		print_result "nested FORBIDDEN is sanitized and not immediately retried" 0
+	else
+		print_result "nested FORBIDDEN is sanitized and not immediately retried" 1 "$output"
+	fi
+	before=$(wc -l <"$GH_GRAPHQL_CALL_LOG")
+	output=$("$HELPER_SCRIPT" has-open-pr 70002 example/repo) || true
+	after=$(wc -l <"$GH_GRAPHQL_CALL_LOG")
+	if [[ "$before" == "$after" && "$output" == *"reason=commit_permission_denied"* ]]; then
+		print_result "unchanged denial suppresses scans across candidates" 0
+	else
+		print_result "unchanged denial suppresses scans across candidates" 1 "$output"
+	fi
+	unset GH_COMMIT_DENIAL
+	if "$HELPER_SCRIPT" has-open-pr 70002 example/other; then
+		print_result "repository denial does not suppress another repository" 1
+	else
+		print_result "repository denial does not suppress another repository" 0
+	fi
+	export AIDEVOPS_DDPR_CAPABILITY_CONTEXT="permission-success-exit"
+	export GH_COMMIT_DENIAL=1 GH_COMMIT_DENIAL_RC=0
+	rc=0
+	output=$("$HELPER_SCRIPT" has-open-pr 70002 example/repo) || rc=$?
+	if [[ "$rc" == 0 && "$output" == *"reason=commit_permission_denied"* ]]; then
+		print_result "partial FORBIDDEN with zero transport status still blocks" 0
+	else
+		print_result "partial FORBIDDEN with zero transport status still blocks" 1 "$output"
+	fi
+	unset GH_COMMIT_DENIAL GH_COMMIT_DENIAL_RC
+	export AIDEVOPS_DDPR_CAPABILITY_CONTEXT="transport-test" GH_PR_LIST_FAIL=1
+	output=$("$HELPER_SCRIPT" has-open-pr 70002 example/repo) || true
+	if [[ "$output" == *"reason=api_request_failed"* && "$output" != *"commit_permission_denied"* ]]; then
+		print_result "transport failure is not a permission denial" 0
+	else
+		print_result "transport failure is not a permission denial" 1 "$output"
+	fi
+	unset GH_PR_LIST_FAIL
+	if "$HELPER_SCRIPT" has-open-pr 70002 example/repo; then
+		print_result "transient transport recovery needs no capability change" 1
+	else
+		print_result "transient transport recovery needs no capability change" 0
+	fi
+	export AIDEVOPS_DDPR_CAPABILITY_CONTEXT="permission-repaired"
+	if "$HELPER_SCRIPT" has-open-pr 70002 example/repo; then
+		print_result "context change enables guarded read, not automatic clearance" 1
+	else
+		print_result "context change enables guarded read, not automatic clearance" 0
+	fi
+	export AIDEVOPS_DDPR_CAPABILITY_CONTEXT="permission-test"
+	for cache_file in "$AIDEVOPS_DDPR_PERMISSION_CACHE_DIR"/*.json; do
+		jq '.denied_at = 0' "$cache_file" >"${cache_file}.expired"
+		mv "${cache_file}.expired" "$cache_file"
+	done
+	if "$HELPER_SCRIPT" has-open-pr 70002 example/repo; then
+		print_result "expired denial allows complete evidence read" 1
+	else
+		print_result "expired denial allows complete evidence read" 0
+	fi
+	export GH_COMMIT_DENIAL_PAGE=1
+	export GH_OPEN_COMMITS_JSON='[{"number":99,"hasNextPage":true,"endCursor":"next","commits":[]}]'
+	output=$("$HELPER_SCRIPT" has-open-pr 70003 example/repo) || true
+	if [[ "$output" == *"reason=commit_permission_denied"* ]]; then
+		print_result "subsequent commit page denial remains fail-closed" 0
+	else
+		print_result "subsequent commit page denial remains fail-closed" 1 "$output"
+	fi
+	unset GH_COMMIT_DENIAL_PAGE GH_OPEN_COMMITS_JSON AIDEVOPS_DDPR_CAPABILITY_CONTEXT
+	return 0
+}
+
 main() {
 	trap teardown_test_env EXIT
 	setup_test_env
@@ -1017,21 +1378,31 @@ main() {
 	test_has_open_pr_detects_closing_keyword
 	test_has_open_pr_detects_task_id_fallback
 	test_has_open_pr_detects_response_metered_commit_reference
+	test_has_open_pr_paginates_only_oversized_pr_commit_evidence
 	test_has_open_pr_allows_owner_repo_same_name
 	test_has_open_pr_returns_nonzero_without_match
 	test_has_open_pr_ignores_planning_for_reference
 	test_has_open_pr_ignores_planning_ref_reference
 	test_has_open_pr_requires_close_keyword_for_our_issue
 	test_has_open_pr_allows_dispatch_on_task_id_collision
+	test_has_open_pr_allows_reopened_issue_after_merged_close
+	test_has_open_pr_blocks_merge_after_latest_reopen
+	test_has_open_pr_fails_closed_when_reopen_lookup_fails
 	test_has_open_pr_detects_open_body_closing_keyword
 	test_has_open_pr_blocks_draft_body_closing_keyword
+	test_has_open_pr_distinguishes_body_mentions_from_references
 	test_has_open_pr_marks_worker_draft_for_stale_routing
+	test_has_open_pr_inline_for_matches_continuation_predicate
 	test_has_open_pr_keeps_protected_draft_unroutable
+	test_has_open_pr_ignores_seed_draft_only_for_its_issue
 	test_has_open_pr_fails_closed_when_sibling_lookup_fails
 	test_has_open_pr_recovers_after_lookup_uncertainty
 	test_has_open_pr_classifies_sanitized_lookup_failures
 	test_has_open_pr_fails_closed_without_response_owned_cost
 	test_has_open_pr_fails_closed_on_partial_sibling_connections
+	test_has_open_pr_decides_draft_with_partial_sibling_files
+	test_has_open_pr_allows_past_oversized_unrelated_sibling
+	test_has_open_pr_blocks_truncated_planning_looking_sibling
 	test_has_open_pr_ignores_open_body_planning_for_reference
 	test_has_open_pr_requires_open_close_keyword_for_our_issue
 	test_has_open_pr_blocks_approved_mergeable_sibling
@@ -1046,12 +1417,16 @@ main() {
 	test_has_open_pr_ignores_adjacent_issue_number_sibling_reference
 	test_has_open_pr_blocks_superseded_consolidated_issue
 	test_has_open_pr_blocks_crlf_superseded_consolidated_issue
+	test_has_open_pr_allows_successor_only_scope
+	test_has_open_pr_allows_partial_multi_component_coverage
+	test_has_open_pr_blocks_complete_multi_component_coverage
 	test_has_open_pr_ignores_planning_only_superseded_reference
 	test_has_open_pr_ignores_dependency_bump_superseded_references
 	test_has_open_pr_preserves_non_bot_bump_implementation
 	test_has_open_pr_preserves_bump_wording_in_implementation_body
 	test_has_open_pr_ignores_consolidation_task_historical_reference
 	test_has_open_pr_requires_canonical_supersedes_marker
+	test_commit_permission_cooldown
 
 	printf '\nRan %s tests, %s failed.\n' "$TESTS_RUN" "$TESTS_FAILED"
 	if [[ "$TESTS_FAILED" -gt 0 ]]; then

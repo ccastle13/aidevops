@@ -4,6 +4,14 @@
 
 set -euo pipefail
 
+# Resolve native Git once from the system default PATH (portable to non-FHS
+# hosts such as NixOS); fixtures must bypass the aidevops git wrapper.
+TEST_NATIVE_GIT=$(command -p -v git) || {
+	printf '%s\n' 'Native Git is unavailable on the system PATH' >&2
+	exit 1
+}
+export TEST_NATIVE_GIT
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 if [[ -d "$ROOT_DIR/.agents/scripts" ]]; then
@@ -11,7 +19,7 @@ if [[ -d "$ROOT_DIR/.agents/scripts" ]]; then
 else
 	AGENTS_SCRIPTS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 fi
-GIT_BIN="${AIDEVOPS_TEST_GIT_BIN:-/usr/bin/git}"
+GIT_BIN="${AIDEVOPS_TEST_GIT_BIN:-${TEST_NATIVE_GIT}}"
 
 # Keep temporary fixture repositories on native Git; canonical mutation-guard
 # behavior is covered by its dedicated tests.
@@ -269,6 +277,240 @@ SH
 	return 0
 }
 
+test_abandoned_central_fixtures() {
+	local base="" candidate="" fixture_root="" now_epoch=0 moved=0 rc=0
+	base=$(cd "$TEST_ROOT/Git/_worktrees" && pwd -P)
+	export AIDEVOPS_WORKTREE_BASE_DIR="$base"
+	export ORPHAN_WORKTREE_GRACE_SECS=1800
+	fixture_root="${TEST_ROOT}gone"
+	candidate="$base/${fixture_root##*/}-feature-auto-20260731-013454"
+	mkdir -p "$candidate"
+	printf 'test\n' >"$candidate/README.md"
+	printf 'gitdir: %s/.git/worktrees/%s\n' "$fixture_root" "${candidate##*/}" >"$candidate/.git"
+	now_epoch=$(($(date +%s) + 3600))
+	_pc_central_fixture_bytes "$candidate" "$base" "$now_epoch" >/dev/null || rc=1
+	print_result "exact abandoned central fixture is classified" "$rc"
+
+	rc=0
+	if _pc_central_fixture_bytes "$candidate" "$base" "$(date +%s)" >/dev/null; then rc=1; fi
+	print_result "recent central fixture is preserved" "$rc"
+	mkdir -p "$fixture_root"
+	rc=0
+	if _pc_central_fixture_bytes "$candidate" "$base" "$now_epoch" >/dev/null; then rc=1; fi
+	rmdir "$fixture_root"
+	print_result "fixture with an existing canonical root is preserved" "$rc"
+
+	printf 'important work\n' >"$candidate/README.md"
+	rc=0
+	if PYTHONOPTIMIZE=1 _pc_central_fixture_bytes "$candidate" "$base" "$now_epoch" >/dev/null; then rc=1; fi
+	print_result "non-fixture content is protected even with optimized Python" "$rc"
+	printf 'test\n' >"$candidate/README.md"
+	ln -s "$TEST_ROOT" "$candidate/TODO.md"
+	rc=0
+	if _pc_central_fixture_bytes "$candidate" "$base" "$now_epoch" >/dev/null; then rc=1; fi
+	rm "$candidate/TODO.md"
+	print_result "symlink inside fixture is preserved" "$rc"
+	touch "$candidate/.aidevops-preserve-forensics"
+	rc=0
+	if _pc_central_fixture_bytes "$candidate" "$base" "$now_epoch" >/dev/null; then rc=1; fi
+	rm "$candidate/.aidevops-preserve-forensics"
+	print_result "forensics marker prevents fixture cleanup" "$rc"
+
+	# Mock only process/ownership evidence; classification and trash moves are real.
+	_worktree_owner_alive() { return 1; }
+	lsof() { return 1; }
+	moved=$(_pc_cleanup_central_fixture_orphans "$now_epoch" audit)
+	rc=0
+	[[ "$moved" == 0 && -d "$candidate" ]] || rc=1
+	print_result "fixture audit mode never moves candidates" "$rc"
+	_worktree_owner_alive() { return 0; }
+	moved=$(_pc_cleanup_central_fixture_orphans "$now_epoch")
+	rc=0
+	[[ "$moved" == 0 && -d "$candidate" ]] || rc=1
+	print_result "owned fixture is preserved" "$rc"
+	_worktree_owner_alive() { return 1; }
+	lsof() { printf '123\n'; return 0; }
+	moved=$(_pc_cleanup_central_fixture_orphans "$now_epoch")
+	rc=0
+	[[ "$moved" == 0 && -d "$candidate" ]] || rc=1
+	print_result "fixture with open files is preserved" "$rc"
+	lsof() { printf 'inspection failed\n' >&2; return 1; }
+	moved=$(_pc_cleanup_central_fixture_orphans "$now_epoch")
+	rc=0
+	[[ "$moved" == 0 && -d "$candidate" ]] || rc=1
+	print_result "process inspection failure preserves fixture" "$rc"
+	lsof() { return 1; }
+	moved=$(unset -f is_registered_canonical; _pc_cleanup_central_fixture_orphans "$now_epoch")
+	rc=0
+	[[ "$moved" == 0 && -d "$candidate" ]] || rc=1
+	print_result "missing canonical guard preserves fixture" "$rc"
+	lsof() {
+		if [[ -f "$TEST_ROOT/process-appeared" ]]; then printf '123\n'; return 0; fi
+		touch "$TEST_ROOT/process-appeared"
+		return 1
+	}
+	moved=$(_pc_cleanup_central_fixture_orphans "$now_epoch")
+	rc=0
+	[[ "$moved" == 0 && -d "$candidate" ]] || rc=1
+	print_result "process appearing during revalidation preserves fixture" "$rc"
+	lsof() { return 1; }
+	moved=$(_pc_cleanup_central_fixture_orphans "$now_epoch")
+	rc=0
+	[[ "$moved" == 1 && ! -e "$candidate" ]] || rc=1
+	local recovered=""
+	for recovered in "$AIDEVOPS_ORPHAN_TRASH_ROOT"/*/"${candidate##*/}"; do
+		[[ -f "$recovered/README.md" && -f "$recovered/.git" ]] || rc=1
+	done
+	print_result "abandoned fixture moves intact to recoverable trash" "$rc"
+	return 0
+}
+
+test_orphan_retry_ledger() {
+	local rc=0
+	python3 - "$AGENTS_SCRIPTS_DIR/orphan-cleanup-state.py" "$TEST_ROOT" <<'PY' || rc=1
+import contextlib
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+from unittest.mock import patch
+
+helper, root = sys.argv[1], Path(sys.argv[2])
+spec = importlib.util.spec_from_file_location('orphan_state', helper)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+os.environ['PULSE_STATE_DIR'] = str(root / 'ledger-state')
+candidate = root / 'ledger-candidate'
+candidate.mkdir()
+child = candidate / 'file'
+child.write_text('preserved')
+
+def run(action, path=candidate):
+    result = subprocess.run([sys.executable, helper, action, str(path)], text=True, capture_output=True)
+    assert not result.stderr, result.stderr
+    return result.returncode, result.stdout.strip()
+
+# Run real filesystem traversal with only the child ownership metadata substituted:
+# unprivileged CI cannot chown a file to root and must not elevate permissions.
+original_lstat = os.lstat
+def foreign_lstat(path, *args, **kwargs):
+    info = original_lstat(path, *args, **kwargs)
+    if str(path) == str(child):
+        values = list(info)
+        values[4] = os.getuid() + 1
+        return os.stat_result(values)
+    return info
+
+output = io.StringIO()
+with patch.object(sys, 'argv', [helper, 'gate', str(candidate)]), patch.object(module.os, 'lstat', foreign_lstat), contextlib.redirect_stdout(output):
+    assert module.main() == 1
+assert output.getvalue().strip() == 'foreign-owner'
+assert run('gate') == (1, '')
+assert run('gate') == (1, '')
+code, report = run('report')
+assert code == 0 and 'foreign-owner' in report and str(candidate) in report
+assert 'sudo find -P' in report and 'chown -h' in report and 'Then reset this record' in report
+assert child.read_text() == 'preserved'
+
+# Explicit reset re-arms the gate; symlink targets are not traversed.
+assert run('clear') == (0, '')
+(candidate / 'root-owned-target').symlink_to('/usr')
+assert run('gate') == (0, '')
+assert run('failure') == (0, 'trash-failed')
+assert run('gate') == (0, '')
+assert run('failure') == (0, 'trash-failed')
+assert run('gate') == (0, '')
+assert run('failure') == (0, 'trash-failed-retry-exhausted')
+assert run('gate') == (1, '')
+assert 'trash-failed-retry-exhausted' in run('report')[1]
+assert run('clear') == (0, '')
+
+# Parallel reservations (even without failure callbacks) cannot exceed the budget.
+processes = [subprocess.Popen([sys.executable, helper, 'gate', str(candidate)], stdout=subprocess.PIPE, text=True) for _ in range(8)]
+results = [(process.communicate()[0], process.returncode) for process in processes]
+assert sum(code == 0 for _, code in results) == 3, results
+assert sum(text.strip() == 'trash-failed-retry-exhausted' for text, _ in results) == 1, results
+assert run('clear') == (0, '')
+
+# Corrupt or symlinked records veto cleanup; report still lists other valid holds.
+assert run('gate') == (0, '')
+ledger = root / 'ledger-state/orphan-trash-failures'
+record = next(ledger.glob('*.json'))
+data = json.loads(record.read_text())
+other = root / 'other-candidate'
+other.mkdir()
+for _ in range(3):
+    assert run('gate', other) == (0, '')
+    run('failure', other)
+for field, value in (('attempts', -1), ('schema', True), ('schema', 1.0)):
+    invalid = dict(data)
+    invalid[field] = value
+    record.write_text(json.dumps(invalid))
+    assert run('gate')[0] == 1
+    code, report = run('report')
+    assert code == 1 and 'Unreadable orphan cleanup record' in report and str(other) in report
+record.unlink()
+record.symlink_to(child)
+assert run('gate')[0] == 1 and child.read_text() == 'preserved'
+record.unlink()
+print('ledger ownership, reporting, reset, concurrency and fail-closed cases passed')
+PY
+	print_result "orphan retry ledger runtime cases" "$rc"
+	return 0
+}
+
+test_orphan_state_write_failure() {
+	local rc=0
+	python3 - "$AGENTS_SCRIPTS_DIR/orphan-cleanup-state.py" "$TEST_ROOT" <<'PY' || rc=1
+import importlib.util
+import os
+from pathlib import Path
+import sys
+from unittest.mock import patch
+
+helper, root = sys.argv[1], Path(sys.argv[2])
+spec = importlib.util.spec_from_file_location('orphan_state', helper)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+os.environ['PULSE_STATE_DIR'] = str(root / 'write-failure-state')
+candidate = root / 'write-failure-candidate'
+candidate.mkdir()
+# Persistence failure must deny the attempt before any trash call.
+with patch.object(sys, 'argv', [helper, 'gate', str(candidate)]), patch.object(module, 'save', side_effect=OSError('disk full')):
+    try:
+        module.main()
+    except OSError:
+        pass
+    else:
+        raise AssertionError('unpersisted attempt permitted')
+PY
+	print_result "state persistence failure denies trash attempt" "$rc"
+	return 0
+}
+
+test_trash_failure_exhaustion() {
+	local rc=0
+	(
+		export ORPHAN_WORKTREE_GRACE_SECS=0
+		export PULSE_STATE_DIR="$TEST_ROOT/caller-state"
+		local candidate="$TEST_ROOT/Git/aidevops-feature-trash-failure"
+		mkdir -p "$candidate"
+		_pc_trash_orphan_dir() { return 1; }
+		_pc_cleanup_orphan_sibling_dirs "$HOME/.config/aidevops/repos.json" "$(date +%s)" >/dev/null
+		_pc_cleanup_orphan_sibling_dirs "$HOME/.config/aidevops/repos.json" "$(date +%s)" >/dev/null
+		_pc_cleanup_orphan_sibling_dirs "$HOME/.config/aidevops/repos.json" "$(date +%s)" >/dev/null
+		local before=""
+		before=$(wc -c <"$LOGFILE")
+		_pc_cleanup_orphan_sibling_dirs "$HOME/.config/aidevops/repos.json" "$(date +%s)" >/dev/null
+		[[ "$(wc -c <"$LOGFILE")" == "$before" && -d "$candidate" ]]
+	) || rc=1
+	print_result "cleanup caller stops and skips silently after three trash failures" "$rc"
+	return 0
+}
+
 main() {
 	if ! command -v jq >/dev/null 2>&1; then
 		printf 'SKIP jq unavailable\n'
@@ -279,6 +521,10 @@ main() {
 	test_ci_repair_sibling_name_validation
 	test_orphan_sibling_dirs_move_to_trash_only
 	test_standalone_clean_check_requires_successful_status
+	test_abandoned_central_fixtures
+	test_orphan_retry_ledger
+	test_orphan_state_write_failure
+	test_trash_failure_exhaustion
 	printf '\n%d/%d tests passed\n' "$TESTS_PASSED" "$TESTS_RUN"
 	[[ "$TESTS_FAILED" -eq 0 ]] || return 1
 	return 0

@@ -4,11 +4,11 @@
 # Planning & Tasks — Detail Reference
 
 Loaded on-demand when working with tasks, TODO.md, or the supervisor dispatch system.
-Core rules are in `AGENTS.md`. Full planning docs: `workflows/plans.md`, `tools/task-management/beads.md`.
+Core rules are in `AGENTS.md`. Full planning docs: `workflows/plans.md`.
 
 ## Key Commands
 
-`/new-task`, `/save-todo`, `/ready`, `/sync-beads`, `/plan-status`, `/create-prd`, `/generate-tasks`
+`/new-task`, `/save-todo`, `/define`, `/show-plan`, `/list-todo`
 
 Use `/save-todo` after planning. Auto-detects complexity:
 - **Simple** → TODO.md only
@@ -16,9 +16,9 @@ Use `/save-todo` after planning. Auto-detects complexity:
 
 ## Task Format
 
-`- [ ] t001 Description @owner #tag ~1h started:ISO blocked-by:t002`
+`- [ ] t1 Description @owner #tag ~1h started:ISO blocked-by:t2`
 
-Dependencies: `blocked-by:t001`, `blocks:t002`, `t001.1` (subtask).
+Dependencies: `blocked-by:t1`, `blocks:t2`, `t1.1` (subtask).
 
 ## Auto-Dispatch
 
@@ -163,7 +163,7 @@ MANDATORY: Use `/new-task` or `claim-task-id.sh`. NEVER grep TODO.md for the nex
 2. `planning-commit-helper.sh next-id --title "Task title"` — wrapper function
 3. `claim-task-id.sh --title "Task title" --repo-path "$(pwd)"` — direct script
 
-**Atomic counter** (t1047): IDs allocated from `.task-counter` via CAS loop — fetch from the configured `counter_branch`, increment, commit, push. Push failure (another session grabbed the ID) → retry from fetch. Guarantees no collisions. A protected counter branch is a setup error: initialize a dedicated unprotected branch from the current canonical counter value, set `.aidevops.json` `counter_branch` to it, and verify the selected branch has no pull-request rule while default-branch protection remains unchanged. When config omits `counter_branch`, the allocator adopts a conventional `task-id-counter` branch only after proving its counter is not behind either the default branch or the TODO-derived seed. Never route counter updates through a PR because review/merge is not an atomic lock. GitHub policy preflight rejects a known PR-only branch before reading or advancing the counter; push rejection remains the fallback when policy APIs are unavailable. Batch: `--count N` claims N consecutive IDs atomically. GitHub/GitLab issue creation happens after ID is secured (optional, non-blocking). Offline fallback: local `.task-counter` + 100 offset (reconcile when back online). Output: `task_id=tNNN ref=GH#NNN` (offline: `ref=offline reconcile=true`; batch: adds `task_id_last=tNNN task_count=N`). Retries up to 10 attempts with backoff — no manual intervention needed.
+**Atomic counter** (t1047): IDs allocated from `.task-counter` via CAS loop — fetch from the configured `counter_branch`, increment, commit, push. Push failure (another session grabbed the ID) → retry from fetch. Guarantees no collisions. A protected counter branch is a setup error: initialize a dedicated unprotected branch from the current canonical counter value, set `.aidevops.json` `counter_branch` to it, and verify the selected branch has no pull-request rule while default-branch protection remains unchanged. When config omits `counter_branch`, the allocator adopts a conventional `task-id-counter` branch only after proving its counter is not behind either the default branch or the TODO-derived seed. Canonical checkouts remain read-only: discovery and CAS run in a disposable bare Git context under `AIDEVOPS_TEMP_DIR`, while TODO/config reads and pre-push hooks remain bound to the source repository. An indeterminate remote probe is a typed setup error, never an implicit fallback to the default branch. Never route counter updates through a PR because review/merge is not an atomic lock. GitHub policy preflight rejects a known PR-only branch before reading or advancing the counter; push rejection remains the fallback when policy APIs are unavailable. Batch: `--count N` claims N consecutive IDs atomically. GitHub/GitLab issue creation happens after ID is secured (optional, non-blocking). Offline fallback: local `.task-counter` + 100 offset (reconcile when back online). Output: `task_id=tNNN ref=GH#NNN` (offline: `ref=offline reconcile=true`; batch: adds `task_id_last=tNNN task_count=N`). Retries up to 10 attempts with backoff — no manual intervention needed.
 
 ## Worker TODO.md Restriction
 

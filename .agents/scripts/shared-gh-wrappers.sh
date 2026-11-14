@@ -14,6 +14,7 @@
 #   - shared-gh-wrappers-session.sh       — session origin, token, internal helpers
 #   - shared-gh-wrappers-create.sh        — issue/PR creation, comments, parent linking
 #   - shared-gh-wrappers-safe-edit.sh     — safe edit/close/merge with audit logging
+#   - shared-gh-wrappers-batch.sh         — bounded manifest-based GitHub writes
 #   - shared-gh-wrappers-status.sh        — status labels, read wrappers with REST fallback
 #   - shared-gh-wrappers-checks.sh        — PR check status via REST check-suites/check-runs (GH#21799)
 #   - shared-gh-wrappers-rest-fallback.sh — REST fallback translators (pre-existing)
@@ -53,10 +54,15 @@ fi
 # shared-constants.sh provides the canonical cleanup stack before sourcing this
 # file in normal bash helper execution. OpenCode zsh recovery commands can
 # source shared-gh-wrappers.sh directly, so provide minimal fallbacks and avoid
-# bash-only `trap ... RETURN` under zsh.
+# bash-only `trap ... RETURN` under zsh. Keep these copies behaviourally in
+# sync with shared-constants.sh "RETURN Trap Cleanup Stack" (t18679 owner
+# tracking); bash-only builtins (`declare -F/-ft`, `trap -p`, FUNCNAME) stay
+# behind BASH_VERSION guards because zsh `declare -F` creates a float.
 if ! command -v push_cleanup >/dev/null 2>&1; then
 	_CLEANUP_CMDS=""
 	_CLEANUP_SAVE_STACK=""
+	_CLEANUP_OWNER=0
+	_CLEANUP_OWNER_STACK=""
 	push_cleanup() {
 		local cmd="$1"
 		if [[ -n "$_CLEANUP_CMDS" ]]; then
@@ -68,44 +74,116 @@ if ! command -v push_cleanup >/dev/null 2>&1; then
 	}
 fi
 if ! command -v _run_cleanups >/dev/null 2>&1; then
-	_run_cleanups() {
-		if [[ -n "$_CLEANUP_CMDS" ]]; then
-			local reversed=""
-			local line
-			while IFS= read -r line; do
-				[[ -z "$line" ]] && continue
-				if [[ -n "$reversed" ]]; then
-					reversed="${line}"$'\n'"${reversed}"
-				else
-					reversed="$line"
-				fi
-			done <<<"$_CLEANUP_CMDS"
-			while IFS= read -r line; do
-				[[ -z "$line" ]] && continue
+	_cleanup_run_commands() {
+		local cmds="$1"
+		[[ -n "$cmds" ]] || return 0
+		local reversed=""
+		local line
+		while IFS= read -r line; do
+			[[ -z "$line" ]] && continue
+			if [[ -n "$reversed" ]]; then
+				reversed="${line}"$'\n'"${reversed}"
+			else
+				reversed="$line"
+			fi
+		done <<<"$cmds"
+		while IFS= read -r line; do
+			[[ -z "$line" ]] && continue
+			if [[ -n "${BASH_VERSION:-}" && "$line" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] && declare -F "$line" >/dev/null 2>&1; then
+				"$line" 2>/dev/null || true
+			else
 				bash -c "$line" 2>/dev/null || true
-			done <<<"$reversed"
-		fi
+			fi
+		done <<<"$reversed"
+		return 0
+	}
+	_cleanup_pop_scope() {
 		local sep=$'\x1F'
-		if [[ -n "$_CLEANUP_SAVE_STACK" ]]; then
+		if [[ -n "${_CLEANUP_SAVE_STACK:-}" ]]; then
 			_CLEANUP_CMDS="${_CLEANUP_SAVE_STACK%%"${sep}"*}"
 			_CLEANUP_SAVE_STACK="${_CLEANUP_SAVE_STACK#*"${sep}"}"
 		else
 			_CLEANUP_CMDS=""
 		fi
+		if [[ -n "${_CLEANUP_OWNER_STACK:-}" ]]; then
+			_CLEANUP_OWNER="${_CLEANUP_OWNER_STACK%%"${sep}"*}"
+			_CLEANUP_OWNER_STACK="${_CLEANUP_OWNER_STACK#*"${sep}"}"
+		else
+			_CLEANUP_OWNER=0
+		fi
 		return 0
 	}
+	_run_cleanups() {
+		local depth=0
+		if [[ -n "${BASH_VERSION:-}" ]]; then
+			depth=$((${#FUNCNAME[@]} - 1))
+		fi
+		local owner cmds
+		local ran_own=0
+		local ran_any=0
+		while true; do
+			owner="${_CLEANUP_OWNER:-0}"
+			[[ "$owner" =~ ^[0-9]+$ ]] || owner=0
+			if [[ "$owner" -eq 0 || "$owner" -lt "$depth" ]]; then
+				break
+			fi
+			if [[ "$owner" -eq "$depth" ]]; then
+				ran_own=1
+			fi
+			ran_any=1
+			cmds="$_CLEANUP_CMDS"
+			_cleanup_pop_scope
+			_cleanup_run_commands "$cmds"
+		done
+		if [[ "$ran_own" -eq 1 ]]; then
+			if [[ -n "${BASH_VERSION:-}" ]]; then
+				trap - RETURN
+			fi
+			return 0
+		fi
+		if [[ "$ran_any" -eq 1 ]]; then
+			return 0
+		fi
+		local return_trap=""
+		if [[ -n "${BASH_VERSION:-}" ]]; then
+			return_trap="$(trap -p RETURN 2>/dev/null)" || return_trap=""
+		fi
+		if [[ "$return_trap" == *_run_cleanups* ]]; then
+			return 0
+		fi
+		cmds="$_CLEANUP_CMDS"
+		_cleanup_pop_scope
+		_cleanup_run_commands "$cmds"
+		return 0
+	}
+	if [[ -n "${BASH_VERSION:-}" ]]; then
+		declare -ft _run_cleanups
+	fi
 fi
 if ! command -v _save_cleanup_scope >/dev/null 2>&1; then
 	_save_cleanup_scope() {
+		local extra_frames="${1:-0}"
+		[[ "$extra_frames" =~ ^[0-9]+$ ]] || extra_frames=0
+		local owner=0
+		if [[ -n "${BASH_VERSION:-}" ]]; then
+			owner=$((${#FUNCNAME[@]} - 1 - extra_frames))
+			[[ "$owner" -gt 0 ]] || owner=0
+		fi
 		local sep=$'\x1F'
-		_CLEANUP_SAVE_STACK="${_CLEANUP_CMDS}${sep}${_CLEANUP_SAVE_STACK}"
+		_CLEANUP_SAVE_STACK="${_CLEANUP_CMDS}${sep}${_CLEANUP_SAVE_STACK:-}"
+		_CLEANUP_OWNER_STACK="${_CLEANUP_OWNER:-0}${sep}${_CLEANUP_OWNER_STACK:-}"
 		_CLEANUP_CMDS=""
+		_CLEANUP_OWNER="$owner"
 		return 0
 	}
 fi
 
+# Open a cleanup scope owned by the calling gh_* wrapper (t18679). The scope
+# is bound to the caller, not this helper, so the RETURN trap set here is a
+# no-op when this helper returns; it persists into the wrapper (which has no
+# trap of its own) and runs the wrapper's cleanups when the wrapper returns.
 _gh_wrapper_enter_cleanup_scope() {
-	_save_cleanup_scope
+	_save_cleanup_scope 1
 	if [[ -n "${BASH_VERSION:-}" ]]; then
 		trap '_run_cleanups' RETURN
 	fi
@@ -419,7 +497,7 @@ _gh_timeout_path_from_args() {
 	case "${command_name}:${subcommand}:${endpoint}" in
 	gh:api:graphql) printf 'graphql\n' ;;
 	gh:api:*) printf 'rest\n' ;;
-	gh:search:*) printf 'search-graphql\n' ;;
+	gh:search:*) printf 'search-rest\n' ;;
 	gh:*:*) printf 'graphql\n' ;;
 	*) printf 'other\n' ;;
 	esac
@@ -456,9 +534,78 @@ _gh_timeout_logical_id() {
 	return 0
 }
 
+_gh_timeout_cooldown_preflight() {
+	local op_class="$1" started="$2" caller="$3" path="$4"
+	local rc=0
+	if command -v _gh_secondary_cooldown_preflight >/dev/null 2>&1; then
+		_gh_secondary_cooldown_preflight "$op_class" || rc=$?
+	fi
+	if [[ "$rc" -ne 0 ]]; then
+		_gh_record_timeout_if_needed "$rc" "$started" "$caller" "$path" "$op_class"
+	fi
+	return "$rc"
+}
+
+# Record shim privacy denials without persisting the rejected body or matches.
+# The flag prevents comment wrappers from retrying a denied write through REST.
+_gh_record_transport_privacy_block() {
+	local op_class="$1"
+	local rc="$2"
+	local err_file="$3"
+	if [[ "$op_class" == "write" && "$rc" -ne 0 && -f "$err_file" ]] &&
+		grep -Fq '[privacy-scan][BLOCK]' "$err_file"; then
+		_GH_WRITE_PRIVACY_BLOCKED=1
+		_gh_edit_audit_rejection "public write" "transport privacy scan blocked write"
+	fi
+	return 0
+}
+
+_gh_block_uncaptured_write() {
+	_GH_WRITE_PRIVACY_BLOCKED=1
+	printf '[aidevops][gh-wrapper][BLOCK] Cannot capture write diagnostics; refusing transport.\n' >&2
+	_gh_edit_audit_rejection "public write" "write diagnostic capture unavailable"
+	return 0
+}
+
+_gh_timeout_budget_seconds() {
+	local op_class="$1"
+	local deadline_epoch="$2"
+	local secs now_epoch remaining_secs
+	case "$op_class" in
+	read) secs="${AIDEVOPS_GH_READ_TIMEOUT:-15}" ;;
+	write) secs="${AIDEVOPS_GH_WRITE_TIMEOUT:-45}" ;;
+	*) secs=30 ;;
+	esac
+	if [[ "$deadline_epoch" =~ ^[0-9]+$ ]]; then
+		now_epoch=$(date +%s 2>/dev/null) || return 124
+		remaining_secs=$((deadline_epoch - now_epoch))
+		[[ "$remaining_secs" -gt 0 ]] || return 124
+		[[ "$remaining_secs" -ge "$secs" ]] || secs="$remaining_secs"
+	fi
+	printf '%s\n' "$secs"
+	return 0
+}
+
+# GH#35194: a successful transport is not a successful read if local response
+# replay fails. Preserve failed transport status; never retry transport here.
+# Write status semantics remain unchanged to avoid replaying an applied mutation.
+_gh_replay_transport_output() {
+	local op_class="$1"
+	local transport_rc="$2"
+	local out_file="$3"
+	local replay_rc=0
+	cat "$out_file" 2>/dev/null || replay_rc=$?
+	if [[ "$op_class" == read && "$replay_rc" -ne 0 ]]; then
+		printf 'Could not replay captured GitHub transport output (exit %s)\n' "$replay_rc" >&2
+		[[ "$transport_rc" -ne 0 ]] || transport_rc="$replay_rc"
+	fi
+	return "$transport_rc"
+}
+
 _gh_with_timeout() {
 	local op_class="${1:-read}"
 	shift
+	_GH_WRITE_PRIVACY_BLOCKED=0
 	local timeout_caller="${BASH_SOURCE[1]:-${0}}"
 	local timeout_path="" timeout_start_ms="" AIDEVOPS_GH_LOGICAL_ID=""
 	AIDEVOPS_GH_LOGICAL_ID=$(_gh_timeout_logical_id)
@@ -468,34 +615,15 @@ _gh_with_timeout() {
 		timeout_start_ms=$(_gh_now_ms) || timeout_start_ms=""
 	fi
 	_gh_cooldown_context_from_args "$op_class" "$@"
-	if command -v _gh_secondary_cooldown_preflight >/dev/null 2>&1; then
-		local preflight_rc=0
-		_gh_secondary_cooldown_preflight "$op_class" || preflight_rc=$?
-		if [[ "$preflight_rc" -ne 0 ]]; then
-			_gh_record_timeout_if_needed "$preflight_rc" "$timeout_start_ms" "$timeout_caller" "$timeout_path" "$op_class"
-			return "$preflight_rc"
-		fi
-	fi
+	_gh_timeout_cooldown_preflight "$op_class" "$timeout_start_ms" "$timeout_caller" "$timeout_path" || return $?
+	local AIDEVOPS_GH_WRAPPER_PREFLIGHT=1
+	export AIDEVOPS_GH_WRAPPER_PREFLIGHT
 	local secs
-	case "$op_class" in
-	read) secs="${AIDEVOPS_GH_READ_TIMEOUT:-15}" ;;
-	write) secs="${AIDEVOPS_GH_WRITE_TIMEOUT:-45}" ;;
-	*) secs=30 ;;
-	esac
 	local deadline_epoch="${AIDEVOPS_GH_DEADLINE_EPOCH:-}"
-	local now_epoch="" remaining_secs=""
-	if [[ "$deadline_epoch" =~ ^[0-9]+$ ]]; then
-		if ! now_epoch=$(date +%s 2>/dev/null); then
-			_gh_record_timeout_if_needed 124 "$timeout_start_ms" "$timeout_caller" "$timeout_path" "$op_class"
-			return 124
-		fi
-		remaining_secs=$((deadline_epoch - now_epoch))
-		if [[ "$remaining_secs" -le 0 ]]; then
-			_gh_record_timeout_if_needed 124 "$timeout_start_ms" "$timeout_caller" "$timeout_path" "$op_class"
-			return 124
-		fi
-		[[ "$remaining_secs" -ge "$secs" ]] || secs="$remaining_secs"
-	fi
+	secs=$(_gh_timeout_budget_seconds "$op_class" "$deadline_epoch") || {
+		_gh_record_timeout_if_needed 124 "$timeout_start_ms" "$timeout_caller" "$timeout_path" "$op_class"
+		return 124
+	}
 	# Invocation-scoped diagnostics may provide a pre-created counter file.
 	# File-backed counting survives command substitutions. Callers may attach a
 	# sanitized operation class; payloads and endpoint arguments are never stored.
@@ -508,27 +636,31 @@ _gh_with_timeout() {
 	local rc=0
 	if [[ -n "$cmd" ]] && declare -f "$cmd" >/dev/null; then
 		err_file=$(mktemp -t aidevops-gh-secondary.XXXXXX) || {
+			if [[ "$op_class" == "write" ]]; then
+				_gh_block_uncaptured_write
+				return 1
+			fi
 			"$@" || rc=$?
 			_gh_record_timeout_if_needed "$rc" "$timeout_start_ms" "$timeout_caller" "$timeout_path" "$op_class"
 			return "$rc"
 		}
 		out_file=$(mktemp -t aidevops-gh-response.XXXXXX) || {
-			"$@" 2>"$err_file"
-			rc=$?
+			"$@" 2>"$err_file" || rc=$?
 			_gh_record_timeout_if_needed "$rc" "$timeout_start_ms" "$timeout_caller" "$timeout_path" "$op_class"
 			cat "$err_file" >&2 2>/dev/null || true
+			_gh_record_transport_privacy_block "$op_class" "$rc" "$err_file"
 			rm -f "$err_file"
 			return $rc
 		}
 		if [[ "$deadline_epoch" =~ ^[0-9]+$ ]]; then
-			_gh_run_bounded_function "$secs" "$@" >"$out_file" 2>"$err_file"
+			_gh_run_bounded_function "$secs" "$@" >"$out_file" 2>"$err_file" || rc=$?
 		else
-			"$@" >"$out_file" 2>"$err_file"
+			"$@" >"$out_file" 2>"$err_file" || rc=$?
 		fi
-		rc=$?
 		_gh_record_timeout_if_needed "$rc" "$timeout_start_ms" "$timeout_caller" "$timeout_path" "$op_class"
-		cat "$out_file" 2>/dev/null || true
+		_gh_replay_transport_output "$op_class" "$rc" "$out_file" || rc=$?
 		cat "$err_file" >&2 2>/dev/null || true
+		_gh_record_transport_privacy_block "$op_class" "$rc" "$err_file"
 		_gh_record_cooldown_response_if_needed "$rc" "$out_file" "$err_file" "$@"
 		rm -f "$err_file" "$out_file"
 		return $rc
@@ -542,16 +674,19 @@ _gh_with_timeout() {
 		}
 	fi
 	if [[ -n "$err_file" && -n "$out_file" ]]; then
-		_gh_run_bounded_command "$secs" "$@" >"$out_file" 2>"$err_file"
-		rc=$?
+		_gh_run_bounded_command "$secs" "$@" >"$out_file" 2>"$err_file" || rc=$?
 	else
-		_gh_run_bounded_command "$secs" "$@"
-		rc=$?
+		if [[ "$op_class" == "write" ]]; then
+			_gh_block_uncaptured_write
+			return 1
+		fi
+		_gh_run_bounded_command "$secs" "$@" || rc=$?
 	fi
 	_gh_record_timeout_if_needed "$rc" "$timeout_start_ms" "$timeout_caller" "$timeout_path" "$op_class"
 	if [[ -n "$err_file" && -n "$out_file" ]]; then
-		cat "$out_file" 2>/dev/null || true
+		_gh_replay_transport_output "$op_class" "$rc" "$out_file" || rc=$?
 		cat "$err_file" >&2 2>/dev/null || true
+		_gh_record_transport_privacy_block "$op_class" "$rc" "$err_file"
 		_gh_record_cooldown_response_if_needed "$rc" "$out_file" "$err_file" "$@"
 		rm -f "$err_file" "$out_file"
 	fi
@@ -601,14 +736,25 @@ _GH_EDIT_REJECTION_REASON=""
 _GH_WRAPPER_BODY_FILE_ARGS=()
 _gh_wrapper_normalize_stdin_body_file() {
 	_GH_WRAPPER_BODY_FILE_ARGS=("$@")
-	local i=0 needs_stdin=0
+	local i=0 needs_stdin=0 array_index_offset=0
+	# Bash arrays are zero-based while zsh arrays are one-based by default.
+	# Keep the loop zero-based and translate only array subscripts for zsh.
+	[[ -n "${ZSH_VERSION:-}" ]] && array_index_offset=1
 	while [[ $i -lt ${#_GH_WRAPPER_BODY_FILE_ARGS[@]} ]]; do
-		case "${_GH_WRAPPER_BODY_FILE_ARGS[i]}" in
+		case "${_GH_WRAPPER_BODY_FILE_ARGS[$((i + array_index_offset))]}" in
 		--body-file)
-			[[ "${_GH_WRAPPER_BODY_FILE_ARGS[i + 1]:-}" == "-" ]] && needs_stdin=1
+			# argv from quoted paths/tool calls does not receive shell tilde expansion.
+			# Resolve only ~/; never evaluate arbitrary shell text or ~other-user.
+			if [[ "${_GH_WRAPPER_BODY_FILE_ARGS[$((i + array_index_offset + 1))]:-}" == \~/* ]]; then
+				_GH_WRAPPER_BODY_FILE_ARGS[i + array_index_offset + 1]="${HOME}/${_GH_WRAPPER_BODY_FILE_ARGS[$((i + array_index_offset + 1))]#\~/}"
+			fi
+			[[ "${_GH_WRAPPER_BODY_FILE_ARGS[$((i + array_index_offset + 1))]:-}" == "-" ]] && needs_stdin=1
 			i=$((i + 1))
 			;;
 		--body-file=-) needs_stdin=1 ;;
+		--body-file=\~/*)
+			_GH_WRAPPER_BODY_FILE_ARGS[i + array_index_offset]="--body-file=${HOME}/${_GH_WRAPPER_BODY_FILE_ARGS[$((i + array_index_offset))]#--body-file=\~/}"
+			;;
 		esac
 		i=$((i + 1))
 	done
@@ -639,19 +785,29 @@ _gh_wrapper_normalize_stdin_body_file() {
 		return 1
 	fi
 
+	local -a normalized_args=()
+	local current_arg
 	i=0
 	while [[ $i -lt ${#_GH_WRAPPER_BODY_FILE_ARGS[@]} ]]; do
-		case "${_GH_WRAPPER_BODY_FILE_ARGS[i]}" in
+		current_arg="${_GH_WRAPPER_BODY_FILE_ARGS[$((i + array_index_offset))]}"
+		case "$current_arg" in
 		--body-file)
-			if [[ "${_GH_WRAPPER_BODY_FILE_ARGS[i + 1]:-}" == "-" ]]; then
-				_GH_WRAPPER_BODY_FILE_ARGS[i + 1]="$stdin_body_file"
+			normalized_args+=("$current_arg")
+			if [[ $((i + 1)) -lt ${#_GH_WRAPPER_BODY_FILE_ARGS[@]} ]]; then
+				if [[ "${_GH_WRAPPER_BODY_FILE_ARGS[$((i + array_index_offset + 1))]}" == "-" ]]; then
+					normalized_args+=("$stdin_body_file")
+				else
+					normalized_args+=("${_GH_WRAPPER_BODY_FILE_ARGS[$((i + array_index_offset + 1))]}")
+				fi
+				i=$((i + 1))
 			fi
-			i=$((i + 1))
 			;;
-		--body-file=-) _GH_WRAPPER_BODY_FILE_ARGS[i]="--body-file=${stdin_body_file}" ;;
+		--body-file=-) normalized_args+=("--body-file=${stdin_body_file}") ;;
+		*) normalized_args+=("$current_arg") ;;
 		esac
 		i=$((i + 1))
 	done
+	_GH_WRAPPER_BODY_FILE_ARGS=("${normalized_args[@]}")
 	return 0
 }
 
@@ -672,14 +828,14 @@ _gh_validate_body_file_content() {
 	file_size=$(echo "$file_size" | tr -d '[:space:]')
 	if [[ "$file_size" -eq 0 ]]; then
 		_GH_EDIT_REJECTION_REASON="body-file '${body_file_val}' is empty"
-		printf '[SAFETY] gh edit rejected: %s\n' "$_GH_EDIT_REJECTION_REASON" >&2
+		printf '[SAFETY] gh %s rejected: %s\n' "${_GH_WRITE_OPERATION:-edit}" "$_GH_EDIT_REJECTION_REASON" >&2
 		return 1
 	fi
 	local body_file_body
 	body_file_body=$(<"$body_file_val")
 	if ! _gh_body_has_substantive_content "$body_file_body"; then
 		_GH_EDIT_REJECTION_REASON="body-file '${body_file_val}' has no content before signature footer"
-		printf '[SAFETY] gh edit rejected: %s\n' "$_GH_EDIT_REJECTION_REASON" >&2
+		printf '[SAFETY] gh %s rejected: %s\n' "${_GH_WRITE_OPERATION:-edit}" "$_GH_EDIT_REJECTION_REASON" >&2
 		return 1
 	fi
 	return 0
@@ -741,13 +897,13 @@ _gh_validate_edit_args() {
 		trimmed_title="${trimmed_title%"${trimmed_title##*[![:space:]]}"}"
 		if [[ -z "$trimmed_title" ]]; then
 			_GH_EDIT_REJECTION_REASON="empty title (after trimming whitespace)"
-			printf '[SAFETY] gh edit rejected: %s\n' "$_GH_EDIT_REJECTION_REASON" >&2
+			printf '[SAFETY] gh %s rejected: %s\n' "${_GH_WRITE_OPERATION:-edit}" "$_GH_EDIT_REJECTION_REASON" >&2
 			return 1
 		fi
 		# Reject bare task-ID stubs: "tNNN: " or "GH#NNN: " with nothing after
 		if [[ "$trimmed_title" =~ ^(t[0-9]+|GH#[0-9]+):[[:space:]]*$ ]]; then
 			_GH_EDIT_REJECTION_REASON="stub title '${trimmed_title}' (task-ID prefix with no description)"
-			printf '[SAFETY] gh edit rejected: %s\n' "$_GH_EDIT_REJECTION_REASON" >&2
+			printf '[SAFETY] gh %s rejected: %s\n' "${_GH_WRITE_OPERATION:-edit}" "$_GH_EDIT_REJECTION_REASON" >&2
 			return 1
 		fi
 	fi
@@ -756,7 +912,7 @@ _gh_validate_edit_args() {
 	if [[ "$has_body" -eq 1 ]]; then
 		if ! _gh_body_has_substantive_content "$body_val"; then
 			_GH_EDIT_REJECTION_REASON="empty body (after trimming whitespace)"
-			printf '[SAFETY] gh edit rejected: %s\n' "$_GH_EDIT_REJECTION_REASON" >&2
+			printf '[SAFETY] gh %s rejected: %s\n' "${_GH_WRITE_OPERATION:-edit}" "$_GH_EDIT_REJECTION_REASON" >&2
 			return 1
 		fi
 	fi
@@ -765,17 +921,17 @@ _gh_validate_edit_args() {
 	if [[ "$has_body_file" -eq 1 ]]; then
 		if [[ "$body_file_val" == "/dev/null" ]]; then
 			_GH_EDIT_REJECTION_REASON="body-file is /dev/null (would clear body)"
-			printf '[SAFETY] gh edit rejected: %s\n' "$_GH_EDIT_REJECTION_REASON" >&2
+			printf '[SAFETY] gh %s rejected: %s\n' "${_GH_WRITE_OPERATION:-edit}" "$_GH_EDIT_REJECTION_REASON" >&2
 			return 1
 		fi
 		if [[ ! -f "$body_file_val" ]]; then
 			_GH_EDIT_REJECTION_REASON="body-file '${body_file_val}' does not exist"
-			printf '[SAFETY] gh edit rejected: %s\n' "$_GH_EDIT_REJECTION_REASON" >&2
+			printf '[SAFETY] gh %s rejected: %s\n' "${_GH_WRITE_OPERATION:-edit}" "$_GH_EDIT_REJECTION_REASON" >&2
 			return 1
 		fi
 		if [[ ! -r "$body_file_val" ]]; then
 			_GH_EDIT_REJECTION_REASON="body-file '${body_file_val}' is not readable"
-			printf '[SAFETY] gh edit rejected: %s\n' "$_GH_EDIT_REJECTION_REASON" >&2
+			printf '[SAFETY] gh %s rejected: %s\n' "${_GH_WRITE_OPERATION:-edit}" "$_GH_EDIT_REJECTION_REASON" >&2
 			return 1
 		fi
 		_gh_validate_body_file_content "$body_file_val" || return 1
@@ -870,6 +1026,10 @@ if [[ -n "$_SHARED_GH_WRAPPERS_DIR" ]]; then
 	# shellcheck source=shared-gh-wrappers-create.sh
 	# shellcheck disable=SC1091  # sub-library resolved at runtime via $_SHARED_GH_WRAPPERS_DIR
 	source "$_SHARED_GH_WRAPPERS_DIR/shared-gh-wrappers-create.sh"
+	if [[ -f "$_SHARED_GH_WRAPPERS_DIR/shared-gh-wrappers-batch.sh" ]]; then
+		# shellcheck source=shared-gh-wrappers-batch.sh
+		source "$_SHARED_GH_WRAPPERS_DIR/shared-gh-wrappers-batch.sh"
+	fi
 
 	# shellcheck source=shared-gh-wrappers-safe-edit.sh
 	# shellcheck disable=SC1091  # sub-library resolved at runtime via $_SHARED_GH_WRAPPERS_DIR
@@ -941,6 +1101,28 @@ _set_origin_label_rest() {
 		else
 			return 1
 		fi
+	fi
+	return 0
+}
+
+#######################################
+# Classify an origin-label write failure without exposing raw API output.
+# Args: $1=stderr file (optional) $2=write exit code
+# Output: bounded operator-safe failure reason
+#######################################
+_gh_origin_label_failure_kind() {
+	local error_file="$1"
+	local write_rc="$2"
+	if [[ -n "$error_file" ]] &&
+		grep -qiE 'permission|forbidden|Resource not accessible|HTTP 403' "$error_file" 2>/dev/null; then
+		printf '%s\n' "credential lacks origin-label permission"
+	elif [[ -n "$error_file" ]] &&
+		grep -qiE 'rate limit|rateLimitExceeded|HTTP 429' "$error_file" 2>/dev/null; then
+		printf '%s\n' "GitHub API rate limited the label write"
+	elif [[ "$write_rc" -eq 124 ]]; then
+		printf '%s\n' "GitHub label write timed out"
+	else
+		printf '%s\n' "GitHub label write failed"
 	fi
 	return 0
 }
@@ -1028,6 +1210,9 @@ set_origin_label() {
 		rm -f "$_err_file"
 		return 0
 	fi
+	local _failure_kind=""
+	_failure_kind=$(_gh_origin_label_failure_kind "$_err_file" "$_gh_rc")
+	printf 'set_origin_label: %s\n' "$_failure_kind" >&2
 	rm -f "$_err_file"
 	return "$_gh_rc"
 }
@@ -1059,6 +1244,47 @@ ensure_solved_labels_exist() {
 			--color "BFD4F2" 2>/dev/null || return 1
 	fi
 	_SOLVED_LABELS_ENSURED="${_SOLVED_LABELS_ENSURED:+$_SOLVED_LABELS_ENSURED,}$repo"
+	return 0
+}
+
+# Provision the opt-in session reminder label only when issue creation requests it.
+_CONTINUATION_REMINDER_LABEL_ENSURED=""
+ensure_continuation_reminder_label_exists() {
+	local repo="$1"
+	[[ -n "$repo" ]] || return 1
+	case ",${_CONTINUATION_REMINDER_LABEL_ENSURED:-}," in
+	*",$repo,"*) return 0 ;;
+	esac
+	local labels_snapshot=""
+	labels_snapshot=$(_gh_managed_label_names_snapshot "$repo") || return 1
+	if ! _gh_managed_label_snapshot_has "$labels_snapshot" "continuation-reminder"; then
+		AIDEVOPS_GH_ROUTE_DECISION="$_GH_MANAGED_LABEL_CREATE_ROUTE" \
+			_gh_with_timeout write gh label create "continuation-reminder" --repo "$repo" \
+			--description "Self-assigned reminder to resume a closed session once blockers land" \
+			--color "C5DEF5" || return 1
+	fi
+	_CONTINUATION_REMINDER_LABEL_ENSURED="${_CONTINUATION_REMINDER_LABEL_ENSURED:+$_CONTINUATION_REMINDER_LABEL_ENSURED,}$repo"
+	return 0
+}
+
+# Provision the PR auto-close opt-out before pulse comments recommend it (GH#34197).
+# Name, colour and description mirror SYSTEM_LABELS in label-sync-helper.sh.
+_DO_NOT_CLOSE_LABEL_ENSURED=""
+ensure_do_not_close_label_exists() {
+	local repo="$1"
+	[[ -n "$repo" ]] || return 1
+	case ",${_DO_NOT_CLOSE_LABEL_ENSURED:-}," in
+	*",$repo,"*) return 0 ;;
+	esac
+	local labels_snapshot=""
+	labels_snapshot=$(_gh_managed_label_names_snapshot "$repo") || return 1
+	if ! _gh_managed_label_snapshot_has "$labels_snapshot" "do-not-close"; then
+		AIDEVOPS_GH_ROUTE_DECISION="$_GH_MANAGED_LABEL_CREATE_ROUTE" \
+			_gh_with_timeout write gh label create "do-not-close" --repo "$repo" \
+			--description "Opt-out: never auto-close this PR in pulse sweeps" \
+			--color "EDEDED" || return 1
+	fi
+	_DO_NOT_CLOSE_LABEL_ENSURED="${_DO_NOT_CLOSE_LABEL_ENSURED:+$_DO_NOT_CLOSE_LABEL_ENSURED,}$repo"
 	return 0
 }
 
@@ -1148,6 +1374,19 @@ set_solved_label_from_merged_pr() {
 #   1 on gh failure
 #   2 on invalid args
 #######################################
+gh_publication_default_has_ref() {
+	local repo="$1" issue_num="$2" branch="" remote_sha="" local_sha=""
+	[[ "$issue_num" =~ ^[0-9]+$ ]] || return 1
+	branch=$(gh repo view "$repo" --json defaultBranchRef --jq '.defaultBranchRef.name') || return 1
+	[[ -n "$branch" ]] || return 1
+	remote_sha=$(gh api "repos/${repo}/git/ref/heads/${branch}" --jq '.object.sha') || return 1
+	local_sha=$(git rev-parse "refs/remotes/origin/${branch}" 2>/dev/null) || return 1
+	[[ "$remote_sha" == "$local_sha" ]] || return 1
+	git show "refs/remotes/origin/${branch}:TODO.md" 2>/dev/null |
+		grep -E "^[[:space:]]*-[[:space:]]+\\[[ x]\\].*ref:GH#${issue_num}([[:space:]]|$)" >/dev/null || return 1
+	return 0
+}
+
 set_solved_label() {
 	local issue_num="$1"
 	local repo_slug="$2"
@@ -1185,6 +1424,15 @@ set_solved_label() {
 		fi
 	done
 	_flags+=("$@")
+	# Closed issues no longer need the publication fence, but a reopened task
+	# without canonical planning could otherwise become dispatchable. Fail closed
+	# when the locally verified default-branch snapshot has no matching ref.
+	local issue_state=""
+	issue_state=$(gh issue view "$issue_num" --repo "$repo_slug" --json state,labels 2>/dev/null) || issue_state=""
+	if [[ -n "$issue_state" ]] && jq -e '.state == "CLOSED" and any(.labels[]?; .name == "publication:pending")' \
+		<<<"$issue_state" >/dev/null 2>&1 && gh_publication_default_has_ref "$repo_slug" "$issue_num"; then
+		_flags+=(--remove-label "publication:pending")
+	fi
 
 	_gh_with_timeout write gh issue edit "$issue_num" --repo "$repo_slug" "${_flags[@]}" 2>/dev/null
 	return $?

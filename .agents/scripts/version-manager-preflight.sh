@@ -259,7 +259,9 @@ _run_secretlint_on_changed_files() {
 		local sl_output=""
 		sl_output=$(
 			cd "$REPO_ROOT" || exit 1
-			"${SECRETLINT_CMD[@]}" "${changed_file_list[@]}" --format compact 2>&1
+			"${SECRETLINT_CMD[@]}" "${changed_file_list[@]}" \
+				--secretlintrc .secretlintrc.json --secretlintignore .secretlintignore \
+				--format compact 2>&1
 		) || sl_exit_code=$?
 
 		if [[ $sl_exit_code -eq 1 ]]; then
@@ -325,13 +327,24 @@ _run_shellcheck_on_changed_files() {
 	return 0
 }
 
-# Run the pre-edit regression test if pre-edit-check.sh or its test was changed.
+# Run the pre-edit regression test if pre-edit-check.sh, its test, or the
+# worktree creation/ownership code it drives was changed. Covering the
+# dependencies surfaces a regression at the release that introduces it rather
+# than at the next unrelated pre-edit change.
 # Arguments: changed_files (newline-separated list) pre_edit_test_script
 _run_pre_edit_regression_test() {
 	local changed_files="$1"
 	local pre_edit_test_script="$2"
+	local trigger="" triggered=0
 
-	if [[ "$changed_files" == *".agents/scripts/pre-edit-check.sh"* ]] || [[ "$changed_files" == *".agents/scripts/tests/test-pre-edit-check.sh"* ]]; then
+	for trigger in pre-edit-check.sh tests/test-pre-edit-check.sh worktree-helper.sh worktree-helper-add.sh \
+		worktree-paths.sh shared-worktree-registry.sh shared-worktree-registry-owner.py; do
+		if [[ "$changed_files" == *".agents/scripts/${trigger}"* ]]; then
+			triggered=1
+			break
+		fi
+	done
+	if [[ "$triggered" -eq 1 ]]; then
 		if [[ ! -x "$pre_edit_test_script" ]]; then
 			print_error "Pre-edit regression test missing or not executable: $pre_edit_test_script"
 			return 1
@@ -394,3 +407,44 @@ run_patch_release_preflight() {
 	print_success "Patch release regression preflight passed"
 	return 0
 }
+
+# PR-time secretlint gate (GH#35329). Reuses configure_secretlint_command and
+# _run_secretlint_on_changed_files so PR CI and the release preflight agree.
+# Arguments: base_ref head_ref
+run_pr_secretlint_check() {
+	local base_ref="$1"
+	local head_ref="${2:-HEAD}"
+	local changed_files=""
+
+	changed_files=$(git -C "$REPO_ROOT" diff --name-only --diff-filter=d "${base_ref}...${head_ref}") || {
+		print_error "Unable to compute changed files for ${base_ref}...${head_ref}"
+		return 1
+	}
+
+	configure_secretlint_command || return 1
+	_run_secretlint_on_changed_files "$base_ref" "$changed_files"
+	return $?
+}
+
+# CLI entrypoint for direct execution.
+# Arguments: subcommand base_ref [head_ref]
+_preflight_main() {
+	local subcommand="${1:-}"
+	local base_ref="${2:-}"
+	local head_ref="${3:-HEAD}"
+
+	if [[ "$subcommand" != "pr-secretlint" || -z "$base_ref" ]]; then
+		echo "usage: ${0##*/} pr-secretlint <base-ref> [head-ref]" >&2
+		return 2
+	fi
+	REPO_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel)}"
+	# shellcheck source=shared-constants.sh
+	source "${SCRIPT_DIR}/shared-constants.sh"
+	run_pr_secretlint_check "$base_ref" "$head_ref"
+	return $?
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+	_preflight_main "$@"
+	exit $?
+fi

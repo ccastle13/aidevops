@@ -113,6 +113,10 @@ guard_child_processes() {
 			# Primary pulse process — runtime governed by PULSE_STALE_THRESHOLD,
 			# not CHILD_RUNTIME_LIMIT. Skip runtime check but keep RSS check.
 			:
+		elif [[ -n "${_PULSE_ROUTINES_TICKER_PID:-}" && "$pid" == "$_PULSE_ROUTINES_TICKER_PID" ]]; then
+			# Cycle-owned routines ticker (GH#37914) lives as long as the
+			# cycle. Skip runtime check but keep RSS check.
+			:
 		elif [[ "$age_seconds" -gt "$runtime_limit" ]]; then
 			violation="runtime ${age_seconds}s > ${runtime_limit}s limit"
 		fi
@@ -201,6 +205,84 @@ run_cmd_with_timeout() {
 #   124 - stage timed out and was killed
 #   else- stage exited with command exit code
 #######################################
+# Return the remaining cycle budget after a finalisation reserve. Missing or
+# invalid clocks/configuration fail open so standalone routines retain their
+# existing timeout behaviour. Pass 0 for admission checks that own a reserve.
+# A dispatch lease is elastic only for the actual instance owner. Standalone
+# routines and housekeeping keep their bounded cycle semantics.
+_pulse_dispatch_lease_active() {
+	local owner="" heartbeat="" now="" ceiling="${PULSE_LOCK_MAX_AGE_S:-1800}"
+	[[ "${PULSE_ELASTIC_DISPATCH_ENABLED:-1}" == 1 && -n "${LOCKDIR:-}" ]] || return 1
+	read -r owner <"${LOCKDIR}/pid" 2>/dev/null || return 1
+	[[ "$owner" == "$$" ]] && kill -0 "$owner" 2>/dev/null || return 1
+	read -r heartbeat <"${LOCKDIR}/supervisor_heartbeat_epoch" 2>/dev/null || return 1
+	[[ "$heartbeat" =~ ^[1-9][0-9]*$ && "$ceiling" =~ ^[1-9][0-9]*$ ]] || return 1
+	now=$(date +%s) || return 1
+	((heartbeat <= now && now - heartbeat <= ceiling)) || return 1
+	return 0
+}
+
+_pulse_cycle_remaining_seconds() {
+	if [[ "${_PULSE_ELASTIC_DISPATCH:-0}" == 1 ]] && _pulse_dispatch_lease_active; then
+		return 1 # No fixed deadline; candidate watchdogs and quota gates still apply.
+	fi
+	local reserve="${1:-${AIDEVOPS_PULSE_CYCLE_FINALISE_RESERVE_S:-90}}"
+	local start="${PULSE_START_EPOCH:-}" stale="${PULSE_STALE_THRESHOLD:-}"
+	local lock="${PULSE_LOCK_MAX_AGE_S:-1800}" now=""
+	[[ "$reserve" =~ ^[0-9]+$ && "$start" =~ ^[0-9]+$ &&
+		"$stale" =~ ^[1-9][0-9]*$ && "$lock" =~ ^[1-9][0-9]*$ ]] || return 1
+	now=$(date +%s 2>/dev/null) || return 1
+	[[ "$now" =~ ^[0-9]+$ && "$now" -ge "$start" ]] || return 1
+	[[ "$lock" -lt "$stale" ]] && stale="$lock"
+	printf '%s\n' "$((start + stale - now - reserve))"
+	return 0
+}
+
+# GH#37811: report whether the main dispatch round can no longer be admitted
+# this cycle, using the round's own admission plan (full, bounded or skip).
+# The cycle clock only moves forward, so a skip now stays a skip. Without the
+# dispatch library or a cycle clock the plan is unknown; report admittable so
+# callers keep the GH#37051 reserve.
+# Returns: 0 when the round would be skipped, 1 otherwise
+_pulse_main_dispatch_round_unadmittable() {
+	local plan=""
+	declare -F _dispatch_round_budget_plan >/dev/null 2>&1 || return 1
+	declare -F _dispatch_round_plan_skips >/dev/null 2>&1 || return 1
+	plan=$(_dispatch_round_budget_plan before 2>/dev/null) || return 1
+	_dispatch_round_plan_skips "$plan" || return 1
+	return 0
+}
+
+_pulse_stage_cycle_timeout() {
+	local stage_name="$1" timeout_seconds="$2" remaining=""
+	[[ "${AIDEVOPS_PULSE_STAGE_CYCLE_CLAMP:-1}" == "1" ]] || { printf '%s\n' "$timeout_seconds"; return 0; }
+	local reserve="${AIDEVOPS_PULSE_CYCLE_FINALISE_RESERVE_S:-90}"
+	local dispatch_reserve="${_PULSE_MAIN_DISPATCH_RESERVE_S:-0}"
+	# GH#37051: every pre-dispatch stage, including nested cleanup and graph
+	# work, must leave the main round its enumeration + candidate budget.
+	# Dispatch itself shadows this internal reserve, not its admission gates.
+	# GH#37811: once the round cannot be admitted, the reserve protects
+	# nothing; stages keep only the finalisation reserve instead of deferring.
+	if [[ "$reserve" =~ ^[0-9]+$ && "$dispatch_reserve" =~ ^[0-9]+$ && "$dispatch_reserve" -gt "$reserve" ]]; then
+		if _pulse_main_dispatch_round_unadmittable; then
+			echo "[pulse-wrapper] Stage dispatch reserve released: ${stage_name} main dispatch round cannot be admitted this cycle (GH#37811)" >>"$LOGFILE"
+		else
+			reserve="$dispatch_reserve"
+		fi
+	fi
+	remaining=$(_pulse_cycle_remaining_seconds "$reserve") || { printf '%s\n' "$timeout_seconds"; return 0; }
+	if [[ "$remaining" -lt 15 ]]; then
+		echo "[pulse-wrapper] Stage deferred: ${stage_name} cycle budget exhausted" >>"$LOGFILE"
+		return 124
+	fi
+	if [[ "$remaining" -lt "$timeout_seconds" ]]; then
+		echo "[pulse-wrapper] Stage cycle budget clamp: ${stage_name} ${timeout_seconds}s -> ${remaining}s" >>"$LOGFILE"
+		timeout_seconds="$remaining"
+	fi
+	printf '%s\n' "$timeout_seconds"
+	return 0
+}
+
 run_stage_with_timeout() {
 	local stage_name="$1"
 	local timeout_seconds="$2"
@@ -214,6 +296,7 @@ run_stage_with_timeout() {
 	if [[ "$timeout_seconds" -lt 1 ]]; then
 		timeout_seconds=1
 	fi
+	timeout_seconds=$(_pulse_stage_cycle_timeout "$stage_name" "$timeout_seconds") || return $?
 
 	local stage_start
 	stage_start=$(date +%s)
@@ -223,9 +306,13 @@ run_stage_with_timeout() {
 		# Background stages inherit the parent's shell state but must never run
 		# process-owner EXIT cleanup such as terminal Pulse cycle publication.
 		trap - EXIT
+		# GH#33957: expose the effective (cycle-clamped) kill deadline so
+		# resumable stages can stop cleanly before the watchdog fires.
+		export PULSE_STAGE_DEADLINE_EPOCH="$((stage_start + timeout_seconds))"
 		"$@"
 	) &
 	local stage_pid=$!
+	local last_heartbeat=0
 
 	while kill -0 "$stage_pid" 2>/dev/null; do
 		local now
@@ -255,6 +342,15 @@ run_stage_with_timeout() {
 					"$stage_pid" >>"$PULSE_STAGE_TIMINGS_LOG" 2>/dev/null || true
 			fi
 			return 124
+		fi
+		# GH#35695: Refresh only while the owner is actively supervising an
+		# in-deadline stage. Keep the two-second timeout cadence, but bound
+		# health writes to once a minute. Nested/standalone stages fail closed.
+		if [[ "$((now - last_heartbeat))" -ge 60 ]]; then
+			if declare -F _pulse_cycle_state_stage_heartbeat >/dev/null 2>&1; then
+				_pulse_cycle_state_stage_heartbeat || true
+			fi
+			last_heartbeat="$now"
 		fi
 		sleep 2
 	done
@@ -553,6 +649,7 @@ _run_pulse_watchdog() {
 	local start_epoch="$2"
 	local effective_cold_start_timeout="$3"
 	local last_active_refill_epoch=0
+	local watchdog_stop_reason=""
 
 	# Idle detection state (t1398.3)
 	local idle_seconds=0
@@ -585,6 +682,7 @@ _run_pulse_watchdog() {
 
 		# Single kill block — avoids duplicating the kill+force-kill sequence.
 		if [[ -n "$kill_reason" ]]; then
+			watchdog_stop_reason="$kill_reason"
 			# t3056 / GH#21781: Classify kill reason for structured telemetry.
 			# t3060 / GH#21788: Setters in _watchdog_check_progress, _watchdog_check_idle,
 			# and _check_watchdog_conditions emit "<UPPER_CLASS>:<prose>". We extract
@@ -614,6 +712,12 @@ _run_pulse_watchdog() {
 			break
 		fi
 
+		# GH#35710: refresh released-instance supervisor liveness at the 60s cadence.
+		# Stay in the owning shell; never turn heartbeat writes into log progress.
+		if declare -F _pulse_cycle_state_supervisor_heartbeat >/dev/null; then
+			_pulse_cycle_state_supervisor_heartbeat || true
+		fi
+
 		# Process guard: kill children exceeding RSS/runtime limits (t1398)
 		guard_child_processes "$opencode_pid"
 
@@ -625,7 +729,12 @@ _run_pulse_watchdog() {
 		sleep 60
 	done
 
-	# Reap the process (may already be dead)
-	wait "$opencode_pid" 2>/dev/null || true
-	return 0
+	# Reap the process (may already be dead) and preserve its status. A watchdog
+	# stop is itself unsuccessful even when the terminated child races to exit 0.
+	local child_rc=0
+	wait "$opencode_pid" 2>/dev/null || child_rc=$?
+	if [[ -n "$watchdog_stop_reason" ]]; then
+		return 1
+	fi
+	return "$child_rc"
 }

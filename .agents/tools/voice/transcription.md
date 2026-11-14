@@ -15,7 +15,8 @@ tools:
 
 ## Quick Reference
 
-- **Helper**: `transcription-helper.sh [transcribe|models|configure|install|status] [options]`
+- **Helper**: `transcription-helper.sh [transcribe|models|configure|install|status] [options]`; `<command> --help` is side-effect free
+- **Install**: `transcription-helper.sh install` creates/reuses `~/.aidevops/.agent-workspace/work/transcription/.venv` (faster-whisper with PyAV `<19`); never create ad-hoc transcription venvs
 - **Default model**: Whisper Large v3 Turbo (best speed/accuracy tradeoff)
 
 ```bash
@@ -39,6 +40,33 @@ transcription-helper.sh transcribe recording.mp3 --model large-v3-turbo    # nat
 
 **Input sources**: YouTube (`yt-dlp -x --audio-format wav`), URL (`curl` + `ffmpeg`), local audio (`.wav .mp3 .flac .ogg .m4a`), local video (`ffmpeg -i input -vn -acodec pcm_s16le output.wav`).
 
+## Mac Dictation Alternatives
+
+- [VoiceInk](https://tryvoiceink.com/) ([source](https://github.com/Beingpax/VoiceInk)) — local-first, system-wide macOS dictation with custom vocabulary and optional cloud text enhancement. Apple Silicon, macOS 14.4+. A practical choice for personal dictation and multilingual workflows; check the selected model's language and translation capabilities separately.
+- [FluidVoice](https://altic.dev/fluid) ([source](https://github.com/altic-dev/FluidVoice)) — free, open-source, local-first system-wide dictation with optional on-device text polishing and selectable Whisper/Parakeet models. macOS 15+; Intel uses Whisper. Language support depends on the model; optional cloud enhancement changes the privacy boundary.
+
+These are user-facing dictation apps, **not** backends of `transcription-helper.sh` or guaranteed replacements for timestamped YouTube transcripts. For translation, distinguish translating speech to another language from transcribing multilingual speech; confirm the selected app/model and output before relying on it. For repeatable file/URL transcription, use the helper above.
+
+## YouTube Transcript Sources
+
+Prefer existing captions with `yt-dlp-helper.sh transcript <url>`; if unavailable and audio is accessible, use the unified transcript helper below for local speech-to-text. `youtube-helper.sh` handles discovery/search separately. Parakeet is listed as a model option above and available in some Mac apps, but is **not** a selectable `transcription-helper.sh` backend today.
+
+For a single timestamped JSON result, use `python3 .agents/scripts/youtube-transcript.py <video-id-or-url> --output transcript.json`. This tries caption tracks first and then local ASR; it never silently calls a paid service. Requires `yt-dlp` for captions; `ffmpeg` and `faster-whisper` for the default ASR fallback. Use `--backend whisper-cpp` or `--backend buzz` when those local backends are installed and can emit compatible segment JSON. Use `--language <code>` to select a caption/ASR language; the default is English. JSON contains `video_id`, `source`, `language`, and `segments` (`start`, `duration`, `text`). Only individual videos are accepted; enumerate playlists/channels with `youtube-helper.sh` before invoking it per video.
+
+**Multilingual audio fallback:** YouTube videos can offer many dubbed tracks, and format IDs change per video. When captions fail, the helper prefers the requested language's original audio track, then other available tracks; it does not pin a format ID or switch to a cloud backend. A locale such as `en-US` is used for audio-track selection, while local Whisper receives the base language `en`. Inspect `yt-dlp -F <url>` if the track is missing, and verify the actual source language before trusting an ASR result. A successful metadata/format listing does not prove the media or captions can be downloaded.
+
+**Speaker attribution:** Plain Whisper segments provide timestamps and text, not speaker identities or reliable turn boundaries. A segment can straddle a question and answer. For a speaker-labeled result, compare nearby video frames/voices with transcript times, then verify affiliation from on-screen labels or publisher metadata. Label an unknown speaker or approximate boundary as uncertain; never infer a person's name from voice or appearance alone. An organisation label is not a verified individual identity. Diarization, when available, can cluster voices but does not establish names by itself.
+
+**Optional local diarization:** `python3 .agents/scripts/diarization-helper.py <local-audio> --binary <audiocpp_cli> --model <Nemotron-3-GGUF> --output speaker-turns.json` produces anonymous, timestamped speaker activity without an upload or model download. Run it only with an explicitly supplied, license-reviewed model and compatible local `audio.cpp` binary. See `tools/voice/nemotron-diarization.md` for setup, overlap, time-base alignment, and Mac CPU vs unverified Metal boundaries. This helper does not automatically label the words from `youtube-transcript.py` or provide verified personal names.
+
+**AI work tiers:** `simple` for deterministic transcript formatting or timestamp conversion; `standard` for checking speaker turns against frames and publisher evidence; `thinking` only for genuinely ambiguous identity, contradictory evidence, or consequential cross-source synthesis. Tier controls analysis effort, not the Whisper/Parakeet transcription model. No tier bypasses privacy, consent, paid API, or access gates.
+
+[TranscriptAPI](https://transcriptapi.com/) is an optional hosted alternative for transcripts plus YouTube search/channel/playlist browsing (REST and MCP). It uses a paid-credit model after the trial; verify current pricing, API contract, and desired data sharing before use. Store its key with `aidevops secret set`, never in a repo or command history. Do not assume local `yt-dlp` access has the hosted service's reliability.
+
+Once the key is available as `TRANSCRIPTAPI_API_KEY` in the process environment, explicitly select `python3 .agents/scripts/youtube-transcript.py <video-id> --source api --output transcript.json` for a hosted transcript. API-backed search/channel/playlist operations remain available through the provider's REST/MCP documentation; they are not implemented in this helper.
+
+For legitimate access issues, diagnose the error and respect platform terms, rate limits, and access controls. A browser profile or residential egress may be relevant only for an explicitly authorized isolation/geo need, not as an automatic block-bypass fallback; obtain approval and follow `tools/browser/auto-browse.md`, `tools/browser/anti-detect-browser.md`, and `tools/browser/proxy-integration.md`. Browser fingerprint changes do not themselves make `yt-dlp` succeed.
+
 ## Whisper (Local)
 
 ```bash
@@ -60,9 +88,11 @@ whisper foreign.mp3 --task translate --model medium              # translate to 
 | Parakeet V2 | 474MB | 9.4/10 | English-only (NVIDIA) |
 | Apple Speech | Built-in | 9.0/10 | macOS 26+, on-device |
 
-**faster-whisper** (`pip install faster-whisper`): `WhisperModel("medium", device="cpu", compute_type="int8")` → `model.transcribe("audio.mp3", language="en")` → iterate `seg.start`, `seg.text`.
+**faster-whisper** (installed by `transcription-helper.sh install`): `WhisperModel("medium", device="cpu", compute_type="int8")` → `model.transcribe("audio.mp3", language="en")` → iterate `seg.start`, `seg.text`.
 
 **whisper.cpp** (Apple Silicon optimised): `git clone https://github.com/ggml-org/whisper.cpp && cd whisper.cpp && make && ./models/download-ggml-model.sh medium` → `./build/bin/whisper-cli -m models/ggml-medium.bin -f audio.wav -otxt -osrt`
+
+`media-qa-helper.sh` discovers local ggml models in this order: explicit `--model`, `WHISPER_MODEL`, then `~/Library/Application Support/WhisperModels/`, `~/Library/Application Support/MacWhisper/WhisperModels/`, `~/.cache/whisper/`, and `~/.local/share/whisper/`. It never downloads a model.
 
 ## Buzz (macOS GUI for Whisper)
 

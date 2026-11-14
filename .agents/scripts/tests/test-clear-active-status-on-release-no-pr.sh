@@ -55,6 +55,30 @@ write_stub_gh() {
 	: >"$GH_PR_LIST_JSON"
 	cat >"${STUB_DIR}/gh" <<'STUBEOF'
 #!/usr/bin/env bash
+if [[ "$1" == "api" && "$2" == repos/*/issues/[0-9]* && "$2" != */comments* ]]; then
+	printf '%s\n' '{"state":"open","labels":[]}'
+	exit 0
+fi
+if [[ "$1" == "api" && "$2" == /repos/*/labels\?per_page=100 ]]; then
+	printf '%s\t%s\t%s\n' \
+		"status:available" "0e8a16" "Task is available for claiming" \
+		"status:queued" "fbca04" "Worker dispatched, not yet started" \
+		"status:claimed" "f9d0c4" "Interactive implementation is actively claimed" \
+		"status:in-progress" "1d76db" "Worker actively running" \
+		"status:in-review" "5319e7" "Non-draft PR ready for review/merge" \
+		"status:done" "6f42c1" "Task is complete" \
+		"status:blocked" "d93f0b" "Partial work blocked; inspect reason and next action"
+	exit 0
+fi
+# Status transitions read the exact label contract with one aliased GraphQL
+# query; serve it from the REST fixture above instead of failing closed.
+if [[ "$1" == "api" && "$2" == "graphql" && "$*" == *'label0: label(name:'* ]]; then
+	"$0" api '/repos/fixture/labels?per_page=100' | jq -Rn '
+		[inputs | split("\t") | {name: .[0], color: .[1], description: .[2]}]
+		| to_entries | map({key: ("label" + (.key | tostring)), value: .value})
+		| from_entries | {data: {repository: .}}'
+	exit $?
+fi
 if [[ "$1" == "issue" && "$2" == "view" ]]; then
 	cat "${GH_VIEW_LABELS}" 2>/dev/null || true
 	exit 0
@@ -109,13 +133,20 @@ assert_grep "remove-assignee alice" "removes assignee alice (no PR)"
 
 # -------------------------------------------------------------------
 # Case 2: entirely empty gh pr list output (offline/error case)
-#         → full cleanup (fail-open preserves pre-t2451 behaviour)
+#         → no write (unreadable metadata is not absence evidence)
 # -------------------------------------------------------------------
 reset_stub
 : >"$GH_PR_LIST_JSON" # deliberately empty file
-clear_active_status_on_release 20156 owner/repo bob
-assert_grep "remove-label status:in-review" "full cleanup when gh pr list returns empty"
-assert_grep "remove-assignee bob" "removes assignee when gh pr list returns empty"
+if clear_active_status_on_release 20156 owner/repo bob; then
+	print_result "empty PR output fails closed" 1
+else
+	print_result "empty PR output fails closed" 0
+fi
+if grep -q 'issue edit' "$GH_CALLS_FILE"; then
+	print_result "empty PR output preserves issue state" 1
+else
+	print_result "empty PR output preserves issue state" 0
+fi
 
 # -------------------------------------------------------------------
 # Case 3: PR exists but references a DIFFERENT issue → full cleanup

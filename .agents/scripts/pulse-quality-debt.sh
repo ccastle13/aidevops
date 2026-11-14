@@ -63,7 +63,11 @@ create_quality_debt_worktree() {
 		parent_dir=$(dirname "$repo_path")
 		qd_wt_slug=$(printf '%s' "$qd_branch" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
 		qd_wt_path="${parent_dir}/${repo_name}-${qd_wt_slug}"
-		git -C "$repo_path" worktree add -b "$qd_branch" "$qd_wt_path" 2>/dev/null || {
+		(
+			# shellcheck source=shared-worktree-create.sh
+			source "${BASH_SOURCE[0]%/*}/shared-worktree-create.sh" || exit 1
+			worktree_create_registered "$repo_path" "$qd_wt_path" HEAD -b "$qd_branch"
+		) >/dev/null || {
 			echo "[create_quality_debt_worktree] Failed to create worktree for #${issue_number}" >>"${LOGFILE:-/dev/null}"
 			return 1
 		}
@@ -152,7 +156,7 @@ _enrichment_resolve_model() {
 }
 
 #######################################
-# Resolve the local filesystem path for a repo slug
+# Resolve the canonical source path for a repo slug (never the worker --dir)
 #
 # Arguments:
 #   $1 - repo slug (owner/repo)
@@ -215,13 +219,13 @@ _enrichment_parse_fast_fail_key() {
 }
 
 #######################################
-# Fetch issue body, title, and validated prior-attempt state.
+# Fetch issue body, title, state, and validated prior-attempt state.
 #
 # Arguments:
 #   $1 - issue number
 #   $2 - repo slug (owner/repo)
 #
-# Outputs: JSON object {title, body, prior_attempt} (stdout)
+# Outputs: JSON object {title, body, state, prior_attempt} (stdout)
 # Exit codes:
 #   0 - data fetched (partial data is acceptable; fields may be empty strings)
 #######################################
@@ -229,11 +233,12 @@ _enrichment_fetch_issue_data() {
 	local issue_number="$1"
 	local repo_slug="$2"
 
-	local issue_json="" issue_body="" issue_title="" prior_attempt=""
+	local issue_json="" issue_body="" issue_title="" issue_state="" prior_attempt=""
 	issue_json=$(gh issue view "$issue_number" --repo "$repo_slug" \
-		--json title,body 2>/dev/null) || issue_json="{}"
+		--json title,body,state 2>/dev/null) || issue_json="{}"
 	issue_title=$(printf '%s' "$issue_json" | jq -r '.title // ""')
 	issue_body=$(printf '%s' "$issue_json" | jq -r '.body // ""')
+	issue_state=$(printf '%s' "$issue_json" | jq -r '.state // ""')
 
 	prior_attempt="$_PQD_DEFAULT_PRIOR_ATTEMPT"
 	if declare -F _objective_disposition_json >/dev/null 2>&1; then
@@ -243,10 +248,11 @@ _enrichment_fetch_issue_data() {
 	jq -n \
 		--arg title "$issue_title" \
 		--arg body "$issue_body" \
+		--arg state "$issue_state" \
 		--arg source_none "$_PQD_PRIOR_SOURCE_NONE" \
 		--arg outcome_unknown "$_PQD_PRIOR_OUTCOME_UNKNOWN" \
 		--argjson prior_attempt "$prior_attempt" \
-		'{title: $title, body: $body, prior_attempt: {
+		'{title: $title, body: $body, state: $state, prior_attempt: {
 			source: ($prior_attempt.source // $source_none),
 			attempt_id: ($prior_attempt.attempt_id // ""),
 			effective_outcome: ($prior_attempt.effective_outcome // $outcome_unknown),
@@ -255,6 +261,37 @@ _enrichment_fetch_issue_data() {
 			classification: ($prior_attempt.classification // ""),
 			next_action: ($prior_attempt.next_action // "")
 		}}'
+	return 0
+}
+
+#######################################
+# Emit issue data only when enrichment remains actionable.
+# Closed/reconciled entries are retired; unknown states remain retryable.
+_enrichment_fetch_actionable_issue_data() {
+	local issue_number="$1"
+	local repo_slug="$2"
+	local issue_data="" issue_state=""
+
+	if _enrichment_should_skip_for_objective "$issue_number" "$repo_slug"; then
+		echo "[pulse-wrapper] Enrichment: skipping #${issue_number} in ${repo_slug}; reconciled outcome is non-failure" >>"$LOGFILE"
+		_ff_with_lock _ff_mark_enrichment_done "$issue_number" "$repo_slug" || true
+		return 1
+	fi
+	issue_data=$(_enrichment_fetch_issue_data "$issue_number" "$repo_slug")
+	issue_state=$(printf '%s' "$issue_data" | jq -r '.state // ""')
+	case "$issue_state" in
+	CLOSED)
+		echo "[pulse-wrapper] Enrichment: skipping #${issue_number}; issue closed (${repo_slug})" >>"$LOGFILE"
+		_ff_with_lock _ff_mark_enrichment_done "$issue_number" "$repo_slug" || true
+		return 1
+		;;
+	OPEN) ;;
+	*)
+		echo "[pulse-wrapper] Enrichment: deferring #${issue_number} in ${repo_slug}; issue state unavailable" >>"$LOGFILE"
+		return 1
+		;;
+	esac
+	printf '%s\n' "$issue_data"
 	return 0
 }
 
@@ -330,6 +367,89 @@ ENRICHMENT_PROMPT_EOF
 }
 
 #######################################
+# Prepare an isolated enrichment worktree using the dispatcher's helper.
+# A unique branch avoids reusing an implementation worker's owned worktree.
+_enrichment_prepare_worktree() {
+	local repo_path="$1"
+	local issue_number="$2"
+	local session_key="$3"
+	local branch="feature/${session_key}" worktree_path="" prepare_status=0
+	local wt_helper="${SCRIPT_DIR}/worktree-helper.sh"
+	(cd "$repo_path" && AIDEVOPS_SESSION_ORIGIN=worker \
+		AIDEVOPS_SKIP_AUTO_CLAIM=1 WORKTREE_NODE_MODULES_RESTORE_ENABLED=0 \
+		"$wt_helper" add "$branch" --issue "$issue_number") >>"$LOGFILE" 2>&1 || prepare_status=$?
+	worktree_path=$(git -C "$repo_path" worktree list --porcelain |
+		awk -v branch="refs/heads/${branch}" '/^worktree / {path = substr($0, 10)} /^branch / && substr($0, 8) == branch && !found {print path; found=1}') || worktree_path=""
+	if [[ -z "$worktree_path" || ! -d "$worktree_path" || "$worktree_path" == "$repo_path" ]]; then
+		# The helper also accepts exact branch names for guarded rollback when
+		# creation partly succeeded but porcelain path discovery failed.
+		_enrichment_release_worktree "$repo_path" "$branch"
+		return 1
+	fi
+	if [[ "$prepare_status" -ne 0 ]]; then
+		_enrichment_release_worktree "$repo_path" "$worktree_path"
+		return 1
+	fi
+	if ! register_worktree "$worktree_path" "$branch" --task "$issue_number" \
+		--session "$session_key" --owner-pid "$$"; then
+		_enrichment_release_worktree "$repo_path" "$worktree_path"
+		return 1
+	fi
+	printf '%s\n' "$worktree_path"
+	return 0
+}
+
+# Release only our registry ownership; guarded removal preserves unexpected work.
+_enrichment_release_worktree() {
+	local repo_path="$1"
+	local worktree_path="$2"
+	# The managed invocation is still alive here. Its post-seal callback owns
+	# cleanup, including rollback of partially prepared worktrees.
+	[[ "${AIDEVOPS_MANAGED_WORKTREE_RUN:-0}" != 1 ]] || return 0
+	unregister_worktree_if_owner_pid "$worktree_path" "$$" >>"$LOGFILE" 2>&1 || true
+	(cd "$repo_path" && "${SCRIPT_DIR}/worktree-helper.sh" remove "$worktree_path") >>"$LOGFILE" 2>&1 || {
+		echo "[pulse-wrapper] Enrichment: guarded worktree cleanup deferred" >>"$LOGFILE"
+	}
+	return 0
+}
+
+# Bare cleanup callbacks run in the current shell. These two variables are
+# dynamically scoped locals of _enrichment_run_worker, still live in RETURN.
+_enrichment_cleanup_worktree() {
+	_enrichment_release_worktree "$repo_path" "$worktree_path"
+	return 0
+}
+
+# Uses the launch arguments dynamically scoped by _enrichment_run_worker.
+# Creation and exec share the managed service leader PID. The headless runtime
+# can renew ownership without admitting an unrelated supervisor/child lifetime.
+_enrichment_launch() {
+	local status=0
+	if [[ "$(uname -s)" == Linux ]]; then
+		local runner="${SCRIPT_DIR}/worktree-managed-run.py"
+		local helper="${SCRIPT_DIR}/pulse-enrichment-run-helper.sh"
+		python3 "$runner" --check-backend >/dev/null 2>&1 || return 2
+		local -x LOGFILE="$LOGFILE"
+		local -x HEADLESS_RUNTIME_HELPER="$HEADLESS_RUNTIME_HELPER"
+		python3 "$runner" --timeout-seconds 1800 \
+			--after bash --after "$helper" --after cleanup --after "$repo_path" \
+			-- bash "$helper" run "$prompt_file" "$issue_number" "$repo_slug" \
+			"$repo_path" "$resolved_model" "$session_key" || status=$?
+	else
+		# Select the existing non-systemd contract before creating anything.
+		local -x AIDEVOPS_WORKTREE_MANAGER=legacy-guards
+		worktree_path=$(_enrichment_prepare_worktree "$repo_path" "$issue_number" "$session_key") || return 2
+		push_cleanup _enrichment_cleanup_worktree
+		WORKER_ISSUE_NUMBER="$issue_number" WORKER_REPO_SLUG="$repo_slug" \
+			WORKER_WORKTREE_PATH="$worktree_path" "$HEADLESS_RUNTIME_HELPER" run \
+			--role worker --session-key "$session_key" --dir "$worktree_path" \
+			--model "$resolved_model" --title "Enrichment analysis: Issue #${issue_number}" \
+			--prompt-file "$prompt_file" || status=$?
+	fi
+	return "$status"
+}
+
+#######################################
 # Run the enrichment worker for a single issue and check whether it succeeded
 #
 # Runs a thinking-tier headless worker using the provided prompt file, then
@@ -340,12 +460,13 @@ ENRICHMENT_PROMPT_EOF
 #   $1 - prompt file path (deleted by this function on completion)
 #   $2 - issue number
 #   $3 - repo slug (owner/repo)
-#   $4 - repo path (working directory for the worker)
+#   $4 - canonical repo path (source for the linked worktree only)
 #   $5 - resolved model identifier
 #
 # Exit codes:
-#   0 - enrichment succeeded (Worker Guidance section found in issue body)
-#   1 - enrichment ran but no Worker Guidance was added
+#   0 - enrichment succeeded (body changed and gained a Worker Guidance heading)
+#   1 - enrichment ran but no new Worker Guidance was added
+#   2 - preparation failed; caller must leave enrichment eligible for retry
 #######################################
 _enrichment_run_worker() {
 	local prompt_file="$1"
@@ -357,32 +478,44 @@ _enrichment_run_worker() {
 	_save_cleanup_scope
 	trap '_run_cleanups' RETURN
 
-	local enrichment_output
-	enrichment_output=$(mktemp)
-	push_cleanup "rm -f '${enrichment_output}'"
-	push_cleanup "rm -f '${prompt_file}'"
+	local enrichment_output="" cleanup="" worktree_path=""
+	printf -v cleanup 'rm -f -- %q' "$prompt_file"
+	push_cleanup "$cleanup"
+	enrichment_output=$(mktemp) || return 2
+	printf -v cleanup 'rm -f -- %q' "$enrichment_output"
+	push_cleanup "$cleanup"
+	local session_key=""
+	session_key="enrichment-${issue_number}-$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}"
 
-	# shellcheck disable=SC2086
-	"$HEADLESS_RUNTIME_HELPER" run \
-		--role worker \
-		--session-key "enrichment-${issue_number}" \
-		--dir "$repo_path" \
-		--model "$resolved_model" \
-		--title "Enrichment analysis: Issue #${issue_number}" \
-		--prompt-file "$prompt_file" </dev/null >"$enrichment_output" 2>&1
+	# Snapshot the body before the run so success means this run added guidance.
+	local pre_body="" pre_count=0 post_count=0
+	pre_body=$(gh issue view "$issue_number" --repo "$repo_slug" \
+		--json body --jq '.body // ""' 2>/dev/null) || {
+		pre_body=""
+		echo "[pulse-wrapper] Enrichment: pre-run body fetch failed for #${issue_number} in ${repo_slug}; success check degrades to post-run heading count" >>"$LOGFILE"
+	}
+	pre_count=$(printf '%s\n' "$pre_body" | grep -c '^#\{1,6\} Worker Guidance' || true)
 
-	local enrichment_exit=$?
+	local enrichment_exit=0
+	_enrichment_launch </dev/null >"$enrichment_output" 2>&1 || enrichment_exit=$?
+	if [[ "$enrichment_exit" -ne 0 ]]; then
+		echo "[pulse-wrapper] Enrichment: worker failed (exit=${enrichment_exit}); last 20 output lines:" >>"$LOGFILE"
+		tail -n 20 "$enrichment_output" >>"$LOGFILE"
+	fi
+	[[ "$enrichment_exit" -ne 2 ]] || return 2
 
 	# Check if enrichment succeeded (issue body was edited)
 	local post_body
 	post_body=$(gh issue view "$issue_number" --repo "$repo_slug" \
 		--json body --jq '.body // ""' 2>/dev/null) || post_body=""
 
-	if [[ "$post_body" == *"Worker Guidance"* ]]; then
+	post_count=$(printf '%s\n' "$post_body" | grep -c '^#\{1,6\} Worker Guidance' || true)
+
+	if [[ "$post_body" != "$pre_body" && "$post_count" -gt "$pre_count" ]]; then
 		echo "[pulse-wrapper] Enrichment: successfully added Worker Guidance to #${issue_number} in ${repo_slug}" >>"$LOGFILE"
 		return 0
 	else
-		echo "[pulse-wrapper] Enrichment: worker ran (exit=${enrichment_exit}) but no Worker Guidance found in #${issue_number} body (${#post_body} chars)" >>"$LOGFILE"
+		echo "[pulse-wrapper] Enrichment: worker ran (exit=${enrichment_exit}) but no new Worker Guidance in #${issue_number} body (${#post_body} chars)" >>"$LOGFILE"
 		return 1
 	fi
 }
@@ -441,11 +574,9 @@ dispatch_enrichment_workers() {
 		local parsed_key="" issue_number="" repo_slug=""
 		parsed_key=$(_enrichment_parse_fast_fail_key "$ff_key") || continue
 		IFS=$'\t' read -r issue_number repo_slug <<<"$parsed_key"
-		if _enrichment_should_skip_for_objective "$issue_number" "$repo_slug"; then
-			echo "[pulse-wrapper] Enrichment: skipping #${issue_number} in ${repo_slug}; reconciled outcome is non-failure" >>"$LOGFILE"
-			_ff_with_lock _ff_mark_enrichment_done "$issue_number" "$repo_slug" || true
-			continue
-		fi
+		# Confirm eligibility before model resolution or worker/worktree creation.
+		local issue_data="" issue_title="" issue_body="" prior_attempt=""
+		issue_data=$(_enrichment_fetch_actionable_issue_data "$issue_number" "$repo_slug") || continue
 		if [[ -z "$resolved_model" ]]; then
 			resolved_model=$(_enrichment_resolve_model) || break
 		fi
@@ -456,9 +587,7 @@ dispatch_enrichment_workers() {
 
 		echo "[pulse-wrapper] Enrichment: analyzing #${issue_number} in ${repo_slug} after worker failure" >>"$LOGFILE"
 
-		# Fetch issue data and bounded machine-generated prior-attempt state.
-		local issue_data="" issue_title="" issue_body="" prior_attempt=""
-		issue_data=$(_enrichment_fetch_issue_data "$issue_number" "$repo_slug")
+		# Use the fetched issue data and bounded machine-generated prior-attempt state.
 		issue_title=$(printf '%s' "$issue_data" | jq -r '.title // ""')
 		issue_body=$(printf '%s' "$issue_data" | jq -r '.body // ""')
 		prior_attempt=$(printf '%s' "$issue_data" | jq -c \
@@ -470,18 +599,27 @@ dispatch_enrichment_workers() {
 		prompt_file=$(_enrichment_build_prompt \
 			"$issue_number" "$issue_title" "$issue_body" "$prior_attempt" "$repo_slug") || continue
 
+		if ! _ff_with_lock _ff_reserve_enrichment_attempt "$issue_number" "$repo_slug"; then
+			rm -f -- "$prompt_file"
+			continue
+		fi
+		enrichment_count=$((enrichment_count + 1))
+		available=$((available - 1))
+
 		# Run enrichment worker; prompt_file is deleted inside helper
+		local enrichment_status=0
 		if _enrichment_run_worker \
 			"$prompt_file" "$issue_number" "$repo_slug" "$repo_path" "$resolved_model"; then
 			enriched_total=$((enriched_total + 1))
+		else
+			enrichment_status=$?
 		fi
+		[[ "$enrichment_status" -eq 2 ]] && continue
 
 		# Mark enrichment complete in fast-fail state (regardless of success —
 		# don't retry enrichment, let normal escalation handle persistent failures)
 		_ff_with_lock _ff_mark_enrichment_done "$issue_number" "$repo_slug" || true
 
-		enrichment_count=$((enrichment_count + 1))
-		available=$((available - 1))
 	done <<<"$enrichment_keys"
 
 	if [[ "$enrichment_count" -gt 0 ]]; then

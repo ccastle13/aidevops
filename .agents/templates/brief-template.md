@@ -28,7 +28,7 @@ mode: subagent
 - **Session:** {app}:{session-id}
 - **Created by:** {author} (human | ai-supervisor | ai-interactive)
 - **Parent task:** {parent_id} (if subtask)
-- **Blocked by:** {GitHub native relationship(s) + optional `blocked-by:tNNN/#NNN` marker; worker-ready ordered leaves keep `#auto-dispatch` plus `status:blocked` after the relationship is verified, while unverifiable edges stay blocked and out of the available queue}
+- **Blocked by:** {GitHub native relationship(s) + optional `blocked-by:tNNN/#NNN` marker; worker-ready ordered leaves keep `#auto-dispatch` plus `status:blocked` after the relationship is verified, while unverifiable edges stay blocked and out of the available queue; a wait on a third-party upstream release also carries an `aidevops:upstream-release-gate` body marker (`workflows/brief.md` "Waiting on an upstream release")}
 - **Conversation context:** {1-2 sentence summary of what was discussed that led to this task}
 
 ## What
@@ -447,14 +447,26 @@ from `_parse_phases_section` — then add new logic to the slimmed parent functi
 - **Resume condition:** {specific condition}
 - **Owner and status:** {owner}; {recovering | blocked | not-triggered}
 
-### Files Scope
+### Scope Boundaries
+
+Initial implementation map. Directly necessary adjacent integration follows
+`reference/worker-discipline.md` "Integration scope recovery": document and verify
+the minimal corrected scope before editing. Explicit exclusions/hard boundaries
+remain binding and require a separate authorized brief-owner decision.
+
+**Hard boundaries:** {explicit restrictions, or `none beyond framework safety guarantees`}
+
+**AI brief owner:** {authorized coordinator; cannot be inferred from worker output}
+
+**Recovery:** preserve the current PR and use the structured runtime request
+and Pulse intake in `reference/worker-discipline.md` when local recovery is unsafe.
 
 <!-- Declares the file paths this task is allowed to modify.
      The scope-guard pre-push hook (scope-guard-pre-push.sh) reads this list
      and blocks pushes that include files outside the declared scope,
      preventing accidental scope-leak during rebase or implementation drift.
-     Glob patterns are supported (e.g., `.agents/hooks/*.sh`).
-     One path or glob pattern per `- ` line.
+      Use exact repository-relative paths only; globs are not supported.
+      One path per `- ` line, with no descriptions or other prose in this section.
 
      CRITICAL RULES:
      1. Paths MUST be relative to the repository root (e.g., `.agents/hooks/foo.sh`,
@@ -463,13 +475,12 @@ from `_parse_phases_section` — then add new logic to the slimmed parent functi
         the repository root via `git rev-parse --show-toplevel`. Paths not anchored to
         the root will silently fail to match — the guard will not fire and unintended
         files can pass through without review.
-     2. Do NOT use overly-permissive globs (e.g., `**/*` or `*.sh` without a prefix).
-        Overly-broad scope declarations create a path traversal risk: files outside
-        the intended scope may be committed and pushed without triggering a block,
-        undermining the entire guard. Declare the narrowest scope that covers the
-        intended changes. -->
+      2. Declare each intended file explicitly; wildcard patterns such as `*.sh`
+         fail the canonical Files Scope validator. -->
 
-- `{path/to/file-or-glob}`
+### Files Scope
+
+- `{path/to/exact-file}`
 
 ## Acceptance Criteria
 

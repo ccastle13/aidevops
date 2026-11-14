@@ -73,14 +73,30 @@ if [[ "\$1" == "api" ]]; then
     exit 0
   fi
   if [[ "\$*" == *'/users/owner/events?per_page=1'* ]]; then
+    case "\${STUB_EVENTS_STATUS:-200}" in
+    304) printf 'gh: HTTP 304\\n' >&2; exit 1 ;;
+    403) printf 'HTTP/2 403\\r\\nretry-after: 60\\r\\nx-ratelimit-remaining: 0\\r\\n\\r\\n{"message":"rate limit exceeded"}'; exit 1 ;;
+    esac
     printf 'HTTP/2 200\\r\\netag: "events"\\r\\n\\r\\n[]'
     exit 0
   fi
   if [[ "$mode" == "not_modified" ]]; then
+    printf 'gh: HTTP 304\\n' >&2
+    exit 1
+  fi
+  if [[ "$mode" == "legacy_not_modified" ]]; then
     printf 'HTTP/2 304\\r\\netag: "etag-v1"\\r\\n\\r\\n'
     exit 1
   fi
-  if [[ "$mode" == "changed" ]]; then
+  if [[ "$mode" == "stderr_failure" ]]; then
+    printf 'gh: HTTP 500\\n' >&2
+    exit 1
+  fi
+  if [[ "$mode" == "mixed" && "\$*" == *'repos/owner/failing/'* ]]; then
+    printf 'HTTP/2 500\\r\\n\\r\\n{}'
+    exit 1
+  fi
+  if [[ "$mode" == "changed" || "$mode" == "mixed" ]]; then
     if [[ "\$*" == *'/pulls?state=open'* ]]; then
       printf 'HTTP/2 200\\r\\netag: "etag-pr-v2"\\r\\n\\r\\n[{"number":7,"title":"PR","updated_at":"2026-05-02T00:00:00Z","user":{"login":"dev"},"head":{"sha":"abc","ref":"branch"}}]'
       exit 0
@@ -170,9 +186,10 @@ test_prefetch_raw_gh_read_detector_rejects_missing_file() {
 }
 
 test_unchanged_repo_uses_304_cache() {
+	local mode="${1:-not_modified}"
 	setup_env
 	seed_cache
-	write_gh_stub not_modified
+	write_gh_stub "$mode"
 	local output
 	output=$("$HELPER" refresh)
 	local issues_snapshot="" prs_snapshot=""
@@ -180,6 +197,8 @@ test_unchanged_repo_uses_304_cache() {
 	prs_snapshot=$("$HELPER" read-snapshot --kind prs --slug owner/repo 2>/dev/null) || prs_snapshot="{}"
 	if grep -q 'conditional_304=2' <<<"$output" \
 		&& ! grep -q 'search issues' "$TEST_ROOT/gh-calls.log" \
+		&& grep -q '304 cache hit' "$LOGFILE" \
+		&& [[ "$(printf '%s' "$issues_snapshot" | jq -r '.etag')" == '"etag-v1"' ]] \
 		&& [[ "$(printf '%s' "$issues_snapshot" | jq -r '.complete')" == "true" ]] \
 		&& [[ "$(printf '%s' "$issues_snapshot" | jq -r '.generation')" == "$(printf '%s' "$prs_snapshot" | jq -r '.generation')" ]]; then
 		print_result "unchanged repo returns conditional 304 and skips search" 0
@@ -187,6 +206,26 @@ test_unchanged_repo_uses_304_cache() {
 		print_result "unchanged repo returns conditional 304 and skips search" 1
 	fi
 	teardown_env
+	return 0
+}
+
+test_stderr_failure_and_unconditional_304_fall_back() {
+	local mode=""
+	for mode in stderr_failure not_modified; do
+		setup_env
+		# No usable cached ETag: a stderr-only 304 must not count as a hit.
+		[[ "$mode" == "stderr_failure" ]] && seed_cache
+		write_gh_stub "$mode"
+		local output=""
+		output=$("$HELPER" refresh)
+		if grep -q 'conditional_304=0' <<<"$output" &&
+			grep -q 'failed for owner/repo; falling back' "$LOGFILE"; then
+			print_result "$mode preserves conditional REST fallback" 0
+		else
+			print_result "$mode preserves conditional REST fallback" 1
+		fi
+		teardown_env
+	done
 	return 0
 }
 
@@ -786,7 +825,103 @@ SH
 	return 0
 }
 
+test_partial_failure_keeps_successful_snapshots() {
+	setup_env
+	printf '%s\n' '{"initialized_repos":[{"slug":"owner/repo","pulse":true},{"slug":"owner/failing","pulse":true}],"git_parent_dirs":[]}' >"$REPOS_JSON"
+	write_gh_stub mixed
+	"$HELPER" refresh >/dev/null 2>&1 || true
+	local successful_calls=0 failed_calls=0
+	successful_calls=$(grep -c 'repos/owner/repo/' "$TEST_ROOT/gh-calls.log" || true)
+	failed_calls=$(grep -c 'repos/owner/failing/' "$TEST_ROOT/gh-calls.log" || true)
+	if [[ "$successful_calls" -eq 2 && "$failed_calls" -eq 4 ]] &&
+		jq -e '.source == "conditional-rest" and .complete == true' "$PULSE_BATCH_PREFETCH_CACHE_DIR/issues-owner__repo.json" >/dev/null &&
+		jq -e '.source == "conditional-rest" and .complete == true' "$PULSE_BATCH_PREFETCH_CACHE_DIR/prs-owner__repo.json" >/dev/null; then
+		print_result "partial issues and PR failure retries only failed repositories" 0
+	else
+		print_result "partial issues and PR failure retries only failed repositories (successful=${successful_calls}, failed=${failed_calls})" 1
+	fi
+	teardown_env
+	return 0
+}
+
+# GH#33074: an events-ETag 304 may skip an owner only while its snapshots are
+# recent; org event feeds omit private-repo activity. Cooldown skips still hold.
+TICKLE_CASE_OUTPUT=""
+TICKLE_CASE_REPO_CALLS=0
+run_tickle_refresh_case() {
+	local events_status="$1"
+	local snapshot_age="$2"
+	local now="" kind="" cache_file=""
+	setup_env
+	export PULSE_EVENTS_TICKLE_ENABLED=1 PULSE_EVENTS_TICKLE_MAX_CACHE_AGE=900
+	export STUB_EVENTS_STATUS="$events_status"
+	seed_cache
+	if [[ "$snapshot_age" == "recent" ]]; then
+		now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+		for kind in issues prs; do
+			cache_file="$PULSE_BATCH_PREFETCH_CACHE_DIR/${kind}-owner__repo.json"
+			jq --arg ts "$now" '.timestamp = $ts | .fetched_at = $ts' "$cache_file" >"$TEST_ROOT/restamp.json"
+			mv "$TEST_ROOT/restamp.json" "$cache_file"
+		done
+	fi
+	mkdir -p "$HOME/.aidevops/cache/pulse-events-etag"
+	printf '%s\n' '{"etag":"events","owner_type":"users","last_check":"2026-05-01T00:00:00Z"}' \
+		>"$HOME/.aidevops/cache/pulse-events-etag/owner.json"
+	write_gh_stub not_modified
+	TICKLE_CASE_OUTPUT=$("$HELPER" refresh 2>/dev/null) || TICKLE_CASE_OUTPUT=""
+	TICKLE_CASE_REPO_CALLS=$(grep -c 'repos/owner/repo/' "$TEST_ROOT/gh-calls.log" 2>/dev/null || true)
+	unset STUB_EVENTS_STATUS PULSE_EVENTS_TICKLE_MAX_CACHE_AGE
+	return 0
+}
+
+test_tickle_304_refreshes_stale_owner_snapshots() {
+	run_tickle_refresh_case 304 stale
+	local prs_ts=""
+	prs_ts=$(jq -r '.timestamp' "$PULSE_BATCH_PREFETCH_CACHE_DIR/prs-owner__repo.json" 2>/dev/null) || prs_ts=""
+	if [[ "${TICKLE_CASE_REPO_CALLS:-0}" -eq 2 && "$prs_ts" != "2026-05-01T00:00:00Z" ]] &&
+		grep -q 'events_tickle_fresh=0' <<<"$TICKLE_CASE_OUTPUT" &&
+		grep -q 'events_tickle_stale=1' <<<"$TICKLE_CASE_OUTPUT" &&
+		grep -q 'but snapshots older than 900s — refreshing' "$LOGFILE"; then
+		print_result "events 304 refreshes an owner whose snapshots are stale" 0
+	else
+		print_result "events 304 refreshes an owner whose snapshots are stale (repo_calls=${TICKLE_CASE_REPO_CALLS}, prs_ts=${prs_ts})" 1
+	fi
+	teardown_env
+	return 0
+}
+
+test_tickle_304_skips_recent_owner_snapshots() {
+	run_tickle_refresh_case 304 recent
+	if [[ "${TICKLE_CASE_REPO_CALLS:-0}" -eq 0 ]] &&
+		grep -q 'events_tickle_fresh=1' <<<"$TICKLE_CASE_OUTPUT" &&
+		grep -q 'events tickle fresh for owner=owner — skipping search calls' "$LOGFILE"; then
+		print_result "events 304 still skips an owner whose snapshots are recent" 0
+	else
+		print_result "events 304 still skips an owner whose snapshots are recent (repo_calls=${TICKLE_CASE_REPO_CALLS})" 1
+	fi
+	teardown_env
+	return 0
+}
+
+test_tickle_cooldown_skips_even_stale_owner_snapshots() {
+	run_tickle_refresh_case 403 stale
+	if [[ "${TICKLE_CASE_REPO_CALLS:-0}" -eq 0 ]] &&
+		grep -q 'events tickle fresh for owner=owner — skipping search calls' "$LOGFILE"; then
+		print_result "events cooldown skips fanout even when snapshots are stale" 0
+	else
+		print_result "events cooldown skips fanout even when snapshots are stale (repo_calls=${TICKLE_CASE_REPO_CALLS})" 1
+	fi
+	teardown_env
+	return 0
+}
+
+test_partial_failure_keeps_successful_snapshots
+test_tickle_304_refreshes_stale_owner_snapshots
+test_tickle_304_skips_recent_owner_snapshots
+test_tickle_cooldown_skips_even_stale_owner_snapshots
 test_unchanged_repo_uses_304_cache
+test_unchanged_repo_uses_304_cache legacy_not_modified
+test_stderr_failure_and_unconditional_304_fall_back
 test_changed_repo_refreshes_cache
 test_bodyless_transport_rows_are_rejected
 test_bodyless_cached_rows_are_rejected

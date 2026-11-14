@@ -8,6 +8,14 @@
 # resolution, admin-merge fallback signaling, merge execution, resource
 # unlocking (PR/issue), stacked PR retargeting, and the cmd_merge command.
 #
+# Focused sub-libraries (sourced below; GH#30748):
+#   - full-loop-helper-merge-worktree.sh    -- worktree identity, cleanup targets
+#   - full-loop-helper-merge-authority.sh   -- external/fork merge authority gates
+#   - full-loop-helper-merge-prospective.sh -- pinned PR refs, isolated object store
+#   - full-loop-helper-merge-cleanup.sh     -- canonical sync, post-merge cleanup
+#   - full-loop-helper-merge-transport.sh   -- bounded gh reads/writes, REST
+#     fallback, timed-out/transient write reconciliation (GH#36968)
+#
 # Usage: source "${SCRIPT_DIR}/full-loop-helper-merge.sh"
 #
 # Dependencies:
@@ -30,26 +38,7 @@ _FULL_LOOP_MERGE_LIB_LOADED=1
 FULL_LOOP_MERGE_SUBJECT_FLAG="--subject"
 FULL_LOOP_MERGE_BODY_FILE_FLAG="--body-file"
 FULL_LOOP_EXTERNAL_AUTHORITY_TARGETS=()
-
-_flm_gh_read() {
-	local rc=0
-	if declare -F _gh_with_timeout >/dev/null 2>&1; then
-		_gh_with_timeout read "$@" || rc=$?
-	else
-		"$@" || rc=$?
-	fi
-	return "$rc"
-}
-
-_flm_gh_write() {
-	local rc=0
-	if declare -F _gh_with_timeout >/dev/null 2>&1; then
-		_gh_with_timeout write "$@" || rc=$?
-	else
-		timeout_sec "${AIDEVOPS_GH_WRITE_TIMEOUT:-45}" "$@" || rc=$?
-	fi
-	return "$rc"
-}
+FULL_LOOP_EXTERNAL_AUTHORITY_APPROVAL_TARGETS=()
 
 # Defensive SCRIPT_DIR fallback
 if [[ -z "${SCRIPT_DIR:-}" ]]; then
@@ -74,6 +63,15 @@ source "${SCRIPT_DIR}/gh-merge-cache-remediation-lib.sh"
 # shellcheck disable=SC1091  # sub-library resolved at runtime via SCRIPT_DIR
 source "${SCRIPT_DIR}/release-lane-helper.sh"
 
+# shellcheck source=./manual-release-hold-helper.sh
+# shellcheck disable=SC1091  # sub-library resolved at runtime via SCRIPT_DIR
+source "${SCRIPT_DIR}/manual-release-hold-helper.sh"
+
+# GH#37955: Cloudron manifest version bumps require release authority.
+# shellcheck source=./cloudron-release-merge-guard-lib.sh
+# shellcheck disable=SC1091  # sub-library resolved at runtime via SCRIPT_DIR
+source "${SCRIPT_DIR}/cloudron-release-merge-guard-lib.sh"
+
 if [[ -f "${SCRIPT_DIR}/full-loop-cleanup-receipt.sh" ]]; then
 	# shellcheck source=./full-loop-cleanup-receipt.sh
 	source "${SCRIPT_DIR}/full-loop-cleanup-receipt.sh"
@@ -82,6 +80,10 @@ fi
 # shellcheck source=./full-loop-helper-evidence.sh
 # shellcheck disable=SC1091  # sub-library resolved at runtime via SCRIPT_DIR
 source "${SCRIPT_DIR}/full-loop-helper-evidence.sh"
+
+# shellcheck source=./full-loop-helper-subject.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/full-loop-helper-subject.sh"
 
 # Canonical TODO task/issue mapping parser shared with issue-sync and pre-push.
 # shellcheck source=./issue-sync-pr-task-resolver.sh
@@ -99,6 +101,26 @@ source "${SCRIPT_DIR}/trusted-dependabot-lib.sh"
 # shellcheck disable=SC1091  # sub-library resolved at runtime via SCRIPT_DIR
 source "${SCRIPT_DIR}/full-loop-helper-merge-worktree.sh"
 
+# External/fork authority gates applied before every merge mode (GH#28622).
+# shellcheck source=./full-loop-helper-merge-authority.sh
+# shellcheck disable=SC1091  # sub-library resolved at runtime via SCRIPT_DIR
+source "${SCRIPT_DIR}/full-loop-helper-merge-authority.sh"
+
+# Pinned PR refs and the isolated object store for the prospective TODO guard.
+# shellcheck source=./full-loop-helper-merge-prospective.sh
+# shellcheck disable=SC1091  # sub-library resolved at runtime via SCRIPT_DIR
+source "${SCRIPT_DIR}/full-loop-helper-merge-prospective.sh"
+
+# Post-merge canonical synchronization and linked-worktree cleanup.
+# shellcheck source=./full-loop-helper-merge-cleanup.sh
+# shellcheck disable=SC1091  # sub-library resolved at runtime via SCRIPT_DIR
+source "${SCRIPT_DIR}/full-loop-helper-merge-cleanup.sh"
+
+# Bounded GitHub read/write adapters, REST fallback and write reconciliation.
+# shellcheck source=./full-loop-helper-merge-transport.sh
+# shellcheck disable=SC1091  # sub-library resolved at runtime via SCRIPT_DIR
+source "${SCRIPT_DIR}/full-loop-helper-merge-transport.sh"
+
 # --- Repo Resolution ---
 
 # _merge_resolve_repo — resolve repo slug from argument or auto-detect from git remote.
@@ -110,7 +132,7 @@ _merge_resolve_repo() {
 		return 0
 	fi
 	local detected=""
-	detected=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || echo "")
+	detected=$(_flm_gh_read gh repo view --json nameWithOwner -q '.nameWithOwner' || true)
 	if [[ -z "$detected" ]]; then
 		print_error "Cannot detect repo. Pass REPO as second argument."
 		return 1
@@ -188,18 +210,44 @@ ${_sig_footer}"
 _merge_output_is_graphql_rate_limit() {
 	local merge_output="$1"
 
-	printf '%s' "$merge_output" | grep -qiE 'GraphQL:.*API rate limit|GraphQL.*rate limit|rateLimitExceeded'
+	grep -qiE 'GraphQL:.*API rate limit|GraphQL.*rate limit|rateLimitExceeded' <<<"$merge_output"
 	return $?
+}
+
+_merge_output_is_transient_server_error() {
+	local merge_output="$1"
+
+	if grep -qiE '(^|[^[:alnum:]_])(HTTP(/[0-9.]+)?[[:space:]]+|status code:[[:space:]]*)(502|503|504)([^0-9]|$)|Something went wrong while executing your query' <<<"$merge_output"; then
+		return 0
+	fi
+	return 1
 }
 
 _merge_output_is_review_policy_block() {
 	local merge_output="$1"
 
-	printf '%s' "$merge_output" | grep -qiE 'At least [0-9]+ approving review|approving review is required|review required|cannot approve your own pull request|can not approve your own pull request|self-approval'
+	grep -qiE 'At least [0-9]+ approving review|approving review is required|review required|cannot approve your own pull request|can not approve your own pull request|self-approval' <<<"$merge_output"
 	return $?
 }
 
+_merge_report_admin_fallback_failure() {
+	local pr_number="$1"
+	local admin_output="$2"
+
+	[[ -n "$admin_output" ]] && printf '%s\n' "$admin_output"
+	#aidevops:trust-boundary -- GitHub error text may select only a safer deferred
+	# outcome; it never grants authority, retries a mutation, or reports success.
+	if _merge_output_is_review_policy_block "$admin_output"; then
+		print_error "Merge deferred for PR #${pr_number}: a native approving review is required; hand off to Pulse."
+		return 0
+	fi
+	print_error "Merge failed for PR #${pr_number} (even with --admin — maintainer gate or admin rights missing)"
+	return 0
+}
+
 _merge_is_headless_session() {
+	# Supervisor sweep must never inherit the interactive --admin exception.
+	[[ "${WORKER_SESSION_KEY:-}" != "supervisor-pulse" ]] || return 0
 	case "${FULL_LOOP_HEADLESS:-}${AIDEVOPS_HEADLESS:-}${Claude_HEADLESS:-}${GITHUB_ACTIONS:-}" in
 	*true* | *1*) return 0 ;;
 	*) return 1 ;;
@@ -212,8 +260,8 @@ _merge_pr_ready_for_interactive_admin_bypass() {
 	local pr_json="${3:-}"
 
 	if [[ -z "$pr_json" ]]; then
-		pr_json=$(gh pr view "$pr_number" --repo "$repo" \
-			--json isDraft,reviewDecision,statusCheckRollup 2>/dev/null) || return 1
+		pr_json=$(_flm_gh_read gh pr view "$pr_number" --repo "$repo" \
+			--json isDraft,reviewDecision,statusCheckRollup) || return 1
 	fi
 
 	printf '%s' "$pr_json" | jq -e '
@@ -226,6 +274,12 @@ _merge_pr_ready_for_interactive_admin_bypass() {
 	return $?
 }
 
+# Recover an interactive auto-merge review-policy block after fresh gate checks.
+# Args: pr_number repo merge_method merge_output expected_head_sha
+#       [squash_subject] [merge_body_file]
+# Returns 0 for an already-completed exact-head merge or an accepted admin write;
+# returns 1 when ineligible or unsuccessful. Headless sessions cannot issue this
+# fallback write, and live authority and readiness checks remain mandatory.
 _merge_try_interactive_admin_auto_fallback() {
 	local pr_number="$1"
 	local repo="$2"
@@ -235,6 +289,7 @@ _merge_try_interactive_admin_auto_fallback() {
 	local squash_subject="${6:-}"
 	local merge_body_file="${7:-}"
 
+	_merge_report_already_merged_at_head "$pr_number" "$repo" "$expected_head_sha" && return 0
 	[[ "$pr_number" =~ ^[0-9]+$ && -n "$repo" ]] || return 1
 	! _merge_is_headless_session || return 1
 	_merge_output_is_review_policy_block "$merge_output" || return 1
@@ -247,21 +302,29 @@ _merge_try_interactive_admin_auto_fallback() {
 	local subject_flags=()
 	[[ -n "$squash_subject" ]] && subject_flags+=("$FULL_LOOP_MERGE_SUBJECT_FLAG" "$squash_subject")
 	[[ -n "$merge_body_file" ]] && subject_flags+=("$FULL_LOOP_MERGE_BODY_FILE_FLAG" "$merge_body_file")
-	local admin_rc=0
-	if _flm_gh_write gh pr merge "$pr_number" --repo "$repo" "$merge_method" --admin --match-head-commit "$expected_head_sha" ${subject_flags[@]+"${subject_flags[@]}"} 2>&1; then
+	local admin_rc=0 admin_output=""
+	_MERGE_WRITE_OUTPUT=""
+	_merge_run_bounded_write "$pr_number" "$repo" "$expected_head_sha" \
+		gh pr merge "$pr_number" --repo "$repo" "$merge_method" --admin --match-head-commit "$expected_head_sha" ${subject_flags[@]+"${subject_flags[@]}"} || admin_rc=$?
+	admin_output="$_MERGE_WRITE_OUTPUT"
+	if [[ "$admin_rc" -eq 0 ]]; then
+		[[ -n "$admin_output" ]] && printf '%s\n' "$admin_output"
 		print_success "PR #${pr_number} merged with interactive --admin fallback"
-		_signal_admin_merge_fallback "$pr_number" "$repo" "$merge_method" "$merge_output"
-		return 0
-	else
-		admin_rc=$?
-	fi
-	if [[ "$admin_rc" -eq 124 ]] && _merge_reconcile_timed_out_write "$pr_number" "$repo" "$expected_head_sha"; then
 		_signal_admin_merge_fallback "$pr_number" "$repo" "$merge_method" "$merge_output"
 		return 0
 	fi
 
-	print_error "Merge failed for PR #${pr_number} (even with --admin — maintainer gate or admin rights missing)"
+	_merge_report_admin_fallback_failure "$pr_number" "$admin_output"
 	return 2
+}
+
+# GH#34466: succeed only when every closing reference names its repository.
+_merge_closing_refs_have_repository() {
+	local pr_json="$1"
+	printf '%s' "$pr_json" | jq -e '
+		all(.closingIssuesReferences[]?;
+			[.repository.owner.login, .repository.name] | all(. != null))' >/dev/null 2>&1
+	return $?
 }
 
 _merge_linked_issue_numbers() {
@@ -271,11 +334,22 @@ _merge_linked_issue_numbers() {
 	local issue_numbers=""
 
 	if [[ -z "$pr_json" ]]; then
-		pr_json=$(gh pr view "$pr_number" --repo "$repo" \
-			--json closingIssuesReferences,body 2>/dev/null) || return 1
+		pr_json=$(_flm_gh_read gh pr view "$pr_number" --repo "$repo" \
+			--json closingIssuesReferences,body) || return 1
 	fi
 
-	issue_numbers=$(printf '%s' "$pr_json" | jq -r '.closingIssuesReferences[]?.number // empty') || return 1
+	# GH#34466: a closing reference carries its own repository. Only references
+	# in this PR's repository are same-repo issue numbers; a reference with no
+	# repository data cannot be bound to a target, so fail closed.
+	_merge_closing_refs_have_repository "$pr_json" || return 1
+	issue_numbers=$(printf '%s' "$pr_json" | jq -r --arg repo "$repo" '
+		.closingIssuesReferences[]?
+		| select(((.repository.owner.login + "/" + .repository.name) | ascii_downcase) == ($repo | ascii_downcase))
+		| .number // empty') || return 1
+	if printf '%s' "$pr_json" | jq -e '(.closingIssuesReferences | length) > 0' >/dev/null 2>&1; then
+		printf '%s\n' "$issue_numbers" | grep -E '^[0-9]+$' | sort -u || true
+		return 0
+	fi
 
 	if [[ -z "$issue_numbers" ]]; then
 		issue_numbers=$(printf '%s' "$pr_json" | jq -r '.body // ""' |
@@ -284,6 +358,26 @@ _merge_linked_issue_numbers() {
 	fi
 
 	printf '%s\n' "$issue_numbers" | grep -E '^[0-9]+$' | sort -u || true
+	return 0
+}
+
+# GH#34466: closing references that live in another repository, as owner/name#N.
+# Same fail-closed repository binding as _merge_linked_issue_numbers.
+_merge_linked_cross_repo_references() {
+	local pr_number="$1"
+	local repo="$2"
+	local pr_json="${3:-}"
+
+	if [[ -z "$pr_json" ]]; then
+		pr_json=$(_flm_gh_read gh pr view "$pr_number" --repo "$repo" \
+			--json closingIssuesReferences) || return 1
+	fi
+	_merge_closing_refs_have_repository "$pr_json" || return 1
+	printf '%s' "$pr_json" | jq -r --arg repo "$repo" '
+		.closingIssuesReferences[]?
+		| (.repository.owner.login + "/" + .repository.name) as $slug
+		| select(($slug | ascii_downcase) != ($repo | ascii_downcase))
+		| "\($slug)#\(.number)"' | sort -u || true
 	return 0
 }
 
@@ -310,7 +404,7 @@ query($owner:String!,$name:String!,$number:Int!) {
       }
     }
   }
-}' -F owner="$owner" -F name="$name" -F number="$pr_number" 2>/dev/null) || return 1
+}' -F owner="$owner" -F name="$name" -F number="$pr_number") || return 1
 	printf '%s' "$result" | jq -e --arg repo "$repo" '
       .data.repository as $r
       | $r.pullRequest.closingIssuesReferences as $refs
@@ -350,380 +444,6 @@ _merge_reconcile_closing_issues() {
 	return 1
 }
 
-_merge_issue_requires_maintainer_review() {
-	local issue_number="$1"
-	local repo="$2"
-	local labels_csv=""
-	local labels_padded=""
-
-	labels_csv=$(gh issue view "$issue_number" --repo "$repo" \
-		--json labels --jq '[.labels[].name] | join(",")' 2>/dev/null) || return 2
-	printf -v labels_padded ',%s,' "$labels_csv"
-	if [[ "$labels_padded" == *",needs-maintainer-review,"* ]]; then
-		return 0
-	fi
-	return 1
-}
-
-# Resolve the verifier from the current framework tree first so worktree fixes
-# are exercised before deployment. The public key remains in the user's
-# root-protected aidevops approval-key directory and is read by the helper.
-_merge_approval_helper_path() {
-	local approval_helper="${SCRIPT_DIR}/approval-helper.sh"
-	if [[ ! -f "$approval_helper" ]]; then
-		approval_helper="${HOME}/.aidevops/agents/scripts/approval-helper.sh"
-	fi
-	[[ -f "$approval_helper" ]] || return 1
-	printf '%s\n' "$approval_helper"
-	return 0
-}
-
-_merge_target_crypto_approved() {
-	local target_type="$1"
-	local target_number="$2"
-	local repo="$3"
-	local expected_head_sha="${4:-}"
-	local approval_helper=""
-	local result=""
-
-	approval_helper=$(_merge_approval_helper_path) || return 1
-	if [[ "$target_type" == "pr" ]]; then
-		[[ -n "$expected_head_sha" ]] || return 1
-		result=$(bash "$approval_helper" verify pr "$target_number" "$repo" \
-			--expect-head "$expected_head_sha" 2>/dev/null) || result=""
-	else
-		result=$(bash "$approval_helper" verify issue "$target_number" "$repo" 2>/dev/null) || result=""
-	fi
-	[[ "$result" == "VERIFIED" ]]
-	return $?
-}
-
-_merge_is_trusted_issue_sync_pr() {
-	local pr_number="$1"
-	local repo="$2"
-	local expected_head_sha="$3"
-	local rbg_helper=""
-
-	[[ -n "$expected_head_sha" ]] || return 1
-	rbg_helper=$(_full_loop_review_bot_gate_helper_path) || return 1
-	#aidevops:trust-boundary -- bind the exact generated Issue Sync identity to
-	# the already verified merge head; helper/API failures remain external.
-	bash "$rbg_helper" is-trusted-issue-sync-pr \
-		"$pr_number" "$repo" "$expected_head_sha" >/dev/null 2>&1
-	return $?
-}
-
-# Returns 0 for live admin/maintain/write authority, 1 for a confirmed external
-# author, and 2 when GitHub cannot provide a trustworthy verdict.
-_merge_author_has_write_authority() {
-	local author="$1"
-	local repo="$2"
-	local permission=""
-
-	# shared-constants.sh loads the App-aware helper in normal full-loop use. It
-	# distinguishes a confirmed 404 non-collaborator (permission=none) from API
-	# uncertainty; the direct gh fallback keeps this library sourceable in tests.
-	if declare -F _gh_collaborator_permission_lookup >/dev/null 2>&1; then
-		_gh_collaborator_permission_lookup "$repo" "$author" permission || return 2
-	else
-		permission=$(gh api "repos/${repo}/collaborators/${author}/permission" \
-			--jq '.permission // "none"' 2>/dev/null) || return 2
-	fi
-	case "$permission" in
-	admin | maintain | write) return 0 ;;
-	none | read | triage) return 1 ;;
-	*) return 2 ;;
-	esac
-}
-
-_merge_collect_linked_issue_authority_gaps() {
-	local issue_numbers="$1"
-	local repo="$2"
-	local require_crypto="$3"
-	local issue_number=""
-	local verify_rc=0
-
-	while IFS= read -r issue_number; do
-		[[ -n "$issue_number" ]] || continue
-		verify_rc=0
-		_merge_issue_requires_maintainer_review "$issue_number" "$repo" || verify_rc=$?
-		if [[ "$verify_rc" -eq 0 ]]; then
-			print_error "Merge blocked: linked issue #${issue_number} still requires maintainer review"
-			return 1
-		elif [[ "$verify_rc" -ne 1 ]]; then
-			print_error "Merge blocked: unable to verify maintainer-review labels on issue #${issue_number}"
-			return 1
-		fi
-		if [[ "$require_crypto" -eq 1 ]] &&
-			! _merge_target_crypto_approved issue "$issue_number" "$repo"; then
-			FULL_LOOP_EXTERNAL_AUTHORITY_TARGETS+=("issue:${issue_number}")
-		fi
-	done <<<"$issue_numbers"
-	return 0
-}
-
-_merge_collect_external_authority_gaps() {
-	local pr_number="$1"
-	local repo="$2"
-	local expected_head_sha="${3:-}"
-	local pr_json="" pr_author="" current_head_sha="" labels_csv="" labels_padded="" is_fork="false"
-	local issue_numbers=""
-	local author_rc=0 treat_as_external=0 trusted_dependabot=0 trusted_issue_sync=0
-
-	FULL_LOOP_EXTERNAL_AUTHORITY_TARGETS=()
-	if ! pr_json=$(gh pr view "$pr_number" --repo "$repo" \
-		--json author,labels,isCrossRepository,headRefOid,closingIssuesReferences,body 2>/dev/null); then
-		print_error "Merge blocked: unable to verify PR #${pr_number} authority metadata"
-		return 1
-	fi
-	if ! printf '%s' "$pr_json" | jq -e '
-		def is_string: type == "string";
-		type == "object"
-		and (.author.login | is_string and length > 0)
-		and (.headRefOid | is_string and length > 0)
-		and (.labels | type == "array")
-		and (.isCrossRepository | type == "boolean")
-		and (.closingIssuesReferences | type == "array")
-		and ((.body == null) or (.body | is_string))
-	' >/dev/null 2>&1; then
-		print_error "Merge blocked: PR #${pr_number} returned malformed authority metadata"
-		return 1
-	fi
-
-	pr_author=$(printf '%s' "$pr_json" | jq -r '.author.login') || return 1
-	current_head_sha=$(printf '%s' "$pr_json" | jq -r '.headRefOid') || return 1
-	labels_csv=$(printf '%s' "$pr_json" | jq -r '[.labels[].name] | join(",")') || return 1
-	printf -v labels_padded ',%s,' "$labels_csv"
-	is_fork=$(printf '%s' "$pr_json" | jq -r '.isCrossRepository') || return 1
-	if [[ -n "$expected_head_sha" && "$current_head_sha" != "$expected_head_sha" ]]; then
-		print_error "Merge blocked: PR #${pr_number} head changed before the final authority check"
-		return 1
-	fi
-
-	#aidevops:trust-boundary GH#17671/GH#28622 -- a live PR NMR label is an
-	# explicit hold. Marker text is never merge authority at this boundary.
-	if [[ "$labels_padded" == *",needs-maintainer-review,"* ]]; then
-		print_error "Merge blocked: PR #${pr_number} still requires maintainer review"
-		return 1
-	fi
-
-	#aidevops:trust-boundary -- repository-generated Issue Sync and Dependabot
-	# PRs may lack collaborator permission. Both narrow predicates bind immutable
-	# bot identity and repository ownership to the exact current head. Live PR and
-	# linked-issue NMR labels remain unconditional holds.
-	if [[ "$pr_author" == "app/github-actions" || "$pr_author" == "github-actions[bot]" ]] &&
-		_merge_is_trusted_issue_sync_pr "$pr_number" "$repo" "$current_head_sha"; then
-		trusted_issue_sync=1
-	elif _is_trusted_dependabot_update_pr "$pr_number" "$repo" "$pr_author" "$current_head_sha"; then
-		trusted_dependabot=1
-	else
-		_merge_author_has_write_authority "$pr_author" "$repo" || author_rc=$?
-		if [[ "$author_rc" -eq 2 ]]; then
-			print_error "Merge blocked: unable to verify live repository permission for PR author ${pr_author}"
-			return 1
-		fi
-		if [[ "$labels_padded" == *",external-contributor,"* ]] ||
-			[[ "$is_fork" == "true" ]] || [[ "$author_rc" -ne 0 ]]; then
-			treat_as_external=1
-		fi
-	fi
-
-	issue_numbers=$(_merge_linked_issue_numbers "$pr_number" "$repo" "$pr_json") || {
-		print_error "Merge blocked: unable to verify linked issues for PR #${pr_number}"
-		return 1
-	}
-
-	_merge_collect_linked_issue_authority_gaps "$issue_numbers" "$repo" "$treat_as_external" || return 1
-	if [[ "$trusted_dependabot" -eq 1 || "$trusted_issue_sync" -eq 1 || "$treat_as_external" -eq 0 ]]; then
-		return 0
-	fi
-	if [[ -z "$issue_numbers" ]]; then
-		print_error "Merge blocked: external/fork PR #${pr_number} has no linked issue"
-		return 1
-	fi
-	if ! _merge_target_crypto_approved pr "$pr_number" "$repo" "$current_head_sha"; then
-		FULL_LOOP_EXTERNAL_AUTHORITY_TARGETS+=("pr:${pr_number}")
-	fi
-
-	return 0
-}
-
-# Legacy name retained for sourced callers and tests. This is now the common
-# final authority guard for every full-loop merge mode, not only --admin.
-_merge_linked_issue_authority_clear() {
-	local issue_numbers="$1"
-	local repo="$2"
-	local require_crypto="$3"
-	local target=""
-
-	FULL_LOOP_EXTERNAL_AUTHORITY_TARGETS=()
-	_merge_collect_linked_issue_authority_gaps "$issue_numbers" "$repo" "$require_crypto" || return 1
-	for target in "${FULL_LOOP_EXTERNAL_AUTHORITY_TARGETS[@]}"; do
-		print_error "Merge blocked: external/fork PR linked issue #${target#issue:} lacks current cryptographic development authority"
-		return 1
-	done
-	return 0
-}
-
-# Legacy name retained for sourced callers and tests. This is now the common
-# final authority guard for every full-loop merge mode, not only --admin.
-_merge_guard_admin_merge_maintainer_review() {
-	local pr_number="$1"
-	local repo="$2"
-	local expected_head_sha="${3:-}"
-	local target=""
-
-	_merge_collect_external_authority_gaps "$pr_number" "$repo" "$expected_head_sha" || return 1
-	for target in "${FULL_LOOP_EXTERNAL_AUTHORITY_TARGETS[@]}"; do
-		case "$target" in
-		issue:*)
-			print_error "Merge blocked: external/fork PR linked issue #${target#issue:} lacks current cryptographic development authority"
-			;;
-		pr:*)
-			print_error "Merge blocked: external/fork PR #${target#pr:} lacks V2 merge authority for the current head"
-			;;
-		esac
-		return 1
-	done
-
-	return 0
-}
-
-_merge_fetch_head_sha_rest() {
-	local pr_number="$1"
-	local repo="$2"
-	local head_sha=""
-	head_sha=$(gh api "repos/${repo}/pulls/${pr_number}" --jq '.head.sha // empty' 2>/dev/null || true)
-	if [[ -z "$head_sha" ]]; then
-		return 1
-	fi
-	printf '%s\n' "$head_sha"
-	return 0
-}
-
-# Return the fresh base ref, base SHA, head SHA, base repository, and clone URL
-# that GitHub currently binds to the PR. These fields form the pinned evidence
-# boundary for a local prospective merge-tree check and keep explicit-repository
-# merges independent of the caller's current Git remote.
-_merge_fetch_pr_refs_rest() {
-	local pr_number="$1"
-	local repo="$2"
-	local refs=""
-	refs=$(gh api "repos/${repo}/pulls/${pr_number}" \
-		--jq '[.base.ref // empty, .base.sha // empty, .head.sha // empty, .base.repo.full_name // empty, .base.repo.clone_url // empty] | @tsv' 2>/dev/null) || return 1
-	[[ "$refs" == *$'\t'*$'\t'*$'\t'*$'\t'* ]] || return 1
-	printf '%s\n' "$refs"
-	return 0
-}
-
-_merge_validate_target_remote_url() {
-	local target_repo="$1"
-	local remote_url="$2"
-	local git_host="${GH_HOST:-github.com}"
-	local expected_url=""
-	local normalized_remote_url=""
-	local normalized_expected_url=""
-	[[ "$git_host" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
-	[[ "$target_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
-	expected_url="https://${git_host}/${target_repo}.git"
-	normalized_remote_url=$(printf '%s' "$remote_url" | tr '[:upper:]' '[:lower:]')
-	normalized_expected_url=$(printf '%s' "$expected_url" | tr '[:upper:]' '[:lower:]')
-	[[ "$normalized_remote_url" == "$normalized_expected_url" ]] || return 1
-	return 0
-}
-
-_merge_fetch_pinned_commit_objects() {
-	local pr_number="$1"
-	local base_ref="$2"
-	local base_sha="$3"
-	local head_sha="$4"
-	local object_repo="${5:-}"
-	local remote_url="${6:-}"
-	local real_git="${7:-}"
-	local fetched_sha=""
-	if [[ -z "$object_repo" ]]; then
-		git cat-file -e "${base_sha}^{commit}" 2>/dev/null ||
-			git fetch --quiet --no-tags origin "refs/heads/${base_ref}" || return 1
-		git cat-file -e "${head_sha}^{commit}" 2>/dev/null ||
-			git fetch --quiet --no-tags origin "refs/pull/${pr_number}/head" || return 1
-		git cat-file -e "${base_sha}^{commit}" 2>/dev/null || return 1
-		git cat-file -e "${head_sha}^{commit}" 2>/dev/null || return 1
-		return 0
-	fi
-
-	[[ -x "$real_git" ]] || return 1
-	if ! _merge_run_repository_isolated_git "$real_git" -C "$object_repo" cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
-		[[ -n "$remote_url" ]] || return 1
-		_merge_run_repository_isolated_git "$real_git" -C "$object_repo" \
-			fetch --quiet --no-tags -- "$remote_url" "refs/heads/${base_ref}" || return 1
-		fetched_sha=$(_merge_run_repository_isolated_git "$real_git" -C "$object_repo" \
-			rev-parse FETCH_HEAD 2>/dev/null) || return 1
-		if [[ "$fetched_sha" != "$base_sha" ]]; then
-			_merge_run_repository_isolated_git "$real_git" -C "$object_repo" \
-				fetch --quiet --no-tags -- "$remote_url" "$base_sha" || return 1
-			fetched_sha=$(_merge_run_repository_isolated_git "$real_git" -C "$object_repo" \
-				rev-parse FETCH_HEAD 2>/dev/null) || return 1
-			[[ "$fetched_sha" == "$base_sha" ]] || return 1
-		fi
-	fi
-	if ! _merge_run_repository_isolated_git "$real_git" -C "$object_repo" cat-file -e "${head_sha}^{commit}" 2>/dev/null; then
-		[[ -n "$remote_url" ]] || return 1
-		_merge_run_repository_isolated_git "$real_git" -C "$object_repo" \
-			fetch --quiet --no-tags -- "$remote_url" "refs/pull/${pr_number}/head" || return 1
-		fetched_sha=$(_merge_run_repository_isolated_git "$real_git" -C "$object_repo" \
-			rev-parse FETCH_HEAD 2>/dev/null) || return 1
-		[[ "$fetched_sha" == "$head_sha" ]] || return 1
-	fi
-	_merge_run_repository_isolated_git "$real_git" -C "$object_repo" \
-		cat-file -e "${base_sha}^{commit}" 2>/dev/null || return 1
-	_merge_run_repository_isolated_git "$real_git" -C "$object_repo" \
-		cat-file -e "${head_sha}^{commit}" 2>/dev/null || return 1
-	return 0
-}
-
-_merge_run_repository_isolated_git() (
-	local git_bin="$1"
-	shift
-	unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_ATTR_SOURCE GIT_COMMON_DIR GIT_DIR
-	unset GIT_EXEC_PATH GIT_GRAFT_FILE GIT_INDEX_FILE GIT_NAMESPACE
-	unset GIT_OBJECT_DIRECTORY GIT_QUARANTINE_PATH GIT_REPLACE_REF_BASE
-	unset GIT_SHALLOW_FILE GIT_WORK_TREE
-	"$git_bin" "$@"
-	return $?
-)
-
-_merge_run_config_isolated_git() (
-	local real_git="$1"
-	local config_root="$2"
-	shift 2
-	unset GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_PARAMETERS GIT_CONFIG_SYSTEM
-	export HOME="${config_root}/home" XDG_CONFIG_HOME="${config_root}/xdg"
-	export GIT_CONFIG_NOSYSTEM=1 GIT_ATTR_NOSYSTEM=1
-	_merge_run_repository_isolated_git "$real_git" "$@"
-	return $?
-)
-
-_merge_create_prospective_object_context() {
-	local context_root="$1"
-	local real_git="$2"
-	local object_repo="${context_root}/repository.git"
-	local source_objects=""
-	local object_format=""
-	[[ -x "$real_git" ]] || return 1
-	mkdir -p "${context_root}/home" "${context_root}/xdg" || return 1
-	source_objects=$(_merge_run_config_isolated_git git "$context_root" \
-		rev-parse --path-format=absolute --git-path objects 2>/dev/null) || return 1
-	object_format=$(_merge_run_config_isolated_git git "$context_root" \
-		rev-parse --show-object-format 2>/dev/null || true)
-	[[ -n "$source_objects" && -n "$object_format" ]] || return 1
-	_merge_run_config_isolated_git "$real_git" "$context_root" -c init.templateDir= \
-		-C "$context_root" init --bare --quiet --object-format="$object_format" repository.git || return 1
-	[[ -d "${object_repo}/objects/info" ]] || return 1
-	printf '%s\n' "$source_objects" >"${object_repo}/objects/info/alternates" || return 1
-	printf '%s\n' "$object_repo"
-	return 0
-}
-
 # Fail closed unless the exact current PR head can be merged prospectively into
 # the fresh base without introducing duplicate TODO task IDs or issue mappings.
 _merge_guard_prospective_todo() (
@@ -742,7 +462,7 @@ _merge_guard_prospective_todo() (
 	local temp_dir=""
 	local object_repo=""
 	local remote_url=""
-	local real_git="${AIDEVOPS_REAL_GIT_BIN:-/usr/bin/git}"
+	local real_git="${AIDEVOPS_REAL_GIT_BIN:-aidevops-native-git-not-found}"
 	local report=""
 	local report_rc="0"
 
@@ -781,6 +501,24 @@ _merge_guard_prospective_todo() (
 		print_error "Merge blocked: native Git executable is unavailable"
 		return 1
 	}
+	local git_version_output=""
+	local git_version=""
+	local git_major=""
+	local git_minor=""
+	git_version_output=$("$real_git" --version 2>/dev/null) || git_version_output=""
+	if [[ "$git_version_output" =~ ^git\ version\ ([0-9]+)\.([0-9]+)(\.[0-9]+)?([[:space:]]|$) ]]; then
+		git_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
+		git_major="${BASH_REMATCH[1]}"
+		git_minor="${BASH_REMATCH[2]}"
+	else
+		git_version="unknown (unparseable version: ${git_version_output:-no output})"
+	fi
+	# merge-tree --write-tree needs Git 2.38; fetch --stdin needs 2.29. Lazy
+	# fetch is prevented by store configuration, not by Git version (GH#33752).
+	if [[ -z "$git_major" ]] || ((git_major < 2 || (git_major == 2 && git_minor < 38))); then
+		print_error "Merge blocked: native Git ${git_version} at ${real_git} is too old (Git 2.38+ required for prospective TODO validation: git merge-tree --write-tree); set AIDEVOPS_REAL_GIT_BIN to a newer Git"
+		return 1
+	fi
 	mkdir -p "$temp_root" || {
 		print_error "Merge blocked: unable to prepare approved temporary root"
 		return 1
@@ -789,7 +527,12 @@ _merge_guard_prospective_todo() (
 		print_error "Merge blocked: unable to create isolated prospective Git context"
 		return 1
 	}
-	trap 'rm -rf "$temp_dir"' EXIT HUP INT TERM
+	# Signals must terminate after cleanup; a handler that returns would resume
+	# the guard after a cancellation (GH#33514).
+	trap 'rm -rf "$temp_dir"' EXIT
+	trap 'rm -rf "$temp_dir"; exit 129' HUP
+	trap 'rm -rf "$temp_dir"; exit 130' INT
+	trap 'rm -rf "$temp_dir"; exit 143' TERM
 	object_repo=$(_merge_create_prospective_object_context "$temp_dir" "$real_git") || {
 		print_error "Merge blocked: unable to initialize isolated prospective Git context"
 		return 1
@@ -835,7 +578,7 @@ _merge_guard_prospective_todo() (
 	else
 		: >"${temp_dir}/base"
 	fi
-	report=$(todo_duplicate_report "${temp_dir}/merged" "${temp_dir}/base") || report_rc=$?
+	report=$(todo_duplicate_report "${temp_dir}/merged" "${temp_dir}/base" 2>&1) || report_rc=$?
 	if [[ "$report_rc" -eq 0 ]]; then
 		return 0
 	fi
@@ -844,186 +587,10 @@ _merge_guard_prospective_todo() (
 		printf '%s\n' "$report" >&2
 		return 1
 	fi
-	print_error "Merge blocked: prospective TODO duplicate evidence is indeterminate"
+	print_error "Merge blocked: prospective TODO duplicate evidence is indeterminate (resolver exit ${report_rc})"
+	[[ -n "$report" ]] && printf '%s\n' "$report" >&2
 	return 1
 )
-
-# _merge_rest_fallback — squash/merge/rebase a PR via the REST pull merge endpoint.
-#
-# This is a transport fallback only. It is called after review-bot-gate has
-# passed and only when `gh pr merge` failed because its GraphQL path was rate
-# limited. The REST endpoint still enforces branch protection and mergeability;
-# failures remain failures.
-#
-# Args: pr_number repo merge_method expected_head_sha [squash_subject] [merge_body_file]
-# Returns: 0 = merged, 1 = REST merge failed
-_merge_rest_fallback() {
-	local pr_number="$1"
-	local repo="$2"
-	local merge_method="$3"
-	local expected_head_sha="$4"
-	local squash_subject="${5:-}"
-	local merge_body_file="${6:-}"
-	local rest_method="${merge_method#--}"
-	local rest_out="" rest_rc=0
-
-	if [[ -z "$expected_head_sha" ]]; then
-		print_error "REST merge fallback unavailable: PR head SHA was not verified before merge"
-		return 1
-	fi
-
-	case "$rest_method" in
-	squash | merge | rebase) ;;
-	*)
-		print_error "Unsupported merge method for REST fallback: ${merge_method}"
-		return 1
-		;;
-	esac
-
-	#aidevops:trust-boundary -- GraphQL transport failure does not preserve a
-	# mutable authority snapshot for the later REST mutation.
-	_merge_revalidate_transport_authority "$pr_number" "$repo" "$expected_head_sha" || return 1
-
-	print_info "GraphQL rate limit blocked gh pr merge; retrying via REST pull merge endpoint with verified head SHA ${expected_head_sha}..."
-	local rest_args=(-f "sha=${expected_head_sha}" -f "merge_method=${rest_method}")
-	[[ -n "$squash_subject" ]] && rest_args+=(-f "commit_title=${squash_subject}")
-	[[ -n "$merge_body_file" ]] && rest_args+=(-F "commit_message=@${merge_body_file}")
-	if rest_out=$(gh api -X PUT "repos/${repo}/pulls/${pr_number}/merge" \
-		${rest_args[@]+"${rest_args[@]}"} 2>&1); then
-		rest_rc=0
-	else
-		rest_rc=$?
-	fi
-
-	printf '%s\n' "$rest_out"
-	if [[ $rest_rc -eq 0 ]]; then
-		print_success "PR #${pr_number} merged via REST fallback (${rest_method})"
-		return 0
-	fi
-
-	print_error "REST merge fallback failed for PR #${pr_number}"
-	return 1
-}
-
-# _merge_execute — attempt `gh pr merge` with optional --admin fallback on branch-protection errors.
-#
-# GH#18538: branch protection that requires an approving review rejects plain
-# `gh pr merge`. Workers share the owner's gh auth, so --admin works when the
-# authed user has admin rights. We only fall back to --admin when the caller
-# did not explicitly pass --admin or --auto (explicit intent is never overridden).
-#
-# GH#18731: --admin / --auto are explicit caller intents; when present, the
-# error-retry path is skipped entirely.
-#
-# Bash 3.2 note: `"${arr[@]}"` raises "unbound variable" under set -u when the
-# array is empty. The `${arr[@]+"${arr[@]}"}` form expands to zero words safely.
-#
-# Args: pr_number repo merge_method has_admin has_auto [merge_body_file]
-# Returns: 0 = merged or queued, 1 = failed
-_merge_resolve_match_head() {
-	local pr_number="$1"
-	local repo="$2"
-	local pre_merge_head_sha=""
-	pre_merge_head_sha=$(_merge_fetch_head_sha_rest "$pr_number" "$repo" || true)
-	if [[ -n "${FULL_LOOP_VERIFIED_PR_HEAD_SHA:-}" ]]; then
-		if [[ -z "$pre_merge_head_sha" ]]; then
-			print_error "Could not retrieve PR #${pr_number} head SHA for verification; refusing merge"
-			return 1
-		fi
-		if [[ "$pre_merge_head_sha" != "$FULL_LOOP_VERIFIED_PR_HEAD_SHA" ]]; then
-			print_error "PR #${pr_number} head changed after remote verification; refusing merge"
-			return 1
-		fi
-	fi
-	local match_head_sha="${FULL_LOOP_VERIFIED_PR_HEAD_SHA:-$pre_merge_head_sha}"
-	[[ -n "$match_head_sha" ]] || return 1
-	printf '%s\n' "$match_head_sha"
-	return 0
-}
-
-_merge_review_state_still_clear() {
-	local pr_number="$1"
-	local repo="$2"
-	local expected_head="$3"
-	local review_json=""
-
-	review_json=$(gh pr view "$pr_number" --repo "$repo" \
-		--json state,isDraft,reviewDecision,headRefOid 2>/dev/null) || {
-		print_error "Could not refresh PR #${pr_number} review state immediately before merge"
-		return 1
-	}
-	#aidevops:trust-boundary — admin and REST merge paths must not bypass a review added after readiness verification.
-	if ! printf '%s\n' "$review_json" | jq -e --arg head "$expected_head" '
-		.state == "OPEN"
-		and .isDraft != true
-		and (.headRefOid // "") == $head
-		and ((.reviewDecision // "") | ascii_upcase) != "CHANGES_REQUESTED"
-	' >/dev/null 2>&1; then
-		print_error "PR #${pr_number} review or head state changed after readiness verification; refusing merge"
-		return 1
-	fi
-	return 0
-}
-
-_merge_revalidate_transport_authority() {
-	local pr_number="$1"
-	local repo="$2"
-	local expected_head_sha="$3"
-
-	_merge_review_state_still_clear "$pr_number" "$repo" "$expected_head_sha" || return 1
-	_merge_guard_admin_merge_maintainer_review "$pr_number" "$repo" "$expected_head_sha" || return 1
-	_merge_guard_prospective_todo "$pr_number" "$repo" || return 1
-	return 0
-}
-
-# A timed-out merge write has an unknown outcome: GitHub may have accepted the
-# mutation before the local process was killed. Re-read the exact PR/head once;
-# accept only a completed merge of the reviewed head and never replay the write.
-_merge_reconcile_timed_out_write() {
-	local pr_number="$1"
-	local repo="$2"
-	local expected_head_sha="$3"
-	local pr_json=""
-
-	print_warning "Merge write timed out for PR #${pr_number}; reconciling exact remote state without retrying the mutation"
-	pr_json=$(_flm_gh_read gh pr view "$pr_number" --repo "$repo" \
-		--json state,mergedAt,mergeCommit,headRefOid 2>/dev/null) || {
-		print_error "Could not reconcile timed-out merge write for PR #${pr_number}; outcome remains unknown"
-		return 1
-	}
-	if printf '%s\n' "$pr_json" | jq -e --arg head "$expected_head_sha" '
-		(.state | ascii_downcase) == "merged"
-		and (.mergedAt // null) != null
-		and (.mergeCommit.oid // null) != null
-		and (.headRefOid // null) == $head
-	' >/dev/null 2>&1; then
-		print_success "PR #${pr_number} merge completed remotely before the local write timeout"
-		return 0
-	fi
-
-	print_error "Timed-out merge write for PR #${pr_number} is not proven merged at the reviewed head; refusing blind retry"
-	return 1
-}
-
-_merge_run_bounded_write() {
-	local pr_number="$1"
-	local repo="$2"
-	local expected_head_sha="$3"
-	local write_rc=0
-	shift 3
-	_MERGE_WRITE_OUTPUT=""
-	if _MERGE_WRITE_OUTPUT=$(_flm_gh_write "$@" 2>&1); then
-		return 0
-	else
-		write_rc=$?
-	fi
-	[[ "$write_rc" -eq 124 ]] || return "$write_rc"
-	_merge_reconcile_timed_out_write "$pr_number" "$repo" "$expected_head_sha" || {
-		_MERGE_WRITE_OUTPUT=""
-		return 1
-	}
-	return 0
-}
 
 # Resolve one authoritative Conventional Commit type from the reviewed PR's
 # commit metadata. Every commit must be conventional and use the same type;
@@ -1059,14 +626,49 @@ _merge_resolve_squash_subject() {
 	local subject=""
 	local task_body=""
 	local conventional_type=""
-	local conventional_ere='^(feat|fix|docs|refactor|perf|test|chore|style|build|ci|security)(\([^()[:cntrl:]]+\))?!?:[[:space:]]+[^[:space:]].*$'
+	local commit_pages=""
+	local conventional_ere='^(feat|fix|docs|refactor|perf|test|chore|style|build|ci|security|plan)(\([^()[:cntrl:]]+\))?!?:[[:space:]]+[^[:space:]].*$'
 	local task_ere='^(t[0-9]+|GH#[0-9]+):[[:space:]]+[^[:space:]].*$'
 
-	pr_json=$(gh pr view "$pr_number" --repo "$repo" --json title,commits 2>/dev/null) || {
+	# GraphQL commit nodes can require Git database authority beyond PR read
+	# access. Use the same repo-routed PR surface as the exact-head guard below,
+	# without switching credentials or retrying a denied GraphQL read.
+	pr_json=$(_flm_gh_read gh pr view "$pr_number" --repo "$repo" --json title) || {
 		print_error "Could not retrieve PR #${pr_number} title and commit metadata for squash-subject validation"
 		return 1
 	}
 	subject=$(printf '%s\n' "$pr_json" | jq -r '.title // empty') || return 1
+	if ! _full_loop_valid_squash_subject "$subject"; then
+		print_error "PR #${pr_number} title is not a valid squash subject; refusing merge"
+		print_error "Use a task-prefixed or conventional title before retrying."
+		return 1
+	fi
+	commit_pages=$(_flm_gh_read gh api "repos/${repo}/pulls/${pr_number}/commits?per_page=100" \
+		--paginate --slurp) || {
+		print_error "Could not retrieve PR #${pr_number} commit metadata for squash-subject validation"
+		return 1
+	}
+	# Incomplete/malformed evidence must not silently become an untyped history.
+	# Commit messages can exceed argv limits; keep the unbounded pages on stdin.
+	pr_json=$(jq -e --arg title "$subject" '
+		def is_array: [arrays] | length == 1;
+		def is_string: type == "string";
+		. as $pages
+		| if ($pages | is_array | not) or ($pages | length) == 0
+			or any($pages[]; is_array | not) then
+			error("invalid PR commit pages")
+		else [$pages[][]] as $commits
+			| if ($commits | length) == 0 or any($commits[];
+				(.sha | is_string | not) or (.sha | length) == 0
+				or (.commit.message | is_string | not)) then
+				error("invalid PR commit metadata")
+			else {title: $title, commits: [$commits[] |
+				{messageHeadline: (.commit.message | split("\n")[0])}]}
+			end
+		end' <<<"$commit_pages") || {
+		print_error "Invalid PR #${pr_number} commit metadata for squash-subject validation"
+		return 1
+	}
 	if [[ "$subject" =~ $task_ere ]]; then
 		task_body="${subject#*: }"
 		if [[ ! "$task_body" =~ $conventional_ere ]]; then
@@ -1077,9 +679,7 @@ _merge_resolve_squash_subject() {
 			fi
 		fi
 	fi
-	if [[ "$subject" == *$'\n'* || "$subject" == *$'\r'* ||
-		"$task_body" =~ ^[Ww][Ii][Pp][[:space:]:\(] ||
-		! "$subject" =~ $conventional_ere && ! "$subject" =~ $task_ere ]]; then
+	if ! _full_loop_valid_squash_subject "$subject"; then
 		print_error "PR #${pr_number} title is not a valid squash subject; refusing merge"
 		print_error "Use a task-prefixed or conventional title before retrying."
 		return 1
@@ -1138,11 +738,11 @@ _merge_remove_body_snapshot() {
 }
 
 # Release provenance later reads merge commit trailers with `git
-# interpret-trailers --parse`. Reject an aggregation body whose raw trailers
+# interpret-trailers --parse`. Reject aggregation content whose raw trailers
 # would be hidden by a non-terminal signature divider before it reaches any
 # merge transport.
-_merge_validate_release_aggregation_body() {
-	local body_file="$1"
+_merge_validate_release_aggregation_content() {
+	local content="$1"
 	local expected_pr="${2:-}"
 	local raw_aggregator=""
 	local raw_aggregates=""
@@ -1150,11 +750,11 @@ _merge_validate_release_aggregation_body() {
 	local parsed_aggregator=""
 	local parsed_aggregates=""
 
-	raw_aggregator=$(awk '/^Aidevops-Release-Aggregator-PR: / { print substr($0, 33) }' "$body_file") || return 1
-	raw_aggregates=$(awk '/^Aidevops-Release-Aggregates: / { print substr($0, 30) }' "$body_file") || return 1
+	raw_aggregator=$(awk '/^Aidevops-Release-Aggregator-PR: / { print substr($0, 33) }' <<<"$content") || return 1
+	raw_aggregates=$(awk '/^Aidevops-Release-Aggregates: / { print substr($0, 30) }' <<<"$content") || return 1
 	[[ -n "$raw_aggregator" || -n "$raw_aggregates" ]] || return 0
 
-	parsed_trailers=$(git interpret-trailers --parse <"$body_file") || return 1
+	parsed_trailers=$(git interpret-trailers --parse <<<"$content") || return 1
 	parsed_aggregator=$(awk '/^Aidevops-Release-Aggregator-PR: / { print substr($0, 33) }' <<<"$parsed_trailers") || return 1
 	parsed_aggregates=$(awk '/^Aidevops-Release-Aggregates: / { print substr($0, 30) }' <<<"$parsed_trailers") || return 1
 	if ! awk '
@@ -1176,10 +776,226 @@ _merge_validate_release_aggregation_body() {
 	return 0
 }
 
+_merge_validate_release_aggregation_body() {
+	local body_file="$1"
+	local expected_pr="${2:-}"
+	local content=""
+	content=$(<"$body_file") || return 1
+	_merge_validate_release_aggregation_content "$content" "$expected_pr"
+	return $?
+}
+
+_merge_release_aggregation_manifest() {
+	local content="$1"
+	awk '/^Aidevops-Release-Aggregator-PR: |^Aidevops-Release-Aggregates: / { print }' <<<"$content"
+	return 0
+}
+
+# Bind an aggregation merge body to the immutable manifest on the exact PR
+# head verified by the pre-merge gate. Select that SHA from the PR commit read
+# surface: Git database reads require Contents authority that a PR reader need
+# not have. Keep the same repo-routed identity, with no credential fallback.
+_merge_validate_verified_head_aggregation_binding() {
+	local pr_number="$1"
+	local repo="$2"
+	local verified_head_sha="$3"
+	local merge_body_file="${4:-}"
+	local commit_pages=""
+	local head_message=""
+	local head_manifest=""
+	local body_content=""
+	local body_manifest=""
+
+	commit_pages=$(_flm_gh_read gh api "repos/${repo}/pulls/${pr_number}/commits?per_page=100" \
+		--paginate --slurp) || {
+		print_error "Merge blocked: unable to inspect the exact verified PR head commit for a release-aggregation manifest; refresh remote evidence and retry."
+		return 1
+	}
+	# A moved PR, truncated list, ambiguous match or malformed response is not
+	# evidence of an absent manifest. Never substitute the latest commit/message.
+	head_message=$(jq -er --arg sha "$verified_head_sha" '
+		if type != "array" or any(.[]; type != "array") then
+			error("invalid PR commit pages")
+		else
+			[.[][] | select(.sha == $sha)] |
+			if length == 1 and (.[0].commit.message | type) == "string" then
+				.[0].commit.message
+			else error("missing or ambiguous verified PR head message") end
+		end' <<<"$commit_pages") || {
+		print_error "Merge blocked: PR commit evidence does not identify one exact verified head message; refresh remote evidence and retry."
+		return 1
+	}
+	head_manifest=$(_merge_release_aggregation_manifest "$head_message") || return 1
+	[[ -n "$head_manifest" ]] || return 0
+
+	if ! _merge_validate_release_aggregation_content "$head_message" "$pr_number"; then
+		print_error "Merge blocked: the exact verified PR head contains an invalid release-aggregation manifest; repair the head manifest and refresh review evidence."
+		return 1
+	fi
+	if [[ -z "$merge_body_file" ]]; then
+		print_error "Merge blocked: the exact verified PR head contains a release-aggregation manifest, but no --body-file was supplied; provide the identical terminal manifest and retry."
+		return 1
+	fi
+	body_content=$(<"$merge_body_file") || {
+		print_error "Merge blocked: the immutable merge body snapshot became unreadable before manifest binding."
+		return 1
+	}
+	body_manifest=$(_merge_release_aggregation_manifest "$body_content") || return 1
+	if [[ "$head_manifest" != "$body_manifest" ]]; then
+		print_error "Merge blocked: the exact verified PR head and squash merge body release-aggregation manifests differ; regenerate --body-file from the verified head manifest and retry."
+		return 1
+	fi
+	return 0
+}
+
+_merge_prepare_verified_head_aggregation_body() {
+	local pr_number="$1"
+	local repo="$2"
+	local source_body_file="${3:-}"
+	local binding_head_sha=""
+	FULL_LOOP_MERGE_PREPARED_BODY_FILE=""
+	FULL_LOOP_MERGE_BODY_SNAPSHOT=""
+
+	if [[ -n "$source_body_file" ]]; then
+		FULL_LOOP_MERGE_BODY_SNAPSHOT=$(_merge_snapshot_body_file "$source_body_file") || return 1
+		FULL_LOOP_MERGE_PREPARED_BODY_FILE="$FULL_LOOP_MERGE_BODY_SNAPSHOT"
+		if ! _merge_validate_release_aggregation_body "$FULL_LOOP_MERGE_PREPARED_BODY_FILE" "$pr_number"; then
+			_merge_remove_body_snapshot "$FULL_LOOP_MERGE_BODY_SNAPSHOT"
+			return 1
+		fi
+	fi
+	if [[ -z "${FULL_LOOP_VERIFIED_PR_HEAD_SHA:-}" && -z "$FULL_LOOP_MERGE_PREPARED_BODY_FILE" ]]; then
+		return 0
+	fi
+	binding_head_sha=$(_merge_resolve_match_head "$pr_number" "$repo") || {
+		_merge_remove_body_snapshot "$FULL_LOOP_MERGE_BODY_SNAPSHOT"
+		print_error "Merge blocked: cannot bind the merge body to an exact remotely verified PR head."
+		return 1
+	}
+	if ! _merge_validate_verified_head_aggregation_binding \
+		"$pr_number" "$repo" "$binding_head_sha" "$FULL_LOOP_MERGE_PREPARED_BODY_FILE"; then
+		_merge_remove_body_snapshot "$FULL_LOOP_MERGE_BODY_SNAPSHOT"
+		return 1
+	fi
+	return 0
+}
+
+# Re-read required-check state immediately before an implicit admin fallback.
+# An empty PR rollup is not proof that the base branch has no required contexts.
+_merge_admin_fallback_required_checks_clear() {
+	local pr_number="$1"
+	local repo="$2"
+	local checks_rc=0
+	AIDEVOPS_ACTIONS_NATIVE_CHECKS_ONLY=1 _merge_with_admission_retry "${SCRIPT_DIR}/gh-checks-wait-helper.sh" wait "$pr_number" --repo "$repo" --timeout 0 --initial-interval 1 --max-interval 1 || checks_rc=$?
+	case "$checks_rc" in
+	0) return 0 ;;
+	8)
+		print_error "LIFECYCLE_STATE=CHECKS_PENDING required checks are not terminal on the verified PR head; refusing admin fallback"
+		return 8
+		;;
+	*)
+		print_error "Could not re-verify required checks before admin fallback; refusing admin fallback"
+		return 1
+		;;
+	esac
+}
+
+# Generic "base branch policy prohibits the merge" text carries no review
+# evidence. Confirm from live state: the PR still needs review and the base
+# branch protection requires at least one approving review.
+_merge_pr_api_path() {
+	local repo="$1" pr_number="$2"
+	printf 'repos/%s/pulls/%s\n' "$repo" "$pr_number"
+	return 0
+}
+
+_merge_generic_block_is_review_only() {
+	local pr_number="$1" repo="$2"
+	local decision="" base_branch="" review_count=""
+	decision=$(_merge_with_admission_retry gh pr view "$pr_number" --repo "$repo" --json reviewDecision --jq '.reviewDecision // ""') || return 1
+	[[ "$decision" == "REVIEW_REQUIRED" ]] || return 1
+	base_branch=$(_merge_with_admission_retry gh api "$(_merge_pr_api_path "$repo" "$pr_number")" --jq '.base.ref // empty') || return 1
+	[[ -n "$base_branch" ]] || return 1
+	review_count=$(_merge_with_admission_retry gh api "repos/${repo}/branches/${base_branch}/protection/required_pull_request_reviews" --jq '.required_approving_review_count // 0') || return 1
+	[[ "$review_count" =~ ^[0-9]+$ && "$review_count" -ge 1 ]] || return 1
+	return 0
+}
+
+# Only a review block after a fresh required-check read permits an implicit
+# admin retry. A generic branch-policy error needs live review evidence.
+_merge_try_review_only_admin_fallback() {
+	local pr_number="$1" repo="$2" merge_method="$3" match_head_sha="$4"
+	local squash_subject="$5" merge_body_file="$6" merge_output="$7"
+	local review_block=0
+	_merge_report_already_merged_at_head "$pr_number" "$repo" "$match_head_sha" && return 0
+	if grep -qE 'At least [0-9]+ approving review' <<<"$merge_output"; then
+		review_block=1
+	elif grep -qE 'base branch policy prohibits' <<<"$merge_output" &&
+		_merge_generic_block_is_review_only "$pr_number" "$repo"; then
+		review_block=1
+	fi
+	if [[ "$review_block" -ne 1 ]]; then
+		# Still re-read required checks so pending/missing contexts report
+		# their lifecycle state before the generic refusal.
+		_merge_admin_fallback_required_checks_clear "$pr_number" "$repo" || return $?
+		print_error "Merge remains blocked by branch policy; refusing admin fallback without a review-only block"
+		return 1
+	fi
+	_merge_admin_fallback_required_checks_clear "$pr_number" "$repo" || return $?
+	_merge_revalidate_transport_authority "$pr_number" "$repo" "$match_head_sha" || return 1
+	print_info "Review count blocked plain merge; retrying with --admin (workers share the maintainer's gh auth per GH#18538)..."
+	local subject_flags=() admin_rc=0 admin_output=""
+	[[ -n "$squash_subject" ]] && subject_flags+=("$FULL_LOOP_MERGE_SUBJECT_FLAG" "$squash_subject")
+	[[ -n "$merge_body_file" ]] && subject_flags+=("$FULL_LOOP_MERGE_BODY_FILE_FLAG" "$merge_body_file")
+	_MERGE_WRITE_OUTPUT=""
+	_merge_run_bounded_write "$pr_number" "$repo" "$match_head_sha" \
+		gh pr merge "$pr_number" --repo "$repo" "$merge_method" --admin --match-head-commit "$match_head_sha" ${subject_flags[@]+"${subject_flags[@]}"} || admin_rc=$?
+	admin_output="$_MERGE_WRITE_OUTPUT"
+	if [[ "$admin_rc" -eq 0 ]]; then
+		[[ -n "$admin_output" ]] && printf '%s\n' "$admin_output"
+		print_success "PR #${pr_number} merged with --admin fallback"
+		_signal_admin_merge_fallback "$pr_number" "$repo" "$merge_method" "$merge_output"
+		return 0
+	fi
+	_merge_report_admin_fallback_failure "$pr_number" "$admin_output"
+	return 1
+}
+
+_merge_check_admin_capability() {
+	local pr_number="$1" repo="$2" has_admin="$3"
+	if [[ "$has_admin" -eq 1 ]]; then
+		# shellcheck source=repo-actions-capability-lib.sh
+		source "${BASH_SOURCE[0]%/*}/repo-actions-capability-lib.sh"
+		#aidevops:trust-boundary -- local evidence never authorizes an explicit
+		# admin bypass of unavailable native required checks.
+		if repo_actions_unavailable "$repo"; then
+			_merge_admin_fallback_required_checks_clear "$pr_number" "$repo" || return 1
+		fi
+	fi
+	return 0
+}
+
+# _merge_execute — attempt `gh pr merge` with optional --admin fallback on branch-protection errors.
+#
+# GH#18538: branch protection that requires an approving review rejects plain
+# `gh pr merge`. Workers share the owner's gh auth, so --admin works when the
+# authed user has admin rights. We only fall back to --admin when the caller
+# did not explicitly pass --admin or --auto (explicit intent is never overridden).
+#
+# GH#18731: --admin / --auto are explicit caller intents; when present, the
+# error-retry path is skipped entirely.
+#
+# Bash 3.2 note: `"${arr[@]}"` raises "unbound variable" under set -u when the
+# array is empty. The `${arr[@]+"${arr[@]}"}` form expands to zero words safely.
+#
+# Args: pr_number repo merge_method has_admin has_auto [merge_body_file]
+# Returns: 0 = merged or queued, 1 = failed
 _merge_execute() {
 	local pr_number="$1" repo="$2" merge_method="$3"
 	local has_admin="$4" has_auto="$5" squash_subject=""
 	local merge_body_file="${6:-}"
+	_merge_check_admin_capability "$pr_number" "$repo" "$has_admin" || return 1
+	_merge_verify_rbg_override_approval "$pr_number" "$repo" || return 1
 	squash_subject=$(_merge_resolve_subject_for_method "$pr_number" "$repo" "$merge_method") || return 1
 	local merge_flags=()
 	[[ "$has_admin" -eq 1 ]] && merge_flags+=("--admin")
@@ -1198,7 +1014,15 @@ _merge_execute() {
 	}
 	#aidevops:trust-boundary GH#17671/GH#28622 -- all merge modes pass the same
 	# live external/fork and exact-head cryptographic authority check.
-	_merge_revalidate_transport_authority "$pr_number" "$repo" "$match_head_sha" || return 1
+	local authority_rc=0
+	_merge_revalidate_transport_authority "$pr_number" "$repo" "$match_head_sha" || authority_rc=$?
+	if [[ "$authority_rc" -eq 3 ]]; then
+		# GH#33567: auto-merge may have completed after readiness verification.
+		_merge_report_already_merged_at_head "$pr_number" "$repo" "$match_head_sha" && return 0
+		print_error "PR #${pr_number} is MERGED but not proven merged at verified head ${match_head_sha}; refusing"
+		return 1
+	fi
+	[[ "$authority_rc" -eq 0 ]] || return 1
 	merge_flags+=("--match-head-commit" "$match_head_sha")
 
 	local _merge_out="" _merge_rc=0 _MERGE_WRITE_OUTPUT=""
@@ -1232,6 +1056,9 @@ ${_merge_retry_out}"
 		if [[ $has_auto -eq 0 ]] && _merge_output_is_graphql_rate_limit "$_merge_out"; then
 			_merge_rest_fallback "$pr_number" "$repo" "$merge_method" "$match_head_sha" "$squash_subject" "$merge_body_file" && return 0
 			return 1
+		elif [[ $has_auto -eq 0 ]] && _merge_output_is_transient_server_error "$_merge_out"; then
+			_merge_recover_transient_server_error "$pr_number" "$repo" "$merge_method" "$match_head_sha" "$squash_subject" "$merge_body_file" || return 1
+			return 0
 		elif [[ $has_admin -eq 0 && $has_auto -eq 1 ]]; then
 			local auto_admin_rc=0
 			_merge_try_interactive_admin_auto_fallback "$pr_number" "$repo" "$merge_method" "$_merge_out" "$match_head_sha" "$squash_subject" "$merge_body_file" || auto_admin_rc=$?
@@ -1241,27 +1068,13 @@ ${_merge_retry_out}"
 			return 1
 		# Only fall back to --admin when caller passed neither --admin nor --auto.
 		elif [[ $has_admin -eq 0 && $has_auto -eq 0 ]] &&
-			printf '%s' "$_merge_out" | grep -qE 'base branch policy prohibits|Required status checks? (is|are) expected|At least [0-9]+ approving review'; then
-			_merge_revalidate_transport_authority "$pr_number" "$repo" "$match_head_sha" || return 1
-			print_info "Branch protection blocked plain merge; retrying with --admin (workers share the maintainer's gh auth per GH#18538)..."
-			local subject_flags=()
-			[[ -n "$squash_subject" ]] && subject_flags+=("$FULL_LOOP_MERGE_SUBJECT_FLAG" "$squash_subject")
-			[[ -n "$merge_body_file" ]] && subject_flags+=("$FULL_LOOP_MERGE_BODY_FILE_FLAG" "$merge_body_file")
-			local admin_rc=0
-			if _flm_gh_write gh pr merge "$pr_number" --repo "$repo" "$merge_method" --admin --match-head-commit "$match_head_sha" ${subject_flags[@]+"${subject_flags[@]}"} 2>&1; then
-				print_success "PR #${pr_number} merged with --admin fallback"
-				# t2247: Signal fallback through a PR comment, audit entry, and label.
-				_signal_admin_merge_fallback "$pr_number" "$repo" "$merge_method" "$_merge_out"
-				return 0
-			else
-				admin_rc=$?
-			fi
-			if [[ "$admin_rc" -eq 124 ]] && _merge_reconcile_timed_out_write "$pr_number" "$repo" "$match_head_sha"; then
-				_signal_admin_merge_fallback "$pr_number" "$repo" "$merge_method" "$_merge_out"
-				return 0
-			fi
-			print_error "Merge failed for PR #${pr_number} (even with --admin — maintainer gate or admin rights missing)"
-			return 1
+			grep -qE 'At least [0-9]+ approving review' <<<"$_merge_out"; then
+			_merge_try_review_only_admin_fallback "$pr_number" "$repo" "$merge_method" "$match_head_sha" "$squash_subject" "$merge_body_file" "$_merge_out" || return $?
+			return 0
+		elif [[ $has_admin -eq 0 && $has_auto -eq 0 ]] &&
+			grep -qE 'base branch policy prohibits|Required status checks? (is|are) expected' <<<"$_merge_out"; then
+			_merge_try_review_only_admin_fallback "$pr_number" "$repo" "$merge_method" "$match_head_sha" "$squash_subject" "$merge_body_file" "$_merge_out" || return $?
+			return 0
 		else
 			print_error "Merge failed for PR #${pr_number}"
 			return 1
@@ -1302,14 +1115,14 @@ _merge_unlock_resources() {
 	local repo="$2"
 
 	local _linked_issue=""
-	_linked_issue=$(gh pr view "$pr_number" --repo "$repo" --json body \
-		--jq '.body' 2>/dev/null |
+	_linked_issue=$(_flm_gh_read gh pr view "$pr_number" --repo "$repo" --json body \
+		--jq '.body' |
 		grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?)\s+#[0-9]+' |
-		grep -oE '[0-9]+' | head -1) || _linked_issue=""
+		grep -oE '[0-9]+' | sed -n '1p') || _linked_issue=""
 	[[ -n "$_linked_issue" && "$_linked_issue" =~ ^[0-9]+$ ]] || return 0
 
 	local labels=""
-	if ! labels=$(gh api "repos/${repo}/issues/${_linked_issue}" --jq '[.labels[]? | .name] | join(",")' 2>/dev/null); then
+	if ! labels=$(_flm_gh_read gh api "repos/${repo}/issues/${_linked_issue}" --jq '[.labels[]? | .name] | join(",")'); then
 		print_warning "Could not verify linked issue labels for #${_linked_issue}; retaining conversation lock"
 		return 0
 	fi
@@ -1339,19 +1152,19 @@ _retarget_stacked_children_interactive() {
 	local pr_number="$1"
 	local repo="$2"
 	local parent_head_ref
-	parent_head_ref=$(gh pr view "$pr_number" --repo "$repo" --json headRefName -q '.headRefName' 2>/dev/null) || parent_head_ref=""
+	parent_head_ref=$(_flm_gh_read gh pr view "$pr_number" --repo "$repo" --json headRefName -q '.headRefName') || parent_head_ref=""
 	if [[ -z "$parent_head_ref" ]]; then
 		return 0
 	fi
 
 	local children
-	children=$(gh pr list --repo "$repo" --base "$parent_head_ref" --state open --json number -q '.[].number' 2>/dev/null) || children=""
+	children=$(_flm_gh_read gh pr list --repo "$repo" --base "$parent_head_ref" --state open --json number -q '.[].number') || children=""
 	if [[ -z "$children" ]]; then
 		return 0
 	fi
 
 	local default_branch
-	default_branch=$(gh repo view "$repo" --json defaultBranchRef -q '.defaultBranchRef.name' 2>/dev/null || true)
+	default_branch=$(_flm_gh_read gh repo view "$repo" --json defaultBranchRef -q '.defaultBranchRef.name' || true)
 	default_branch="${default_branch:-main}"
 
 	local child
@@ -1360,268 +1173,6 @@ _retarget_stacked_children_interactive() {
 		print_info "Retargeting stacked PR #${child} from '${parent_head_ref}' to '${default_branch}' before merging PR #${pr_number} (t2412)"
 		gh pr edit "$child" --repo "$repo" --base "$default_branch" 2>&1 || true
 	done <<<"$children"
-	return 0
-}
-
-# --- Post-Merge Worktree Cleanup ---
-
-_merge_current_canonical_dir_for_cleanup() {
-	local current_root="$1"
-	local porcelain=""
-	local canonical_dir=""
-
-	[[ -n "$current_root" ]] || return 1
-	porcelain=$(git worktree list --porcelain 2>/dev/null || true)
-	[[ -n "$porcelain" ]] || return 1
-	canonical_dir="${porcelain%%$'\n'*}"
-	canonical_dir="${canonical_dir#worktree }"
-	[[ -n "$canonical_dir" && "$canonical_dir" != "$current_root" && -d "$canonical_dir" ]] || return 1
-	printf '%s\n' "$canonical_dir"
-	return 0
-}
-
-_merge_current_worktree_cleanup_plan() {
-	local pr_head_ref="$1"
-	local pr_head_oid="$2"
-	local pr_head_repo="$3"
-	local repo="$4"
-	local cleanup_target=""
-	local worktree_path=""
-	local branch_name=""
-	local delete_remote_branch=""
-	local canonical_dir=""
-
-	cleanup_target=$(_merge_current_worktree_cleanup_target "$pr_head_ref" "$pr_head_oid" "$pr_head_repo" "$repo") || return 1
-	IFS=$'\t' read -r worktree_path branch_name delete_remote_branch <<<"$cleanup_target"
-	canonical_dir=$(_merge_current_canonical_dir_for_cleanup "$worktree_path") || return 1
-	printf '%s\t%s\t%s\t%s\n' "$worktree_path" "$branch_name" "$canonical_dir" "$delete_remote_branch"
-	return 0
-}
-
-_merge_fresh_worktree_cleanup_target() {
-	local pr_number="$1"
-	local repo="$2"
-	local pr_json=""
-	pr_json=$(AIDEVOPS_GH_PR_VIEW_CACHE_DISABLE=1 gh pr view "$pr_number" --repo "$repo" \
-		--json headRefName,headRefOid,headRepository,isCrossRepository 2>/dev/null) || return 1
-	printf '%s' "$pr_json" | jq -e --arg string_type "string" '
-		(.headRefName | type == $string_type and length > 0)
-		and (.headRefOid | type == $string_type and length > 0)
-		and (.headRepository.nameWithOwner | type == $string_type and length > 0)
-		and (.isCrossRepository | type == "boolean")' >/dev/null 2>&1 || return 1
-
-	local pr_head_ref=""
-	local pr_head_oid=""
-	local pr_head_repo=""
-	local is_cross_repository=""
-	IFS=$'\t' read -r pr_head_ref pr_head_oid pr_head_repo is_cross_repository < <(
-		printf '%s' "$pr_json" | jq -r '[.headRefName, .headRefOid, .headRepository.nameWithOwner, .isCrossRepository] | @tsv'
-	)
-	: "$is_cross_repository"
-	_merge_current_worktree_cleanup_target "$pr_head_ref" "$pr_head_oid" "$pr_head_repo" "$repo" || return 1
-	return 0
-}
-
-_merge_fresh_worktree_cleanup_plan() {
-	local pr_number="$1"
-	local repo="$2"
-	local cleanup_target=""
-	local worktree_path=""
-	local branch_name=""
-	local delete_remote_branch=""
-	local canonical_dir=""
-
-	cleanup_target=$(_merge_fresh_worktree_cleanup_target "$pr_number" "$repo") || return 1
-	IFS=$'\t' read -r worktree_path branch_name delete_remote_branch <<<"$cleanup_target"
-	canonical_dir=$(_merge_current_canonical_dir_for_cleanup "$worktree_path") || return 1
-	printf '%s\t%s\t%s\t%s\n' "$worktree_path" "$branch_name" "$canonical_dir" "$delete_remote_branch"
-	return 0
-}
-
-_merge_fresh_adopted_worktree_cleanup_target() {
-	local pr_number="$1"
-	local repo="$2"
-	local pr_json=""
-	local pr_head_ref=""
-	local pr_head_oid=""
-	local pr_head_repo=""
-	local cleanup_target=""
-	local worktree_path=""
-	local branch_name=""
-	local delete_remote_branch=""
-	local current_repo=""
-
-	pr_json=$(AIDEVOPS_GH_PR_VIEW_CACHE_DISABLE=1 gh pr view "$pr_number" --repo "$repo" \
-		--json state,mergedAt,mergeCommit,headRefName,headRefOid,headRepository,isCrossRepository 2>/dev/null) || return 2
-	printf '%s' "$pr_json" | jq -e '
-		.state == "MERGED"
-		and (.mergedAt | strings | length > 0)
-		and (.mergeCommit.oid | strings | length > 0)
-		and (.headRefName | strings | length > 0)
-		and (.headRefOid | strings | length > 0)
-		and (.headRepository.nameWithOwner | strings | length > 0)
-		and (.isCrossRepository == true or .isCrossRepository == false)
-	' >/dev/null 2>&1 || return 3
-	IFS=$'\t' read -r pr_head_ref pr_head_oid pr_head_repo < <(
-		printf '%s' "$pr_json" | jq -r '[.headRefName, .headRefOid, .headRepository.nameWithOwner] | @tsv'
-	)
-	cleanup_target=$(_merge_current_worktree_cleanup_target "$pr_head_ref" "$pr_head_oid" "$pr_head_repo" "$repo") || return 1
-	IFS=$'\t' read -r worktree_path branch_name delete_remote_branch <<<"$cleanup_target"
-	: "$delete_remote_branch"
-	[[ "$branch_name" == "$pr_head_ref" ]] || return 1
-	current_repo=$(_merge_current_github_repo_identity "$worktree_path" 2>/dev/null || true)
-	[[ -n "$current_repo" && "$current_repo" == "$repo" ]] || return 1
-	printf '%s\n' "$cleanup_target"
-	return 0
-}
-
-_merge_default_branch_for_cleanup() {
-	local canonical_dir="$1"
-	local default_ref=""
-	default_ref=$(git -C "$canonical_dir" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null || true)
-	default_ref="${default_ref#refs/remotes/origin/}"
-	if [[ -n "$default_ref" && "$default_ref" != refs/* ]]; then
-		printf '%s\n' "$default_ref"
-		return 0
-	fi
-	printf '%s\n' "main"
-	return 0
-}
-
-_merge_refresh_canonical_for_cleanup() {
-	local canonical_dir="$1"
-	local default_branch="$2"
-	[[ -d "$canonical_dir" && -n "$default_branch" ]] || return 1
-
-	if ! git fetch --quiet origin "$default_branch" >/dev/null 2>&1; then
-		print_warning "CANONICAL_SYNC_PENDING=true reason=origin_fetch_failed"
-		return 1
-	fi
-	local current_canonical_branch=""
-	current_canonical_branch=$(git -C "$canonical_dir" branch --show-current 2>/dev/null || true)
-	local canonical_head=""
-	canonical_head=$(git -C "$canonical_dir" rev-parse HEAD 2>/dev/null || true)
-	local remote_head=""
-	remote_head=$(git rev-parse "origin/${default_branch}" 2>/dev/null || true)
-	if [[ "$current_canonical_branch" == "$default_branch" && -n "$remote_head" && "$canonical_head" == "$remote_head" ]]; then
-		print_success "LIFECYCLE_STATE=CANONICAL_SYNCED sha=${remote_head}"
-		return 0
-	fi
-	print_warning "CANONICAL_SYNC_PENDING=true canonical=${canonical_dir} branch=${current_canonical_branch:-detached}"
-	return 1
-}
-
-_merge_report_canonical_sync_state() {
-	local canonical_dir="$1"
-	if [[ -z "$canonical_dir" ]]; then
-		print_warning "CANONICAL_SYNC_PENDING=true reason=canonical_path_unavailable"
-		return 1
-	fi
-	local default_branch
-	default_branch=$(_merge_default_branch_for_cleanup "$canonical_dir")
-	_merge_refresh_canonical_for_cleanup "$canonical_dir" "$default_branch"
-	return $?
-}
-
-_merge_resolve_worktree_helper() {
-	if [[ -x "${SCRIPT_DIR}/worktree-helper.sh" ]]; then
-		printf '%s\n' "${SCRIPT_DIR}/worktree-helper.sh"
-		return 0
-	fi
-	if [[ -n "${HOME:-}" && -x "${HOME}/.aidevops/agents/scripts/worktree-helper.sh" ]]; then
-		printf '%s\n' "${HOME}/.aidevops/agents/scripts/worktree-helper.sh"
-		return 0
-	fi
-	return 1
-}
-
-_merge_remove_worktree_for_cleanup() {
-	local branch_name="$1"
-	local helper_path=""
-
-	helper_path=$(_merge_resolve_worktree_helper 2>/dev/null || true)
-	if [[ -n "$helper_path" ]]; then
-		WORKTREE_FORCE_REMOVE=1 "$helper_path" remove "$branch_name" --force >/dev/null 2>&1 && return 0
-		print_warning "Post-merge worktree cleanup: guarded helper deferred removal for ${branch_name}"
-		return 1
-	fi
-
-	print_warning "Post-merge worktree cleanup: guarded worktree helper unavailable for ${branch_name}"
-	return 1
-}
-_merge_cleanup_linked_worktree() {
-	local cleanup_plan="$1"
-	local repo="$2"
-	[[ -n "$cleanup_plan" ]] || return 0
-
-	local worktree_path branch_name canonical_dir delete_remote_branch
-	IFS=$'\t' read -r worktree_path branch_name canonical_dir delete_remote_branch <<<"$cleanup_plan"
-	[[ -n "$worktree_path" && -n "$branch_name" && -n "$canonical_dir" ]] || return 0
-	[[ -d "$canonical_dir" ]] || return 0
-	print_info "Post-merge worktree cleanup: removing linked worktree ${worktree_path} for ${branch_name} in ${repo}"
-	local default_branch=""
-	default_branch=$(_merge_default_branch_for_cleanup "$canonical_dir")
-	_merge_refresh_canonical_for_cleanup "$canonical_dir" "$default_branch" || true
-
-	if ! cd "$canonical_dir" 2>/dev/null; then
-		print_warning "Post-merge worktree cleanup: could not cd to canonical repo ${canonical_dir}"
-		return 0
-	fi
-
-	if _merge_remove_worktree_for_cleanup "$branch_name"; then
-		if [[ "$delete_remote_branch" == "1" ]]; then
-			git push origin --delete "$branch_name" >/dev/null 2>&1 || true
-		fi
-		git branch -D "$branch_name" >/dev/null 2>&1 || true
-		print_success "Post-merge worktree cleanup complete for ${branch_name}"
-		return 0
-	fi
-
-	print_warning "Post-merge worktree cleanup did not remove ${worktree_path}; safety-net cleanup will retry later"
-	return 0
-}
-
-_merge_record_deferred_cleanup_owner() {
-	local pr_number="$1"
-	local repo="$2"
-	local cleanup_target="$3"
-	local release_status="${4:-pending}"
-	local executor_completion_state="${5:-FINALIZATION_PENDING}"
-	local worktree_path="" branch_name="" delete_remote_branch=""
-	IFS=$'\t' read -r worktree_path branch_name delete_remote_branch <<<"$cleanup_target"
-	: "$delete_remote_branch"
-	[[ -n "$worktree_path" && -n "$branch_name" ]] || return 1
-	[[ -d "$worktree_path" ]] || return 1
-
-	local owner_pid=""
-	if declare -F _resolve_worktree_owner_pid >/dev/null 2>&1; then
-		owner_pid=$(_resolve_worktree_owner_pid "" 2>/dev/null || true)
-	fi
-	[[ "$owner_pid" =~ ^[0-9]+$ ]] || owner_pid="$PPID"
-	[[ "$owner_pid" =~ ^[0-9]+$ ]] || return 1
-
-	local owner_session="${AIDEVOPS_SESSION_ID:-${OPENCODE_SESSION_ID:-${CLAUDE_SESSION_ID:-$_FULL_LOOP_OWNER_SESSION_FALLBACK}}}"
-	if ! declare -F full_loop_write_cleanup_deferred >/dev/null 2>&1; then
-		return 1
-	fi
-	full_loop_write_cleanup_deferred "$repo" "$pr_number" "$worktree_path" "$branch_name" \
-		"$owner_pid" "$owner_session" "$release_status" "$executor_completion_state" >/dev/null || return 1
-
-	local marker_dir="${worktree_path}/.agents"
-	local marker_path="${marker_dir}/.full-loop-cleanup-deferred"
-	mkdir -p "$marker_dir" || return 1
-	# Keep the legacy marker during rollout so an older deployed cleanup
-	# supervisor still preserves the live owner. The external receipt above is
-	# the durable source of lifecycle truth and survives worktree removal.
-	printf '%s\n' "$owner_pid" >"${marker_path}.tmp.$$" || return 1
-	mv "${marker_path}.tmp.$$" "$marker_path" || return 1
-
-	if declare -F claim_worktree_ownership >/dev/null 2>&1; then
-		claim_worktree_ownership "$worktree_path" "$branch_name" \
-			--owner-pid "$owner_pid" \
-			--session "$owner_session" \
-			--task "post-merge-cleanup" >/dev/null 2>&1 || true
-	fi
 	return 0
 }
 
@@ -1690,6 +1241,32 @@ _merge_capture_session_distill_provenance() {
 	return 0
 }
 
+# A merged protected release PR resumes only the matching active source lane.
+# Run in a subshell: release helpers must not alter merge/cleanup globals.
+_merge_reconcile_provenance_release() (
+	local pr_number="$1"
+	local repo="$2"
+	local pr_json="" head_ref="" tag_name="" source_pr="" reconcile_rc=0 lane_rc=0
+	pr_json=$(_flm_gh_read gh api "$(_merge_pr_api_path "$repo" "$pr_number")") || return 1
+	head_ref=$(jq -r '.head.ref // ""' <<<"$pr_json") || return 1
+	[[ "$head_ref" =~ ^chore/release-(v[0-9]+\.[0-9]+\.[0-9]+)-provenance$ ]] || return 0
+	tag_name="${BASH_REMATCH[1]}"
+	#aidevops:trust-boundary
+	jq -e --arg repo "$repo" '.merged == true and .head.repo.full_name == $repo
+		and .base.repo.full_name == $repo and .base.ref == "main"' <<<"$pr_json" >/dev/null || return 1
+	# shellcheck source=./release-lane-helper.sh
+	source "${SCRIPT_DIR}/release-lane-helper.sh"
+	release_lane_read "$repo" || lane_rc=$?
+	case "$lane_rc" in 0) ;; 2) return 0 ;; *) return 1 ;; esac
+	source_pr=$(jq -er --arg tag "$tag_name" 'select(.active == true
+		and .phase == "remote-publication" and .tag == $tag and .terminal_receipt == null)
+		| .source_pr | select(type == "number" and . > 0 and floor == .)' \
+		<<<"$_AIDEVOPS_RELEASE_LANE_JSON") || return 0
+	AIDEVOPS_FULL_LOOP_REPO="$repo" bash "${SCRIPT_DIR}/full-loop-release-helper.sh" \
+		reconcile "$source_pr" || reconcile_rc=$?
+	case "$reconcile_rc" in 0 | 8) return 0 ;; *) return "$reconcile_rc" ;; esac
+)
+
 _merge_finalize_post_merge() {
 	local pr_number="$1"
 	local repo="$2"
@@ -1700,13 +1277,15 @@ _merge_finalize_post_merge() {
 	linked_issue=$(gh pr view "$pr_number" --repo "$repo" --json body \
 		--jq '.body' 2>/dev/null |
 		grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?)\s+#[0-9]+' |
-		grep -oE '[0-9]+' | head -1) || linked_issue=""
+		grep -oE '[0-9]+' | sed -n '1p') || linked_issue=""
 	if [[ -n "$linked_issue" ]]; then
 		release_interactive_claim_on_merge "$pr_number" "$repo" "$linked_issue" || true
 	fi
 	_merge_reconcile_closing_issues "$pr_number" "$repo" || true
+	_merge_reconcile_provenance_release "$pr_number" "$repo" ||
+		print_warning "Protected release reconciliation deferred; inspect the matching source lane with aidevops release status"
 	if declare -F _full_loop_record_merged_pr >/dev/null 2>&1; then
-		_full_loop_record_merged_pr "$pr_number" || return 1
+		_full_loop_record_merged_pr "$pr_number" "$repo" || return 1
 	fi
 	if [[ "$has_auto" -eq 0 && -n "$linked_issue" ]]; then
 		auto_file_next_phase "$linked_issue" "$repo" || true
@@ -1717,7 +1296,8 @@ _merge_finalize_post_merge() {
 		if _merge_record_deferred_cleanup_owner "$pr_number" "$repo" "$cleanup_target"; then
 			print_info "LIFECYCLE_STATE=CLEANUP_DEFERRED; guarded cleanup ownership persisted outside the worktree"
 		else
-			print_warning "Post-merge worktree cleanup deferred, but durable handoff evidence could not be recorded"
+			print_warning "Post-merge worktree cleanup deferred, but durable handoff evidence could not be recorded (reason: ${_FULL_LOOP_CLEANUP_FAILURE_REASON:-unknown})"
+			print_info "Recovery: full-loop-helper.sh adopt-merged-receipt ${pr_number} ${repo}, then finalize-receipt (or record-no-release) once release status is known"
 		fi
 	fi
 	return 0
@@ -1742,12 +1322,38 @@ _merge_finalize_post_merge() {
 # "merge now", so --auto adds no value); --auto is dropped silently with an
 # informational message rather than failing the merge.
 # Exit codes: 0 = merged (or queued, with --auto), 1 = gate failed or merge failed
+
+# Protected release PRs (version-manager-protected-main.sh) carry a signed
+# release commit that the tag points at. Squash or rebase rewrites it, so the
+# tag is never reachable from main and reconciliation fails. Prints the method
+# to use: always --merge for release provenance branches, else the request.
+_merge_release_provenance_method() {
+	local pr_number="$1"
+	local repo="$2"
+	local merge_method="$3"
+	local head_ref="${4:-}"
+	if [[ -z "$head_ref" ]]; then
+		head_ref=$(_flm_gh_read gh api "$(_merge_pr_api_path "$repo" "$pr_number")" --jq '.head.ref // ""') || {
+			print_error "Merge blocked: cannot read PR #${pr_number} head ref for release provenance check"
+			return 1
+		}
+	fi
+	if [[ "$head_ref" =~ ^chore/release-v[0-9]+\.[0-9]+\.[0-9]+-provenance$ && "$merge_method" != "--merge" ]]; then
+		print_info "PR #${pr_number} is a protected release provenance PR; using --merge (not ${merge_method}) to keep the signed release commit reachable from main"
+		merge_method="--merge"
+	fi
+	printf '%s\n' "$merge_method"
+	return 0
+}
+
 _merge_parse_command_args() {
 	FULL_LOOP_MERGE_PARSED_REPO=""
 	FULL_LOOP_MERGE_PARSED_METHOD="--squash"
 	FULL_LOOP_MERGE_PARSED_ADMIN=0
 	FULL_LOOP_MERGE_PARSED_AUTO=0
+	FULL_LOOP_MERGE_PARSED_ALLOW_PARENT_CLOSE=0
 	FULL_LOOP_MERGE_PARSED_BODY_FILE=""
+	FULL_LOOP_MERGE_PARSED_RBG_OVERRIDE_REASON=""
 	local arg=""
 	while [[ $# -gt 0 ]]; do
 		arg="$1"
@@ -1756,11 +1362,25 @@ _merge_parse_command_args() {
 		--squash | --merge | --rebase)
 			FULL_LOOP_MERGE_PARSED_METHOD="$arg"
 			;;
+		--override-review-bot-gate=*)
+			if [[ -n "$FULL_LOOP_MERGE_PARSED_RBG_OVERRIDE_REASON" || -z "${arg#--override-review-bot-gate=}" ]]; then
+				print_error "--override-review-bot-gate=REASON requires exactly one non-empty reason"
+				return 1
+			fi
+			FULL_LOOP_MERGE_PARSED_RBG_OVERRIDE_REASON="${arg#--override-review-bot-gate=}"
+			;;
+		--override-review-bot-gate)
+			print_error "Use --override-review-bot-gate=\"<reason, 20+ characters>\""
+			return 1
+			;;
 		--admin)
 			FULL_LOOP_MERGE_PARSED_ADMIN=1
 			;;
 		--auto)
 			FULL_LOOP_MERGE_PARSED_AUTO=1
+			;;
+		--allow-parent-close)
+			FULL_LOOP_MERGE_PARSED_ALLOW_PARENT_CLOSE=1
 			;;
 		"$FULL_LOOP_MERGE_BODY_FILE_FLAG")
 			if [[ $# -eq 0 || "$1" == -* || -n "$FULL_LOOP_MERGE_PARSED_BODY_FILE" ]]; then
@@ -1794,6 +1414,81 @@ _merge_parse_command_args() {
 		print_error "Merge body file must be a readable regular file: ${FULL_LOOP_MERGE_PARSED_BODY_FILE}"
 		return 1
 	fi
+	_merge_prepare_rbg_override "$FULL_LOOP_MERGE_PARSED_RBG_OVERRIDE_REASON" || return 1
+	return 0
+}
+
+# GH#34790: ci-gate-policy rule 14 requires a PR-body note when a qlty check is
+# skipped as out of credits on a limited repository. The note is written after
+# the merge so the body edit cannot retrigger `edited` workflows behind
+# required checks before the merge write. Best-effort: never changes the
+# merge outcome.
+_merge_read_qlty_billing_skips() {
+	local pr_number="$1"
+	local repo="$2"
+	"${SCRIPT_DIR}/gh-checks-wait-helper.sh" qlty-skips "$pr_number" --repo "$repo" 2>/dev/null
+	return $?
+}
+
+# Print the body with the skipped-check note inserted, or return 1 when the
+# note marker is already present. Lines go under an existing
+# "## Skipped checks" heading, else in a new section just before the
+# signature footer, else at the end of the body.
+_merge_body_with_qlty_skips() {
+	local body="$1"
+	local skips="$2"
+	local marker='<!-- aidevops:skipped-check:qlty-out-of-credits -->'
+	grep -Fq -- "$marker" <<<"$body" && return 1
+	local lines="$marker" name="" link=""
+	while IFS=$'\t' read -r name link; do
+		[[ -n "$name" ]] || continue
+		lines+=$'\n'"- \`${name}\`: skipped, Qlty is out of credits on this limited repository (\`reference/ci-gate-policy.md\` rule 14).${link:+ ${link}}"
+	done <<<"$skips"
+	printf '%s\n' "$body" | QLTY_SKIP_LINES="$lines" awk '
+		BEGIN {
+			lines = ENVIRON["QLTY_SKIP_LINES"]
+			section = "\n## Skipped checks\n\n" lines "\n"
+		}
+		{ row[NR] = $0 }
+		$0 == "## Skipped checks" && !heading { heading = NR }
+		$0 == "<!-- aidevops:sig -->" && !sig { sig = NR }
+		END {
+			for (i = 1; i <= NR; i++) {
+				if (!heading && sig && i == sig) printf "%s\n", section
+				print row[i]
+				if (heading && i == heading) printf "\n%s\n", lines
+			}
+			if (!heading && !sig) printf "%s", section
+		}'
+	return 0
+}
+
+_merge_record_qlty_billing_skips() {
+	local pr_number="$1"
+	local repo="$2"
+	local skips="" body="" new_body="" body_file=""
+	skips=$(_merge_read_qlty_billing_skips "$pr_number" "$repo") || {
+		print_warning "Could not observe qlty credit status for PR #${pr_number}; skipped-check note not recorded"
+		return 0
+	}
+	[[ -n "$skips" ]] || return 0
+	body=$(_flm_gh_read gh pr view "$pr_number" --repo "$repo" --json body --jq '.body // ""') || {
+		print_warning "Could not read PR #${pr_number} body; skipped-check note not recorded"
+		return 0
+	}
+	new_body=$(_merge_body_with_qlty_skips "$body" "$skips") || {
+		print_info "QLTY_SKIP_NOTE=present pr=${pr_number}"
+		return 0
+	}
+	body_file=$(mktemp "${TMPDIR:-/tmp}/aidevops-qlty-skip-body.XXXXXX") || return 0
+	printf '%s\n' "$new_body" >"$body_file"
+	if declare -F gh_pr_edit_safe >/dev/null 2>&1 &&
+		gh_pr_edit_safe "$pr_number" --repo "$repo" --body-file "$body_file" >/dev/null; then
+		print_info "QLTY_SKIP_NOTE=recorded pr=${pr_number} (ci-gate-policy rule 14; policy-decided, not a user ask)"
+	else
+		print_warning "Could not record the qlty skipped-check note in PR #${pr_number} body"
+	fi
+	rm -f "$body_file"
 	return 0
 }
 
@@ -1806,6 +1501,13 @@ _merge_report_pre_merge_gate_failure() {
 			print_error "Merge deferred: GitHub API cooldown is active; retry after the cooldown expires."
 		fi
 		;;
+	github-api-read-deferred)
+		if [[ "${FULL_LOOP_PRE_MERGE_BLOCKER_DETAIL:-}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+			print_error "Merge deferred by GitHub read admission; retry_at=${FULL_LOOP_PRE_MERGE_BLOCKER_DETAIL}. ${FULL_LOOP_REQUIRED_CHECKS_ERROR_DETAIL:-retry when capacity returns}"
+		else
+			print_error "Merge deferred by GitHub read admission: ${FULL_LOOP_REQUIRED_CHECKS_ERROR_DETAIL:-retry when capacity returns}"
+		fi
+		;;
 	review-bot)
 		print_error "Merge blocked by review bot gate. Address bot findings or wait for reviews."
 		;;
@@ -1816,10 +1518,255 @@ _merge_report_pre_merge_gate_failure() {
 	return 0
 }
 
+_merge_pre_merge_gate_with_admission_retry() {
+	local pr_number="$1"
+	local repo="$2"
+	_merge_with_admission_retry _merge_pre_merge_gate_once "$pr_number" "$repo"
+	return $?
+}
+
+# Required-check readers retain diagnostics in globals. Re-emit only the
+# deadline established by their local-admission parser for shared recovery.
+_merge_pre_merge_gate_once() {
+	local pr_number="$1"
+	local repo="$2"
+	cmd_pre_merge_gate "$pr_number" "$repo" && return 0
+	if [[ "${FULL_LOOP_PRE_MERGE_BLOCKER_KIND:-}" == github-api-read-deferred &&
+		"${FULL_LOOP_PRE_MERGE_BLOCKER_DETAIL:-}" =~ ^[0-9]{1,10}([.][0-9]+)?$ ]]; then
+		printf '[gh-transport] error_kind=github-api-read-deferred attempted=false deferred_by=local_admission retry_at=%s\n' \
+			"$FULL_LOOP_PRE_MERGE_BLOCKER_DETAIL" >&2
+	fi
+	return 1
+}
+
+# A protected release PR already merged by native auto-merge skips the open-PR
+# readiness gate, verifies the merge, and runs the same source-lane reconcile
+# as a helper-driven merge. Returns 0 handled, 1 handled-but-failed, 2 not
+# applicable (ordinary PRs keep failing closed on state != OPEN).
+_merge_handle_already_merged_provenance() {
+	local pr_number="$1"
+	local repo="$2"
+	local pr_json="" head_ref=""
+	pr_json=$(_flm_gh_read gh api "$(_merge_pr_api_path "$repo" "$pr_number")" 2>/dev/null) || return 2
+	#aidevops:trust-boundary
+	jq -e --arg repo "$repo" '.merged == true and .head.repo.full_name == $repo
+		and .base.repo.full_name == $repo and .base.ref == "main"' <<<"$pr_json" >/dev/null 2>&1 || return 2
+	head_ref=$(jq -r '.head.ref // ""' <<<"$pr_json") || return 2
+	[[ "$head_ref" =~ ^chore/release-v[0-9]+\.[0-9]+\.[0-9]+-provenance$ ]] || return 2
+	if ! _merge_verify_completed_state "$pr_number" "$repo"; then
+		print_error "PR #${pr_number} is a release provenance PR but GitHub has not reported a merge SHA"
+		return 1
+	fi
+	print_success "LIFECYCLE_STATE=MERGED merge_sha=${FULL_LOOP_MERGE_SHA} (already merged; no merge write)"
+	_merge_reconcile_provenance_release "$pr_number" "$repo" || {
+		print_error "Protected release reconciliation failed for already-merged PR #${pr_number}; inspect with aidevops release status"
+		return 1
+	}
+	return 0
+}
+
+# Verify release-lane PR identity and guard; sets _release_lane_head_ref in the
+# caller (dynamic scope) for the provenance merge-method check.
+_merge_release_lane_check() {
+	local pr_number="$1"
+	local repo="$2"
+	if [[ "$repo" != "${AIDEVOPS_RELEASE_LANE_COORDINATED_REPO:-marcusquinn/aidevops}" ]]; then
+		# Advisory manual-release hold: refuse other PRs while a release PR is in flight.
+		manual_release_hold_check "$repo" "$pr_number" || {
+			print_error "Merge deferred by active manual release hold"
+			return 1
+		}
+		return 0
+	fi
+	local pr_refs="" base_ref=""
+	pr_refs=$(_flm_gh_read gh api "repos/${repo}/pulls/${pr_number}" --jq '[.base.ref, .head.ref] | @tsv') || {
+		print_error "Merge blocked: cannot verify release-lane PR identity"
+		return 1
+	}
+	IFS=$'\t' read -r base_ref _release_lane_head_ref <<<"$pr_refs"
+	release_lane_merge_guard "$repo" "$pr_number" "$base_ref" "$_release_lane_head_ref" || {
+		print_error "Merge deferred by active exact-tip release lane"
+		return 1
+	}
+	return 0
+}
+
+# --- Review-bot-gate maintainer override (GH#36901) ---
+
+_FULL_LOOP_RBG_OVERRIDE_MIN_REASON_CHARS=20
+
+#aidevops:trust-boundary GH#36901 -- an explicit interactive maintainer may
+# admin-merge past a stuck review-bot-gate. Headless sessions, short reasons and
+# --auto are refused. Every other required check, the external/fork authority
+# gate and exact-head binding stay enforced; the PR approval is re-verified
+# immediately before the merge write.
+_merge_prepare_rbg_override() {
+	local reason="$1"
+	_FULL_LOOP_RBG_OVERRIDE_REASON=""
+	[[ -n "$reason" ]] || return 0
+	if _merge_is_headless_session; then
+		print_error "--override-review-bot-gate is interactive-only; headless sessions must wait for review evidence"
+		return 1
+	fi
+	if [[ "${#reason}" -lt "$_FULL_LOOP_RBG_OVERRIDE_MIN_REASON_CHARS" ]]; then
+		print_error "--override-review-bot-gate reason must be at least ${_FULL_LOOP_RBG_OVERRIDE_MIN_REASON_CHARS} characters"
+		return 1
+	fi
+	_FULL_LOOP_RBG_OVERRIDE_REASON="$reason"
+	# The override merges now with --admin; it never queues auto-merge.
+	FULL_LOOP_MERGE_PARSED_ADMIN=1
+	FULL_LOOP_MERGE_PARSED_AUTO=0
+	return 0
+}
+
+# Requires a cryptographic maintainer approval of the PR that still verifies.
+_merge_verify_rbg_override_approval() {
+	local pr_number="$1" repo="$2"
+	local verdict=""
+	[[ -n "${_FULL_LOOP_RBG_OVERRIDE_REASON:-}" ]] || return 0
+	verdict=$("${SCRIPT_DIR}/approval-helper.sh" verify pr "$pr_number" "$repo" 2>/dev/null | tail -1) || verdict=""
+	if [[ "$verdict" != "VERIFIED" ]]; then
+		print_error "Review-bot-gate override refused: PR #${pr_number} approval is ${verdict:-unverifiable}; run: sudo aidevops approve pr ${pr_number} ${repo}"
+		return 1
+	fi
+	print_info "Review-bot-gate override: PR #${pr_number} maintainer approval VERIFIED"
+	return 0
+}
+
+# Post-merge audit trail. Posting earlier would stale the PR approval snapshot.
+_merge_record_rbg_override() {
+	local pr_number="$1" repo="$2" merge_sha="$3"
+	local head_sha="${FULL_LOOP_VERIFIED_PR_HEAD_SHA:-unknown}"
+	local reason="$_FULL_LOOP_RBG_OVERRIDE_REASON"
+	local sig_footer="" body=""
+	sig_footer=$(gh-signature-helper.sh footer --model "${AIDEVOPS_MODEL:-unknown}" 2>/dev/null) || sig_footer=""
+	body="<!-- ops:start — workers: skip this comment, it is audit trail not implementation context -->
+## Review-bot-gate maintainer override (GH#36901)
+
+An interactive maintainer session merged this PR with \`--admin\` while \`review-bot-gate\` was failing. All other required checks passed, and the maintainer approval verified at head \`${head_sha}\`.
+
+**Reason:** ${reason}
+**Merge commit:** \`${merge_sha}\`
+<!-- ops:end -->
+${sig_footer}"
+	if gh_pr_comment "$pr_number" --repo "$repo" --body "$body" >/dev/null 2>&1; then
+		print_info "Review-bot-gate override comment posted on PR #${pr_number}"
+	else
+		print_warning "Failed to post review-bot-gate override comment on PR #${pr_number}"
+	fi
+	"${SCRIPT_DIR}/audit-log-helper.sh" log security.event \
+		"review-bot-gate maintainer override: PR #${pr_number} in ${repo} head ${head_sha} merge ${merge_sha}" \
+		--detail "reason=${reason}" 2>/dev/null || print_warning "Audit log entry for review-bot-gate override failed"
+	gh pr edit "$pr_number" --repo "$repo" --add-label "admin-merge" >/dev/null 2>&1 || true
+	return 0
+}
+
+# Best-effort post-merge records; never change the merge outcome.
+_merge_record_post_merge_audits() {
+	local pr_number="$1" repo="$2" merge_sha="$3"
+	[[ -z "${_FULL_LOOP_RBG_OVERRIDE_REASON:-}" ]] || _merge_record_rbg_override "$pr_number" "$repo" "$merge_sha"
+	_merge_record_qlty_billing_skips "$pr_number" "$repo"
+	return 0
+}
+
+# GH#36922: a planning-checkpoint verdict is valid for one head only; pin it
+# via FULL_LOOP_EXPECTED_PR_HEAD_SHA so a later push is refused at merge.
+_merge_worker_briefed_gate_pinned() {
+	local pr_number="$1" repo="$2" has_admin="$3"
+	local head_file="" pinned_head=""
+	head_file=$(mktemp "${TMPDIR:-/tmp}/worker-briefed-head.XXXXXX") || return 1
+	WORKER_BRIEFED_PLANNING_HEAD_FILE="$head_file" \
+		_merge_worker_briefed_trust_gate "$pr_number" "$repo" "$has_admin" || {
+		rm -f "$head_file"
+		return 1
+	}
+	pinned_head=$(tr -d '[:space:]' <"$head_file")
+	rm -f "$head_file"
+	[[ -n "$pinned_head" ]] || return 0
+	if [[ -n "${FULL_LOOP_EXPECTED_PR_HEAD_SHA:-}" && "$FULL_LOOP_EXPECTED_PR_HEAD_SHA" != "$pinned_head" ]]; then
+		print_error "Merge blocked by GH#36922: PR head moved since planning-checkpoint check"
+		return 1
+	fi
+	FULL_LOOP_EXPECTED_PR_HEAD_SHA="$pinned_head"
+	export FULL_LOOP_EXPECTED_PR_HEAD_SHA
+	return 0
+}
+
+# GH#36174: enforce the creation-time closure invariant for existing PRs too.
+_merge_check_closure_metadata() {
+	local pr_number="$1" repo="$2"
+	local closure_json="" closure_reason=""
+	closure_json=$(_flm_gh_read gh pr view "$pr_number" --repo "$repo" --json body,closingIssuesReferences) || {
+		print_error "Merge blocked for PR #${pr_number}: closing-reference metadata unavailable"
+		return 1
+	}
+	if ! closure_reason=$(_gh_pr_merge_closure_check "$closure_json" "$repo"); then
+		print_error "Merge blocked for PR #${pr_number}: ${closure_reason}"
+		return 1
+	fi
+	FULL_LOOP_MERGE_CLOSURE_JSON="$closure_json"
+	return 0
+}
+
+# GH#37690: re-run the parent-task closing-keyword guard at merge time. PRs
+# opened outside create-pr/commit-and-pr (raw `gh pr create`, web UI, a later
+# body edit) otherwise merge and let GitHub auto-close a parent-task issue
+# before post-merge reconciliation can react. Checks the body and GitHub's
+# repository-qualified closingIssuesReferences; unverifiable labels refuse.
+_merge_check_parent_task_keywords() {
+	local pr_number="$1" repo="$2" allow="$3" metadata="${4:-}"
+	local refs="" ref_repo="" ref_number="" tmp="" rc=0
+	[[ "$allow" -eq 1 ]] && return 0
+	local guard="${SCRIPT_DIR}/parent-task-keyword-guard.sh"
+	if [[ ! -x "$guard" ]]; then
+		print_error "Merge blocked for PR #${pr_number}: parent-task keyword guard unavailable"
+		return 1
+	fi
+	if [[ -z "$metadata" ]]; then
+		metadata=$(_flm_gh_read gh pr view "$pr_number" --repo "$repo" --json body,closingIssuesReferences) || {
+			print_error "Merge blocked for PR #${pr_number}: closing-reference metadata unavailable"
+			return 1
+		}
+	fi
+	refs=$(printf '%s' "$metadata" | jq -r '
+		if ([.body // "" | strings] | length) != 1 or ([.closingIssuesReferences | arrays] | length) != 1 then error("invalid metadata") else
+		.closingIssuesReferences[] | select(.number != null and .repository.owner.login != null and .repository.name != null)
+		| "\(.repository.owner.login)/\(.repository.name) \(.number)" end') || {
+		print_error "Merge blocked for PR #${pr_number}: invalid closing-reference metadata"
+		return 1
+	}
+	_merge_closing_refs_have_repository "$metadata" || return 1
+	tmp=$(mktemp) || return 1
+	printf '%s' "$metadata" | jq -r '.body // ""' >"$tmp"
+	"$guard" check-body --body-file "$tmp" --repo "$repo" --strict --fail-on-uncertain || rc=$?
+	while read -r ref_repo ref_number; do
+		[[ -n "$ref_repo" && "$ref_number" =~ ^[0-9]+$ ]] || continue
+		printf 'Resolves #%s\n' "$ref_number" >"$tmp"
+		"$guard" check-body --body-file "$tmp" --repo "$ref_repo" --strict --fail-on-uncertain || rc=$?
+	done <<<"$refs"
+	rm -f "$tmp"
+	if [[ "$rc" -ne 0 ]]; then
+		print_error "Merge blocked for PR #${pr_number}: closing keyword targets a parent-task issue (edit the body to 'For #N'/'Ref #N', or pass --allow-parent-close for the verified final phase)"
+		return 1
+	fi
+	return 0
+}
+
+# Closure invariant (GH#36174) then parent-task keyword guard (GH#37690),
+# sharing one closing-reference metadata read.
+_merge_check_closing_guards() {
+	local pr_number="$1" repo="$2"
+	FULL_LOOP_MERGE_CLOSURE_JSON=""
+	_merge_check_closure_metadata "$pr_number" "$repo" || return 1
+	_merge_check_parent_task_keywords "$pr_number" "$repo" \
+		"${FULL_LOOP_MERGE_PARSED_ALLOW_PARENT_CLOSE:-0}" "$FULL_LOOP_MERGE_CLOSURE_JSON" || return 1
+	return 0
+}
+
 cmd_merge() {
 	local pr_number="${1:-}"
 	if [[ -z "$pr_number" ]]; then
-		print_error "Usage: full-loop-helper.sh merge <PR_NUMBER> [REPO] [--squash|--merge|--rebase] [--admin] [--auto] [--body-file PATH]"
+		print_error "Usage: full-loop-helper.sh merge <PR_NUMBER> [REPO] [--squash|--merge|--rebase] [--admin] [--auto] [--allow-parent-close] [--body-file PATH] [--override-review-bot-gate=REASON]"
 		return 1
 	fi
 	shift
@@ -1847,31 +1794,34 @@ cmd_merge() {
 
 	repo=$(_merge_resolve_repo "$repo") || return 1
 
+	local _already_merged_rc=0
+	_merge_handle_already_merged_provenance "$pr_number" "$repo" || _already_merged_rc=$?
+	if [[ "$_already_merged_rc" -ne 2 ]]; then
+		return "$_already_merged_rc"
+	fi
+
+	_merge_check_closing_guards "$pr_number" "$repo" || return 1
+
+	# t2449: use the deterministic worker-briefed linked-issue trust verdict
+	# before pre-merge checks or any native/admin merge transport.
+	# shellcheck disable=SC1091
+	source "${SCRIPT_DIR}/pulse-merge-process-worker-briefed.sh" || return 1
+	_merge_worker_briefed_gate_pinned "$pr_number" "$repo" "$has_admin" || return 1
+
 	# Gate: enforce review-bot-gate before merge.
-	cmd_pre_merge_gate "$pr_number" "$repo" || {
+	_merge_pre_merge_gate_with_admission_retry "$pr_number" "$repo" || {
 		_merge_report_pre_merge_gate_failure
 		return 1
 	}
-	if [[ "$repo" == "${AIDEVOPS_RELEASE_LANE_COORDINATED_REPO:-marcusquinn/aidevops}" ]]; then
-		local _release_lane_pr_refs=""
-		local _release_lane_base_ref=""
-		local _release_lane_head_ref=""
-		local _release_lane_pr_endpoint="repos/${repo}/pulls"
-		_release_lane_pr_refs=$(gh api "${_release_lane_pr_endpoint}/${pr_number}" --jq '[.base.ref, .head.ref] | @tsv' 2>/dev/null) || {
-			print_error "Merge blocked: cannot verify release-lane PR identity"
-			return 1
-		}
-		IFS=$'\t' read -r _release_lane_base_ref _release_lane_head_ref <<<"$_release_lane_pr_refs"
-		release_lane_merge_guard "$repo" "$pr_number" "$_release_lane_base_ref" "$_release_lane_head_ref" || {
-			print_error "Merge deferred by active exact-tip release lane"
-			return 1
-		}
-	fi
+	local _release_lane_head_ref=""
+	_merge_release_lane_check "$pr_number" "$repo" || return 1
+	merge_method=$(_merge_release_provenance_method "$pr_number" "$repo" "$merge_method" "$_release_lane_head_ref") || return 1
 	local _cleanup_target=""
 	local _cleanup_worktree=""
 	local _cleanup_branch=""
 	local _cleanup_delete_remote_branch=""
 	local _canonical_dir=""
+	_canonical_dir=$(_merge_canonical_dir_for_sync 2>/dev/null || true)
 	if [[ "$has_auto" -eq 0 ]]; then
 		_cleanup_target=$(_merge_fresh_worktree_cleanup_target "$pr_number" "$repo" 2>/dev/null || true)
 		if [[ -n "$_cleanup_target" ]]; then
@@ -1880,15 +1830,9 @@ cmd_merge() {
 			_canonical_dir=$(_merge_current_canonical_dir_for_cleanup "$_cleanup_worktree" 2>/dev/null || true)
 		fi
 	fi
-	local _merge_body_snapshot=""
-	if [[ -n "$merge_body_file" ]]; then
-		_merge_body_snapshot=$(_merge_snapshot_body_file "$merge_body_file") || return 1
-		merge_body_file="$_merge_body_snapshot"
-		if ! _merge_validate_release_aggregation_body "$merge_body_file" "$pr_number"; then
-			_merge_remove_body_snapshot "$_merge_body_snapshot"
-			return 1
-		fi
-	fi
+	_merge_prepare_verified_head_aggregation_body "$pr_number" "$repo" "$merge_body_file" || return 1
+	local _merge_body_snapshot="$FULL_LOOP_MERGE_BODY_SNAPSHOT"
+	merge_body_file="$FULL_LOOP_MERGE_PREPARED_BODY_FILE"
 	# Retarget any open PRs stacked on this branch before the head branch is
 	# deleted post-merge. GitHub auto-closes stacked children when their base
 	# branch disappears; retargeting to the default branch prevents this.
@@ -1909,11 +1853,30 @@ cmd_merge() {
 		return 1
 	fi
 	print_success "LIFECYCLE_STATE=MERGED merge_sha=${FULL_LOOP_MERGE_SHA}"
-	_merge_report_canonical_sync_state "$_canonical_dir" || true
+	_merge_restore_partial_continuation "$pr_number" "$repo" || print_warning "Partial continuation restore could not run for PR #${pr_number}"
+	_merge_record_post_merge_audits "$pr_number" "$repo" "$FULL_LOOP_MERGE_SHA"
+	_merge_sync_canonical_then_reconcile "$pr_number" "$repo" "$_canonical_dir"
 	if declare -F is_loop_active >/dev/null 2>&1 && is_loop_active; then
-		_full_loop_record_phase "postflight" "$pr_number" || return 1
+		_full_loop_record_phase "postflight" "$pr_number" "$repo" || return 1
 	fi
 	_merge_finalize_post_merge "$pr_number" "$repo" "$has_auto" "$_cleanup_target"
 
 	return 0
 }
+
+# Isolate pulse globals; the restore itself checks worker origin, closing refs,
+# merged state and ownership before any writes. It is best-effort after merge.
+_merge_restore_partial_continuation() (
+	local pr_number="$1" repo="$2" LOGFILE="" line=""
+	LOGFILE=$(mktemp "${TMPDIR:-/tmp}/partial-restore.XXXXXX") || return 1
+	trap 'rm -f "$LOGFILE"' EXIT
+	# shellcheck disable=SC1091
+	source "${SCRIPT_DIR}/pulse-merge.sh" || return 1
+	_pm_restore_partial_continuation "$pr_number" "$repo" "" "" || return 1
+	if [[ -s "$LOGFILE" ]]; then
+		while IFS= read -r line; do print_info "$line"; done <"$LOGFILE"
+	else
+		print_info "Partial continuation restore checked for PR #${pr_number}"
+	fi
+	return 0
+)

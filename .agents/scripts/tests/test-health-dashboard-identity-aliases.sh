@@ -304,10 +304,10 @@ body=$(_build_health_issue_body \
 	"0" "4" "0.00" "0.00" "low" "100" "supervisor" \
 	"—" "—" "0" "0" "_No diagnostics_" "$canonical" "$aliases")
 
-if [[ "$body" == *"canonical:"* && "$body" == *"canonical-operator"* && "$body" == *"local-user"* ]]; then
-	pass "dashboard body exposes canonical identity context"
+if [[ "$body" == *"canonical operator:"* && "$body" == *"canonical-operator"* && "$body" != *"local-user"* ]]; then
+	pass "dashboard body shows canonical operator without publishing local aliases"
 else
-	fail "dashboard body exposes canonical identity context" "$body"
+	fail "dashboard body shows canonical operator without publishing local aliases" "$body"
 fi
 
 : >"$LOGFILE"
@@ -448,11 +448,50 @@ else
 	fail "health dashboard supports an explicit priority repository override" "entries=${priority_entries}"
 fi
 
+# GH#31356: persisted canonical refresh/attempt ordering, without forged freshness.
+schedule_entries=$'owner/new|/repo/new\nowner/old|/repo/old\nowner/missing|/repo/missing'
+new_cache=$(_health_schedule_cache_file owner/new github-user)
+old_cache=$(_health_schedule_cache_file owner/old github-user)
+printf 'active|200\n' >"${new_cache}.refresh-state"
+printf 'idle|100\n' >"${old_cache}.refresh-state"
+ordered=$(_order_health_repo_entries "$schedule_entries" github-user)
+if [[ "$ordered" == $'owner/missing|/repo/missing\nowner/old|/repo/old\nowner/new|/repo/new' ]]; then
+	pass "missing then oldest canonical refresh states run first"
+else
+	fail "missing then oldest canonical refresh states run first" "$ordered"
+fi
+missing_cache=$(_health_schedule_cache_file owner/missing github-user)
+printf '300\n' >"${missing_cache}.attempt"
+ordered=$(_order_health_repo_entries "$schedule_entries" github-user)
+if [[ "$ordered" == $'owner/old|/repo/old\nowner/new|/repo/new\nowner/missing|/repo/missing' && ! -e "${missing_cache}.refresh-state" ]]; then
+	pass "failed or skipped attempt yields to other stale dashboards without claiming freshness"
+else
+	fail "failed or skipped attempt yields to other stale dashboards" "$ordered"
+fi
+printf 'invalid|not-an-epoch\n' >"${new_cache}.refresh-state"
+ordered=$(_order_health_repo_entries "$schedule_entries" github-user)
+if [[ "$ordered" == $'owner/new|/repo/new\nowner/old|/repo/old\nowner/missing|/repo/missing' ]]; then
+	pass "invalid refresh timestamp is treated as missing"
+else
+	fail "invalid refresh timestamp is treated as missing" "$ordered"
+fi
+_HEALTH_WORK_DEADLINE=$(date +%s)
+if _health_dashboard_optional_work_has_budget "$(date +%s)"; then
+	fail "optional admission uses aggregate deadline not a restarted phase clock"
+else
+	pass "optional admission uses aggregate deadline not a restarted phase clock"
+fi
+unset _HEALTH_WORK_DEADLINE
+
 : >"$GH_CALLS"
 export HEALTH_FIXTURE=label_hygiene
 gh() {
 	local call="$*"
 	printf '%s\n' "$call" >>"$GH_CALLS"
+	if [[ "$call" == *"label list --repo owner/repo"* ]]; then
+		printf '%s' '[{"name":"persistent"},{"name":"source:health-dashboard"},{"name":"supervisor"},{"name":"github-user"},{"name":"origin:worker"}]'
+		return 0
+	fi
 	if [[ "$call" == *"issue view 20408 --repo owner/repo --json labels"* ]]; then
 		printf '%s' '{"labels":[{"name":"persistent"},{"name":"source:health-dashboard"},{"name":"supervisor"},{"name":"github-user"},{"name":"operator:canonical-operator"},{"name":"origin:worker"},{"name":"origin:interactive"},{"name":"origin:worker-takeover"},{"name":"auto-dispatch"},{"name":"status:available"}]}'
 	fi
@@ -462,10 +501,34 @@ _normalize_health_issue_labels "20408" "owner/repo" "github-user" "supervisor" "
 if grep -q -- '--remove-label auto-dispatch' "$GH_CALLS" \
 	&& grep -q -- '--remove-label status:available' "$GH_CALLS" \
 	&& grep -q -- '--remove-label origin:interactive' "$GH_CALLS" \
-	&& grep -q -- '--remove-label origin:worker-takeover' "$GH_CALLS"; then
-	pass "dashboard label normalization removes task lifecycle labels"
+	&& grep -q -- '--remove-label origin:worker-takeover' "$GH_CALLS" \
+	&& grep -q -- 'label create operator:canonical-operator' "$GH_CALLS" \
+	&& ! grep -q -- 'label create origin:worker' "$GH_CALLS"; then
+	pass "dashboard label normalization provisions missing labels and removes task lifecycle labels"
 else
-	fail "dashboard label normalization removes task lifecycle labels" "calls=$(tr '\n' ';' <"$GH_CALLS")"
+	fail "dashboard label normalization provisions missing labels and removes task lifecycle labels" "calls=$(tr '\n' ';' <"$GH_CALLS")"
+fi
+
+: >"$GH_CALLS"
+: >"$LOGFILE"
+gh() {
+	local call="$*"
+	printf '%s\n' "$call" >>"$GH_CALLS"
+	if [[ "$call" == *"issue view 20408 --repo owner/repo --json labels"* ]]; then
+		printf '%s' '{"labels":[{"name":"persistent"}]}'
+	elif [[ "$call" == *"label list --repo owner/repo"* ]]; then
+		printf '%s' '[]'
+	elif [[ "$call" == *"label create persistent"* ]]; then
+		return 1
+	fi
+	return 0
+}
+_normalize_health_issue_labels "20408" "owner/repo" "github-user" "supervisor" "canonical-operator"
+if grep -q 'failed to provision label persistent' "$LOGFILE" \
+	&& ! grep -q 'issue edit' "$GH_CALLS"; then
+	pass "dashboard label provisioning failure preserves diagnostics and skips normalization"
+else
+	fail "dashboard label provisioning failure preserves diagnostics and skips normalization" "calls=$(tr '\n' ';' <"$GH_CALLS"); log=$(tr '\n' ';' <"$LOGFILE")"
 fi
 
 : >"$GH_CALLS"
@@ -502,6 +565,82 @@ if ! grep -q 'issue edit' "$GH_CALLS"; then
 	pass "unchanged dashboard metrics preserve the existing changed timestamp"
 else
 	fail "unchanged dashboard metrics preserve the existing changed timestamp" "calls=$(tr '\n' ';' <"$GH_CALLS")"
+fi
+
+# GH#32730: only other operators' dashboards with a parseable, old freshness
+# marker are archived; the current operator's own dashboard never is.
+stale_issues_json='[
+ {"number":1,"body":"x\nlast_refresh: 2026-01-01T00:00:00Z\n","labels":[{"name":"operator:github-user"}]},
+ {"number":2,"body":"x\nlast_refresh: 2026-01-01T00:00:00Z\n","labels":[{"name":"operator:other-user"}]},
+ {"number":3,"body":"x\nlast_refresh: 2026-01-30T00:00:00Z\n","labels":[{"name":"operator:recent-user"}]},
+ {"number":4,"body":"legacy body without marker","labels":[{"name":"operator:legacy-user"}]}
+]'
+stale_now=$(_health_iso_to_epoch "2026-02-01T00:00:00Z")
+stale_selected=$(_select_stale_operator_dashboards "$stale_issues_json" "github-user" "$stale_now" 1209600 | tr '\n' ' ')
+if [[ "$stale_selected" == "2|2026-01-01T00:00:00Z " ]]; then
+	pass "stale archive selects only other operators with old freshness markers"
+else
+	fail "stale archive selects only other operators with old freshness markers" "selected=${stale_selected}"
+fi
+
+# Exercise the paginated REST shape, including a later-page oldest issue,
+# exact age filtering, PR exclusion and trusted recommendations on later pages.
+test_aged_holds() (
+	gh() {
+		local args="$*"
+		[[ "$args" == *"--paginate --slurp"* ]] || return 1
+		[[ "$fetch_mode" != failed ]] || return 1
+		if [[ "$fetch_mode" == empty ]]; then
+			printf '[[]]\n'
+			return 0
+		fi
+		if [[ "$args" == *"/comments?"* ]]; then
+			jq -n '[[range(100) | {author_association:"OWNER",body:"Recommended path: old"}],
+				[{author_association:"MEMBER",body:"Recommended path: latest"},
+				 {author_association:"NONE",body:"Recommended path: untrusted"}]]'
+		else
+			jq -n 'def issue($n; $seconds): {number:$n,title:"held",html_url:("https://github.com/owner/repo/issues/" + ($n|tostring)),created_at:((now-$seconds)|floor|todateiso8601)};
+				[[range(1;101) | issue(.; 3*86400+3600+.*10)],
+				 [issue(101;3*86400+7200), (issue(102;9*86400) + {pull_request:{}}), issue(103;2*86400)]]'
+		fi
+		return 0
+	}
+	local result="" first="" fetch_mode="" rendered=""
+	result=$(_health_aged_hold_section owner/repo)
+	[[ "$result" == *"days (101)"* && "$result" == *"91 more not shown"* ]] || return 1
+	first=$(printf '%s\n' "$result" | jq -Rs 'split("\n") | map(select(startswith("| 3d"))) | .[0]')
+	[[ "$first" == *"#101 held | latest"* && "$result" != *"untrusted"* ]] || return 1
+	# Fetch failures must survive optional-section rendering; a healthy empty
+	# response must still omit the section entirely.
+	fetch_mode=failed
+	result=$(_health_aged_hold_section owner/repo) || return 1
+	rendered=$(_dashboard_optional_section "Maintainer decisions waiting" "$result")
+	[[ "$rendered" == *"### Maintainer decisions waiting"* &&
+		"$rendered" == *"issue fetch failed this cycle"* ]] || return 1
+	fetch_mode=empty
+	result=$(_health_aged_hold_section owner/repo) || return 1
+	rendered=$(_dashboard_optional_section "Maintainer decisions waiting" "$result")
+	[[ -z "$result" && -z "$rendered" ]] || return 1
+	# No API calls or aged section for contributor dashboards.
+	_health_aged_hold_section() { printf 'AGED_HOLD_SENTINEL'; return 0; }
+	local args=() i role
+	for ((i=0; i<34; i++)); do args+=(""); done
+	args[3]="owner/repo"
+	for role in contributor supervisor; do
+		args[26]="$role"
+		result=$(_build_health_issue_body "${args[@]}")
+		if [[ "$role" == contributor ]]; then
+			[[ "$result" != *"AGED_HOLD_SENTINEL"* ]] || return 1
+		else
+			[[ "$result" == *"AGED_HOLD_SENTINEL"* ]] || return 1
+		fi
+	done
+	return 0
+)
+if test_aged_holds; then
+	pass "aged holds paginate, sort exact ages, select latest trusted recommendation and respect role"
+else
+	fail "aged holds paginate, sort exact ages, select latest trusted recommendation and respect role"
 fi
 
 printf '\n== Summary ==\n'

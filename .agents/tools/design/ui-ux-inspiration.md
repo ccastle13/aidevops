@@ -32,10 +32,16 @@ model: standard
 - **Report presentation**: `tools/design/report-presentation.md` (Markdown/HTML/PDF report tokens and component taxonomy)
 - **Palette tools**: `tools/design/colour-palette.md` (generation, spinning, narrowing)
 - **Browser**: Playwright full-render extraction (see `tools/browser/browser-automation.md`)
+- **Composition / critique**: `tools/design/distinctive-ui.md` for structure-first design, read-only audit/study, and faithful adoption of accepted reference traits
 
 **Design workflow** (apply in order):
 
-1. **Check brand identity** -- does `brand-identity.md` exist? If yes, use it. If no, run brand identity interview.
+For audit/study-only requests, extract and report first; do not run the design-file
+creation steps unless implementation or export is requested. Concept-only work
+uses `visual-concepts.md` and keeps unaccepted choices out of canonical files. Distinguish observed,
+inferred and accepted traits; screenshots do not establish exact fonts or rights.
+
+1. **Check brand identity** -- does the project's `context/brand-identity.toon` exist? If yes, use it. If no, run a scoped brand identity interview when creation is authorized.
 2. **Check DESIGN.md** -- does `DESIGN.md` exist in project root? If yes, coding agents can use it directly. If no, generate one after brand identity is established.
 3. **Consult design stack** -- check `ui-ux-catalogue.toon` for matching style presets and palettes, `colour-palette.md` for accessible palette/inverse derivation, and `report-presentation.md` when reports, PDFs, or decks are in scope. Browse `tools/design/library/` for brand examples and style archetypes.
 4. **Check inspiration** -- user has reference URLs? Run URL study. No URLs? Present curated examples from `design-inspiration.md`.
@@ -47,7 +53,7 @@ model: standard
 
 ## Brand Identity Interview
 
-Run when no `brand-identity.md` exists or user requests a rebrand. People describe preferences poorly but recognise them instantly -- use concrete examples.
+Run when no project `context/brand-identity.toon` exists and creation is authorized, or the user requests a rebrand. Reuse answered context; use `brand-concepts.md` when concrete directions would help selection.
 
 ### Step 1: Present Curated Examples
 
@@ -89,7 +95,8 @@ For each selected URL, run URL study (below) then synthesise:
 
 ### Step 4: Generate Brand Identity + DESIGN.md
 
-Write to `tools/design/brand-identity.md`:
+Record accepted choices in the project's `context/brand-identity.toon` using the
+template in `tools/design/brand-identity.md`; never overwrite the framework guide:
 
 - Primary and secondary colour palette (hex values)
 - Typography stack (families, sizes, weights, line heights)
@@ -123,8 +130,8 @@ Extract computed styles from representative elements in each category:
 
 ```text
 1. Navigate with Playwright (headed mode, full render)
-2. Wait for fonts/images (networkidle)
-3. Take full-page screenshot for reference
+2. Wait for relevant fonts/images with bounded page readiness; do not rely on networkidle on a streaming page
+3. Capture viewport-sized screenshots (max 1568px longest side) using browser-qa-helper.sh; never fullPage: true for AI review
 4. Extract computed styles from representative elements:
    - Sample across headings, body text, containers/cards, form controls,
      navigation, interactive elements (buttons, links, chips, badges)
@@ -187,7 +194,7 @@ Process a bookmarks export or URL list into a pattern summary.
 2. Run URL study per URL -- batches of 4 (Playwright concurrency limit), 2s delay, 30s timeout per page, skip failures
 3. Aggregate: most common colour palettes (cluster by hue/saturation), font families (rank by frequency), layout patterns, button/form style clusters
 4. Generate "You gravitate toward..." synthesis (top 3 patterns), notable outliers, recommended palette and typography
-5. Write to `brand-identity.md` or append to existing
+5. Report the synthesis for study-only work; when adoption is authorized, merge accepted choices into the project's `context/brand-identity.toon`
 
 **Limits**: max 4 concurrent Playwright pages, 30s per-page timeout, 10 min total for up to 20 URLs.
 
@@ -204,7 +211,7 @@ Validate before finalising any brand identity or design recommendation:
 
 ### Performance
 
-- Prefer Google Fonts or system font stacks (avoid obscure web fonts adding load time)
+- Prefer system font stacks or openly licensed families (for example OFL fonts from Google Fonts), self-hosted so visitors make no third-party font request; load only used weights (`tools/design/font-pairing.md`)
 - Colour palette works without gradients (graceful degradation)
 - Layout doesn't depend on JavaScript for initial render
 
@@ -229,7 +236,7 @@ Use `tools/design/design-md-from-links.md` for the production workflow. It cover
 - `tools/design/colour-palette.md` -- palette generation, spinning, narrowing
 - `tools/design/library/` -- 54 brand examples + 12 style archetypes
 - `tools/design/ui-ux-catalogue.toon` -- style presets and palette data
-- `tools/design/brand-identity.md` -- output destination for brand profiles
+- `tools/design/brand-identity.md` -- template/owner for per-project `context/brand-identity.toon` profiles
 - `tools/browser/browser-automation.md` -- Playwright tool selection and usage
 - `tools/ui/tailwind-css.md` -- implementing extracted styles in Tailwind
 - `tools/ui/shadcn.md` -- component library for applying design tokens

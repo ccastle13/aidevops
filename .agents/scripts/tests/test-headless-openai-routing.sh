@@ -65,33 +65,33 @@ select_model() {
 test_openai_allowlist_selects_standard_tier_model() {
 	local selected=""
 	selected=$(select_model standard)
-	if [[ "$selected" == "openai/gpt-5.6-terra" ]]; then
+	if [[ "$selected" == "openai/gpt-6.1-sol" ]]; then
 		print_result "OpenAI allowlist selects standard tier from routing table" 0
 		return 0
 	fi
-	print_result "OpenAI allowlist selects standard tier from routing table" 1 "Expected openai/gpt-5.6-terra, got ${selected:-<empty>}"
+	print_result "OpenAI allowlist selects standard tier from routing table" 1 "Expected openai/gpt-6.1-sol, got ${selected:-<empty>}"
 	return 0
 }
 
 test_openai_allowlist_selects_simple_tier_model() {
 	local selected=""
 	selected=$(select_model simple)
-	if [[ "$selected" == "openai/gpt-5.6-luna" ]]; then
+	if [[ "$selected" == "openai/gpt-6-luna" ]]; then
 		print_result "OpenAI allowlist selects simple tier from routing table" 0
 		return 0
 	fi
-	print_result "OpenAI allowlist selects simple tier from routing table" 1 "Expected openai/gpt-5.6-luna, got ${selected:-<empty>}"
+	print_result "OpenAI allowlist selects simple tier from routing table" 1 "Expected openai/gpt-6-luna, got ${selected:-<empty>}"
 	return 0
 }
 
 test_openai_allowlist_selects_thinking_tier_model() {
 	local selected=""
 	selected=$(select_model thinking)
-	if [[ "$selected" == "openai/gpt-5.6-sol" ]]; then
+	if [[ "$selected" == "openai/gpt-6.1-sol" ]]; then
 		print_result "OpenAI allowlist selects thinking tier from routing table" 0
 		return 0
 	fi
-	print_result "OpenAI allowlist selects thinking tier from routing table" 1 "Expected openai/gpt-5.6-sol, got ${selected:-<empty>}"
+	print_result "OpenAI allowlist selects thinking tier from routing table" 1 "Expected openai/gpt-6.1-sol, got ${selected:-<empty>}"
 	return 0
 }
 
@@ -111,31 +111,74 @@ test_standard_alternatives_are_scoped() {
 	local routing_table="${SCRIPT_DIR}/../../configs/model-routing-table.json"
 	local models=""
 	models=$(jq -r '.tiers.standard.models[]' "$routing_table")
-	if printf '%s\n' "$models" | grep -qx 'zai-coding-plan/glm-5.2' &&
-		! printf '%s\n' "$models" | grep -qx 'zai/glm-5.2'; then
-		print_result "Standard tier includes coding-plan GLM-5.2 but excludes direct Z.AI" 0
+	if ! grep -q '^zai' <<<"$models"; then
+		print_result "Standard tier ships no Z.AI GLM candidate" 0
 		return 0
 	fi
-	print_result "Standard tier includes coding-plan GLM-5.2 but excludes direct Z.AI" 1
+	print_result "Standard tier ships no Z.AI GLM candidate" 1
 	return 0
 }
 
-test_coding_plan_requires_provider_auth() {
-	printf '{"openai":{"type":"oauth","access":"test-openai-access"}}\n' >"${HOME}/.local/share/opencode/auth.json"
-	local selected=""
-	selected=$(AIDEVOPS_HEADLESS_PROVIDER_ALLOWLIST=zai-coding-plan bash "$HELPER_SCRIPT" select --role worker --tier standard 2>/dev/null || true)
-	if [[ -n "$selected" ]]; then
-		print_result "Coding-plan GLM requires provider-specific auth" 1 "Unexpected model without coding-plan auth: ${selected}"
+test_entitlement_rejections_classify_as_model_unavailable() {
+	local classifier="${SCRIPT_DIR}/../headless-runtime-provider-classifier.py"
+	local structured="${TEST_ROOT}/entitlement-structured.jsonl"
+	local codex="${TEST_ROOT}/entitlement-codex.jsonl"
+	local plaintext="${TEST_ROOT}/entitlement-plaintext.log"
+	local permission="${TEST_ROOT}/permission.jsonl"
+	printf '%s\n' '{"type":"error","error":{"name":"APIError","data":{"statusCode":404,"responseBody":"{\"error\":{\"code\":\"model_not_found\"}}"}}}' >"$structured"
+	printf '%s\n' '{"type":"error","error":{"name":"APIError","data":{"statusCode":400,"responseBody":"{\"detail\":\"The '"'"'gpt-6-sol'"'"' model is not supported when using Codex with a ChatGPT account.\"}"}}}' >"$codex"
+	printf '%s\n' "[provider_error] The 'gpt-6-sol' model is not supported when using Codex with a ChatGPT account." >"$plaintext"
+	printf '%s\n' '{"type":"error","error":{"name":"APIError","data":{"statusCode":403,"responseBody":"{\"error\":{\"code\":\"model_not_found\"}}"}}}' >"$permission"
+	local structured_reason codex_reason plaintext_reason permission_reason
+	structured_reason=$(python3 "$classifier" "$structured" | cut -f1)
+	codex_reason=$(python3 "$classifier" "$codex" | cut -f1)
+	plaintext_reason=$(python3 "$classifier" "$plaintext" | cut -f1)
+	permission_reason=$(python3 "$classifier" "$permission" | cut -f1)
+	if [[ "$structured_reason" == "model_unavailable" && "$codex_reason" == "model_unavailable" &&
+		"$plaintext_reason" == "model_unavailable" && "$permission_reason" == "access_denied" ]]; then
+		print_result "Entitlement rejections classify as model_unavailable only" 0
 		return 0
 	fi
+	print_result "Entitlement rejections classify as model_unavailable only" 1 \
+		"structured=${structured_reason} codex=${codex_reason} plaintext=${plaintext_reason} permission=${permission_reason}"
+	return 0
+}
 
-	printf '{"zai-coding-plan":{"type":"oauth","access":"test-zai-access"}}\n' >"${HOME}/.local/share/opencode/auth.json"
-	selected=$(AIDEVOPS_HEADLESS_PROVIDER_ALLOWLIST=zai-coding-plan bash "$HELPER_SCRIPT" select --role worker --tier standard 2>/dev/null || true)
-	if [[ "$selected" == "zai-coding-plan/glm-5.2" ]]; then
-		print_result "Coding-plan GLM requires provider-specific auth" 0
+test_entitlement_backoff_is_model_scoped() {
+	printf '{"openai":{"type":"oauth","access":"test-openai-access"}}\n' >"${HOME}/.local/share/opencode/auth.json"
+	local status="" standard="" simple=""
+	bash "$HELPER_SCRIPT" backoff set openai/gpt-6.1-sol model_unavailable 3600
+	status=$(bash "$HELPER_SCRIPT" backoff status)
+	# Sol is skipped for the next same-tier OpenAI candidate; Luna stays usable.
+	standard=$(select_model standard)
+	simple=$(select_model simple)
+	bash "$HELPER_SCRIPT" backoff clear openai/gpt-6.1-sol >/dev/null 2>&1 || true
+	if [[ "$status" == *"openai/gpt-6.1-sol|model_unavailable|"* && "$standard" == "openai/gpt-6.1-terra" && "$simple" == "openai/gpt-6-luna" ]]; then
+		print_result "Entitlement rejection backs off only the rejected model" 0
 		return 0
 	fi
-	print_result "Coding-plan GLM requires provider-specific auth" 1 "Expected zai-coding-plan/glm-5.2, got ${selected:-<empty>}"
+	print_result "Entitlement rejection backs off only the rejected model" 1 \
+		"status=${status:-<empty>} standard=${standard:-<empty>} simple=${simple:-<empty>}"
+	return 0
+}
+
+test_entitlement_backoff_clears_on_auth_change() {
+	printf '{"openai":{"type":"oauth","access":"test-openai-access"}}\n' >"${HOME}/.local/share/opencode/auth.json"
+	local before="" after=""
+	bash "$HELPER_SCRIPT" backoff set openai/gpt-6.1-sol model_unavailable 3600
+	before=$(select_model standard)
+	# A re-login (new token) changes the auth signature and clears the record.
+	printf '{"openai":{"type":"oauth","access":"test-openai-access-relogin"}}\n' >"${HOME}/.local/share/opencode/auth.json"
+	# The signature uses whole-second mtime; force a distinct one so a rewrite in
+	# the same second cannot leave the signature unchanged (flaky on fast runs).
+	touch -d '2 minutes' "${HOME}/.local/share/opencode/auth.json" 2>/dev/null ||
+		touch -t "$(date -v+2M +%Y%m%d%H%M.%S 2>/dev/null)" "${HOME}/.local/share/opencode/auth.json" 2>/dev/null || true
+	after=$(select_model standard)
+	if [[ "$before" == "openai/gpt-6.1-terra" && "$after" == "openai/gpt-6.1-sol" ]]; then
+		print_result "Model backoff clears when the OpenAI auth changes" 0
+		return 0
+	fi
+	print_result "Model backoff clears when the OpenAI auth changes" 1 "before=${before:-<empty>} after=${after:-<empty>}"
 	return 0
 }
 
@@ -146,7 +189,9 @@ main_test() {
 	test_openai_allowlist_selects_thinking_tier_model
 	test_openai_allowlist_requires_openai_auth_entry
 	test_standard_alternatives_are_scoped
-	test_coding_plan_requires_provider_auth
+	test_entitlement_rejections_classify_as_model_unavailable
+	test_entitlement_backoff_is_model_scoped
+	test_entitlement_backoff_clears_on_auth_change
 	teardown_test_env
 
 	printf '\nRan %s tests, %s failed.\n' "$TESTS_RUN" "$TESTS_FAILED"

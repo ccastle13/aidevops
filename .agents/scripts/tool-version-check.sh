@@ -86,11 +86,53 @@ _opencode_upgrade_cmd() {
 
 _oc_upgrade_cmd=$(_opencode_upgrade_cmd "latest")
 
+# GH#34252: the release channel must match the package manager that owns the
+# resolved binary, decided by the same probe that selects the upgrade route.
+# Homebrew-owned OpenCode is compared against its installed formula (which may
+# be tap-qualified, e.g. anomalyco/tap/opencode, and lag the npm registry).
+_opencode_brew_formula_name() {
+	local formulae="" formula=""
+	formulae=$(brew list --formula --full-name 2>/dev/null || true)
+	while IFS= read -r formula; do
+		if [[ "$formula" == opencode || "$formula" == */opencode ]]; then
+			printf '%s\n' "$formula"
+			return 0
+		fi
+	done <<<"$formulae"
+	printf '%s\n' opencode
+	return 0
+}
+
+_oc_npm_tool_spec="npm|OpenCode|opencode|--version|opencode-ai|${_oc_upgrade_cmd}"
+_oc_brew_tool_spec=""
+if [[ "$(aidevops_opencode_install_owner 2>/dev/null || true)" == brew ]]; then
+	_oc_brew_tool_spec="brew|OpenCode|opencode|--version|$(_opencode_brew_formula_name)|${_oc_upgrade_cmd}"
+	_oc_npm_tool_spec=""
+fi
+
+# GH#35942: Claude Code follows the same owner-decides-channel rule. Casks are
+# checked against the cask catalogue; the native installer self-updates.
+_cc_npm_tool_spec="npm|Claude Code CLI|claude|--version|@anthropic-ai/claude-code|npm install -g @anthropic-ai/claude-code@latest"
+_cc_brew_tool_spec=""
+_cc_self_tool_spec=""
+_cc_owner=$(aidevops_claude_code_install_owner 2>/dev/null || true)
+case "$_cc_owner" in
+brew-cask:?*)
+	_cc_brew_tool_spec="brew|Claude Code CLI|claude|--version|cask:${_cc_owner#brew-cask:}|brew upgrade --cask ${_cc_owner#brew-cask:}"
+	_cc_npm_tool_spec=""
+	;;
+native)
+	_cc_self_tool_spec="self|Claude Code CLI|claude|--version|claude-code|claude update"
+	_cc_npm_tool_spec=""
+	;;
+esac
+
 # Platform-aware brew package upgrade command.
-# On macOS (or any system with brew), use brew upgrade.
+# On macOS (or any system with brew), upgrade installed formulas and install
+# selected formulas supplied by another package manager.
 # On Debian/Ubuntu (apt), use apt-get install --only-upgrade.
 # On Fedora/RHEL/CentOS (dnf/yum), use dnf upgrade.
-# Falls back to brew upgrade if no system package manager is detected.
+# Fails explicitly if no supported system package manager is detected.
 # $1 = brew formula name (e.g. "gh", "jq", "shellcheck")
 # $2 = apt/dnf package name if different from brew name (optional; defaults to $1)
 # The returned string is a self-contained bash -c payload (no expansion at definition time).
@@ -100,56 +142,118 @@ _brew_upgrade_cmd() {
 	local sys_pkg="${2:-$1}"
 	# Return a self-contained bash -c string that detects the package manager at runtime.
 	# Uses single quotes so variables are NOT expanded now — they expand inside bash -c.
-	printf '%s' 'if command -v brew >/dev/null 2>&1; then brew upgrade '"${brew_pkg}"'; elif command -v apt-get >/dev/null 2>&1; then sudo apt-get install --only-upgrade -y '"${sys_pkg}"'; elif command -v dnf >/dev/null 2>&1; then sudo dnf upgrade -y '"${sys_pkg}"'; elif command -v yum >/dev/null 2>&1; then sudo yum upgrade -y '"${sys_pkg}"'; else echo "No supported package manager found (brew/apt-get/dnf/yum)" >&2; exit 1; fi'
+	printf '%s' 'if command -v brew >/dev/null 2>&1; then if brew list --formula '"${brew_pkg}"' >/dev/null 2>&1; then brew upgrade '"${brew_pkg}"'; else brew install '"${brew_pkg}"'; fi; elif command -v apt-get >/dev/null 2>&1; then sudo apt-get install --only-upgrade -y '"${sys_pkg}"'; elif command -v dnf >/dev/null 2>&1; then sudo dnf upgrade -y '"${sys_pkg}"'; elif command -v yum >/dev/null 2>&1; then sudo yum upgrade -y '"${sys_pkg}"'; else echo "No supported package manager found (brew/apt-get/dnf/yum)" >&2; exit 1; fi'
 }
 
 # PEP 668-safe pip upgrade command.
 # Ubuntu 24.04+, Fedora 38+, and modern Debian mark the system Python as
 # "externally managed" — bare `pip install` is blocked with an error.
 # Safe upgrade order: pipx (isolated venv) → pip --user (user site-packages).
-# $1 = pip package name (e.g. "beads-viewer", "dspy-ai", "crawl4ai")
+# $1 = pip package name (e.g. "analytics-mcp")
 # shellcheck disable=SC2016  # Single quotes intentional: bash -c payload
 _pip_upgrade_cmd() {
 	local pkg="$1"
 	printf '%s' 'if command -v pipx >/dev/null 2>&1 && pipx list --short 2>/dev/null | grep -qi '"^${pkg}"'; then pipx upgrade '"${pkg}"'; else pip install --user --upgrade '"${pkg}"' 2>/dev/null || pip install --upgrade '"${pkg}"'; fi'
 }
 
+# GH#35515: the reviewed Playwriter pin has one source of truth, the MCP
+# generator policy. Prints the approved version, or "unknown" (fail closed:
+# classification then reports unknown instead of queueing an unreviewed pin).
+_playwriter_approved_version() {
+	local policy_file="${SCRIPT_DIR}/lib/mcp_config.py"
+	local version=""
+	if [[ -f "$policy_file" ]]; then
+		# sed quits at the first match itself; no early-exit pipe reader under pipefail.
+		version=$(sed -nE "/^PLAYWRITER_MCP_PACKAGE = 'playwriter@[0-9]+\.[0-9]+\.[0-9]+'$/{s/^PLAYWRITER_MCP_PACKAGE = 'playwriter@([0-9]+\.[0-9]+\.[0-9]+)'$/\1/p;q;}" "$policy_file")
+	fi
+	printf '%s\n' "${version:-unknown}"
+	return 0
+}
+
+# GH#35515: report the aidevops-generated package-runner Playwriter entry
+# (npx/bun x playwriter@X.Y.Z, usually disabled for on-demand activation).
+# Reads configuration only — never launches the runner or a relay — and
+# prints the configured package version. Returns 1 when no generated entry
+# exists. Custom commands are not recognised here and keep PATH semantics.
+_playwriter_managed_mcp_version() {
+	local config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+	python3 - "${SCRIPT_DIR}/lib" \
+		"${config_home}/opencode/opencode.json" \
+		"$HOME/.claude.json" \
+		"${config_home}/Claude/Claude.json" \
+		"$HOME/Library/Application Support/Claude/claude_desktop_config.json" <<'PYEOF' 2>/dev/null
+import json
+import re
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from mcp_config import _is_generated_playwriter_command
+
+for path in sys.argv[2:]:
+    try:
+        with open(path) as stream:
+            config = json.load(stream)
+        servers = config.get('mcp') or config.get('mcpServers') or {}
+        command = servers.get('playwriter', {}).get('command')
+        if not isinstance(command, list) or not command or not isinstance(command[-1], str):
+            continue
+        match = re.fullmatch(r'playwriter@([0-9]+\.[0-9]+\.[0-9]+)', command[-1])
+        if match and _is_generated_playwriter_command(command, (command[-1],)):
+            print(match.group(1))
+            sys.exit(0)
+    except (OSError, ValueError, AttributeError):
+        continue
+sys.exit(1)
+PYEOF
+	return $?
+}
+
+PLAYWRITER_APPROVED_VERSION=$(_playwriter_approved_version)
+
 # Tool definitions
 # Format: category|display_name|cli_command|version_flag|package_name|update_command
 
 NPM_TOOLS=(
-	"npm|OpenCode|opencode|--version|opencode-ai|${_oc_upgrade_cmd}"
-	"npm|Claude Code CLI|claude|--version|@anthropic-ai/claude-code|npm install -g @anthropic-ai/claude-code@latest"
 	"npm|Codex CLI|codex|--version|@openai/codex|npm install -g @openai/codex@latest"
-	"npm|Repomix|repomix|--version|repomix|npm install -g repomix@latest"
-	"npm|DSPyGround|dspyground|--version|dspyground|npm install -g dspyground@latest"
 	"npm|LocalWP MCP|mcp-local-wp|--version|@verygoodplugins/mcp-local-wp|npm install -g @verygoodplugins/mcp-local-wp@latest"
-	"npm|Beads UI|beads-ui|--version|beads-ui|npm install -g beads-ui@latest"
-	"npm|BDUI|bdui|--version|bdui|npm install -g bdui@latest"
 	"npm|Chrome DevTools MCP|chrome-devtools-mcp|--version|chrome-devtools-mcp|npm install -g chrome-devtools-mcp@latest"
 	"npm|GSC MCP|mcp-server-gsc|--version|mcp-server-gsc|npm install -g mcp-server-gsc@latest"
-	"npm|Playwriter MCP|playwriter|--version|playwriter|npm install -g playwriter@0.5.0"
+	"npm|Playwriter MCP|playwriter|--version|playwriter|npm install -g playwriter@${PLAYWRITER_APPROVED_VERSION}"
 	"npm|macOS Automator MCP|macos-automator-mcp|--version|@steipete/macos-automator-mcp|npm install -g @steipete/macos-automator-mcp@latest"
 	"npm|Claude Code MCP|claude-code-mcp|--version|@steipete/claude-code-mcp|npm install -g @steipete/claude-code-mcp@latest"
 	"npm|Google Workspace CLI|gws|--version|@googleworkspace/cli|npm install -g @googleworkspace/cli@latest"
+	"npm|Cloudflare cf CLI|cf|--version|cf|npm install -g cf@latest"
+	"npm|Cloudron CLI|cloudron|--version|cloudron|npm install -g cloudron@latest"
 )
 
 BREW_TOOLS=(
 	"brew|GitHub CLI|gh|--version|gh|$(_brew_upgrade_cmd gh)"
 	"brew|GitLab CLI|glab|--version|glab|$(_brew_upgrade_cmd glab)"
 	"brew|Worktrunk|wt|--version|max-sixty/worktrunk/wt|$(_brew_upgrade_cmd max-sixty/worktrunk/wt)"
-	"brew|Beads CLI|bd|version|steveyegge/beads/bd|$(_brew_upgrade_cmd steveyegge/beads/bd)"
 	"brew|jq|jq|--version|jq|$(_brew_upgrade_cmd jq)"
 	"brew|ripgrep|rg|--version|ripgrep|$(_brew_upgrade_cmd ripgrep)"
 	"brew|ShellCheck|shellcheck|--version|shellcheck|$(_brew_upgrade_cmd shellcheck)"
 )
 
+# OpenCode, then Claude Code, lead whichever category owns them.
+if [[ -n "$_cc_npm_tool_spec" ]]; then
+	NPM_TOOLS=("$_cc_npm_tool_spec" "${NPM_TOOLS[@]}")
+fi
+if [[ -n "$_cc_brew_tool_spec" ]]; then
+	BREW_TOOLS=("$_cc_brew_tool_spec" "${BREW_TOOLS[@]}")
+fi
+if [[ -n "$_oc_npm_tool_spec" ]]; then
+	NPM_TOOLS=("$_oc_npm_tool_spec" "${NPM_TOOLS[@]}")
+fi
+if [[ -n "$_oc_brew_tool_spec" ]]; then
+	BREW_TOOLS=("$_oc_brew_tool_spec" "${BREW_TOOLS[@]}")
+fi
+
 PIP_TOOLS=(
-	"pip|Beads Viewer|beads_viewer|--version|beads-viewer|$(_pip_upgrade_cmd beads-viewer)"
 	"pip|Analytics MCP|analytics-mcp|--version|analytics-mcp|pipx upgrade analytics-mcp"
 	"pip|Outscraper MCP|outscraper-mcp-server|--version|outscraper-mcp-server|uv tool upgrade outscraper-mcp-server"
 )
-# Library dependencies (e.g. dspy-ai, crawl4ai) are intentionally excluded from
+# Library dependencies (e.g. crawl4ai) are intentionally excluded from
 # PIP_TOOLS. They are project-level dependencies managed inside project venvs via
 # pyproject.toml / requirements.txt — not global CLI tools. Auto-updating them
 # here installs redundant global copies that diverge from pinned project versions.
@@ -172,17 +276,24 @@ _tool_package_supported_on_platform() {
 # which skips latest-version lookup and just reports installed version
 CUSTOM_TOOLS=(
 	"self|Cursor CLI|agent|--version|cursor-agent|agent update"
-	"self|Droid CLI|droid|--version|droid|curl -fsSL https://app.factory.ai/install.sh | bash"
+	"self|Droid CLI|droid|--version|droid|curl -fsSL https://app.factory.ai/cli | sh"
 )
+if [[ -n "$_cc_self_tool_spec" ]]; then
+	CUSTOM_TOOLS=("$_cc_self_tool_spec" "${CUSTOM_TOOLS[@]}")
+fi
 
 # Counters
 OUTDATED_COUNT=0
 INSTALLED_COUNT=0
+EXTERNALLY_MANAGED_COUNT=0
 NOT_INSTALLED_COUNT=0
 TIMEOUT_COUNT=0
 UNKNOWN_COUNT=0
 SUDO_SKIP_COUNT=0
+UPDATE_FAILURE_COUNT=0
+UPDATE_NOOP_COUNT=0
 declare -a OUTDATED_PACKAGES=()
+declare -a OUTDATED_TOOL_SPECS=()
 declare -a JSON_RESULTS=()
 
 # Timeout for local --version calls (seconds).
@@ -225,7 +336,7 @@ get_uv_installed_version() {
 # Get installed version for Python packages across all install methods.
 # Tries pip show first (standard pip installs), then pipx (isolated tools like
 # analytics-mcp), then uv tool (isolated tools like outscraper-mcp-server).
-# pip-only libraries (e.g. crawl4ai, dspy) have no CLI binary so command -v
+# pip-only libraries (e.g. crawl4ai) have no CLI binary so command -v
 # always fails — this function handles all three installation methods.
 get_python_installed_version() {
 	local pkg="$1"
@@ -256,6 +367,10 @@ get_python_installed_version() {
 	return 0
 }
 
+# npm versions are semver, so a hyphen suffix is a prerelease. Other package
+# channels (apt revisions such as 1.7.1-1) must keep using the plain pattern.
+readonly _NPM_SEMVER_PATTERN='[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?'
+
 # Get installed version from npm global package.json
 # Fallback for tools where --version starts a server instead of printing a version
 get_npm_pkg_version() {
@@ -265,8 +380,10 @@ get_npm_pkg_version() {
 	[[ -n "$npm_root" ]] || return 1
 	local pkg_json="${npm_root}/${pkg}/package.json"
 	if [[ -f "$pkg_json" ]]; then
-		grep -oE '"version"\s*:\s*"[0-9]+\.[0-9]+\.[0-9]+"' "$pkg_json" |
-			grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+		# Keep semver prereleases (1.0.0-beta.5) so they compare against the
+		# npm registry version instead of a truncated 1.0.0.
+		grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?"' "$pkg_json" |
+			grep -oE "$_NPM_SEMVER_PATTERN" | head -1
 		return 0
 	fi
 	return 1
@@ -313,7 +430,11 @@ get_installed_version() {
 		local ver_output
 		ver_output=$(head -1 "$_ver_log")
 		rm -f "$_ver_log"
-		version=$(echo "$ver_output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+		if [[ -n "$pkg" ]]; then
+			version=$(echo "$ver_output" | grep -oE "$_NPM_SEMVER_PATTERN" | head -1)
+		else
+			version=$(echo "$ver_output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+		fi
 		if [[ -z "$version" ]]; then
 			version=$(echo "$ver_output" | grep -oE '[0-9]+\.[0-9]+' | head -1)
 		fi
@@ -369,16 +490,24 @@ get_brew_latest() {
 	local pkg="$1"
 	local brew_bin=""
 	brew_bin=$(command -v brew 2>/dev/null || true)
-	if [[ -n "$brew_bin" && -x "$brew_bin" ]]; then
-		timeout_sec "$PKG_QUERY_TIMEOUT" "$brew_bin" info "$pkg" 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown"
+	if [[ -n "$brew_bin" && -x "$brew_bin" && "$pkg" == cask:?* ]]; then
+		# GH#35942: casks (cask:<name>) publish .casks[0].version, not formulae.
+		local cask_version=""
+		cask_version=$(timeout_sec "$PKG_QUERY_TIMEOUT" "$brew_bin" info --cask --json=v2 "${pkg#cask:}" 2>/dev/null |
+			jq -r '.casks[0].version // empty' 2>/dev/null) || cask_version=""
+		printf '%s\n' "${cask_version:-unknown}"
+	elif [[ -n "$brew_bin" && -x "$brew_bin" ]]; then
+		local stable=""
+		stable=$(timeout_sec "$PKG_QUERY_TIMEOUT" "$brew_bin" info --json=v2 "$pkg" 2>/dev/null |
+			jq -r '.formulae[0].versions.stable // empty' 2>/dev/null) || stable=""
+		printf '%s\n' "${stable:-unknown}"
 	else
 		# No brew — fall back to GitHub Releases API for known tools.
-		# Strip tap prefix (e.g. "max-sixty/worktrunk/wt" → "wt") for matching.
-		local base_pkg="${pkg##*/}"
-		case "$base_pkg" in
+		# Tap-qualified formulas never reach here without brew (see
+		# _tool_latest_version): no system package manager can update them.
+		case "$pkg" in
 		gh) get_public_release_tag "cli/cli" ;;
 		glab) get_public_release_tag "gitlab-org/cli" ;;
-		wt) get_public_release_tag "max-sixty/worktrunk" ;;
 		jq) get_public_release_tag "jqlang/jq" ;;
 		ripgrep) get_public_release_tag "BurntSushi/ripgrep" ;;
 		shellcheck) get_public_release_tag "koalaman/shellcheck" ;;
@@ -386,6 +515,60 @@ get_brew_latest() {
 		esac
 	fi
 	return 0
+}
+
+# Apt is the selected upgrade channel when Homebrew is absent. An upstream
+# release does not imply that the configured apt repository can install it.
+get_apt_candidate() {
+	local pkg="$1"
+	local policy installed candidate
+	policy=$(timeout_sec "$PKG_QUERY_TIMEOUT" apt-cache policy "$pkg" 2>/dev/null) || { printf '%s\n' unknown; return 0; }
+	installed=$(printf '%s\n' "$policy" | awk '$1 == "Installed:" {print $2; exit}')
+	candidate=$(printf '%s\n' "$policy" | awk '$1 == "Candidate:" {print $2; exit}')
+	if [[ -z "$candidate" || "$candidate" == "(none)" ]]; then
+		printf '%s\n' unknown
+	elif [[ "$installed" == "$candidate" ]]; then
+		printf '%s\n' channel_current
+	else
+		printf '%s\n' "$candidate"
+	fi
+	return 0
+}
+
+_tool_normalize_version() {
+	local version="$1"
+	# Accept v1.2.3, jq-1.8.2, and Debian epoch/revision suffixes, but
+	# never turn an empty or failed probe into an actionable update.
+	if [[ "$version" =~ (^|[^0-9])([0-9]+\.[0-9]+(\.[0-9]+)?)($|[^0-9]) ]]; then
+		printf '%s\n' "${BASH_REMATCH[2]}"
+	else
+		printf '%s\n' unknown
+	fi
+	return 0
+}
+
+# Return the sudo command selected on this host, if the update needs one.
+# Platform-dispatch commands contain dormant sudo fallbacks even on Homebrew
+# hosts, so scanning the whole command would incorrectly skip safe brew updates.
+_tool_selected_sudo_command() {
+	local update_cmd="$1"
+	local manager=""
+	if [[ "$update_cmd" == if\ command\ -v\ brew* ]]; then
+		command -v brew >/dev/null 2>&1 && return 1
+		if command -v apt-get >/dev/null 2>&1; then
+			manager="apt-get"
+		elif command -v dnf >/dev/null 2>&1; then
+			manager="dnf"
+		elif command -v yum >/dev/null 2>&1; then
+			manager="yum"
+		else
+			return 1
+		fi
+		grep -oE "sudo ${manager}[^;]+" <<<"$update_cmd" | head -1
+		return $?
+	fi
+	grep -oE 'sudo [^;]+' <<<"$update_cmd" | head -1
+	return $?
 }
 
 # Get latest pip version
@@ -404,10 +587,36 @@ version_lt() {
 		return 1
 	fi
 
+	# Semver: a release ranks above its own prereleases (1.0.0-beta.5 < 1.0.0),
+	# which sort -V orders the other way round.
+	local base1="${v1%%-*}" base2="${v2%%-*}"
+	if [[ "$base1" == "$base2" ]]; then
+		if [[ "$v1" == *-* && "$v2" != *-* ]]; then
+			return 0
+		fi
+		if [[ "$v1" != *-* && "$v2" == *-* ]]; then
+			return 1
+		fi
+	fi
+
 	# Use sort -V for version comparison
 	local lowest
 	lowest=$(printf '%s\n%s' "$v1" "$v2" | sort -V | head -1)
 	[[ "$lowest" == "$v1" ]]
+}
+
+# Return 0 when the `cf` on PATH is the Cloud Foundry CLI ("cf version 8.x"),
+# not Cloudflare's npm `cf` package. Uses a temp file rather than a pipe for
+# the same macOS timeout reason documented in get_installed_version.
+_cf_binary_is_cloud_foundry() {
+	command -v cf &>/dev/null || return 1
+	local ver_log="" first_line=""
+	ver_log=$(mktemp "${TMPDIR:-/tmp}/tool-ver.XXXXXX") || return 1
+	timeout_sec "$VERSION_TIMEOUT" cf --version >"$ver_log" 2>/dev/null || true
+	first_line=$(head -1 "$ver_log")
+	rm -f "$ver_log"
+	[[ "$first_line" == "cf version "* ]] && return 0
+	return 1
 }
 
 # Detect the installed version for a tool specification.
@@ -422,6 +631,12 @@ _tool_installed_version() {
 		get_python_installed_version "$pkg"
 		;;
 	npm)
+		# The Cloud Foundry CLI also installs a `cf` binary ("cf version 8.x");
+		# never report it as the Cloudflare npm package or offer to replace it.
+		if [[ "$pkg" == cf ]] && _cf_binary_is_cloud_foundry; then
+			echo "not installed"
+			return 0
+		fi
 		get_installed_version "$cmd" "$ver_flag" "$pkg"
 		;;
 	*)
@@ -438,8 +653,21 @@ _tool_latest_version() {
 	local installed="$3"
 
 	case "$category" in
-	npm) get_npm_latest "$pkg" ;;
-	brew) get_brew_latest "$pkg" ;;
+	npm)
+		# Playwriter updates target the reviewed pin, not the registry head.
+		if [[ "$pkg" == playwriter ]]; then _playwriter_approved_version; else get_npm_latest "$pkg"; fi ;;
+	brew)
+		if ! command -v brew >/dev/null 2>&1 && [[ "$pkg" == */* || "$pkg" == cask:* ]]; then
+			# Tap-qualified formulas (owner/tap/formula) exist only in Homebrew.
+			# apt/dnf/yum cannot upgrade them, and a same-named distro package
+			# can be an unrelated tool (e.g. apt "bd" is not Beads), so report
+			# unknown rather than queue an update that cannot succeed.
+			printf '%s\n' unknown
+		elif ! command -v brew >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+			get_apt_candidate "$pkg"
+		else
+			get_brew_latest "$pkg"
+		fi ;;
 	pip) get_pip_latest "$pkg" ;;
 	self) printf '%s\n' "$installed" ;; # Self-updating tools — no registry to check
 	*) printf '%s\n' "unknown" ;;
@@ -471,7 +699,9 @@ _classify_tool_status() {
 		class_color="$RED"
 		effective_latest=">=${AIDEVOPS_GH_MIN_SLURP_VERSION}"
 		((++OUTDATED_COUNT))
-		OUTDATED_PACKAGES+=("$update_cmd")
+		# An unmet CLI prerequisite is real, but apt cannot fix it when the
+		# configured channel has no newer candidate.
+		[[ "$approved_version" != "$installed" && "$approved_version" != unknown ]] && OUTDATED_PACKAGES+=("$update_cmd")
 	elif [[ "$installed" == "not installed" ]]; then
 		class_status="not_installed"
 		class_icon="○"
@@ -482,7 +712,7 @@ _classify_tool_status() {
 		class_icon="⏱"
 		class_color="$RED"
 		((++TIMEOUT_COUNT))
-	elif [[ "$installed" == "unknown" || "$approved_version" == "unknown" ]]; then
+	elif [[ "$installed" == "unknown" || -z "$approved_version" || "$approved_version" == "unknown" ]]; then
 		class_status="unknown"
 		class_icon="?"
 		class_color="$YELLOW"
@@ -514,12 +744,68 @@ _append_tool_json_result() {
 	local latest="$4"
 	local status="$5"
 	local update_cmd="$6"
+	# Optional pre-built, internally generated JSON members (no user input).
+	local extra_members="${7:-}"
 
 	local json_name="${name//\\/\\\\}"
 	json_name="${json_name//\"/\\\"}"
 	local json_update="${update_cmd//\\/\\\\}"
 	json_update="${json_update//\"/\\\"}"
-	JSON_RESULTS+=("{\"name\": \"$json_name\", \"category\": \"$category\", \"installed\": \"$installed\", \"latest\": \"$latest\", \"status\": \"$status\", \"update_cmd\": \"$json_update\"}")
+	JSON_RESULTS+=("{\"name\": \"$json_name\", \"category\": \"$category\", \"installed\": \"$installed\", \"latest\": \"$latest\", \"status\": \"$status\", \"update_cmd\": \"$json_update\"${extra_members}}")
+	return 0
+}
+
+# GH#35515: Playwriter's "latest" is the reviewed pin. Expose the registry
+# head separately so the pin is never presented as the newest upstream.
+# Sets _PW_EXTRA_JSON and prints an indented console note (unless quiet/json).
+# Args: approved_version
+_playwriter_version_policy_note() {
+	local approved="$1"
+	local upstream=""
+	upstream=$(get_npm_latest playwriter 2>/dev/null || true)
+	[[ "$upstream" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || upstream="unknown"
+	_PW_EXTRA_JSON=", \"version_policy\": \"approved_pin\", \"approved\": \"${approved}\", \"upstream_latest\": \"${upstream}\""
+	if [[ "$JSON_OUTPUT" != "true" && "$QUIET" != "true" ]]; then
+		echo "   Approved pin: ${approved} (registry latest: ${upstream}; adoption requires review)"
+	fi
+	return 0
+}
+
+# GH#35515: a generated package-runner Playwriter entry is the supported
+# install path; a missing global CLI does not mean the MCP is absent.
+# Config presence is not live health, so point to the live diagnostic.
+# Args: name, category, configured_version, approved_version
+_report_managed_playwriter() {
+	local name="$1"
+	local category="$2"
+	local configured="$3"
+	local approved="$4"
+	local status="managed_mcp" icon="✓" color="$GREEN"
+	if [[ "$configured" == "$approved" ]]; then
+		((++INSTALLED_COUNT))
+	else
+		status="managed_mcp_mismatch"
+		icon="!"
+		color="$YELLOW"
+		((++UNKNOWN_COUNT))
+	fi
+	if [[ "$JSON_OUTPUT" == "true" ]]; then
+		_playwriter_version_policy_note "$approved"
+		_append_tool_json_result "$category" "$name" "$configured" "$approved" "$status" "" \
+			", \"install\": \"managed_package_runner\", \"global_cli\": \"absent\", \"live_health\": \"not_checked\"${_PW_EXTRA_JSON}"
+		return 0
+	fi
+	if [[ "$QUIET" == "true" && "$status" == managed_mcp ]]; then
+		return 0
+	fi
+	echo -e "${color}${icon}  $name: $configured (aidevops-managed on-demand MCP; no global CLI needed)${NC}"
+	if [[ "$status" == managed_mcp_mismatch ]]; then
+		echo "   Generated entry pins $configured; approved is $approved. Re-run setup (aidevops update) to migrate it."
+	fi
+	if [[ "$QUIET" != "true" ]]; then
+		_playwriter_version_policy_note "$approved"
+		echo "   Live health is not checked here: mcp-diagnose.sh playwriter"
+	fi
 	return 0
 }
 
@@ -532,11 +818,15 @@ _print_tool_status() {
 	local icon="$5"
 	local color="$6"
 
-	if [[ "$QUIET" == "true" && "$status" != "outdated" && "$status" != "timeout" ]]; then
+	if [[ "$QUIET" == "true" && "$status" != "outdated" && "$status" != "timeout" && "$status" != "externally_managed" ]]; then
 		return 0
 	fi
 
 	case "$status" in
+	externally_managed)
+		echo -e "${color}${icon}  $name: $installed (Nix-managed; automatic update skipped)${NC}"
+		echo "   Update through the Nix configuration or profile that owns this tool (NixOS, Home Manager, or nix profile)."
+		;;
 	not_installed)
 		echo -e "${color}${icon}  $name: not installed${NC}"
 		if [[ "$QUIET" != "true" ]]; then
@@ -552,6 +842,12 @@ _print_tool_status() {
 	unknown)
 		echo -e "${color}${icon}  $name: $installed (could not check latest)${NC}"
 		;;
+	channel_current)
+		echo -e "${color}${icon}  $name: $installed (no newer candidate in selected channel)${NC}"
+		;;
+	metadata_mismatch)
+		echo -e "${color}${icon}  $name: CLI $installed; installed package $latest (version mismatch, not reinstalling)${NC}"
+		;;
 	minimum_required)
 		echo -e "${color}${icon}  $name: $installed (requires >= ${AIDEVOPS_GH_MIN_SLURP_VERSION} for gh api --paginate --slurp)${NC}"
 		;;
@@ -565,6 +861,20 @@ _print_tool_status() {
 	return 0
 }
 
+# Nix also runs on non-NixOS hosts: detect binary ownership, not the OS or
+# presence of the nix CLI. Resolve profile/system symlinks before checking.
+_tool_is_nix_managed() {
+	local cmd="$1"
+	local binary="" resolved=""
+	binary=$(command -v "$cmd" 2>/dev/null) || return 1
+	[[ "$binary" == /* ]] || return 1
+	resolved=$(readlink -f "$binary" 2>/dev/null || realpath "$binary" 2>/dev/null || printf '%s' "$binary")
+	if [[ "$resolved" == /nix/store/* ]]; then
+		return 0
+	fi
+	return 1
+}
+
 # Check a single tool
 check_tool() {
 	local category="$1"
@@ -576,22 +886,87 @@ check_tool() {
 
 	local installed
 	# pip tools: detect across pip/pipx/uv — pip-only libraries (e.g.
-	# crawl4ai, dspy) have no CLI binary so command -v always fails.
+	# crawl4ai) have no CLI binary so command -v always fails.
 	# npm tools: pass package name so fallback to package.json works.
 	# All other categories: standard CLI binary detection.
 	installed=$(_tool_installed_version "$category" "$cmd" "$ver_flag" "$pkg")
 
+	# The owning Nix configuration/profile controls the update channel. Do not
+	# query unrelated registries or queue commands that cannot update this binary.
+	if _tool_is_nix_managed "$cmd"; then
+		local managed_status="externally_managed"
+		((++EXTERNALLY_MANAGED_COUNT))
+		if [[ "$JSON_OUTPUT" == "true" ]]; then
+			_append_tool_json_result "$category" "$name" "$installed" "unknown" "$managed_status" ""
+		else
+			_print_tool_status "$name" "$installed" "unknown" "$managed_status" "⊘" "$YELLOW"
+		fi
+		return 0
+	fi
+
+	local managed_version=""
+	if [[ "$category" == npm && "$pkg" == playwriter && "$installed" == "not installed" ]] &&
+		managed_version=$(_playwriter_managed_mcp_version); then
+		_report_managed_playwriter "$name" "$category" "$managed_version" "$(_playwriter_approved_version)"
+		return 0
+	fi
+
 	local latest="unknown"
 	latest=$(_tool_latest_version "$category" "$pkg" "$installed")
+	local channel_current=false
+	if [[ "$latest" == channel_current ]]; then
+		channel_current=true
+		latest="$installed"
+	elif [[ "$category" == brew ]]; then
+		latest=$(_tool_normalize_version "$latest")
+	fi
 
 	local status="up_to_date"
 	local icon="✓"
 	local color="$GREEN"
+	# Repair an earlier successful install too: otherwise metadata_mismatch
+	# below deliberately suppresses reinstalling the already-current package.
+	# JSON output remains a read-only report, even when combined with --update.
+	if [[ "$AUTO_UPDATE" == true && "$JSON_OUTPUT" != true && "$category" == npm && "$pkg" == opencode-ai && "$installed" != "$latest" ]]; then
+		local opencode_package_version=""
+		opencode_package_version=$(get_npm_pkg_version "$pkg" || true)
+		if [[ -n "$opencode_package_version" && "$opencode_package_version" == "$latest" ]] &&
+			_opencode_reconcile_npm_shim "$opencode_package_version"; then
+			installed=$(_tool_installed_version "$category" "$cmd" "$ver_flag" "$pkg")
+		fi
+	fi
 	_classify_tool_status "$cmd" "$installed" "$latest" "$update_cmd" status icon color latest
+	if [[ "$channel_current" == true && "$status" == up_to_date ]]; then status=channel_current; fi
+	# A package already at the approved target with a stale CLI --version is
+	# a mismatch, not a reason to reinstall the same package on every pass.
+	if [[ "$category" == npm && "$installed" != "not installed" ]]; then
+		local package_version=""
+		package_version=$(get_npm_pkg_version "$pkg" || true)
+		if [[ -n "$package_version" && "$package_version" != "$installed" && "$package_version" == "$latest" ]]; then
+			if [[ "$status" == outdated ]]; then
+				OUTDATED_COUNT=$((OUTDATED_COUNT - 1))
+				unset "OUTDATED_PACKAGES[$((${#OUTDATED_PACKAGES[@]} - 1))]"
+			elif [[ "$status" == up_to_date ]]; then
+				INSTALLED_COUNT=$((INSTALLED_COUNT - 1))
+			fi
+			status=metadata_mismatch
+			icon="!"
+			color="$YELLOW"
+			((++UNKNOWN_COUNT))
+		fi
+	fi
+	if [[ "$status" == outdated || ( "$status" == minimum_required && "$channel_current" != true && "$latest" != unknown ) ]]; then
+		OUTDATED_TOOL_SPECS+=("$category|$cmd|$ver_flag|$pkg|$installed|$latest")
+	fi
 
 	# JSON output (escape special characters for valid JSON)
 	if [[ "$JSON_OUTPUT" == "true" ]]; then
-		_append_tool_json_result "$category" "$name" "$installed" "$latest" "$status" "$update_cmd"
+		_PW_EXTRA_JSON=""
+		[[ "$pkg" == playwriter ]] && _playwriter_version_policy_note "$(_playwriter_approved_version)"
+		_append_tool_json_result "$category" "$name" "$installed" "$latest" "$status" "$update_cmd" "$_PW_EXTRA_JSON"
+	elif [[ "$pkg" == playwriter ]]; then
+		_print_tool_status "$name" "$installed" "$latest (approved pin)" "$status" "$icon" "$color"
+		[[ "$QUIET" == "true" ]] || _playwriter_version_policy_note "$(_playwriter_approved_version)"
 	else
 		_print_tool_status "$name" "$installed" "$latest" "$status" "$icon" "$color"
 	fi
@@ -659,7 +1034,8 @@ _output_json_results() {
 	echo "    \"outdated\": $OUTDATED_COUNT,"
 	echo "    \"not_installed\": $NOT_INSTALLED_COUNT,"
 	echo "    \"timeout\": $TIMEOUT_COUNT,"
-	echo "    \"unknown\": $UNKNOWN_COUNT"
+	echo "    \"unknown\": $UNKNOWN_COUNT,"
+	echo "    \"externally_managed\": $EXTERNALLY_MANAGED_COUNT"
 	echo "  },"
 	echo "  \"tools\": ["
 	local first=true
@@ -677,6 +1053,99 @@ _output_json_results() {
 	return 0
 }
 
+# GH#35461: npm can install into a user prefix while our stable launcher still
+# executes a system-prefix binary. Reuse setup's atomic, identity-validated writer
+# rather than editing exec lines or touching an unmanaged/system launcher.
+_opencode_reconcile_npm_shim() {
+	local expected="$1"
+	local shim="${HOME}/.local/bin/opencode"
+	local selected prefix candidate candidate_version owner
+	selected=$(command -v opencode 2>/dev/null || true)
+	prefix=$(npm prefix -g 2>/dev/null) || return 1
+	[[ "$prefix" == /* ]] || return 1
+	candidate="${prefix%/}/bin/opencode"
+	printf '  OpenCode npm prefix mismatch: selected %s; installed candidate %s (%s).\n' "$selected" "$candidate" "$expected"
+	printf '  Recovery requires a writable aidevops-managed %s and a validated candidate; otherwise run setup with %s first on PATH.\n' "$shim" "${prefix%/}/bin"
+	[[ "$selected" == "$shim" && -f "$shim" && ! -L "$shim" && -O "$shim" && -w "$shim" ]] || return 1
+	grep -Fq '# aidevops:terminal-title-owner' "$shim" || return 1
+	owner=$(AIDEVOPS_OPENCODE_BIN="$shim" aidevops_opencode_install_owner v1) || return 1
+	[[ "$owner" == npm && -x "$candidate" && ! "$candidate" -ef "$shim" ]] || return 1
+	candidate_version=$(timeout_sec 10 "$candidate" --version 2>/dev/null) || return 1
+	[[ "$candidate_version" == "$expected" ]] || return 1
+	# Sourcing setup changes shell options/IFS/traps, so isolate it from the
+	# updater. The explicit candidate bypasses setup's existing-target retention.
+	(
+		# shellcheck source=setup/modules/tool-install.sh
+		source "${SCRIPT_DIR}/setup/modules/tool-install.sh"
+		export AIDEVOPS_OPENCODE_PROFILE=v1
+		_setup_ensure_opencode_stable_shim "$candidate" >/dev/null || exit 1
+	) || return 1
+	return 0
+}
+
+# Execute queued updates and verify the selected binary after each action.
+_run_outdated_tool_updates() {
+	local index spec category cmd ver_flag pkg before target after package_after update_cmd
+	for index in "${!OUTDATED_PACKAGES[@]}"; do
+		update_cmd="${OUTDATED_PACKAGES[index]}"
+		spec="${OUTDATED_TOOL_SPECS[index]}"
+		IFS='|' read -r category cmd ver_flag pkg before target <<<"$spec"
+		echo "  Running: $update_cmd"
+		# Preserve the existing sudo gate for the selected package-manager branch.
+		local _manual_cmd=""
+		_manual_cmd=$(_tool_selected_sudo_command "$update_cmd" || true)
+		if [[ -n "$_manual_cmd" ]] && ! sudo -n true 2>/dev/null; then
+			if [[ -t 0 && -t 1 ]]; then
+				echo -e "  ${BLUE}Privilege confirmation is required for this system package update.${NC}"
+				if ! sudo -v; then
+					echo -e "  ${YELLOW}⊘ Blocked: privilege confirmation failed; the next interactive update will retry.${NC}"
+					((++SUDO_SKIP_COUNT))
+					continue
+				fi
+			else
+				echo -e "  ${YELLOW}⊘ Deferred: privilege confirmation requires an attached terminal; the next interactive update will retry.${NC}"
+				((++SUDO_SKIP_COUNT))
+				continue
+			fi
+		fi
+		# Commands are hardcoded in tool definitions, not external input. A
+		# temporary log avoids macOS timeout fallback pipe hangs.
+		local _update_log
+		if ! _update_log=$(mktemp "${TMPDIR:-/tmp}/tool-update.XXXXXX"); then
+			echo -e "  ${RED}✗ Failed to create temp log${NC}"
+			((++UPDATE_FAILURE_COUNT))
+			continue
+		fi
+		if timeout_sec 120 bash -c "$update_cmd" >"$_update_log" 2>&1; then
+			tail -2 "$_update_log"
+			after=$(_tool_installed_version "$category" "$cmd" "$ver_flag" "$pkg")
+			package_after=""
+			if [[ "$category" == npm ]]; then package_after=$(get_npm_pkg_version "$pkg" || true); fi
+			if [[ "$pkg" == opencode-ai && "$category" == npm && "$after" != "$target" && "$package_after" == "$target" ]]; then
+				if _opencode_reconcile_npm_shim "$package_after"; then
+					after=$(_tool_installed_version "$category" "$cmd" "$ver_flag" "$pkg")
+				fi
+			fi
+			if [[ "$after" != "$before" && ( "$after" == "$target" || "$target" == '>='* ) ]]; then
+				echo -e "  ${GREEN}✓ Updated and verified ($after)${NC}"
+			elif [[ -n "$package_after" && "$package_after" == "$target" ]]; then
+				echo -e "  ${YELLOW}⊘ Package $package_after installed, but CLI reports $after; check binary ownership${NC}"
+				((++UPDATE_NOOP_COUNT))
+			else
+				echo -e "  ${YELLOW}⊘ No verified update ($before → $after); check selected package channel${NC}"
+				((++UPDATE_NOOP_COUNT))
+			fi
+		else
+			tail -2 "$_update_log"
+			echo -e "  ${RED}✗ Failed${NC}"
+			((++UPDATE_FAILURE_COUNT))
+		fi
+		rm -f "$_update_log"
+		echo ""
+	done
+	return 0
+}
+
 # Print summary counts and handle auto-update or update instructions
 _output_summary_and_updates() {
 	# Summary (skip in quiet mode if nothing outdated)
@@ -690,6 +1159,9 @@ _output_summary_and_updates() {
 		echo "  Installed & up to date: $INSTALLED_COUNT"
 		echo "  Outdated: $OUTDATED_COUNT"
 		echo "  Not installed: $NOT_INSTALLED_COUNT"
+		if [[ $EXTERNALLY_MANAGED_COUNT -gt 0 ]]; then
+			echo "  Externally managed (Nix; skipped): $EXTERNALLY_MANAGED_COUNT"
+		fi
 		if [[ $TIMEOUT_COUNT -gt 0 ]]; then
 			echo "  Timeout (version check hung): $TIMEOUT_COUNT"
 		fi
@@ -700,64 +1172,23 @@ _output_summary_and_updates() {
 	fi
 
 	if [[ $OUTDATED_COUNT -gt 0 ]]; then
+		if [[ ${#OUTDATED_PACKAGES[@]} -eq 0 ]]; then
+			printf '%s\n' 'No upgrade is available in the selected channel; resolve any unmet minimum version separately.'
+			return 0
+		fi
 		if [[ "$AUTO_UPDATE" == "true" ]]; then
 			echo -e "${BLUE}Updating outdated tools...${NC}"
 			echo ""
-		for update_cmd in "${OUTDATED_PACKAGES[@]}"; do
-			echo "  Running: $update_cmd"
-			# Sudo safety gate (GH#21734): commands routed through apt-get/dnf/yum
-			# require sudo. Probe for passwordless sudo first; if not available,
-			# skip and print the manual command instead of hanging on an
-			# interactive password prompt during unattended `aidevops update`.
-			if [[ "$update_cmd" == *" sudo "* ]]; then
-				if ! sudo -n true 2>/dev/null; then
-					local _manual_cmd
-					_manual_cmd=""
-					if command -v apt-get >/dev/null 2>&1; then
-						_manual_cmd=$(grep -oE 'sudo apt-get[^;]+' <<<"$update_cmd" | head -1)
-					elif command -v dnf >/dev/null 2>&1; then
-						_manual_cmd=$(grep -oE 'sudo dnf[^;]+' <<<"$update_cmd" | head -1)
-					elif command -v yum >/dev/null 2>&1; then
-						_manual_cmd=$(grep -oE 'sudo yum[^;]+' <<<"$update_cmd" | head -1)
-					fi
-					echo -e "  ${YELLOW}⊘ Skipped: requires sudo. Run manually:${NC}"
-					if [[ -n "$_manual_cmd" ]]; then
-						echo "    ${_manual_cmd}"
-					else
-						echo "    $update_cmd"
-					fi
-					((++SUDO_SKIP_COUNT))
-					echo ""
-					continue
-				fi
-			fi
-			# Run update command directly (not via eval for security)
-			# Commands are hardcoded in tool definitions, not user input
-			# Timeout prevents hangs on slow registries/network issues
-			# Use timeout_sec for macOS compatibility (no native timeout)
-			# NOTE: Do NOT pipe timeout_sec output to tail/head — on macOS the
-			# perl alarm fallback doesn't close the pipe's write end on SIGALRM,
-			# causing tail to block forever. Use a temp file instead.
-			local _update_log
-			if ! _update_log=$(mktemp "${TMPDIR:-/tmp}/tool-update.XXXXXX"); then
-				echo -e "  ${RED}✗ Failed to create temp log${NC}"
-				continue
-			fi
-			if timeout_sec 120 bash -c "$update_cmd" >"$_update_log" 2>&1; then
-				tail -2 "$_update_log"
-				echo -e "  ${GREEN}✓ Updated${NC}"
+			_run_outdated_tool_updates
+			if [[ $UPDATE_FAILURE_COUNT -gt 0 ]]; then
+				echo -e "${RED}Tool maintenance failed: ${UPDATE_FAILURE_COUNT} action(s) did not complete or verify.${NC}"
+				return 1
+			elif [[ $SUDO_SKIP_COUNT -gt 0 || $UPDATE_NOOP_COUNT -gt 0 ]]; then
+				echo -e "${YELLOW}Tool maintenance incomplete: ${SUDO_SKIP_COUNT} deferred, ${UPDATE_NOOP_COUNT} not verified as updated.${NC}"
+				return 1
 			else
-				tail -2 "$_update_log"
-				echo -e "  ${RED}✗ Failed${NC}"
+				echo -e "${GREEN}Tool updates applied and verified.${NC}"
 			fi
-			rm -f "$_update_log"
-			echo ""
-		done
-		if [[ $SUDO_SKIP_COUNT -gt 0 ]]; then
-			echo -e "${GREEN}Updates complete (${SUDO_SKIP_COUNT} skipped — manual sudo required).${NC}"
-		else
-			echo -e "${GREEN}Updates complete. Re-run to verify.${NC}"
-		fi
 		else
 			echo "To update all outdated tools, run:"
 			echo "  tool-version-check.sh --update"
@@ -767,6 +1198,10 @@ _output_summary_and_updates() {
 				echo "  $update_cmd"
 			done
 		fi
+	elif [[ $UNKNOWN_COUNT -gt 0 ]]; then
+		echo -e "${YELLOW}No verified tool updates are pending; ${UNKNOWN_COUNT} installed tool(s) could not be verified.${NC}"
+	elif [[ $EXTERNALLY_MANAGED_COUNT -gt 0 ]]; then
+		echo -e "${YELLOW}No automatic tool updates are pending; Nix-managed tools were skipped.${NC}"
 	else
 		echo -e "${GREEN}All installed tools are up to date!${NC}"
 	fi

@@ -300,7 +300,9 @@ cmd_analyze() {
 
 	# Run secretlint if available
 	echo -e "${CYAN}Running secret detection...${NC}"
+	local secret_stage="Secretlint unavailable (not run)"
 	if check_command secretlint || (check_command npx && npx secretlint --version &>/dev/null 2>&1); then
+		secret_stage="Secretlint ran"
 		local secretlint_cmd="secretlint"
 		if ! check_command secretlint; then
 			secretlint_cmd="npx secretlint"
@@ -314,8 +316,10 @@ cmd_analyze() {
 	fi
 
 	echo ""
-	echo -e "${GREEN}Analysis complete.${NC}"
-	echo -e "For AI-powered deep analysis, use the security-analysis subagent."
+	# GH#35120: report the scanner stage only; this is not a completed audit.
+	echo -e "${GREEN}Scanner stage finished:${NC} ${secret_stage}."
+	echo -e "${YELLOW}Not a security audit:${NC} no source-to-sink investigation or independent verification ran."
+	echo -e "For deep analysis, use the security-analysis subagent (tools/code-review/security-analysis.md)."
 
 	return 0
 }
@@ -530,7 +534,8 @@ _skill_scan_launch_parallel() {
 		full_path="${agents_dir}/${local_path#.agents/}"
 
 		if [[ ! -f "$full_path" ]]; then
-			echo -e "${YELLOW}SKIP${NC}: $name (file not found: $local_path)"
+			# stderr: stdout carries only "pid name path" launch records.
+			echo -e "${YELLOW}SKIP${NC}: $name (file not found: $local_path)" >&2
 			continue
 		fi
 
@@ -588,21 +593,31 @@ _skill_scan_collect_results() {
 
 		if [[ -n "$scan_output" ]]; then
 			local findings max_severity
-			findings=$(echo "$scan_output" | jq -r '.total_findings // 0' 2>/dev/null || echo "0")
+			# Scanner JSON reports .findings_count (1.x and 2.x); fall back to the array length (GH#34619).
+			findings=$(echo "$scan_output" | jq -r '.findings_count // (.findings | length) // 0' 2>/dev/null || echo "0")
 			max_severity=$(echo "$scan_output" | jq -r '.max_severity // "SAFE"' 2>/dev/null || echo "SAFE")
 
 			if [[ "$findings" -gt 0 ]]; then
 				total_findings=$((total_findings + findings))
-				skills_with_issues=$((skills_with_issues + 1))
-				echo -e "  ${RED}ISSUES${NC}: $findings findings (max severity: $max_severity)"
 
-				local skill_critical skill_high skill_medium
+				local skill_critical skill_high skill_medium is_safe
 				skill_critical=$(echo "$scan_output" | jq '[.findings[]? | select(.severity == "CRITICAL")] | length' 2>/dev/null || echo "0")
 				skill_high=$(echo "$scan_output" | jq '[.findings[]? | select(.severity == "HIGH")] | length' 2>/dev/null || echo "0")
 				skill_medium=$(echo "$scan_output" | jq '[.findings[]? | select(.severity == "MEDIUM")] | length' 2>/dev/null || echo "0")
+				is_safe=$(echo "$scan_output" | jq -r 'if .is_safe == false then "false" else "true" end' 2>/dev/null || echo "true")
 				total_critical=$((total_critical + skill_critical))
 				total_high=$((total_high + skill_high))
 				total_medium=$((total_medium + skill_medium))
+
+				# Fail only on the scanner's unsafe verdict or CRITICAL/HIGH findings
+				# (the import blocking threshold); lower-severity policy notes such as
+				# a missing license are reported without failing the batch.
+				if [[ "$is_safe" == "false" || "$skill_critical" -gt 0 || "$skill_high" -gt 0 ]]; then
+					skills_with_issues=$((skills_with_issues + 1))
+					echo -e "  ${RED}ISSUES${NC}: $findings findings (max severity: $max_severity)"
+				else
+					echo -e "  ${YELLOW}NOTES${NC}: $findings findings (max severity: $max_severity)"
+				fi
 
 				echo "$scan_output" | jq -r \
 					'.findings[]? | select(.severity == "CRITICAL" or .severity == "HIGH") | "  [\(.severity)] \(.rule_id): \(.description)"' \
@@ -702,9 +717,15 @@ _skill_scan_all() {
 	trap "rm -rf '$scan_tmpdir'" RETURN
 
 	# Phase 1: launch all scans in parallel; capture pid/name/path per job.
+	# Launch in the current shell (redirect, not process substitution) so the
+	# background scans are children of this shell and Phase 2 can wait for
+	# them; a `< <(...)` launcher makes `wait` return 127 immediately and the
+	# collector reads empty output files (GH#34619).
 	local scan_pids=()
 	local scan_names=()
 	local scan_paths=()
+	local launch_file="$scan_tmpdir/launch.txt"
+	_skill_scan_launch_parallel "$scanner_cmd" "$agents_dir" "$skill_sources" "$scan_tmpdir" >"$launch_file"
 
 	while IFS= read -r launch_line; do
 		local pid name lpath
@@ -714,7 +735,7 @@ _skill_scan_all() {
 		scan_pids+=("$pid")
 		scan_names+=("$name")
 		scan_paths+=("$lpath")
-	done < <(_skill_scan_launch_parallel "$scanner_cmd" "$agents_dir" "$skill_sources" "$scan_tmpdir")
+	done <"$launch_file"
 
 	# Phase 2: collect results and accumulate counters.
 	# Called as a regular function (not a subshell) so it can access scan_pids/

@@ -43,7 +43,7 @@ check_dependencies() {
 load_config() {
     local api_key
     
-    # First try environment variable (preferred - set via credentials.sh)
+    # First try environment variable
     api_key="${UPDOWN_API_KEY:-}"
     
     # Fallback to config file if env var not set
@@ -51,9 +51,14 @@ load_config() {
         api_key=$(jq -r '.api_key // empty' "$CONFIG_FILE" 2>/dev/null)
     fi
 
+    # Then credentials.sh, then gopass aidevops/UPDOWN_API_KEY (GH#34892)
+    if [[ -z "$api_key" ]]; then
+        api_key=$(aidevops_resolve_secret UPDOWN_API_KEY) || api_key=""
+    fi
+
     if [[ -z "$api_key" ]]; then
         print_error "$ERROR_API_KEY_MISSING"
-        print_error "Set UPDOWN_API_KEY in ~/.config/aidevops/credentials.sh"
+        print_error "Set it with: aidevops secret set UPDOWN_API_KEY"
         return 1
     fi
 
@@ -66,8 +71,8 @@ load_config() {
 # ------------------------------------------------------------------------------
 
 execute_request() {
-    local method="$command"
-    local endpoint="$account_name"
+    local method="$1"
+    local endpoint="$2"
     local data="${3:-}"
     
     local api_key
@@ -130,7 +135,7 @@ get_checks_json() {
 }
 
 add_check() {
-    local url="$command"
+    local url="$1"
     local alias="${2:-}"
     local period="${3:-3600}" # Default to 1 hour (3600 seconds)
 
@@ -157,7 +162,7 @@ add_check() {
 }
 
 delete_check() {
-    local token="$command"
+    local token="$1"
 
     if [[ -z "$token" ]]; then
         print_error "Check token is required"
@@ -174,7 +179,7 @@ delete_check() {
 }
 
 get_metrics() {
-    local token="$command"
+    local token="$1"
     
     if [[ -z "$token" ]]; then
         print_error "Check token is required"
@@ -209,20 +214,11 @@ show_help() {
 main() {
     # Assign positional parameters to local variables
     local command="${1:-help}"
-    local account_name="$account_name"
-    local target="$target"
-    local options="$options"
-    # Assign positional parameters to local variables
-    local command="${1:-help}"
-    local account_name="$account_name"
-    local target="$target"
-    local options="$options"
-    check_dependencies || return 1
-
-    local command="${1:-help}"
     local arg1="${2:-}"
     local arg2="${3:-}"
     local arg3="${4:-}"
+
+    check_dependencies || return 1
 
     case "$command" in
         "list")
